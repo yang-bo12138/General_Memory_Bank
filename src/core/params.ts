@@ -184,20 +184,84 @@ export interface ParamViolation {
   reason: string;
 }
 
-/** 校验失败时抛出的错误的 `details` 形状。 */
-export type ParamViolationDetails = Record<string, Omit<ParamViolation, 'key'>>;
+/**
+ * 校验失败时抛出的错误的 `details` 形状。
+ *
+ * ⚠️ §5 原文的形状是「**一个键一个对象**」：
+ *   `details = { REDUNDANCY_COS: { current: 0.90, maxAllowed: 0.85, reason: '...' } }`
+ *   ⇒ `details[key]` **不是数组**（改成数组会破坏调用方与既有断言的形状）。
+ */
+export type ParamViolationDetails = Record<string, ParamViolationDetail>;
 
-/** 构造 `details[key]` 的内部工具。 */
-function violationDetails(violation: ParamViolation): Omit<ParamViolation, 'key'> {
-  const detail: Omit<ParamViolation, 'key'> = {
-    current: violation.current,
-    reason: violation.reason,
-  };
-  if (violation.maxAllowed !== undefined) {
-    detail.maxAllowed = violation.maxAllowed;
+/**
+ * 一个键的违反详情（`details[key]`）。
+ *
+ * ⚠️ 在 §5 的形状之上，**额外**保留该键的**全部**违反项：
+ *   同一个键可能同时违反多条约束（例：`ROUTER_COARSE_CENTERS` 同时低于
+ *   `ROUTER_NPROBE_COARSE` 与 `ROUTER_NPROBE_WRITE_COARSE` 两个探针数），
+ *   只留一条会把另一条**掩盖**掉（QA 报告 §四·观察项 7）。
+ */
+export interface ParamViolationDetail extends Omit<ParamViolation, 'key'> {
+  /**
+   * 该键的**全部**违反项（仅当该键违反**多条**约束时才有）。
+   *
+   * ⚠️ 之所以不是数组而是「对象 + 这个列表」：
+   *   §5 承诺的 `details[key]` 形状是**一个对象**（含可直接读取的建议值），
+   *   改成数组会破坏调用方的形状契约与既有断言。
+   */
+  violations?: ParamViolation[];
+}
+
+/**
+ * 把**同一个键**的**一条或多条**违反项合并成**一条**可执行的建议值（§5）。
+ *
+ * ⚠️ 为什么不能简单地「保留第一条」：
+ *   同一个键的若干条违反项**都要满足** ⇒ 真正的**约束**是它们里**最严**的那条
+ *   （下界取**最大**、上界取**最小**）。若只报第一条，可能报出一个
+ *   **照着改仍然不合法**的建议值（例：`ROUTER_NPROBE_WRITE_COARSE = 100` 时，
+ *   `ROUTER_COARSE_CENTERS` 的两条违反项分别要求 ≥20 与 ≥100，
+ *   只报 20 ⇒ 调用方改成 20 依旧非法）。
+ * ⇒ 这里取**最严**的界，并 `violations` 保留全部违反项（不掩盖）。
+ *
+ * ⚠️ 「取最大/取最小」是**与顺序无关**的 ⇒ 同一组违反项无论校验顺序如何，
+ *   得到的建议值都相同（可复现）。
+ */
+function mergeViolationDetails(violations: readonly ParamViolation[]): ParamViolationDetail {
+  const first = violations[0];
+  if (first === undefined) {
+    throw new Error('mergeViolationDetails 需要至少一条违反项');
   }
-  if (violation.minAllowed !== undefined) {
-    detail.minAllowed = violation.minAllowed;
+
+  const detail: ParamViolationDetail = {
+    current: first.current,
+    // ⚠️ 理由**全部**保留（用「；」连接）⇒ 哪一条约束也不被掩盖。
+    reason: violations.map((violation) => violation.reason).join('；'),
+  };
+
+  let minAllowed: number | undefined;
+  let maxAllowed: number | undefined;
+  for (const violation of violations) {
+    if (violation.minAllowed !== undefined) {
+      minAllowed =
+        minAllowed === undefined
+          ? violation.minAllowed
+          : Math.max(minAllowed, violation.minAllowed);
+    }
+    if (violation.maxAllowed !== undefined) {
+      maxAllowed =
+        maxAllowed === undefined
+          ? violation.maxAllowed
+          : Math.min(maxAllowed, violation.maxAllowed);
+    }
+  }
+  if (minAllowed !== undefined) {
+    detail.minAllowed = minAllowed;
+  }
+  if (maxAllowed !== undefined) {
+    detail.maxAllowed = maxAllowed;
+  }
+  if (violations.length > 1) {
+    detail.violations = [...violations];
   }
   return detail;
 }
@@ -432,14 +496,24 @@ export function assertParamsValid(params: Params): void {
   if (violations.length === 0) {
     return;
   }
-  const details: ParamViolationDetails = {};
+  // ⚠️ 同一个键可能有多条违反（如 `ROUTER_COARSE_CENTERS` 同时低于两个探针数）⇒
+  //    按键**分组**后合并成**一条**可执行的建议值（取最严的界），并保留全部违反项。
+  //    详见 `mergeViolationDetails` 的说明。
+  const byKey = new Map<string, ParamViolation[]>();
   for (const violation of violations) {
-    // ⚠️ 同一键可能有多条违反（如 `ROUTER_COARSE_CENTERS` 同时低于两个探针数）——
-    //    保留**第一条**，避免 details 的形状随违反顺序漂移（不可复现）。
-    if (details[violation.key] === undefined) {
-      details[violation.key] = violationDetails(violation);
+    const bucket = byKey.get(violation.key);
+    if (bucket === undefined) {
+      byKey.set(violation.key, [violation]);
+    } else {
+      bucket.push(violation);
     }
   }
+
+  const details: ParamViolationDetails = {};
+  for (const [key, group] of byKey) {
+    details[key] = mergeViolationDetails(group);
+  }
+
   throw MemoryError.invalidInput(
     `参数未通过跨参数校验：${violations.map((v) => v.key).join(', ')}`,
     details,

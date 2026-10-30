@@ -227,6 +227,43 @@ describe('P0-T02 · 8 条跨参数校验（逐条）', () => {
   });
 });
 
+describe('P0-T07 · 同一键的多条违反项（details 必须给出可执行的建议值）', () => {
+  it('★ 建议值取**最严**的界：照着改必须真的合法', () => {
+    // ⚠️ 场景：写入路径的探针数（100）比召回路径（20）更严 ⇒
+    //    `ROUTER_COARSE_CENTERS` 同时违反两条约束（≥20 与 ≥100）。
+    //    若只报第一条（≥20），调用方照着改成 20 **依旧非法** ⇒ 建议值必须是 ≥100。
+    const error = expectInvalidInput({
+      ROUTER_NPROBE_WRITE_COARSE: 100,
+      ROUTER_COARSE_CENTERS: 10,
+    });
+    const detail = error.details.ROUTER_COARSE_CENTERS as {
+      current: number;
+      minAllowed?: number;
+      reason: string;
+      violations?: { minAllowed?: number; reason: string }[];
+    };
+    expect(detail.current).toBe(10);
+    expect(detail.minAllowed).toBe(100);
+    // ⚠️ 全部违反项都保留（不掩盖）：两条理由都在，且 `violations` 列全。
+    expect(detail.reason).toContain('ROUTER_NPROBE_COARSE');
+    expect(detail.reason).toContain('ROUTER_NPROBE_WRITE_COARSE');
+    expect(detail.violations).toHaveLength(2);
+  });
+
+  it('单条违反项时 details 的形状不变（§5 承诺的「一个键一个对象」）', () => {
+    const error = expectInvalidInput({ REDUNDANCY_COS: 0.95 });
+    const detail = error.details.REDUNDANCY_COS as {
+      current: number;
+      maxAllowed?: number;
+      violations?: unknown[];
+    };
+    expect(detail.current).toBe(0.95);
+    expect(detail.maxAllowed).toBe(0.92);
+    // ⚠️ 只有一条违反时不需要 `violations` 列表。
+    expect(detail.violations).toBeUndefined();
+  });
+});
+
 describe('P0-T02 · 刻意不做的联动校验（不得「顺手」加上）', () => {
   it('COACT_MIN_COS 与 REDUNDANCY_COS 不联动', () => {
     expect(validateParams(withOverrides({ COACT_MIN_COS: 0.01, REDUNDANCY_COS: 0.9 }))).toEqual([]);

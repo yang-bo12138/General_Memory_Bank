@@ -6,3 +6,24 @@
 两个是引擎——「遗忘曲线」是时间引擎（驱动强度随时间衰减），\
 「神经元交互」是网络引擎（驱动记忆之间的关系随使用而变化）。\
 两个引擎并列，不是主从。
+
+## 开发
+
+```bash
+pnpm install     # 装依赖
+pnpm run verify  # 门禁：类型检查 → 代码风格 → 单元测试 → 5 条契约脚本
+pnpm build       # 构建产物（tsup：CJS + ESM + d.ts）
+```
+
+> ⚠️ **门禁命令是 `pnpm run verify`**（别名：`pnpm run ci`）。
+>
+> **裸 `pnpm ci` / `npm ci` 只做依赖安装（clean install），不做任何校验，退出码却是 0。**
+> 那是包管理器的**内建命令**，它会**遮蔽同名 script** ⇒
+> 「跑了一下 `pnpm ci`，退出码 0」**不能**说明门禁跑过了。
+> 这正是设计稿 C31 警告的症状：「一个从不失败的闸门，看起来在把关」。
+>
+> 门禁的形状由 `scripts/check-gate-entry.ts` **机器可检**：
+> `scripts.ci` 必须**恰好**是 `pnpm run verify` 的别名，
+> 且 `scripts.verify` 串起的 8 条子命令逐名齐全、每段都写成 `pnpm run <名>`。
+>
+> CI 工作流在 `.github/workflows/ci.yml`，跑的是 `pnpm run verify`（**不是** `pnpm ci`）。

@@ -15,6 +15,7 @@ import {
   EXPECTED_CLOCK_READ_FILES,
   EXPECTED_CLOCK_READ_SITES,
   evaluateExpectations,
+  evaluateWhitelistLength,
   scanClockReads,
   stripComments,
 } from '../../scripts/check-clock.js';
@@ -176,6 +177,24 @@ describe('P0-T05 · C37 静态扫描', () => {
     expect(failures.join(' ')).toContain('分母写死');
     expect(EXPECTED_CLOCK_READ_FILES).toBe(ALLOWED_CLOCK_READ_FILES.length);
     expect(EXPECTED_CLOCK_READ_SITES).toBeGreaterThan(0);
+  });
+
+  it('★ 分母是字面量：白名单长度与写死的期望文件数不一致 ⇒ 失败', () => {
+    // ⚠️ 这一条防的是「有人往白名单里加文件却没同步改期望值」——
+    //   若期望值由白名单长度派生，这条永远不可能失败（假绿）。
+    expect(evaluateWhitelistLength(ALLOWED_CLOCK_READ_FILES, EXPECTED_CLOCK_READ_FILES)).toEqual(
+      [],
+    );
+    expect(EXPECTED_CLOCK_READ_FILES).toBe(1);
+    expect(ALLOWED_CLOCK_READ_FILES).toHaveLength(EXPECTED_CLOCK_READ_FILES);
+
+    // ★ 反例：白名单多了一个文件而期望值没同步改 ⇒ 必须报出来
+    const drifted = evaluateWhitelistLength(
+      [...ALLOWED_CLOCK_READ_FILES, 'src/core/params.ts'],
+      EXPECTED_CLOCK_READ_FILES,
+    );
+    expect(drifted.length).toBeGreaterThan(0);
+    expect(drifted.join(' ')).toContain('白名单长度');
   });
 
   it('★ 故意加一行 Date.now() ⇒ 扫描器必须报违规', () => {

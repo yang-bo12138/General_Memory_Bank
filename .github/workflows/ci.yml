@@ -1,0 +1,72 @@
+# CI 工作流 —— 阶段 0 的门禁在 GitHub Actions 上真正跑起来。
+#
+# ⚠️ **不要写 `pnpm ci`**：`pnpm ci` / `npm ci` 是**包管理器的内建命令**（clean install），
+#   它会**遮蔽同名 script** ⇒ 退出码 0，但**一条契约脚本都没跑**（假绿闸门）。
+#   门禁的规范入口是 `pnpm run verify`（`pnpm run ci` 是它的别名）。
+#   详见 `scripts/check-gate-entry.ts`（机器可检的防线）。
+name: CI
+
+on: [push, pull_request]
+
+# ⚠️ 并发时取消旧的运行（同一分支只留最新一次）。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── 门禁：8 条子命令串成一条链，任一失败 ⇒ 退出码非 0 ──
+  verify:
+    name: 门禁（verify）
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+
+      # ⚠️ 版本号必须与 `package.json` 的 `packageManager` 字段一致（pnpm@12.16.1）。
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12.16.1
+
+      # ⚠️ Node 22：`better-sqlite3@13` 的预编译产物按 **Node-API v10** 构建
+      #   （Node 20 最高只支持 v9）⇒ 在 Node 20 上加载会**段错误**。
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # ⚠️ `--frozen-lockfile` ⇒ CI 装的依赖必须与 `pnpm-lock.yaml` 逐字一致。
+      #   `pnpm-workspace.yaml` 的 `allowBuilds` 已放行 better-sqlite3 / esbuild / @biomejs/biome
+      #   的构建脚本（它们各自的平台二进制要在这一步落地）。
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      # ⚠️ **不是 `pnpm ci`** —— 门禁入口是 `verify`。
+      - name: 跑门禁
+        run: pnpm run verify
+
+  # ── 构建：tsup 产物（CJS + ESM + d.ts 三件套）──
+  build:
+    name: 构建（tsup）
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12.16.1
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 构建产物
+        run: pnpm build

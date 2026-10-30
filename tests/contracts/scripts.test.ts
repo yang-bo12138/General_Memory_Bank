@@ -14,12 +14,25 @@ import {
   normalizeCell,
 } from '../../scripts/check-anchor.js';
 import {
+  EXPECTED_MISSING_EXPRESSION_GROUPS,
+  EXPECTED_READONLY_WRITE_METHODS,
+  EXPECTED_WARNING_ONLY_CASES,
   checkContracts,
   parseSection5ValidationCount,
   parseSection6Params,
+  parseSection7_1WriteMethods,
   parseSection11_2Methods,
   parseSection12ValidationReference,
 } from '../../scripts/check-contract-ids.js';
+import {
+  EXPECTED_CI_ALIAS,
+  EXPECTED_GATE_COMMANDS,
+  PNPM_BUILTIN_COMMANDS,
+  checkGateEntry,
+  compareNameSets,
+  parseVerifyChain,
+  readPackageJson,
+} from '../../scripts/check-gate-entry.js';
 import { compareParams, parseSection5Params } from '../../scripts/check-params.js';
 import {
   comparePayloadKeys,
@@ -36,6 +49,14 @@ import {
   splitTableRow,
   stripBlockquote,
 } from '../../scripts/lib/design-doc.js';
+import {
+  METHODS_THROWING_CONFLICT,
+  METHODS_THROWING_NOT_FOUND,
+  METHODS_THROWING_READONLY_VIOLATION,
+  MISSING_IDS_KEY,
+  NOT_FOUND_METHODS_WITH_MISSING_IDS,
+  WARNING_ONLY_CASES,
+} from '../../src/core/errors.js';
 import { EVENT_PAYLOAD_KEYS, EVENT_TYPES } from '../../src/core/events.types.js';
 import {
   CROSS_PARAM_VALIDATION_COUNT,
@@ -247,5 +268,125 @@ describe('P0-T06 · 表格行解析', () => {
     const rows = parseAllTableRows('> | `a` | 1 |\n> | --- | --- |\n> | `b` | 2 |');
     expect(rows).toHaveLength(2);
     expect(rows[0]?.[0]).toBe('`a`');
+  });
+});
+
+describe('P0-T07 · §11.2 的六组表达方式（逐名比对，不是计数）', () => {
+  it('§7.1 的写方法清单能解析出 16 个，且与写死的期望逐名相同', () => {
+    const parsed = parseSection7_1WriteMethods(markdown);
+    expect(parsed).toHaveLength(16);
+    expect([...parsed].sort()).toEqual([...EXPECTED_READONLY_WRITE_METHODS].sort());
+  });
+
+  it('★ 反例：§7.1 少写一个方法 ⇒ 逐名比对必须抓出来（不是只比数量）', () => {
+    // ⚠️ 若只比「数量 == 16」，把 `sweep` 换成 `sweepX` 是**发现不了**的
+    //   （数量对上了，名字对不上 ⇒ 另一种假绿）。
+    const swapped = EXPECTED_READONLY_WRITE_METHODS.map((name) =>
+      name === 'sweep' ? 'sweepX' : name,
+    );
+    const diffs = compareNameSets(EXPECTED_READONLY_WRITE_METHODS, swapped, '写方法');
+    expect(diffs.length).toBeGreaterThan(0);
+    expect(diffs.map((d) => d.reason).join(' ')).toContain('sweep');
+  });
+
+  it('期望分组写死为常量（不从设计稿现场解析当分母）', () => {
+    // ⚠️ §11.2 的「涉及方法」列对 READONLY_VIOLATION 只写「全部写方法」，
+    //   解析出来的名单**不完整** ⇒ 期望值必须是外部写死的常量（C31）。
+    expect(EXPECTED_MISSING_EXPRESSION_GROUPS.throw_not_found).toHaveLength(10);
+    expect(EXPECTED_MISSING_EXPRESSION_GROUPS.return_null).toEqual(['get']);
+    expect(EXPECTED_MISSING_EXPRESSION_GROUPS.conflict).toEqual([
+      'restore',
+      'updateContent',
+      'setAlias',
+    ]);
+    expect(EXPECTED_READONLY_WRITE_METHODS).toHaveLength(16);
+  });
+
+  it('`ALIAS_CONFLICT` 刻意不是异常 ⇒ 不在任何抛错分组里', () => {
+    expect(EXPECTED_WARNING_ONLY_CASES).toEqual(['ALIAS_CONFLICT']);
+    for (const group of Object.values(EXPECTED_MISSING_EXPRESSION_GROUPS)) {
+      expect(group).not.toContain('ALIAS_CONFLICT');
+    }
+    expect(EXPECTED_READONLY_WRITE_METHODS).not.toContain('ALIAS_CONFLICT');
+    expect(METHODS_THROWING_NOT_FOUND).not.toContain('ALIAS_CONFLICT');
+    expect(METHODS_THROWING_CONFLICT).not.toContain('ALIAS_CONFLICT');
+    expect(METHODS_THROWING_READONLY_VIOLATION).not.toContain('ALIAS_CONFLICT');
+    expect(WARNING_ONLY_CASES).toEqual(['ALIAS_CONFLICT']);
+  });
+
+  it('`missingIds` 锚点：承载它的方法必须在 NOT_FOUND 分组里', () => {
+    expect(MISSING_IDS_KEY).toBe('missingIds');
+    for (const method of NOT_FOUND_METHODS_WITH_MISSING_IDS) {
+      expect(METHODS_THROWING_NOT_FOUND).toContain(method);
+    }
+  });
+
+  it('§11.2 的 warnings 那一行确实标了 ALIAS_CONFLICT（文档 ↔ 代码）', () => {
+    const semantics = parseSection11_2Methods(markdown);
+    expect(semantics.get('warning_only')).toContain('ALIAS_CONFLICT');
+    expect(semantics.get('warning_only')).toContain('write');
+  });
+});
+
+describe('P0-T07 · 门禁入口的可见性（防「假绿闸门」）', () => {
+  it('真实的 package.json 完全合规', () => {
+    expect(checkGateEntry(readPackageJson())).toEqual([]);
+  });
+
+  it('规范入口是 `verify`（不是任何包管理器的内建命令名）', () => {
+    expect(PNPM_BUILTIN_COMMANDS).toContain('ci');
+    expect(PNPM_BUILTIN_COMMANDS).not.toContain('verify');
+  });
+
+  it('`scripts.ci` 恰好是 `pnpm run verify` 的别名', () => {
+    expect(EXPECTED_CI_ALIAS).toBe('pnpm run verify');
+    const pkg = readPackageJson();
+    // ⚠️ `ci` 是**别名**（内容恰好是 `pnpm run verify`）；`verify` 本身是那条链。
+    expect(pkg.scripts?.ci).toBe(EXPECTED_CI_ALIAS);
+    expect(pkg.scripts?.verify).not.toBe(EXPECTED_CI_ALIAS);
+    expect(pkg.scripts?.verify).toContain('pnpm run typecheck');
+  });
+
+  it('`verify` 链恰好串起 8 条门禁，且每段都写成 `pnpm run <名>`', () => {
+    const pkg = readPackageJson();
+    const { names, malformed } = parseVerifyChain(pkg.scripts?.verify ?? '');
+    expect(malformed).toEqual([]);
+    expect(names).toEqual([...EXPECTED_GATE_COMMANDS]);
+  });
+
+  it('★ 反例：把 `ci` 改回一串别的命令 ⇒ 必须失败', () => {
+    const pkg = readPackageJson();
+    const diffs = checkGateEntry({
+      scripts: { ...pkg.scripts, ci: 'pnpm run typecheck && pnpm run lint' },
+    });
+    expect(diffs.length).toBeGreaterThan(0);
+    expect(diffs.map((d) => d.reason).join(' ')).toContain('scripts.ci');
+  });
+
+  it('★ 反例：从 `verify` 上摘掉一条门禁 ⇒ 必须失败', () => {
+    const pkg = readPackageJson();
+    const diffs = checkGateEntry({
+      scripts: { ...pkg.scripts, verify: 'pnpm run typecheck && pnpm run lint' },
+    });
+    expect(diffs.length).toBeGreaterThan(0);
+    expect(diffs.map((d) => d.reason).join(' ')).toContain('缺少');
+  });
+
+  it('★ 反例：链里写了裸 `pnpm ci` ⇒ 必须失败（会被内建命令遮蔽）', () => {
+    const pkg = readPackageJson();
+    const diffs = checkGateEntry({
+      scripts: { ...pkg.scripts, verify: 'pnpm ci && pnpm run typecheck' },
+    });
+    expect(diffs.length).toBeGreaterThan(0);
+    expect(diffs.map((d) => d.reason).join(' ')).toContain('pnpm run <脚本名>');
+  });
+
+  it('★ 反例：链里引用了不存在的 script ⇒ 必须失败', () => {
+    const pkg = readPackageJson();
+    const diffs = checkGateEntry({
+      scripts: { ...pkg.scripts, verify: 'pnpm run typecheck && pnpm run ghost' },
+    });
+    expect(diffs.length).toBeGreaterThan(0);
+    expect(diffs.map((d) => d.reason).join(' ')).toContain('ghost');
   });
 });

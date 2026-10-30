@@ -177,6 +177,28 @@ export const METHODS_THROWING_READONLY_VIOLATION: readonly string[] = [
  */
 export const WARNING_ONLY_CASES: readonly string[] = ['ALIAS_CONFLICT'];
 
+/**
+ * §4.2 / §4.5：`NOT_FOUND` 的 `details` 里承载「**缺失 id 差集**」的键名。
+ *
+ * ⚠️ §4.2 原文：`touch(ids)` 取回的集合与传入 ids 不等 ⇒ 抛 `NOT_FOUND`，
+ *   `details.missingIds` = **差集**（先校验全集，一条都不加固）。
+ *   §4.5 原文：`linkByIds` 的任一实体缺失 ⇒ 抛 `NOT_FOUND`（`details.missingIds`）。
+ *
+ * ⚠️ **阶段 0 只声明这个键名，不实现差集算法**（`touch` 属 P1-T06）。
+ *   它在这里的作用是给 P1-T06 留一个**机器可检的锚点**：
+ *   `scripts/check-contract-ids.ts` 会断言它被 §11.2 的 `NOT_FOUND` 分组引用，
+ *   避免 P1-T06 把键名写成别的、或把它塞进一个**不抛** `NOT_FOUND` 的方法里。
+ */
+export const MISSING_IDS_KEY = 'missingIds';
+
+/**
+ * §11.2 的 `NOT_FOUND` 分组中，`details` **必须**带 `missingIds`（差集）的方法。
+ *
+ * ⚠️ 这不是「哪些方法会抛 `NOT_FOUND`」的完整名单（那份是 `METHODS_THROWING_NOT_FOUND`），
+ *   而是「抛了 `NOT_FOUND` 之后、`details` 里必须额外说明**缺了哪些 id**」的子集。
+ */
+export const NOT_FOUND_METHODS_WITH_MISSING_IDS: readonly string[] = ['touch', 'linkByIds'];
+
 /** 一个方法在「目标不存在」时的表达方式。 */
 export type MissingExpression = 'throw_not_found' | 'return_null' | 'not_applicable';
 

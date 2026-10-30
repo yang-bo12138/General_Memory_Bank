@@ -21,6 +21,9 @@ import {
   METHODS_THROWING_CONFLICT,
   METHODS_THROWING_NOT_FOUND,
   METHODS_THROWING_READONLY_VIOLATION,
+  MISSING_IDS_KEY,
+  NOT_FOUND_METHODS_WITH_MISSING_IDS,
+  WARNING_ONLY_CASES,
 } from '../src/core/errors.js';
 import {
   CROSS_PARAM_VALIDATION_COUNT,
@@ -28,6 +31,7 @@ import {
   DEFAULT_PARAMS,
   VECTOR_OVERFETCH_FACTOR,
 } from '../src/core/params.js';
+import { checkGateEntry, compareNameSets, readPackageJson } from './check-gate-entry.js';
 import {
   extractBacktickSpans,
   extractSection,
@@ -38,8 +42,74 @@ import {
 /** §5 / §6 / §11.2 / §12 的标题行。 */
 const SECTION_5_HEADING = '## 5. 参数表（集中配置）';
 const SECTION_6_HEADING = '## 6. 接口设计（TypeScript 同步 API）';
+const SECTION_7_1_HEADING = '### 7.1 定位与安全';
 const SECTION_11_2_HEADING = '### 11.2 错误类型体系';
 const SECTION_12_HEADING = '## 12. 实施路线图';
+
+/**
+ * ★ **写死的期望值**：§11.2「缺失的表达方式对照」表的**期望分组**。
+ *
+ * ⚠️ 为什么不现场解析设计稿：那张表的「涉及方法」列里，
+ *   `INVALID_INPUT` 与 `READONLY_VIOLATION` 两行写的是「**全部写方法**」，
+ *   不是逐个方法名 ⇒ 从设计稿解析出来的名单**不完整**，
+ *   用它当分母会让「少了一个方法」看起来像「全绿」（C31 的典型症状）。
+ * ⇒ 期望分组**写死在这里**，代码侧的名单必须**逐名**对上。
+ *
+ * ⚠️ `readonly_violation` 的 16 个写方法**逐名**列在 §7.1 的
+ *   「写（16 个，一律抛 `READONLY_VIOLATION`）」清单里 —— 见 `EXPECTED_READONLY_WRITE_METHODS`。
+ */
+export const EXPECTED_MISSING_EXPRESSION_GROUPS: Readonly<Record<string, readonly string[]>> = {
+  /** 抛 `NOT_FOUND` 的方法（§11.2 第一行）。 */
+  throw_not_found: [
+    'forget',
+    'restore',
+    'updateContent',
+    'pin',
+    'unpin',
+    'touch',
+    'link',
+    'linkByIds',
+    'setAlias',
+    'mergeEntities',
+  ],
+  /** 返回 `null` 的方法（§11.2 第二行）。 */
+  return_null: ['get'],
+  /** 抛 `CONFLICT` 的方法（§11.2 第四行）。 */
+  conflict: ['restore', 'updateContent', 'setAlias'],
+};
+
+/**
+ * ★ **写死的期望值**：§7.1「写（16 个，一律抛 `READONLY_VIOLATION`）」的 16 个写方法。
+ *
+ * ⚠️ **逐名**断言，**不是**「数量 == 16」——
+ *   数量对上了但**名字对不上**是另一种假绿（C31）。
+ */
+export const EXPECTED_READONLY_WRITE_METHODS: readonly string[] = [
+  'write',
+  'touch',
+  'link',
+  'linkByIds',
+  'forget',
+  'restore',
+  'pin',
+  'unpin',
+  'setAlias',
+  'mergeEntities',
+  'updateContent',
+  'sweep',
+  'setParams',
+  'rebuildArchivalSchedule',
+  'rebuildVectorBuckets',
+  'recluster',
+];
+
+/**
+ * ★ **写死的期望值**：§11.2 的「**不抛错**，走 `write()` 的 `warnings`」那一种情形。
+ *
+ * ⚠️ `ALIAS_CONFLICT` **刻意不是异常** ⇒ 它**不在**任何抛错分组里，
+ *   只出现在 `WARNING_ONLY_CASES`（§11.2 末段）。
+ */
+export const EXPECTED_WARNING_ONLY_CASES: readonly string[] = ['ALIAS_CONFLICT'];
 
 /** 从 §5 的「跨参数校验」块里数出条目。 */
 export function parseSection5ValidationCount(markdown: string): number[] {
@@ -162,6 +232,50 @@ export function parseSection11_2Methods(markdown: string): Map<string, string[]>
   return result;
 }
 
+/**
+ * 从 §7.1 的「写（16 个，一律抛 `READONLY_VIOLATION`）」清单里取出**逐名**的写方法。
+ *
+ * ⚠️ 为什么单独解析 §7.1：§11.2 的「涉及方法」列在 `READONLY_VIOLATION` 行写的是
+ *   「**全部写方法**」——不是逐个名字 ⇒ 只有 §7.1 才有那份**完整名单**。
+ *
+ * @param markdown 设计稿全文
+ * @returns 写方法名（按 §7.1 的出现顺序）
+ */
+export function parseSection7_1WriteMethods(markdown: string): string[] {
+  const section = extractSection(markdown, SECTION_7_1_HEADING);
+  const lines = section.split('\n');
+  const methods: string[] = [];
+  let collecting = false;
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    // ⚠️ 先剥掉引用标记：§7.1 的清单在引用块里（`> ` 前缀）。
+    const stripped = stripBlockquote(line).trim();
+
+    if (!collecting) {
+      // 清单的**起始标记**：「写（16 个，一律抛 `READONLY_VIOLATION`）」
+      if (stripped.includes('写（16 个')) {
+        collecting = true;
+      }
+      continue;
+    }
+
+    // 结束标记：清单后面紧跟「⚠️ **后三个是…维护方法**」那段说明。
+    if (stripped.startsWith('⚠️')) {
+      break;
+    }
+
+    for (const span of extractBacktickSpans(stripped)) {
+      const name = (span.split('(')[0] ?? '').trim();
+      if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) && name !== 'READONLY_VIOLATION') {
+        methods.push(name);
+      }
+    }
+  }
+
+  return methods;
+}
+
 /** 一处不一致。 */
 export interface ContractDiff {
   reason: string;
@@ -263,13 +377,84 @@ export function checkContracts(markdown: string): ContractDiff[] {
     }
   };
 
+  // ⚠️ 三方比对：§11.2（设计稿）↔ 写死的期望分组 ↔ 代码。
+  //   期望分组写死 ⇒ 即使设计稿被改坏，闸门仍会拿**外部写死**的分母去判（§11.2 的
+  //   「涉及方法」列对 `READONLY_VIOLATION` 只写「全部写方法」，不能当分母用）。
+  const codeGroups: Readonly<Record<string, readonly string[]>> = {
+    throw_not_found: METHODS_THROWING_NOT_FOUND,
+    return_null: METHODS_RETURNING_NULL,
+    conflict: METHODS_THROWING_CONFLICT,
+  };
+  for (const [groupName, expected] of Object.entries(EXPECTED_MISSING_EXPRESSION_GROUPS)) {
+    diffs.push(
+      ...compareNameSets(expected, codeGroups[groupName] ?? [], `§11.2「${groupName}」的期望分组`),
+    );
+  }
+
   compare(semantics.get('throw_not_found'), METHODS_THROWING_NOT_FOUND, 'NOT_FOUND');
   compare(semantics.get('return_null'), METHODS_RETURNING_NULL, '返回 null');
   compare(semantics.get('conflict'), METHODS_THROWING_CONFLICT, 'CONFLICT');
-  if (METHODS_THROWING_READONLY_VIOLATION.length !== 16) {
-    diffs.push({
-      reason: `READONLY_VIOLATION 的写方法应是 16 个（§7.1），实际 ${METHODS_THROWING_READONLY_VIOLATION.length} 个`,
-    });
+
+  // ⚠️ §11.2 的 `READONLY_VIOLATION` 行写的是「全部写方法」，**不是逐个名字** ⇒
+  //   它的完整名单在 §7.1 ⇒ 从 §7.1 解析出来，**逐名**比对代码侧的 16 个写方法。
+  //   （不接受「数量 == 16」这种计数式断言：数量对上了但名字对不上是另一种假绿。）
+  const section7_1WriteMethods = parseSection7_1WriteMethods(markdown);
+  diffs.push(
+    ...compareNameSets(
+      EXPECTED_READONLY_WRITE_METHODS,
+      section7_1WriteMethods,
+      '§7.1 的写方法清单',
+    ),
+  );
+  diffs.push(
+    ...compareNameSets(
+      EXPECTED_READONLY_WRITE_METHODS,
+      METHODS_THROWING_READONLY_VIOLATION,
+      '只读违例的写方法',
+    ),
+  );
+
+  // ⚠️ `warning_only` 组：`ALIAS_CONFLICT` **刻意不是异常** ⇒
+  //   ① 它在 `WARNING_ONLY_CASES` 里；② 它**不在**任何抛错分组里；
+  //   ③ §11.2 的那一行确实把它标成了「不抛错、走 warnings」。
+  diffs.push(
+    ...compareNameSets(EXPECTED_WARNING_ONLY_CASES, WARNING_ONLY_CASES, '只走 warnings 的情形'),
+  );
+  const docWarningOnly = semantics.get('warning_only') ?? [];
+  for (const caseName of EXPECTED_WARNING_ONLY_CASES) {
+    if (!docWarningOnly.includes(caseName)) {
+      diffs.push({
+        reason: `§11.2 的「不抛错，走 write() 的 warnings」那一行里找不到 ${caseName}`,
+      });
+    }
+  }
+  for (const [groupName, group] of Object.entries({
+    ...codeGroups,
+    readonly_violation: METHODS_THROWING_READONLY_VIOLATION,
+  })) {
+    for (const caseName of EXPECTED_WARNING_ONLY_CASES) {
+      if (group.includes(caseName)) {
+        diffs.push({
+          reason: `${caseName} 刻意不是异常，却出现在「${groupName}」的代码名单里`,
+        });
+      }
+    }
+  }
+
+  // ⚠️ `missingIds` 锚点（§4.2 / §4.5）：它是 `NOT_FOUND` 分组的**详情键**，
+  //   ⇒ 承载它的方法必须**都在** `NOT_FOUND` 分组里（否则 P1-T06 会写到别的方法上）。
+  for (const method of NOT_FOUND_METHODS_WITH_MISSING_IDS) {
+    if (!METHODS_THROWING_NOT_FOUND.includes(method)) {
+      diffs.push({
+        reason: `${method} 要带 details.${MISSING_IDS_KEY}，却不在 NOT_FOUND 分组里`,
+      });
+    }
+  }
+
+  // ⚠️ 门禁入口的可见性（防「假绿闸门」）：`scripts.ci` 必须是 `pnpm run verify` 的别名，
+  //   且 `scripts.verify` 必须串起全部 8 条门禁。
+  for (const diff of checkGateEntry(readPackageJson())) {
+    diffs.push({ reason: diff.reason });
   }
 
   return diffs;

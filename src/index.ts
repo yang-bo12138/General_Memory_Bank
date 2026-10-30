@@ -60,6 +60,8 @@ export {
   METHODS_THROWING_CONFLICT,
   METHODS_THROWING_NOT_FOUND,
   METHODS_THROWING_READONLY_VIOLATION,
+  MISSING_IDS_KEY,
+  NOT_FOUND_METHODS_WITH_MISSING_IDS,
   translateSqliteError,
   WARNING_ONLY_CASES,
   type ConflictDetails,
@@ -95,8 +97,10 @@ export {
   type ParamChange,
   type ParamKey,
   type ParamPatch,
-  type Params,
   type ParamViolation,
+  type ParamViolationDetail,
+  type ParamViolationDetails,
+  type Params,
   type VectorRouterMode,
 } from './core/params.js';
 export { LIBRARY_VERSION, SCHEMA_VERSION } from './core/version.js';

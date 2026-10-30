@@ -35,10 +35,20 @@ import { CLOCK_EXEMPT_METHODS } from '../src/core/clock.js';
  */
 export const ALLOWED_CLOCK_READ_FILES: readonly string[] = ['src/core/clock.ts'];
 
-/** ★ **写死的期望值**：允许读真实时钟的**文件数**。 */
-export const EXPECTED_CLOCK_READ_FILES = ALLOWED_CLOCK_READ_FILES.length;
+/**
+ * ★ **写死的期望值**：允许读真实时钟的**文件数**。
+ *
+ * ⚠️ **为什么是字面量、不是 `ALLOWED_CLOCK_READ_FILES.length`**：
+ *   若期望值由白名单长度派生，白名单一改，期望值就跟着改 ⇒
+ *   「多放了一个文件进白名单」永远不会被发现（C31 的典型症状：
+ *   闸门脚本误删 5 条函数仍显示「35/35 全绿」）。
+ * ⇒ 期望值**独立写死**；白名单长度与它的一致性由下面那条独立断言把关。
+ */
+export const EXPECTED_CLOCK_READ_FILES = 1;
 
-/** ★ **写死的期望值**：允许读真实时钟的**命中点数**。 */
+/**
+ * ★ **写死的期望值**：允许读真实时钟的**命中点数**。
+ */
 export const EXPECTED_CLOCK_READ_SITES = 1;
 
 /** 时钟读取的三种形态。 */
@@ -477,8 +487,43 @@ export function scanClockReads(root: string, repoRoot = process.cwd()): ClockSca
  *
  * @returns 不满足的期望（空数组 = 全部满足）
  */
+/**
+ * ★ **独立断言**：白名单的长度必须与**写死的**期望文件数一致。
+ *
+ * ⚠️ 这一条与「本次实际命中了几个文件」**无关** ⇒ 它防的是
+ *   「有人往白名单里加了一个文件，却没同步改写死的期望值」这种漂移。
+ *   若期望值由白名单长度派生（`ALLOWED_CLOCK_READ_FILES.length`），
+ *   这条断言就**永远不可能失败** ⇒ 假绿。
+ *
+ * @param whitelist 白名单（长度）
+ * @param expected 写死的期望文件数
+ * @returns 不满足的期望（空数组 = 满足）
+ */
+export function evaluateWhitelistLength(whitelist: readonly string[], expected: number): string[] {
+  if (whitelist.length === expected) {
+    return [];
+  }
+  return [
+    `时钟白名单长度 ${whitelist.length} ≠ 期望 ${expected}（白名单改动必须同步改写死的期望值，C31）`,
+  ];
+}
+
+/**
+ * 校验「命中数」与**写死的期望值**是否一致（C31）。
+ *
+ * ⚠️ ★ 分母必须是**外部写死的期望值**，不是「本次实际命中几个」——
+ *   闸门脚本误删 5 条函数仍显示「35/35 全绿」是它的典型症状。
+ * ⇒ 「实际比期望多」= 有人偷偷加了时钟读取；
+ *   「实际比期望少」= 有人删了代码（缺口被自动掩盖）。
+ *
+ * @returns 不满足的期望（空数组 = 全部满足）
+ */
 export function evaluateExpectations(result: ClockScanResult): string[] {
   const failures: string[] = [];
+
+  // ⚠️ **独立断言**：白名单的长度必须与**写死的**期望文件数一致（见上面的说明）。
+  failures.push(...evaluateWhitelistLength(ALLOWED_CLOCK_READ_FILES, EXPECTED_CLOCK_READ_FILES));
+
   if (result.files.length !== EXPECTED_CLOCK_READ_FILES) {
     failures.push(
       `命中时钟读取的文件数 ${result.files.length} ≠ 期望 ${EXPECTED_CLOCK_READ_FILES}（分母写死，C31）`,
