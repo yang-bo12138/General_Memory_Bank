@@ -102,7 +102,7 @@ describe('P0-T02 · ParamStore 的事务形状', () => {
     expect(backend.events).toHaveLength(1);
     const event = backend.events[0];
     expect(event?.type).toBe('config');
-    // ⚠️ config 事件不关联任何记忆 ⇒ `memory_id` 必须是**显式 null**（§8.4 硬规则 5）
+    // ⚠️ config 事件不关联任何记忆 ⇒ `memory_id` 必须是**显式 null**（§8.4 硬规则 6）
     expect(event?.memoryId).toBeNull();
 
     const payload = event?.payload as {

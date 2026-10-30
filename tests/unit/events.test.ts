@@ -120,7 +120,7 @@ const MINIMAL_PAYLOADS: Readonly<Record<EventType, EventPayload>> = {
 };
 
 /**
- * 编译期断言：§8.4 硬规则 5 —— `memory_id` 是**必传实参**。
+ * 编译期断言：§8.4 硬规则 6 —— `memory_id` 是**必传实参**。
  *
  * ⚠️ 本函数**永不执行**；它的唯一作用是让 `tsc --noEmit` 检查下面两处 `@ts-expect-error`。
  *   （若哪天有人把 `memoryId` 改成可选参数，`@ts-expect-error` 会因「没有错误」而让编译失败。）
