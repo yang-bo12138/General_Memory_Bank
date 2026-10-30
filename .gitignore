@@ -30,3 +30,4 @@ Thumbs.db
 
 # tsx 在受限临时目录环境下的残留（路径解析退化为字面量 undefined）
 undefined/
+.tmp_arch/
