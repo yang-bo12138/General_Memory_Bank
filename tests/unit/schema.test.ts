@@ -139,11 +139,14 @@ describe('P1-T01 · 建库脚本与 schema 版本', () => {
     expect(() => ensureSchema(db)).toThrow(/不认识的 schema 版本/);
   });
 
-  it('v1 库（user_version = 1）⇒ 明确抛错（P1-T02 前不支持自动升级）', () => {
+  it('user_version = 1 ⇒ 走 v1 → v2 迁移（P1-T02 已支持）⇒ 结束后版本为 2', () => {
     const db = open(join(dir, 'memory.db'));
     createSchema(db);
     db.pragma('user_version = 1');
-    expect(() => ensureSchema(db)).toThrow(/v1 → v2 迁移尚未实现/);
+    const result = ensureSchema(db);
+    expect(result.migrated).toBe(true);
+    expect(result.version).toBe(SCHEMA_VERSION);
+    expect(findV2Tables(db)).toHaveLength(EXPECTED_V2_TABLE_COUNT);
   });
 });
 

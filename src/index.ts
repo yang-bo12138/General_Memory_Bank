@@ -15,6 +15,13 @@
  */
 
 export {
+  computeStabilityGrowth,
+  difficultyBonus,
+  spacingFactor,
+  type StabilityGrowth,
+  type StabilityInput,
+} from './core/stability.js';
+export {
   CLOCK_EXEMPT_METHODS,
   CLOCK_INJECTION_METHODS,
   resolveNow,
