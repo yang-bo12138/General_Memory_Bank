@@ -99,3 +99,183 @@ export class MemoryError extends Error {
   static readonly databaseBusy = (message: string, details: MemoryErrorDetails = {}): MemoryError =>
     new MemoryError(MemoryErrorCode.DATABASE_BUSY, message, details);
 }
+
+// ─────────────────────────── §11.2 的「缺失的表达方式」契约 ───────────────────────────
+
+/**
+ * §11.2「缺失的表达方式对照」——**写接口用异常表达缺失**。
+ *
+ * ⚠️ 「目标不存在，且方法必须成功才有意义」⇒ 抛 `NOT_FOUND`。
+ *   `link` 仅在 `createMissing: false` 时属于这一类。
+ */
+export const METHODS_THROWING_NOT_FOUND: readonly string[] = [
+  'forget',
+  'restore',
+  'updateContent',
+  'pin',
+  'unpin',
+  'touch',
+  'link',
+  'linkByIds',
+  'setAlias',
+  'mergeEntities',
+];
+
+/**
+ * §11.2「缺失的表达方式对照」——**读接口用返回值表达缺失**。
+ *
+ * ⚠️ 只有 `get`：单条读取是查看器与调试的高频操作，「查不到」是常态而不是异常；
+ *   写成异常会让每次单条读取都得包一层 try-catch。
+ */
+export const METHODS_RETURNING_NULL: readonly string[] = ['get'];
+
+/**
+ * §11.2：抛 `CONFLICT` 的方法（**必须带 `details.conflictingId`**）。
+ *
+ * 三个来源，全部是「唯一索引挡住的合法意图」：
+ * 1. `restore()` 撞 `content_hash` → 传 `mergeInto` 走合并；
+ * 2. `updateContent()` 的新正文撞另一条未删记忆 → 应改走 `write()` 或先清理重复项；
+ * 3. `setAlias()` 的 alias 撞既有主名 → 需先 `mergeEntities`。
+ */
+export const METHODS_THROWING_CONFLICT: readonly string[] = [
+  'restore',
+  'updateContent',
+  'setAlias',
+];
+
+/**
+ * §7.1：只读实例上抛 `READONLY_VIOLATION` 的 **16 个写方法**。
+ *
+ * ⚠️ 「不要用『等』字省略」——只读拒绝必须**按方法**判定，
+ *   而不能靠调用方记得哪些参数算写。漏掉任何一个 = 它在只读实例上会真的写下去。
+ */
+export const METHODS_THROWING_READONLY_VIOLATION: readonly string[] = [
+  'write',
+  'touch',
+  'link',
+  'linkByIds',
+  'forget',
+  'restore',
+  'pin',
+  'unpin',
+  'setAlias',
+  'mergeEntities',
+  'updateContent',
+  'sweep',
+  'setParams',
+  'rebuildArchivalSchedule',
+  'rebuildVectorBuckets',
+  'recluster',
+];
+
+/**
+ * §11.2 末：**主体工作做成了，但附属产出未生效 ⇒ 不抛错**，走 `write()` 的 `warnings`。
+ *
+ * ⚠️ `ALIAS_CONFLICT` 刻意不是异常：别名冲突时**记忆本身已经写成功**，
+ *   只有附属的别名映射没落库。抛异常会让调用方重试 `write()`，
+ *   结果是同一事实被写两遍。
+ */
+export const WARNING_ONLY_CASES: readonly string[] = ['ALIAS_CONFLICT'];
+
+/** 一个方法在「目标不存在」时的表达方式。 */
+export type MissingExpression = 'throw_not_found' | 'return_null' | 'not_applicable';
+
+/** §11.2 的错误语义表（机器可检；`scripts/check-contract-ids.ts` 会与 §11.2 的表比对）。 */
+export interface ErrorSemantic {
+  /** 方法名。 */
+  method: string;
+  /** 目标不存在时的表达方式。 */
+  missing: MissingExpression;
+  /** 备注（§11.2 的原文要点）。 */
+  note: string;
+}
+
+/**
+ * §11.2「缺失的表达方式对照」的**代码化声明**。
+ *
+ * ⚠️ 这张表是「一眼看完」的机器可读版本：
+ *   读接口返回 `null`，写接口抛 `NOT_FOUND`——**边界必须一眼看完**。
+ */
+export const ERROR_SEMANTICS: readonly ErrorSemantic[] = [
+  ...METHODS_THROWING_NOT_FOUND.map(
+    (method): ErrorSemantic => ({
+      method,
+      missing: 'throw_not_found',
+      note:
+        method === 'link'
+          ? 'link({createMissing:false})'
+          : '目标不存在，且方法必须成功才有意义 ⇒ 抛 NOT_FOUND',
+    }),
+  ),
+  ...METHODS_RETURNING_NULL.map(
+    (method): ErrorSemantic => ({
+      method,
+      missing: 'return_null',
+      note: '目标不存在，但「查不到」是该接口的常态 ⇒ 返回 null（不抛错）',
+    }),
+  ),
+];
+
+// ─────────────────────────── SQLite 错误码的规范化出口 ───────────────────────────
+
+/** better-sqlite3 抛出的错误形状（只取用得上的字段）。 */
+export interface SqliteErrorLike {
+  code?: string;
+  message?: string;
+}
+
+/**
+ * 把 SQLite 的错误码翻译成库对外的错误类型。
+ *
+ * ⚠️ **裸的 SQLite 错误码绝不能抛给调用方**（§4.9 步骤 2 并发兜底）：
+ * · `SQLITE_CONSTRAINT_UNIQUE` ⇒ `MemoryError.CONFLICT`（**带 `details.conflictingId`**）；
+ * · `SQLITE_BUSY` / `SQLITE_LOCKED` ⇒ `MemoryError.DATABASE_BUSY`。
+ *
+ * ⚠️ **`FK` 报错未类型化**，会原样穿到调用方（违反「客户端只看到规范化的错误结构」）⇒
+ *   `linkByIds` 必须**自己校验实体存在性**，不能指望外键（§4.5 步骤 4）。
+ *   本函数**不**把 FK 错误映射到五个 code 里的任何一个——
+ *   §11.2 的五个 code 是一个**封闭集合**，擅自扩一个会让那张表失去封闭性；
+ *   正确做法是**让它不发生**（调用方自己校验）。
+ *
+ * @param error 捕获到的错误
+ * @param details 冲突详情（`CONFLICT` 时必须带 `conflictingId` / `conflictingEntityId`）
+ * @returns 规范化后的 `MemoryError`
+ */
+export function translateSqliteError(
+  error: unknown,
+  details: MemoryErrorDetails = {},
+): MemoryError {
+  const candidate = error as SqliteErrorLike | null;
+  const code = candidate?.code;
+
+  if (code === 'SQLITE_CONSTRAINT_UNIQUE') {
+    const conflictingId =
+      typeof details.conflictingId === 'string' ? details.conflictingId : undefined;
+    const conflictingEntityId =
+      typeof details.conflictingEntityId === 'string' ? details.conflictingEntityId : undefined;
+    const reason =
+      conflictingId === undefined && conflictingEntityId === undefined
+        ? 'conflictingId 缺失：调用方必须先查出冲突对象再转译（§11.2：否则调用方无法决定下一步）'
+        : undefined;
+    return new MemoryError(
+      MemoryErrorCode.CONFLICT,
+      '唯一性冲突：目标已存在（§4.8.1 / §4.9.1 / §4.9.2 的三个来源）',
+      reason === undefined
+        ? { ...details, conflictingId, conflictingEntityId }
+        : { ...details, reason },
+    );
+  }
+
+  if (code === 'SQLITE_BUSY' || code === 'SQLITE_LOCKED') {
+    return new MemoryError(
+      MemoryErrorCode.DATABASE_BUSY,
+      '并发等待超时（§9.1 的 busy_timeout = 5000）',
+      details,
+    );
+  }
+
+  // ⚠️ 不在 §11.2 五个 code 之内的错误：**原样抛出**。
+  //   把未知错误硬塞进某个 code 只会让调用方拿到一个**语义错误**的 code，
+  //   比「未类型化的错误」更难排查。
+  throw error;
+}

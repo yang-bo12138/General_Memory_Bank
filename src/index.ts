@@ -15,6 +15,12 @@
  */
 
 export {
+  CLOCK_EXEMPT_METHODS,
+  CLOCK_INJECTION_METHODS,
+  resolveNow,
+  resolveNowStrictly,
+} from './core/clock.js';
+export {
   CONTENT_TEXT_KEY,
   EVENT_PAYLOAD_KEYS,
   EVENT_PAYLOAD_VARIANTS,
@@ -46,7 +52,21 @@ export {
   type UnpinEventPayload,
   type WriteEventPayload,
 } from './core/events.types.js';
-export { MemoryError, MemoryErrorCode, type ConflictDetails } from './core/errors.js';
+export {
+  ERROR_SEMANTICS,
+  MemoryError,
+  MemoryErrorCode,
+  METHODS_RETURNING_NULL,
+  METHODS_THROWING_CONFLICT,
+  METHODS_THROWING_NOT_FOUND,
+  METHODS_THROWING_READONLY_VIOLATION,
+  translateSqliteError,
+  WARNING_ONLY_CASES,
+  type ConflictDetails,
+  type ErrorSemantic,
+  type MemoryErrorDetails,
+  type MissingExpression,
+} from './core/errors.js';
 export {
   BASELINE_FLAGS,
   BOOLEAN_FLAG_KEYS,
