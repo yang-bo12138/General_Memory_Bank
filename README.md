@@ -15,6 +15,16 @@ pnpm run verify  # 门禁：类型检查 → 代码风格 → 单元测试 → 5
 pnpm build       # 构建产物（tsup：CJS + ESM + d.ts）
 ```
 
+> ⚠️ **需要 Node ≥ 22**（`package.json` 的 `engines.node`）。
+>
+> 根因：依赖 `better-sqlite3@13` 的预编译产物按 **Node-API v10** 构建
+> （Node 20 最高只支持 Node-API v9）⇒ 在 Node 20 上 `require('better-sqlite3')`
+> 会**段错误（exit 139）**，而不是一个可读的报错。
+> ⇒ 用 Node 20 跑本仓库会崩在装依赖之后的第一步。
+>
+> ⚠️ 注意 `engines` 只是**声明**，不是**闸门**（pnpm 默认 `engine-strict=false`，
+> 不匹配只警告不拦）⇒ 真正把版本钉住的是 CI 的 `node-version: 22`。
+
 > ⚠️ **门禁命令是 `pnpm run verify`**（别名：`pnpm run ci`）。
 >
 > **裸 `pnpm ci` / `npm ci` 只做依赖安装（clean install），不做任何校验，退出码却是 0。**

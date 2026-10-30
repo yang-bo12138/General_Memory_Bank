@@ -42,9 +42,35 @@ import {
 /** §5 / §6 / §11.2 / §12 的标题行。 */
 const SECTION_5_HEADING = '## 5. 参数表（集中配置）';
 const SECTION_6_HEADING = '## 6. 接口设计（TypeScript 同步 API）';
+const SECTION_4_2_HEADING = '### 4.2 稳定度增长（记忆加固）';
+const SECTION_4_5_HEADING = '### 4.5 边权重衰减与强化';
 const SECTION_7_1_HEADING = '### 7.1 定位与安全';
 const SECTION_11_2_HEADING = '### 11.2 错误类型体系';
 const SECTION_12_HEADING = '## 12. 实施路线图';
+
+/**
+ * ★ **写死的期望值**：`details.missingIds` 的**文档锚点**（§4.2 / §4.5 步骤 4）。
+ *
+ * ⚠️ 为什么锚在**这两节的正文**、而不是 §11.2 的对照表：
+ *   §11.2 那张表**没有 `missingIds` 这一列**（它的三列是「情形 / 表达方式 / 涉及方法」），
+ *   而「`details.missingIds` = 差集」这句话只出现在 §4.2（`touch`）与 §4.5 步骤 4（`linkByIds`）。
+ *   ⇒ 锚点必须绑**原文出现的地方**，否则锚的是一个不存在的列。
+ *
+ * ⚠️ 另外：§11.2 对照表的**第 2 列绝不能**出现 `NOT_FOUND` / `null` / `CONFLICT` /
+ *   `READONLY_VIOLATION` / `warnings` 这些关键字——`parseSection11_2Methods()` 会把
+ *   第 3 列的反引号标识符当成**方法名**收进映射 ⇒ 新加表格会误伤既有门禁。
+ */
+export const EXPECTED_MISSING_IDS_ANCHORS: readonly {
+  /** 该方法在设计稿里的锚点小节（用于核对「锚点原文确实写着 missingIds」）。 */
+  section: string;
+  /** 该锚点小节的标题行。 */
+  heading: string;
+  /** 该方法名（必须出现在锚点小节里）。 */
+  method: string;
+}[] = [
+  { section: '§4.2', heading: SECTION_4_2_HEADING, method: 'touch' },
+  { section: '§4.5 步骤 4', heading: SECTION_4_5_HEADING, method: 'linkByIds' },
+];
 
 /**
  * ★ **写死的期望值**：§11.2「缺失的表达方式对照」表的**期望分组**。
@@ -447,6 +473,23 @@ export function checkContracts(markdown: string): ContractDiff[] {
     if (!METHODS_THROWING_NOT_FOUND.includes(method)) {
       diffs.push({
         reason: `${method} 要带 details.${MISSING_IDS_KEY}，却不在 NOT_FOUND 分组里`,
+      });
+    }
+  }
+
+  // ⚠️ `missingIds` 的**文档锚点**：§4.2 / §4.5 步骤 4 的原文确实写着
+  //   「`details.missingIds`」，且**对应方法名**也在那一节里 ⇒
+  //   设计稿若把它挪走/改写，门禁当场发现（而不是让 P1-T06 按一个不存在的约定去写）。
+  for (const anchor of EXPECTED_MISSING_IDS_ANCHORS) {
+    const section = extractSection(markdown, anchor.heading);
+    if (!section.includes(`details.${MISSING_IDS_KEY}`)) {
+      diffs.push({
+        reason: `${anchor.section} 里找不到「details.${MISSING_IDS_KEY}」的原文（missingIds 的锚点不见了）`,
+      });
+    }
+    if (!section.includes(anchor.method)) {
+      diffs.push({
+        reason: `${anchor.section} 里找不到 ${anchor.method}（missingIds 的锚点方法不见了）`,
       });
     }
   }
