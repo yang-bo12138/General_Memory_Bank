@@ -253,11 +253,13 @@ export interface SqliteErrorLike {
  * · `SQLITE_CONSTRAINT_UNIQUE` ⇒ `MemoryError.CONFLICT`（**带 `details.conflictingId`**）；
  * · `SQLITE_BUSY` / `SQLITE_LOCKED` ⇒ `MemoryError.DATABASE_BUSY`。
  *
- * ⚠️ **`FK` 报错未类型化**，会原样穿到调用方（违反「客户端只看到规范化的错误结构」）⇒
- *   `linkByIds` 必须**自己校验实体存在性**，不能指望外键（§4.5 步骤 4）。
- *   本函数**不**把 FK 错误映射到五个 code 里的任何一个——
- *   §11.2 的五个 code 是一个**封闭集合**，擅自扩一个会让那张表失去封闭性；
- *   正确做法是**让它不发生**（调用方自己校验）。
+ * · `SQLITE_CONSTRAINT_FOREIGNKEY` ⇒ `MemoryError.NOT_FOUND`：
+ *   FK 违规的语义 =「**被引用的行不存在**」⇒ 复用既有的 `NOT_FOUND`，
+ *   **不扩码**（扩码是破坏性变更：§11.2 的五个 code 是一个封闭集合）。
+ *   ⚠️ 这条是**兜底**，不是主路径：§4.5 步骤 4 要求 `linkByIds` **自己校验实体存在性**，
+ *   不能指望外键——外键报错里不带「缺了哪些 id」，
+ *   而 `details.missingIds`（差集）必须由**调用方**算出来才能带上（§4.2 / §4.5）。
+ *   ⇒ 主路径自己校验（抛 `NOT_FOUND` + `details.missingIds`），本分支只保证「不穿裸错误码」。
  *
  * @param error 捕获到的错误
  * @param details 冲突详情（`CONFLICT` 时必须带 `conflictingId` / `conflictingEntityId`）
@@ -285,6 +287,15 @@ export function translateSqliteError(
       reason === undefined
         ? { ...details, conflictingId, conflictingEntityId }
         : { ...details, reason },
+    );
+  }
+
+  if (code === 'SQLITE_CONSTRAINT_FOREIGNKEY') {
+    // FK 违规 =「被引用的行不存在」⇒ NOT_FOUND（复用，不扩码）
+    return new MemoryError(
+      MemoryErrorCode.NOT_FOUND,
+      '外键约束失败：被引用的行不存在（§4.5 步骤 4：linkByIds 必须自己校验实体存在性，不能指望外键）',
+      details,
     );
   }
 

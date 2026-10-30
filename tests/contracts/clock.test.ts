@@ -8,6 +8,7 @@
  *   故意在某个方法里加一行 `Date.now()` ⇒ CI 必须失败
  */
 
+import Database from 'better-sqlite3';
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -138,6 +139,44 @@ describe('P0-T05 · §11.2 的错误类型体系', () => {
   it('SQLITE_BUSY ⇒ DATABASE_BUSY', () => {
     const sqliteError = Object.assign(new Error('database is locked'), { code: 'SQLITE_BUSY' });
     expect(translateSqliteError(sqliteError).code).toBe('DATABASE_BUSY');
+  });
+
+  it('SQLITE_CONSTRAINT_FOREIGNKEY ⇒ NOT_FOUND（FK 违规 = 被引用的行不存在；复用，不扩码）', () => {
+    const sqliteError = Object.assign(new Error('FOREIGN KEY constraint failed'), {
+      code: 'SQLITE_CONSTRAINT_FOREIGNKEY',
+    });
+    const translated = translateSqliteError(sqliteError, { missingIds: ['e9'] });
+    expect(translated).toBeInstanceOf(MemoryError);
+    expect(translated.code).toBe('NOT_FOUND');
+    expect(translated.details.missingIds).toEqual(['e9']);
+  });
+
+  it('★ 真实 SQLite：FK 违规确实报 SQLITE_CONSTRAINT_FOREIGNKEY ⇒ 分支可达（不是死代码）', () => {
+    const db = new Database(':memory:');
+    try {
+      // ⚠️ 外键是**每连接**开关，且默认关闭 ⇒ 必须显式打开（§3 的建库脚本同理）
+      db.pragma('foreign_keys = ON');
+      db.exec(
+        'CREATE TABLE parent (id TEXT PRIMARY KEY);' +
+          'CREATE TABLE child (id TEXT PRIMARY KEY, parent_id TEXT REFERENCES parent(id));',
+      );
+
+      let caught: unknown;
+      try {
+        db.prepare('INSERT INTO child (id, parent_id) VALUES (?, ?)').run('c1', 'no-such-parent');
+      } catch (error) {
+        caught = error;
+      }
+
+      expect(caught).toBeInstanceOf(Error);
+      expect((caught as { code?: string }).code).toBe('SQLITE_CONSTRAINT_FOREIGNKEY');
+
+      // 真实错误 ⇒ 规范化出口 ⇒ NOT_FOUND（复用，不扩码）
+      const translated = translateSqliteError(caught);
+      expect(translated.code).toBe('NOT_FOUND');
+    } finally {
+      db.close();
+    }
   });
 
   it('未在 §11.2 五个 code 之内的错误原样抛出（不擅自扩 code）', () => {
