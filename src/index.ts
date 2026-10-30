@@ -39,6 +39,16 @@ export {
   type EntityStatement,
 } from './core/entities.js';
 export {
+  findPrimaryNameConflict,
+  isSelfLoop,
+  mergeEdges,
+  missingIds,
+  reinforceWeight,
+  selectMergeSelfLoops,
+  type GraphEdgeInput,
+  type MergedEdge,
+} from './core/graph.js';
+export {
   CONTENT_TEXT_KEY,
   EVENT_PAYLOAD_KEYS,
   EVENT_PAYLOAD_VARIANTS,
