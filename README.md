@@ -11,9 +11,15 @@
 
 ```bash
 pnpm install     # 装依赖
-pnpm run verify  # 门禁：类型检查 → 代码风格 → 单元测试 → 5 条契约脚本
+pnpm run verify  # 门禁：类型检查 → 代码风格 → 单元测试 → 6 条契约脚本（共 9 段）
 pnpm build       # 构建产物（tsup：CJS + ESM + d.ts）
 ```
+
+> 📌 **当前实现范围**：阶段 0（骨架与不变量）已完成并通过独立验证；
+> 阶段 1（存储与基础运算）完成 3/9、部分 2/9；阶段 2~5 尚未开始。
+> ⇒ 逐任务状态、验收证据、遗留清单与**下一步起点**见
+> [`docs/progress/stage0-stage1-progress.md`](docs/progress/stage0-stage1-progress.md)，
+> 交付总览见 [`docs/DELIVERY.md`](docs/DELIVERY.md)。
 
 > ⚠️ **需要 Node ≥ 22**（`package.json` 的 `engines.node`）。
 >
@@ -34,6 +40,6 @@ pnpm build       # 构建产物（tsup：CJS + ESM + d.ts）
 >
 > 门禁的形状由 `scripts/check-gate-entry.ts` **机器可检**：
 > `scripts.ci` 必须**恰好**是 `pnpm run verify` 的别名，
-> 且 `scripts.verify` 串起的 8 条子命令逐名齐全、每段都写成 `pnpm run <名>`。
+> 且 `scripts.verify` 串起的 9 条子命令逐名齐全、每段都写成 `pnpm run <名>`。
 >
 > CI 工作流在 `.github/workflows/ci.yml`，跑的是 `pnpm run verify`（**不是** `pnpm ci`）。
