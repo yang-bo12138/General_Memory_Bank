@@ -1,0 +1,23 @@
+# 行尾策略：**仓库内一律 LF**。
+#
+# ⚠️ 为什么要显式钉死：本机 git 的 `core.autocrlf = true`，
+#    检出时会把 LF 转成 CRLF。工作树里是 CRLF、仓库里是 LF 时：
+#    · `biome check` 的 formatter（lineEnding: "lf"）会报「格式不符」；
+#    · `git diff` 可能反复出现「文件被修改」的假象；
+#    · 换一台机器（CI / 同事）检出同一份代码，行尾却不同 ⇒ 校验结果不可复现。
+#    ⇒ 「提交前必须 biome check 通过」这条纪律，会被行尾差异无端打断。
+#
+# ⇒ 统一：文本文件在工作树与仓库里都是 LF；二进制文件不做任何转换。
+* text=auto eol=lf
+
+# 二进制资源：禁止行尾转换与 diff
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.pdf binary
+*.db binary
+*.db-wal binary
+*.db-shm binary
