@@ -350,7 +350,7 @@
   `write` / `merge` / `restore` / `manual_fix` / `alias` / `touch` / `recall` / `link` / `pin` / `unpin` / `forget` / `sweep` / `config`。  
   ⚠️ §3 已写明：**加新 type 必须同改三处**（CHECK 约束 / §8.4 表 / §8.1 动作对照表）——  
   而 §3 的 CHECK **无法 ALTER** ⇒ 改 type = 重建 events 表 + 重建全部索引与触发器 ⇒ **不新增 type**。
-- **`touch` 事件新增 5 个键**（§8.4 硬规则 3）：
+- **`touch` 事件新增 5 个键**：其中 **4 个归 §8.4 硬规则 3**（`coactPairs` / `coactPairsTruncated` / `activationWrites` / `coactSkipped`），**`stabilityDelta` 归 §8.4 硬规则 5**：
   - `stabilityDelta`：本次 stability 的实际增量（天，`after − before`；未增长时为 **0**，**键恒在**）。  
     ★ **「键的有无」就是「这次有没有真的加固」的标志**（§8.4 硬规则 5）。
   - `coactPairs`：本次写入的共激活对，每项 `{a, b, affinityAfter}`。
@@ -423,8 +423,16 @@
 - ⚠️ **裸的 SQLite 错误码绝不能抛给调用方**（§4.9 步骤 2 并发兜底）：  
   必须捕获 `SQLITE_CONSTRAINT_UNIQUE` 转成 `MemoryError.CONFLICT`（带 `details.conflictingId`）。  
   同源同处理：§4.8.1 的 `restore` 撞唯一索引。
-- ⚠️ **`FK` 报错未类型化**，会原样穿到调用方（违反「客户端只看到规范化的错误结构」）⇒  
-  `linkByIds` 必须**自己校验实体存在性**，不能指望外键（§4.5 步骤 4）。
+- ⚠️ **全局纪律：任何 SQLite 原生错误码都不得穿给调用方**（§11.2 的「归一化收口」）：  
+  `SQLITE_CONSTRAINT_UNIQUE` ⇒ `MemoryError.CONFLICT`（带 `details.conflictingId`）；  
+  `SQLITE_CONSTRAINT_FOREIGNKEY` ⇒ `MemoryError.NOT_FOUND`（带 `details.missingIds`）；  
+  `SQLITE_BUSY` / `SQLITE_LOCKED` ⇒ `MemoryError.DATABASE_BUSY`；  
+  `SQLITE_READONLY` ⇒ `MemoryError.READONLY_VIOLATION`；  
+  **其余未列出的码** ⇒ 原样抛出但**必须带 `code` 字段**（**不得**硬塞进上面四个 code 里的任何一个）。  
+  ⚠️ **兜底是最后一道网，不是常态路径** ⇒ `link` / `linkByIds` 必须**自己校验**：  
+  两端的**实体**存在性 **+ `memoryId`（记忆）**存在性（§4.5 步骤 4）——  
+  `edges.memory_id` 有 `REFERENCES memories(id)`（§3），而 `@memoryId` 是**调用方给的 id**、本库不校验。  
+  ⚠️ **不能只靠外键兜底**：`PRAGMA foreign_keys` 是**每连接**开关（§9.1），漏开时**不报错也不告警**。
 - **时钟注入表（§11.1）**：`now?: number` 的方法有  
   `write` / `recall` / `touch` / `link` / `updateContent` / `forget` / `sweep` / `stats` / `get` /  
   `clusters` / `inhibitionTrace`。  
@@ -909,7 +917,7 @@
   ③ `last_access` / `access_count` 一并更新，不留给调用方。  
   **数据库写回也在函数内完成** ⇒ 调用方不会漏 UPDATE（漏写不报错，只会让加固静默失效——最难查的一类 bug）。
 - ⚠️ **`stabilityDelta` 必须返回**（v2.1 裁决）：调用点算不出 `before`（它是函数内局部变量）⇒  
-  若函数不返回，**事件流就会缺这个键** ⇒ §8.4 规则 4 的对账恒等式恒不成立。  
+  若函数不返回，**事件流就会缺这个键** ⇒ §8.4 规则 5 的对账恒等式恒不成立。  
   ⚠️ **调用方不得用 `boosted` 反推 delta**（一个是布尔、一个是数值）。未增长时为 0，**键恒在**。
 - **间隔重复加成**：`spacing = useSpacing ? min(SPACING_CAP, 1 + log2(intervalDays)) : 1`。  
   ⚠️ `useSpacing` 的语义：`touch = true`；**合并 = false**（合并只是「又提了一次」，不是一次间隔重复，  
