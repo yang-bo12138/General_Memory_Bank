@@ -16,11 +16,35 @@
 
 export {
   CONTENT_TEXT_KEY,
+  EVENT_PAYLOAD_KEYS,
+  EVENT_PAYLOAD_VARIANTS,
   EVENT_TYPES,
   TYPES_ALLOWING_CONTENT_TEXT,
+  TOUCH_ALWAYS_KEYS,
+  TOUCH_EXPLICIT_ONLY_KEYS,
+  isRestoreMergePayload,
+  type AliasEventPayload,
+  type ActivationWrite,
+  type CoactPair,
+  type CoactSkipped,
   type ConfigEventPayload,
   type EventPayload,
   type EventType,
+  type ForgetEventPayload,
+  type LinkEventPayload,
+  type ManualFixEventPayload,
+  type MergeEventPayload,
+  type MergeEventPayload3c,
+  type MergeEventPayloadRestoreMerge,
+  type PinEventPayload,
+  type RecallEventPayload,
+  type RestoreEventPayload,
+  type SweepEventPayload,
+  type SweepItemEventPayload,
+  type SweepSummaryEventPayload,
+  type TouchEventPayload,
+  type UnpinEventPayload,
+  type WriteEventPayload,
 } from './core/events.types.js';
 export { MemoryError, MemoryErrorCode, type ConflictDetails } from './core/errors.js';
 export {
@@ -56,3 +80,25 @@ export {
   type VectorRouterMode,
 } from './core/params.js';
 export { LIBRARY_VERSION, SCHEMA_VERSION } from './core/version.js';
+export {
+  allowsContentText,
+  EventWriter,
+  type EventDatabase,
+  type EventStatement,
+  type EventWriterOptions,
+} from './store/events.js';
+export {
+  FileLogger,
+  flattenField,
+  flattenFields,
+  formatLogLine,
+  LOG_ACTIONS,
+  LOG_QUEUE_MAX_LINES,
+  LOG_QUEUE_MAX_MS,
+  MemoryLogger,
+  type FileLoggerOptions,
+  type LogAction,
+  type LogFields,
+  type LogLevel,
+  type Logger,
+} from './util/log.js';
