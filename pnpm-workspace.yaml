@@ -1,0 +1,11 @@
+# pnpm 工作区设置（单包仓库）。
+#
+# ⚠️ pnpm 默认**不执行**依赖的构建脚本（防止供应链攻击），
+#   但本项目有两个包必须执行：
+#   · better-sqlite3 —— 预编译包缺失时需要 node-gyp 编译（§3 依赖 FTS5，D-06）
+#   · esbuild         —— vitest / tsup 的底层转译器，必须跑它的 postinstall 才能落地二进制
+#   · @biomejs/biome  —— 平台二进制的落地脚本
+allowBuilds:
+  better-sqlite3: true
+  esbuild: true
+  '@biomejs/biome': true
