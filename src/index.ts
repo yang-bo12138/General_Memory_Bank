@@ -1,7 +1,7 @@
 /**
  * `memory-ocean` —— 通用记忆库 v2.1（记忆海版）公共导出入口。
  *
- * ⚠️ **阶段 0（P0-T01）的导出面刻意很小**：
+ * ⚠️ **阶段 0（P0-T01~T06）的导出面刻意很小**：
  * DESIGN-v2.md §12 阶段 0 原文——「本阶段**不实现任何新机制**，只建开关与不变量测试。
  * 没有这个阶段，后面每个机制的『没改坏别的东西』都无法证明。」
  *
@@ -14,4 +14,31 @@
  *   不在此处声明一个「23 个方法齐全、但一个都没实现」的空接口。
  */
 
+export {
+  CONTENT_TEXT_KEY,
+  EVENT_TYPES,
+  TYPES_ALLOWING_CONTENT_TEXT,
+  type ConfigEventPayload,
+  type EventPayload,
+  type EventType,
+} from './core/events.types.js';
+export { MemoryError, MemoryErrorCode, type ConflictDetails } from './core/errors.js';
+export {
+  applyParamPatch,
+  assertParamsValid,
+  COACT_AFFINITY_MAX_DDL_CHECK,
+  DEFAULT_PARAMS,
+  diffParams,
+  PARAM_COUNT,
+  PARAM_KEYS,
+  validateParams,
+  VECTOR_OVERFETCH_FACTOR,
+  VECTOR_ROUTER_MODES,
+  type ParamChange,
+  type ParamKey,
+  type ParamPatch,
+  type Params,
+  type ParamViolation,
+  type VectorRouterMode,
+} from './core/params.js';
 export { LIBRARY_VERSION, SCHEMA_VERSION } from './core/version.js';

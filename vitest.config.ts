@@ -12,7 +12,7 @@ export default defineConfig({
   test: {
     pool: 'forks',
     environment: 'node',
-    include: ['tests/**/*.test.ts'],
+    include: ['tests/**/*.test.ts', 'src/**/*.test.ts'],
     exclude: ['tests/**/node_modules/**', 'tests/golden/__captured__/**'],
     testTimeout: 30_000,
     hookTimeout: 30_000,

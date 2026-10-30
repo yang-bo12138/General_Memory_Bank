@@ -24,3 +24,6 @@ tests/golden/__captured__/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# 本机验收脚本与临时产物（不提交）
+.tmp/
