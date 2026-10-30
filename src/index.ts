@@ -21,6 +21,24 @@ export {
   resolveNowStrictly,
 } from './core/clock.js';
 export {
+  archiveAt,
+  edgeWeight,
+  effectiveStability,
+  intensity,
+  layerOf,
+  MS_PER_DAY,
+  type DecayEdgeInput,
+  type DecayMemoryInput,
+  type MemoryLayer,
+} from './core/decay.js';
+export {
+  RESOLVE_ENTITY_BY_ALIAS_SQL,
+  RESOLVE_ENTITY_BY_NAME_SQL,
+  resolveEntity,
+  type EntityDatabase,
+  type EntityStatement,
+} from './core/entities.js';
+export {
   CONTENT_TEXT_KEY,
   EVENT_PAYLOAD_KEYS,
   EVENT_PAYLOAD_VARIANTS,

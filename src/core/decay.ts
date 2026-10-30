@@ -1,0 +1,149 @@
+/**
+ * 衰减 / 强度 / 层级 / 边权 / 归档时刻 —— DESIGN-v2.md §4.1 / §4.4 / §4.5 / §9.4.1 的**纯函数**实现。
+ *
+ * ★ 本文件**全是纯函数**：不碰数据库、不写任何状态、不读真实时钟。
+ *   ⇒ 写入路径（§4.9）与召回路径（§4.6）共用同一套公式，
+ *     避免「两条路径各写各的公式」的漂移（§4.2 把 `growStability` 收成唯一写入点是同一条纪律）。
+ *
+ * ⚠️ **量纲口径（§4.1）**：`effectiveStability` 是负指数衰减的**时间常数 τ**，**不是半衰期**。
+ *   `intensity = exp(-t/τ)` 在 `t = τ` 时衰减到 `1/e ≈ 36.8%`；
+ *   **真正的半衰期 = τ × ln2 ≈ 0.693τ**。
+ *   ⇒ 凡用到「半衰期」必同时给出换算，不允许混用——
+ *     把 τ 当半衰期用会让衰减速率差 **1.44 倍**（`exp(-1)=0.368` 对 `0.5`），
+ *     且不报错、只是「记忆保鲜时长看起来不太对」。
+ *
+ * ⚠️ **`intensity` 的两重防护缺一不可**（§4.1）：
+ *   ① `Δt = max(0, now - last_access)`（防时钟回拨 / 注入过去时刻）；
+ *   ② 结果再 `min(1, ...)`（防 `τ → 0` 等极端输入）。
+ *   缺任一 ⇒ `intensity > 1` ⇒ §4.4 的层级判定错乱、§4.6 的 `0.30 × intensity` 越界。
+ *   ⇒ §4.6 步骤 2 的召回 SQL **必须照抄这两重钳制**（同一条理由）。
+ *
+ * ⚠️ **C37 时钟注入**：`intensity` / `edgeWeight` 的签名含 `now?`，
+ *   缺省时经 `resolveNow()` 取真实时钟（唯一入口是 `src/core/clock.ts`）。
+ *   本文件**不得**出现 `Date.now()` / `new Date()` ⇒ 否则 C37 扫描会判为未获准的时钟读取。
+ *
+ * ⚠️ **前置条件**：`stability > 0` 且 `pin_factor ≥ 1.0`（§4.1 的校验规则保证）。
+ *   `effectiveStability == 0` 会让除零退化（`Δt = 0` 时得 `NaN`）——
+ *   这里**刻意不**偷偷加一个 ε 兜底：那会让「公式」与「实现」不再是同一个东西，
+ *   而这类兜底掩盖的正是「有人传了 0 进来」这个真问题。
+ */
+
+import { resolveNow } from './clock.js';
+import type { Params } from './params.js';
+
+/** 一天的毫秒数（§4.1 / §4.5 公式里的 `86400000`）。 */
+export const MS_PER_DAY = 86400000;
+
+/**
+ * 强度衰减所需的记忆字段（§4.1）。
+ *
+ * ⚠️ **刻意只声明用到的三个字段**（结构化 / 鸭子类型）：
+ *   阶段 1 的 `memories` 行、召回路径的投影、测试里的手算输入都能直接传进来，
+ *   不必为了调一个纯函数先构造一整行。
+ */
+export interface DecayMemoryInput {
+  /** 稳定度（天，时间常数 τ 的基数）。 */
+  stability: number;
+  /** 强调系数（`[1.0, MAX_PIN_FACTOR]`，默认 1.0）。 */
+  pin_factor: number;
+  /** 最近一次访问时刻（epoch 毫秒）。 */
+  last_access: number;
+}
+
+/** 边权重衰减所需的边字段（§4.5）。 */
+export interface DecayEdgeInput {
+  /** 边的权重（写入侧已被 `MAX_EDGE_WEIGHT` 封顶）。 */
+  weight: number;
+  /** 最近一次活跃时刻（epoch 毫秒）。 */
+  last_active: number;
+}
+
+/** §4.4 的四个层级。 */
+export type MemoryLayer = 'L3' | 'L2' | 'L1' | 'archived';
+
+/**
+ * 有效稳定度 = `stability × pin_factor`（§4.1），单位**天**，语义是**时间常数 τ**。
+ *
+ * ⚠️ `pin_factor` 在**分母内**（拉长 τ ⇒ 衰减更慢），**绝不回写 `stability`**：
+ *   直接改 `stability` 就无法撤销了（§4.1：这正是用 `pin_factor` 而非直接改 `stability` 的原因）。
+ */
+export function effectiveStability(memory: DecayMemoryInput): number {
+  return memory.stability * memory.pin_factor;
+}
+
+/**
+ * 当前强度（§4.1）：`min(1, exp(-Δt / (τ × 86400000)))`，`Δt = max(0, now - last_access)`。
+ *
+ * @param memory 记忆（只需 `stability` / `pin_factor` / `last_access`）
+ * @param now 注入时钟（C37）；缺省取真实时钟
+ * @returns `intensity ∈ (0, 1]`
+ */
+export function intensity(memory: DecayMemoryInput, now?: number): number {
+  const tauMs = effectiveStability(memory) * MS_PER_DAY;
+  const elapsedMs = Math.max(0, resolveNow(now) - memory.last_access);
+  return Math.min(1, Math.exp(-elapsedMs / tauMs));
+}
+
+/**
+ * 层级判定（§4.4）：`> THRESHOLD_L3 → L3`；`> THRESHOLD_L2 → L2`；`> ARCHIVE_LINE → L1`；否则 `archived`。
+ *
+ * ⚠️ **三处比较都是严格大于**（§4.4 原文是 `intensity > 0.7`，不是 `≥`）：
+ *   写成 `≥` 会让「恰好落在阈值上」的记忆被抬进更高一层，
+ *   而阈值本身是可调参数 ⇒ 调参时边界行为会悄悄反向。
+ *
+ * ⚠️ **层级不落库**，是读取时现算的派生值（§4.4 标题即写明「纯函数，不落库」）。
+ *
+ * @param value `intensity`
+ * @param params 生效参数（阈值是可调项 ⇒ **必传**，不给默认值，见下）
+ */
+export function layerOf(value: number, params: Params): MemoryLayer {
+  if (value > params.THRESHOLD_L3) {
+    return 'L3';
+  }
+  if (value > params.THRESHOLD_L2) {
+    return 'L2';
+  }
+  if (value > params.ARCHIVE_LINE) {
+    return 'L1';
+  }
+  return 'archived';
+}
+
+/**
+ * 边权重衰减（§4.5）：`weight × exp(-Δt / (EDGE_STABILITY × 86400000))`，`Δt = max(0, now - last_active)`。
+ *
+ * ⚠️ 这里**没有** `min(1, ...)`：§4.5 的公式就是裸的，上界由**写入侧**的
+ *   `MAX_EDGE_WEIGHT` 保证（§4.5 的强化形式 `min(MAX_EDGE_WEIGHT, w + STEP)`）。
+ *   在这里多夹一道会让「权重被封顶」这件事有两个权威来源。
+ *
+ * ⚠️ `EDGE_STABILITY`（默认 30 天）是**时间常数 τ**，实际半衰期 = `30 × ln2 ≈ 20.8 天`。
+ *
+ * @param edge 边（只需 `weight` / `last_active`）
+ * @param params 生效参数（**必传**：`EDGE_STABILITY` 是可调项）
+ * @param now 注入时钟（C37）；缺省取真实时钟
+ */
+export function edgeWeight(edge: DecayEdgeInput, params: Params, now?: number): number {
+  const elapsedMs = Math.max(0, resolveNow(now) - edge.last_active);
+  const tauMs = params.EDGE_STABILITY * MS_PER_DAY;
+  return edge.weight * Math.exp(-elapsedMs / tauMs);
+}
+
+/**
+ * 归档时刻（§9.4.1）：`last_access + stability × pin_factor × ln(1/ARCHIVE_LINE) × 86400000`。
+ *
+ * ★ **它是精确的，不是近似**（ADR-18）：
+ *   `intensity ≤ ARCHIVE_LINE ⟺ Δt ≥ τ × ln(1/ARCHIVE_LINE)` ⇒
+ *   `archive_at` 那一刻的强度**恰好**等于 `ARCHIVE_LINE`
+ *   （`tests/unit/decay.test.ts` 用这条做同源自洽校验）。
+ *   ⇒ `countArchived()` 可以只查 `archive_at <= now` 而不逐行算 `exp()`。
+ *
+ * ⚠️ **公式里必须有 `pin_factor`**：漏掉它 ⇒ 被 pin 的记忆归档时刻算早 `pin_factor` 倍
+ *   （默认 5 倍），表现为「刚强调过的记忆几天就被判归档」。
+ *
+ * @param memory 记忆（只需 `stability` / `pin_factor` / `last_access`）
+ * @param params 生效参数（**必传**：`ARCHIVE_LINE` 是可调项）
+ */
+export function archiveAt(memory: DecayMemoryInput, params: Params): number {
+  const tauDays = effectiveStability(memory);
+  return memory.last_access + tauDays * Math.log(1 / params.ARCHIVE_LINE) * MS_PER_DAY;
+}
