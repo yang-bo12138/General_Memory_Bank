@@ -347,7 +347,7 @@ describe('P0-T07 · 门禁入口的可见性（防「假绿闸门」）', () => 
     expect(pkg.scripts?.verify).toContain('pnpm run typecheck');
   });
 
-  it('`verify` 链恰好串起 8 条门禁，且每段都写成 `pnpm run <名>`', () => {
+  it('`verify` 链恰好串起 9 条门禁，且每段都写成 `pnpm run <名>`', () => {
     const pkg = readPackageJson();
     const { names, malformed } = parseVerifyChain(pkg.scripts?.verify ?? '');
     expect(malformed).toEqual([]);

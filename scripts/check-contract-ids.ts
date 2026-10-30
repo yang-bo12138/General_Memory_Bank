@@ -495,7 +495,7 @@ export function checkContracts(markdown: string): ContractDiff[] {
   }
 
   // ⚠️ 门禁入口的可见性（防「假绿闸门」）：`scripts.ci` 必须是 `pnpm run verify` 的别名，
-  //   且 `scripts.verify` 必须串起全部 8 条门禁。
+  //   且 `scripts.verify` 必须串起全部 9 条门禁。
   for (const diff of checkGateEntry(readPackageJson())) {
     diffs.push({ reason: diff.reason });
   }

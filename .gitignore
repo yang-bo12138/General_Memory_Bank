@@ -27,6 +27,11 @@ Thumbs.db
 
 # 本机验收脚本与临时产物（不提交）
 .tmp/
+.tmp_arch/
+
+# vite / vitest 加载配置文件时落下的临时文件（会反复出现）
+vite.config.ts.timestamp-*.mjs
+vitest.config.ts.timestamp-*.mjs
 
 # tsx 在受限临时目录环境下的残留（路径解析退化为字面量 undefined）
 undefined/
