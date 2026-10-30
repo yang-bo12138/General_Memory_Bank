@@ -365,6 +365,64 @@ export function validateParams(params: Params): ParamViolation[] {
 }
 
 /**
+ * §5 的 **8 条跨参数校验**的清单（机器可读）。
+ *
+ * ⚠️ **条数是会被交叉引用与断言的量**：清单增删必须同步改引用处的数字
+ *   （与 §12 方法覆盖表同一条纪律，C25）。
+ *   ⇒ `scripts/check-contract-ids.ts` 会把它与 §5 正文里数出来的条数、
+ *     以及 §12 里引用的数字**三方比对**。
+ */
+export const CROSS_PARAM_VALIDATION_RULES: ReadonlyArray<{
+  /** 编号（1~8，连续）。 */
+  id: number;
+  /** 条件（§5 原文的简写）。 */
+  condition: string;
+  /** 默认值下的方向说明（§5 原文）。 */
+  direction?: string;
+}> = [
+  {
+    id: 1,
+    condition: '0 < REDUNDANCY_COS ≤ DEDUP_COS_MIN',
+    direction: '0.90 ≤ 0.92 ✓（方向是 ≤ 不是 <）',
+  },
+  {
+    id: 2,
+    condition: 'COACT_AFFINITY_MAX > COACT_REINFORCE_STEP + COACT_CAUSAL_BONUS',
+    direction: '1.0 > 0.45 ✓（严格大于）',
+  },
+  {
+    id: 3,
+    condition: 'COACT_REINFORCE_STEP ≥ COACT_AFFINITY_MIN',
+    direction: '0.20 ≥ 0.15 ✓',
+  },
+  {
+    id: 4,
+    condition: 'COACT_MIN_ENTITIES >= 1、COACT_MIN_COS ∈ (0,1]',
+  },
+  {
+    id: 5,
+    condition: 'COACT_MAX_PAIRS_PER_TOUCH >= 1、COACT_BATCH_MAX >= 1',
+  },
+  {
+    id: 6,
+    condition: 'ROUTER_NPROBE_COARSE ≥ 1 且 ROUTER_NPROBE_FINE ≥ 1',
+  },
+  {
+    id: 7,
+    condition:
+      'ROUTER_COARSE_CENTERS ≥ ROUTER_NPROBE_COARSE 且 ROUTER_FINE_CENTERS ≥ ROUTER_NPROBE_FINE（写入路径两个探针数同理）',
+  },
+  {
+    id: 8,
+    condition: 'COACT_AFFINITY_MAX = 1.0 与 §3 的 CHECK 约束必须同步',
+    direction: '改上界要同时改 DDL',
+  },
+];
+
+/** §5 的跨参数校验条数（写死的期望值）。 */
+export const CROSS_PARAM_VALIDATION_COUNT = CROSS_PARAM_VALIDATION_RULES.length;
+
+/**
  * 校验全量参数；不合法则抛 `MemoryError.INVALID_INPUT`（`details` 带建议值）。
  *
  * @throws {MemoryError} code = `INVALID_INPUT`
