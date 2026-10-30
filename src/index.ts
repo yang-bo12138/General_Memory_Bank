@@ -24,6 +24,20 @@ export {
 } from './core/events.types.js';
 export { MemoryError, MemoryErrorCode, type ConflictDetails } from './core/errors.js';
 export {
+  BASELINE_FLAGS,
+  BOOLEAN_FLAG_KEYS,
+  FEATURE_FLAG_SPEC,
+  isBaselineConfig,
+  resolveFlags,
+  resolveVectorBackendState,
+  toBaselineParams,
+  type BooleanFlagKey,
+  type FeatureFlags,
+  type VectorBackendFacts,
+  type VectorBackendMode,
+  type VectorBackendState,
+} from './core/flags.js';
+export {
   applyParamPatch,
   assertParamsValid,
   COACT_AFFINITY_MAX_DDL_CHECK,
