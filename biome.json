@@ -33,6 +33,12 @@
     }
   },
   "files": {
-    "ignore": ["node_modules/**", "dist/**", "coverage/**", "tests/golden/__captured__/**"]
+    "ignore": [
+      "node_modules/**",
+      "dist/**",
+      "coverage/**",
+      "tests/golden/__captured__/**",
+      ".tmp/**"
+    ]
   }
 }
