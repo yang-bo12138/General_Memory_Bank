@@ -174,9 +174,18 @@ export {
 // ⚠️ 类型名**全部来自 `src/` 里已有的定义**（先 grep 再导），不自造别名。
 export { type MemoryConfig, MemoryStore } from './store/MemoryStore.js';
 export type { MergeEntitiesResult } from './store/entities.js';
+// ⚠️⚠️ **v2.1（P2 QA 第二轮 ②-1 + P2-T06 发现 1）**：
+//   `MemoryMaintainer` 此前是 **type-only 导出** ⇒ 运行时**拿不到这个类**
+//   ⇒ ⇒ 宿主**根本调不到「启动对账」**（`reconcileBuckets()`）
+//   ⇒ ⇒ 而「启动对账」是 §9.3.2 ③ 的**宿主责任**（库不自动跑：只读实例不能修 §7.1、
+//   且每次 open 多一遍全表扫）⇒ 没有宿主可调的入口 ⇒ 这条能力**等于不存在**。
+//   ⇒ ⇒ 现在**改成值导出**（**类的运行时值**）⇒ 宿主能 `new MemoryMaintainer(...)` 或
+//   从实例拿到它 ⇒ 有了真正的入口。
+//   ⇒ ⚠️ **不新增 `MemoryStore` 的公开方法**：§3.1 的方法归位表规定阶段 2 只加
+//   `rebuildVectorBuckets` 一个 ⇒ 这里只动**导出面**，不动**门面方法清单**。
+export { MemoryMaintainer } from './store/maintain.js';
 export type {
   MaintainContext,
-  MemoryMaintainer,
   RebuildBucketsOptions,
   RebuildBucketsResult,
   RebuildOnceOutcome,
