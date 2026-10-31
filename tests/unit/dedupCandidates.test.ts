@@ -22,14 +22,14 @@ import { describe, expect, it } from 'vitest';
 import { MS_PER_DAY } from '../../src/core/decay.js';
 import { EVENT_PAYLOAD_VARIANTS } from '../../src/core/events.types.js';
 import { DEFAULT_PARAMS, type Params } from '../../src/core/params.js';
-import { EventWriter } from '../../src/store/events.js';
 import {
   type DedupCandidateContext,
   collectDedupCandidates,
   collectVectorCandidates,
 } from '../../src/store/dedupCandidates.js';
-import { type WriteStore, write } from '../../src/store/write.js';
+import { EventWriter } from '../../src/store/events.js';
 import { runWriteTransaction } from '../../src/store/transaction.js';
+import { type WriteStore, write } from '../../src/store/write.js';
 import { MemoryLogger } from '../../src/util/log.js';
 import { type BucketAssignContext, assignBucket } from '../../src/vector/bucketAssign.js';
 import { CentroidCache, type IvfCentroidModel } from '../../src/vector/centroids.js';
@@ -39,8 +39,8 @@ import {
   scanBucketCandidates,
   trainCentroids,
 } from '../../src/vector/ivf.js';
-import { createTestDb, insertMemory, pseudoUnitVector } from '../fixtures/vector.js';
 import { readEvents } from '../fixtures/graph-store.js';
+import { createTestDb, insertMemory, pseudoUnitVector } from '../fixtures/vector.js';
 
 /** 一个固定的时间基准（毫秒）。 */
 const T0 = 1_700_000_000_000;
@@ -464,7 +464,9 @@ describe('P2-T07 · 写入路径的去重候选收窄（§4.9 步骤 3a2）', ()
       expect(vectorSecond.merged).toBe(true);
 
       const textKeys = Object.keys(readEvents(textFixture.db, 'merge')[0]?.payload ?? {}).sort();
-      const vectorKeys = Object.keys(readEvents(vectorFixture.db, 'merge')[0]?.payload ?? {}).sort();
+      const vectorKeys = Object.keys(
+        readEvents(vectorFixture.db, 'merge')[0]?.payload ?? {},
+      ).sort();
 
       // 性质：**两条路的 payload 键集逐字一致**
       expect(vectorKeys).toEqual(textKeys);
@@ -519,9 +521,7 @@ describe('P2-T07 · 写入路径的去重候选收窄（§4.9 步骤 3a2）', ()
 
       // ⚠️ **flat 的 top-N**（按余弦取前 `VECTOR_TOPK` 条）——**错误的分母**
       const flatRows = fixture.db
-        .prepare(
-          'SELECT id, embedding FROM memories WHERE deleted = 0 AND embedding IS NOT NULL',
-        )
+        .prepare('SELECT id, embedding FROM memories WHERE deleted = 0 AND embedding IS NOT NULL')
         .all() as Array<{ id: string; embedding: Buffer }>;
       const scored = flatRows
         .map((row) => ({ id: row.id, cos: cosineWith(query, row.embedding) }))
@@ -653,7 +653,9 @@ describe('P2-T07 · 静态断言：候选收集不做全表扫', () => {
     const code = stripComments(source);
 
     // 性质：**没有**「直接从 memories 取全部有向量的行」那种 SQL
-    expect(code).not.toMatch(/FROM\s+memories\s+m?\s*WHERE\s+m?\.?deleted\s*=\s*0\s+AND\s+m?\.?embedding\s+IS\s+NOT\s+NULL/i);
+    expect(code).not.toMatch(
+      /FROM\s+memories\s+m?\s*WHERE\s+m?\.?deleted\s*=\s*0\s+AND\s+m?\.?embedding\s+IS\s+NOT\s+NULL/i,
+    );
     // 性质：**没有**「无 LIMIT 的 memories 全表扫」
     expect(code).not.toMatch(/SELECT[\s\S]{0,200}FROM\s+memories(?![\s\S]{0,400}JOIN\s+memories)/i);
   });
