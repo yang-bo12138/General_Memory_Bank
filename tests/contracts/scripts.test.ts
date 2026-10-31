@@ -354,7 +354,10 @@ describe('P0-T07 · §11.2 的六组表达方式（逐名比对，不是计数�
     expect(METHODS_THROWING_NOT_FOUND).not.toContain('ALIAS_CONFLICT');
     expect(METHODS_THROWING_CONFLICT).not.toContain('ALIAS_CONFLICT');
     expect(METHODS_THROWING_READONLY_VIOLATION).not.toContain('ALIAS_CONFLICT');
-    expect(WARNING_ONLY_CASES).toEqual(['ALIAS_CONFLICT']);
+    // ⚠️ 这份名单镜像的是 `src/core/errors.ts` 的 `WARNING_ONLY_CASES`（代码侧），
+    //   ⇒ 与上面那行（镜像**脚本侧**的 `EXPECTED_WARNING_ONLY_CASES`）是**两份**，
+    //   两边必须同步改，否则「代码 ↔ 脚本 ↔ 文档」三处相等的关系会破。
+    expect(WARNING_ONLY_CASES).toEqual(['ALIAS_CONFLICT', 'ALIAS_TARGET_NOT_LINKED']);
   });
 
   it('`missingIds` 锚点：承载它的方法必须在 NOT_FOUND 分组里', () => {

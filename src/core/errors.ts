@@ -174,8 +174,18 @@ export const METHODS_THROWING_READONLY_VIOLATION: readonly string[] = [
  * ⚠️ `ALIAS_CONFLICT` 刻意不是异常：别名冲突时**记忆本身已经写成功**，
  *   只有附属的别名映射没落库。抛异常会让调用方重试 `write()`，
  *   结果是同一事实被写两遍。
+ *
+ * ⚠️ `ALIAS_TARGET_NOT_LINKED` 同样刻意不是异常（ADR-P1-T07-DEC 的 D-3/R2 终裁）：
+ *   它报的是「**别名目标实体建好了，但没跟本条记忆关联**」——
+ *   记忆本身已经写成功，别名映射也挂上了 ⇒ 只是「**这条记忆跟 X 有关**」这件事
+ *   **没有**被表达（关联只由 `input.entities` 表达 ⇒ §14.3 边界原则 1）。
+ *   ⚠️ **边界可以存在，但必须可观测** ⇒ 走 `warnings`（而不是抛错），
+ *     调用方据此把实体名补进 `input.entities`；**不重试 `write()`**
+ *     （重试 = 同一事实写两遍）。
+ *
+ * ⚠️ 两者都是「**主体工作做成了，附属产出未生效**」这一类 ⇒ 都不抛错。
  */
-export const WARNING_ONLY_CASES: readonly string[] = ['ALIAS_CONFLICT'];
+export const WARNING_ONLY_CASES: readonly string[] = ['ALIAS_CONFLICT', 'ALIAS_TARGET_NOT_LINKED'];
 
 /**
  * §4.2 / §4.5：`NOT_FOUND` 的 `details` 里承载「**缺失 id 差集**」的键名。
