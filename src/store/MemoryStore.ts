@@ -1,5 +1,5 @@
 /**
- * 门面 `MemoryStore` —— DESIGN-v2.md §6 的公开 API 入口（阶段 1 的 10 个方法）。
+ * 门面 `MemoryStore` —— DESIGN-v2.md §6 的公开 API 入口（阶段 1 的 10 个方法 + 阶段 2 的 `rebuildVectorBuckets`）。
  *
  * ⚠️ **本文件只做「委托」，一行业务逻辑都没有**（§14.3 边界原则 1：
  *   「每个承诺都要能指到唯一代码路径」）：
@@ -7,15 +7,17 @@
  *   · **不取时钟**（`now` 由调用方注入，实现里统一走 `resolveNow`，§11.1 / C37）；
  *   · **不开事务**（事务在 `runWriteTransaction()` 里统一包，§4.2 / §4.5 / §4.9.2）；
  *   · **不算任何派生值**（`intensity` / `layer` / `effectiveStability` 都是库内部现算，§4.1）。
- *   ⇒ 门面**唯一**的职责是「把 10 个函数各自需要的上下文对象（`db` / `params` / `events` /
+ *   ⇒ 门面**唯一**的职责是「把每个函数各自需要的上下文对象（`db` / `params` / `events` /
  *     `logger`）补齐」，然后原样转交。
  *
- * ⚠️ **公开面严格是 10 个方法**（DEVELOPMENT-PLAN.md §3.1 的阶段 1 归位表）：
- *   `write` / `recall` / `touch` / `get` / `pin` / `unpin` / `link` / `linkByIds` /
- *   `setAlias` / `mergeEntities`。
- *   ⇒ **刻意不实现 `stats`**（阶段 4）、**不加第 11 个方法**：
+ * ⚠️ **公开面 = 已落地阶段的公开方法之和**（DEVELOPMENT-PLAN.md §3.1 的方法归位表）：
+ *   · **阶段 1 的 10 个**：`write` / `recall` / `touch` / `get` / `pin` / `unpin` /
+ *     `link` / `linkByIds` / `setAlias` / `mergeEntities`；
+ *   · **阶段 2 的 1 个**：`rebuildVectorBuckets`（§4.15.5 的重训；P2-T05 落地）。
+ *   ⇒ **刻意不实现 `stats`**（阶段 4）、**不提前实现其余 12 个**：
  *   每多一个公开方法都是一次**公开承诺**，而 §6 的 23 个方法分属阶段 1~5
- *   ⇒ 阶段 1 的门面只承诺这 10 个，其余的等各自阶段落地时再加。
+ *   ⇒ 门面只承诺**已落地阶段**的那几个，其余的等各自阶段落地时再加
+ *   （**导出了却没实现 = 空承诺，比不导更糟**）。
  *
  * ⚠️ **签名全部从现有实现抄**（`src/store/*.ts`），不臆测、不「按设计稿再美化一次」：
  *   形参顺序、可选性、返回类型与实现**逐字一致**（含 `memoryId?: string | null` 这种
@@ -50,6 +52,11 @@ import {
   linkByIds as linkByIdsImpl,
   link as linkImpl,
 } from './link.js';
+import {
+  MemoryMaintainer,
+  type RebuildBucketsOptions,
+  type RebuildBucketsResult,
+} from './maintain.js';
 import { pin as pinImpl, unpin as unpinImpl } from './pin.js';
 import { type RecallOptions, type RecallResult, recall as recallImpl } from './recall.js';
 import { type TouchOptions, type TouchOutcome, touch as touchImpl } from './touch.js';
@@ -154,9 +161,10 @@ function ensureSchemaForMode(db: Database.Database, readonly: boolean): void {
 /**
  * 门面 —— 库对外的唯一入口（§6）。
  *
- * ⚠️ **只暴露 10 个公开方法**（阶段 1 的归位表），其余全是私有字段：
+ * ⚠️ **只暴露已落地阶段的公开方法**（阶段 1 的 10 个 + 阶段 2 的 `rebuildVectorBuckets`），
+ *   其余全是私有字段：
  *   公开面每多一个名字就是一次公开承诺（§14.3 原则 1），
- *   而 §6 的 23 个方法分属阶段 1~5 ⇒ 阶段 1 只承诺这 10 个。
+ *   而 §6 的 23 个方法分属阶段 1~5 ⇒ 只承诺**已落地**的那几个。
  *
  * ⚠️ **不提供 `close()`**：§6 的公开面里没有它，而阶段 1 的门面方法归位表里也没有它
  *   ⇒ 本阶段不加。调用方要释放句柄时，自行管理 `dbPath` 的生命周期即可
@@ -187,6 +195,18 @@ export class MemoryStore {
    *   （当前阶段还没有重训入口 ⇒ 本字段先备好）。
    */
   readonly #centroids: CentroidCache;
+
+  /**
+   * 维护器（阶段 2 的 `rebuildVectorBuckets` 与它的 `inRetrain` 状态）。
+   *
+   * ⚠️ **为什么是实例字段而不是模块级变量**（§4.15.5）：
+   *   `inRetrain` 是**进程内的实例状态** ⇒ 模块级变量会让**两个库实例互相干扰**
+   *   （A 库在重训、B 库的 `inRetrain` 也变成 true ⇒ 面板说谎）。
+   * ⚠️ **`inRetrain` 本身不暴露成公开成员**：§6 的公开面是 **23 个方法**（§3.1 的归位表）
+   *   ⇒ 它是 `stats().vectorBackend.inRetrain`（阶段 4）的**数据源**，
+   *   由 `stats()` 去读 ⇒ 门面不多开一个名字。
+   */
+  readonly #maintainer: MemoryMaintainer;
 
   /**
    * 构造一个门面实例。
@@ -231,6 +251,19 @@ export class MemoryStore {
     //   ⇒ 中心模型**只从库里读**（`CentroidCache` ⇒ 走真实的加载路径）
     //   ⇒ 库里没有桶 ⇒ `assignBucket` 返回「没入桶」而**不抛错**（库仍可写）。
     this.#centroids = new CentroidCache(db);
+
+    // ⚠️ **桶归属上下文**（§9.3.0 的唯一写入点）：
+    //   写入路径改 `embedding` 时**同事务**同步桶归属（§9.3.2 ①）。
+    //   ⚠️ **探针数用参数表的 `ROUTER_NPROBE_COARSE`**（§5）——它必须与**训练时**用的探针数一致，
+    //     否则一条记忆会在下次写入时被**重新归桶**（无谓的桶 churn，§4.15.3）。
+    //   ⚠️ **写路径与重训共用同一份**（`src/store/maintain.ts` 的维护器也拿它）
+    //     ⇒ 训练期与运行期的规则**必然一致** ⇒ 不会产生无谓的桶 churn。
+    const buckets = {
+      db,
+      centroids: () => this.#centroids.model(),
+      nprobeCoarse: params.ROUTER_NPROBE_COARSE,
+    };
+
     // ⚠️ `embedder` 是**可选属性**：`exactOptionalPropertyTypes` 下显式写 `embedder: undefined`
     //   与「不传」是**两件事** ⇒ 用条件展开，避免把「没有 embedder」写成「embedder 是 undefined」。
     this.#writeContext = {
@@ -238,17 +271,20 @@ export class MemoryStore {
       params,
       events,
       logger,
-      // ⚠️ **桶归属上下文**（§9.3.0 的唯一写入点）：
-      //   写入路径改 `embedding` 时**同事务**同步桶归属（§9.3.2 ①）。
-      //   ⚠️ **探针数用参数表的 `ROUTER_NPROBE_COARSE`**（§5）——它必须与**训练时**用的探针数一致，
-      //     否则一条记忆会在下次写入时被**重新归桶**（无谓的桶 churn，§4.15.3）。
-      buckets: {
-        db,
-        centroids: () => this.#centroids.model(),
-        nprobeCoarse: params.ROUTER_NPROBE_COARSE,
-      },
+      buckets,
       ...(config.embedder === undefined ? {} : { embedder: config.embedder }),
     };
+
+    // ⚠️ **维护器**（阶段 2 的 `rebuildVectorBuckets`，§4.15.5）：
+    //   重训**之后**必须让中心缓存失效 ⇒ 否则路由继续用**旧中心** ⇒ 召回静默变差。
+    this.#maintainer = new MemoryMaintainer({
+      db,
+      params,
+      events,
+      logger,
+      buckets,
+      reloadCentroids: () => this.#centroids.reload(),
+    });
   }
 
   /**
@@ -397,5 +433,31 @@ export class MemoryStore {
    */
   mergeEntities(sourceId: string, targetId: string): MergeEntitiesResult {
     return mergeEntitiesImpl(this.#context, sourceId, targetId);
+  }
+
+  /**
+   * 重训两级分桶 + 全量重分配 —— §6 的 `rebuildVectorBuckets()`（§4.15.5）。
+   *
+   * ⚠️ ★ **阻塞 1~3 分钟**：库是**全同步 API**（ADR-5）⇒ 同一线程调用会阻塞这么久
+   *   （**同步模型的必然结果，不是缺陷**）。
+   *   ⇒ 要让重训期间不阻塞请求：调用方须在**自己的另一个线程**里调用它，
+   *     并使用**独立的数据库连接** ⇒ 此时 **WAL 保证「读不阻塞写」**
+   *     ⇒ `recall` / `stats` 照常工作；⚠️ **写仍然互斥**（其它写调用会等锁）。
+   *
+   * ⚠️ **库内没有定时器、没有后台线程** ⇒ **触发权在调用方**
+   *   （库不自己决定何时训练；§4.15.5 的 v2.1 裁决）。
+   *
+   * ⚠️ **幂等**（§4.15.5）：连做两次 ⇒ 结果**逐条相同**。
+   *
+   * ⚠️ **崩溃可恢复**：步骤 ② 分批提交 ⇒ 崩在「提交了一部分」时，库里是「部分迁移」的
+   *   中间态（每条记忆仍有且仅有一个归属 ⇒ **库仍可用**）⇒ **重做一次**即可回到完整状态。
+   *
+   * ⚠️ **写事件**：`type='sweep'`、`action='rebuildBuckets'`，payload 只有 `cells` 与 `members`。
+   *
+   * @param options 触发原因（只进日志）
+   * @returns §6 的 `{ cells, members }`
+   */
+  rebuildVectorBuckets(options?: RebuildBucketsOptions): RebuildBucketsResult {
+    return this.#maintainer.rebuildVectorBuckets(options);
   }
 }

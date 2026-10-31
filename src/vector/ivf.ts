@@ -65,6 +65,59 @@ export interface IvfTrainingResult {
 }
 
 /**
+ * 一条「有向量的记忆」（**含软删**）。
+ *
+ * ⚠️ **软删的也读**：软删记忆**保留向量**（§8.2）⇒ 它在桶里也有一席之地（§9.3.2 ②：
+ *   软删不删桶归属）⇒ 重训时**必须**一并迁移，否则它的归属会挂在旧代桶上，
+ *   旧代桶被清空时会被级联删掉 ⇒ `restore()` 之后它**永久进不了向量路**（静默、永久）。
+ */
+export interface VectorMemoryRow {
+  /** 记忆 id。 */
+  id: string;
+  /** 向量（已从 BLOB 解码；**未做维度校验** —— 校验在 `assignBucket` 那条路上）。 */
+  vector: Float32Array;
+  /** 是否软删（`memories.deleted = 1`）。 */
+  deleted: boolean;
+}
+
+/**
+ * 读出**全部有向量的记忆**（含软删；**按 rowid 升序**）——
+ * 「有向量的记忆」这件事的**唯一读取口径**。
+ *
+ * ⚠️ **为什么单独抽出来**（C36：同一件事不得有两份实现）：
+ *   `trainCentroids()`（训练）与 `rebuild.ts` 的重训序列（迁移）都要读这批行
+ *   ⇒ 两处各写一条 SQL ⇒ 哪天一边加了过滤条件、另一边没加
+ *   ⇒ **训练用的向量集合与迁移用的向量集合悄悄不是同一批** ⇒ 重训的归属与训练的几何错位。
+ *   ⇒ 抽成一个函数 ⇒ 口径只有一份。
+ *
+ * ⚠️ **按 rowid 升序**（不是按 id 排序）：初始中心 = **输入顺序的前 K 条**（§4.15.3）
+ *   ⇒ 顺序就是「确定性」的依据 ⇒ 换排序方式会换掉整套桶。
+ *
+ * ⚠️ **不做维度校验**：`blobToVector` 只负责解码 ⇒ 维度不对的行由
+ *   `assignBucket()` 那条路上的 `assertValidEmbedding` 报错（口径只有一份）。
+ *
+ * @param db 库句柄
+ * @returns 有向量的记忆（**含软删**；顺序即 rowid 顺序）
+ */
+export function readVectorMemories(db: Database.Database): VectorMemoryRow[] {
+  const rows = db
+    .prepare(
+      'SELECT id, embedding, deleted FROM memories WHERE embedding IS NOT NULL ORDER BY rowid',
+    )
+    .all() as Array<{ id: string; embedding: Buffer; deleted: number }>;
+
+  const result: VectorMemoryRow[] = [];
+  for (const row of rows) {
+    result.push({
+      id: row.id,
+      vector: blobToVector(row.embedding),
+      deleted: row.deleted === 1,
+    });
+  }
+  return result;
+}
+
+/**
  * **训练两级桶中心**（粗 200 / 细 1 万，§4.15.3）——**三个触发时机共用的唯一入口**。
  *
  * ⚠️ **三个触发时机（缺一不可，§4.15.3）**：① 建库时；② 库长大成人时（过了
@@ -103,16 +156,14 @@ export function trainCentroids(
   }
 
   // ⚠️ **按 rowid 顺序取**（不是随机采样、也不是按 id 排序）⇒ 初始中心确定。
-  const rows = db
-    .prepare(
-      'SELECT id, embedding FROM memories ' +
-        'WHERE embedding IS NOT NULL AND deleted = 0 ORDER BY rowid',
-    )
-    .all() as Array<{ id: string; embedding: Buffer }>;
+  //   ⚠️ **走 `readVectorMemories()`**（唯一一份「有向量的记忆」的读取口径）⇒
+  //   本函数与重训序列（`src/vector/rebuild.ts`）读到的是**同一批行、同一顺序**
+  //   ⇒ 训练输入逐条相同 ⇒ 两次训练的中心逐条相同。
+  const rows = readVectorMemories(db).filter((row) => !row.deleted);
 
   const vectors: Float32Array[] = [];
   for (const row of rows) {
-    vectors.push(blobToVector(row.embedding));
+    vectors.push(row.vector);
   }
 
   const maxIterations = options.maxIterations ?? DEFAULT_MAX_ITERATIONS;

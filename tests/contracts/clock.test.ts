@@ -3,7 +3,7 @@
  *
  * 覆盖的验收硬断言（DEVELOPMENT-PLAN.md P0-T05）：
  * · 五个错误码都存在，`details` 结构符合 §11.2
- * · §11.1 豁免清单里的 6 个方法**确实不含** `now?`，且在代码里有注释写明理由
+ * · §11.1 豁免清单里的 7 个方法**确实不含** `now?`，且在代码里有注释写明理由
  * · `scripts/check-clock.ts` 在 CI 里运行，**分母写死**；
  *   故意在某个方法里加一行 `Date.now()` ⇒ CI 必须失败
  */
@@ -55,10 +55,18 @@ describe('P0-T05 · §11.1 的时钟注入表', () => {
     ]);
   });
 
-  it('豁免清单恰好是 6 个方法，且每个都写明了理由', () => {
+  it('豁免清单恰好是 7 个方法，且每个都写明了理由', () => {
     const names = Object.keys(CLOCK_EXEMPT_METHODS).sort();
-    expect(names).toEqual(['mergeEntities', 'pin', 'restore', 'setAlias', 'setParams', 'unpin']);
-    expect(names).toHaveLength(6);
+    expect(names).toEqual([
+      'mergeEntities',
+      'pin',
+      'rebuildVectorBuckets',
+      'restore',
+      'setAlias',
+      'setParams',
+      'unpin',
+    ]);
+    expect(names).toHaveLength(7);
     for (const [name, reason] of Object.entries(CLOCK_EXEMPT_METHODS)) {
       expect(reason.length).toBeGreaterThan(0);
       expect(name.length).toBeGreaterThan(0);
