@@ -129,6 +129,56 @@ export function edgeWeight(edge: DecayEdgeInput, params: Params, now?: number): 
 }
 
 /**
+ * 归档跨度因子（**唯一实现**，无量纲）：`ln(1 / ARCHIVE_LINE)`。
+ *
+ * ★ **为什么需要它**（C36：两份副本可能不一致）：
+ *   `ln(1 / ARCHIVE_LINE)` 这个数在**三处**都要用到——
+ *   ① §9.4.1 的 `archive_at`（本文件 `archiveAt`）；
+ *   ② §9.4.1 迁移回填 `archival_schedule.archive_at`（`src/db/migrate.ts`）；
+ *   ③ §4.6 步骤 2 的粗筛窗口（`src/core/scoring.ts` 的 `coarseGateWindow`）。
+ *   三处各写一遍 `Math.log(1 / ARCHIVE_LINE)` ⇒ 改公式要改三处，
+ *   **漏改一处不会报错**，只会让两个口径对不上：
+ *   表现为「一条记忆按迁移回填的 `archive_at` 判定未归档、按粗筛窗口却已被挡住」
+ *   ——**两个口径打架**，用户看到的是「明明没过期却召不回」。
+ *
+ * ⚠️ **本函数是那三处的唯一权威**；`archiveSpanMs` 只是它的毫秒形态，**不是第二份实现**。
+ *
+ * ⚠️ **刻意不给默认参数**：`ARCHIVE_LINE` 是**可调项**（§9.4.3 `setParams` 的第 10 条路径）。
+ *   若在核心公式里藏一个 `DEFAULT_PARAMS.ARCHIVE_LINE` 默认值，
+ *   「改了参数表、却忘了改那个默认」的漂移就**无从察觉**
+ *   （调用点会安静地继续用旧值，且不报错）。
+ *   ⇒ 调用方必须显式传 `params.ARCHIVE_LINE`（与 `layerOf` / `archiveAt` 的口径一致）。
+ *
+ * @param archiveLine 归档线（传 `params.ARCHIVE_LINE`）
+ * @returns `ln(1 / archiveLine)`（`ARCHIVE_LINE = 0.05` ⇒ `ln(20) ≈ 2.9957`）
+ */
+export function archiveSpanFactor(archiveLine: number): number {
+  return Math.log(1 / archiveLine);
+}
+
+/**
+ * 归档跨度（**毫秒**）：`ln(1 / ARCHIVE_LINE) × MS_PER_DAY`。
+ *
+ * ★ 语义：**从「归档线」到「归档点」的毫秒跨度**——
+ *   一条 τ = 1 天的记忆，从强度 1 衰减到 `ARCHIVE_LINE` 需要这么多个毫秒
+ *   （§9.4.1：`archive_at` 那一刻的强度**恰好**等于 `ARCHIVE_LINE`，ADR-18）。
+ *
+ * ⚠️ **「天 → 毫秒」的换算只有一个来源**：`MS_PER_DAY`（本文件顶部）。
+ *   历史上 `src/db/migrate.ts` 自己写了一份 `86_400_000` ⇒ 出现**两份**「天→毫秒」的权威
+ *   ⇒ 改一处不改另一处 ⇒ 迁移回填的 `archive_at` 与运行时算的 `archive_at` 差一截
+ *   ⇒ **不报错**，只是归档判定提前 / 推后（要等 §9.4.4 护栏①才抓到）。
+ *   ⇒ 现在**只有本文件**能写这个换算。
+ *
+ * ⚠️ 本函数**不重写公式**，它就是 `archiveSpanFactor` 的毫秒形态（避免公式分叉）。
+ *
+ * @param archiveLine 归档线（传 `params.ARCHIVE_LINE`）
+ * @returns 归档跨度（毫秒）
+ */
+export function archiveSpanMs(archiveLine: number): number {
+  return archiveSpanFactor(archiveLine) * MS_PER_DAY;
+}
+
+/**
  * 归档时刻（§9.4.1）：`last_access + stability × pin_factor × ln(1/ARCHIVE_LINE) × 86400000`。
  *
  * ★ **它是精确的，不是近似**（ADR-18）：
@@ -145,5 +195,7 @@ export function edgeWeight(edge: DecayEdgeInput, params: Params, now?: number): 
  */
 export function archiveAt(memory: DecayMemoryInput, params: Params): number {
   const tauDays = effectiveStability(memory);
-  return memory.last_access + tauDays * Math.log(1 / params.ARCHIVE_LINE) * MS_PER_DAY;
+  // ⚠️ 跨度只从唯一权威 `archiveSpanFactor` 取（不再就地写 `Math.log(1 / ARCHIVE_LINE)`）。
+  //   乘法顺序保持 `τ × 因子 × MS_PER_DAY` ⇒ 与收敛前的数值**逐位相同**。
+  return memory.last_access + tauDays * archiveSpanFactor(params.ARCHIVE_LINE) * MS_PER_DAY;
 }
