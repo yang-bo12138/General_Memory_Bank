@@ -49,6 +49,7 @@ import {
 } from '../../scripts/check-gate-entry.js';
 import { compareParams, parseSection5Params } from '../../scripts/check-params.js';
 import {
+  compareActionGroups,
   comparePayloadKeys,
   parseSection8_4PayloadKeys,
   parseSweepActionGroups,
@@ -80,7 +81,11 @@ import {
   NOT_FOUND_METHODS_WITH_MISSING_IDS,
   WARNING_ONLY_CASES,
 } from '../../src/core/errors.js';
-import { EVENT_PAYLOAD_KEYS, EVENT_TYPES } from '../../src/core/events.types.js';
+import {
+  EVENT_PAYLOAD_KEYS,
+  EVENT_PAYLOAD_VARIANTS,
+  EVENT_TYPES,
+} from '../../src/core/events.types.js';
 import {
   CROSS_PARAM_VALIDATION_COUNT,
   DEFAULT_PARAMS,
@@ -184,6 +189,41 @@ describe('P0-T06 · check-payload-keys（§8.4 键集）', () => {
       'rebuildBuckets',
       'recluster',
     ]);
+  });
+
+  // ⚠️⚠️ **硬规则 4 的 action 级守卫**（v2.1 / P2-T05 收口时补上）
+  //   此前 `parseSweepActionGroups` 只被用来把 action 组的键**并进** sweep 的总键集
+  //   ⇒ **action 级字段集零比对** ⇒ 代码里改掉某个 action 的字段集（只要并集仍覆盖）
+  //   ⇒ 门禁**照样全绿** ⇒ 写事件时可以填**本次根本没发生的事实**（= 伪造）且无人发现。
+  it('★ action 级字段集与 §8.4 **双向**一致（硬规则 4）', () => {
+    const section = readDesignDoc();
+    const groups = parseSweepActionGroups(section);
+    const diffs = compareActionGroups(groups, EVENT_PAYLOAD_VARIANTS.sweep);
+    expect(diffs).toEqual([]);
+  });
+
+  it('★ 负控：某个 action 的字段集多出一个键 ⇒ 必须报红（证明上一条不是摆设）', () => {
+    const section = readDesignDoc();
+    const groups = parseSweepActionGroups(section);
+    const broken = {
+      ...EVENT_PAYLOAD_VARIANTS.sweep,
+      action_rebuildBuckets: ['cells', 'members', 'vacuumed'],
+    };
+    const diffs = compareActionGroups(groups, broken);
+    expect(diffs.length).toBeGreaterThan(0);
+    expect(diffs[0]?.reason).toContain('rebuildBuckets');
+  });
+
+  it('★ 负控：代码里偷偷加一个 §8.4 没规定的 action ⇒ 必须报红', () => {
+    const section = readDesignDoc();
+    const groups = parseSweepActionGroups(section);
+    const broken = {
+      ...EVENT_PAYLOAD_VARIANTS.sweep,
+      action_secretSweep: ['whatever'],
+    };
+    const diffs = compareActionGroups(groups, broken);
+    expect(diffs.length).toBeGreaterThan(0);
+    expect(diffs.some((diff) => diff.reason.includes('secretSweep'))).toBe(true);
   });
 
   it('★ 反例：代码少一个键 ⇒ 失败并指出是哪个 type', () => {

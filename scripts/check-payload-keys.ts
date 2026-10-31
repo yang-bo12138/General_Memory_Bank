@@ -156,6 +156,72 @@ export function compareVariants(): PayloadKeyDiff[] {
   return diffs;
 }
 
+/**
+ * ★ **硬规则 4 的 action 级比对**（v2.1 / P2-T05 收口时补上）。
+ *
+ * ⚠️ **为什么必须补这条**（这是「门禁只比对了一部分」的典型盲区）：
+ *   `parseSweepActionGroups()` 早就能从 §8.4 解析出「每个 action 各自的字段集」，
+ *   但它此前**只被用来把这些键并进 sweep 的总键集** ⇒
+ *   ⇒ **action 级字段集本身零比对** ⇒ 硬规则 4（「payload 按 action 分组写清字段集」）
+ *     **只靠自觉**：代码里把 `action='rebuildBuckets'` 的字段集改成任意字段集，
+ *     只要**并集**仍覆盖 sweep 的总键集 ⇒ 门禁**照样全绿**。
+ *   ⇒ 后果：写 `rebuildBuckets` 事件时可以填**本次根本没发生的事实**（= 伪造）
+ *     ⇒ 而事件是审计依据 ⇒ 审计记录会撒谎且**无人发现**。
+ *
+ * ⇒ 本函数做**双向**比对：§8.4 的每个 action ⇒ 代码里必须存在、且字段集**恰好相等**。
+ *
+ * @param docGroups §8.4 解析出的 `action → 字段集`
+ * @param codeVariants 代码侧的变体键集（`EVENT_PAYLOAD_VARIANTS['sweep']`）
+ * @returns 每一处差异
+ */
+export function compareActionGroups(
+  docGroups: Record<string, string[]>,
+  codeVariants: Record<string, readonly string[]> | undefined,
+): PayloadKeyDiff[] {
+  const diffs: PayloadKeyDiff[] = [];
+  const variants = codeVariants ?? {};
+  for (const [action, docKeys] of Object.entries(docGroups)) {
+    const codeKeys = variants[`action_${action}`];
+    if (codeKeys === undefined) {
+      diffs.push({
+        type: 'sweep',
+        doc: docKeys,
+        code: undefined,
+        reason: `§8.4 规定了 action='${action}' 的字段集，但代码里没有 \`action_${action}\` 这个变体`,
+      });
+      continue;
+    }
+    const docSet = new Set(docKeys);
+    const codeSet = new Set(codeKeys);
+    const missing = [...docSet].filter((key) => !codeSet.has(key));
+    const extra = [...codeSet].filter((key) => !docSet.has(key));
+    if (missing.length > 0 || extra.length > 0) {
+      diffs.push({
+        type: 'sweep',
+        doc: [...docSet].sort(),
+        code: [...codeSet].sort(),
+        reason: `action='${action}' 的字段集与 §8.4 不一致：代码缺少 [${missing.join(', ')}]；代码多出 [${extra.join(', ')}]`,
+      });
+    }
+  }
+  // 反向：代码里存在、但 §8.4 没规定的 action ⇒ 报出来（不许「偷偷加一个 action」）
+  for (const key of Object.keys(variants)) {
+    if (!key.startsWith('action_')) {
+      continue;
+    }
+    const action = key.slice('action_'.length);
+    if (docGroups[action] === undefined) {
+      diffs.push({
+        type: 'sweep',
+        doc: undefined,
+        code: [...(variants[key] ?? [])].sort(),
+        reason: `代码里有 action='${action}' 这个变体，但 §8.4 没有规定它的字段集`,
+      });
+    }
+  }
+  return diffs;
+}
+
 /** 主流程。 */
 function main(): void {
   const markdown = readDesignDoc();
@@ -164,7 +230,13 @@ function main(): void {
   process.stdout.write('§8.4 payload 键集断言\n');
   process.stdout.write(`  §8.4 解析出的 type 数：${docKeys.size}\n`);
 
-  const diffs = [...comparePayloadKeys(docKeys, EVENT_PAYLOAD_KEYS), ...compareVariants()];
+  const sweepSection = extractSection(markdown, SECTION_8_4_HEADING);
+  const actionGroups = parseSweepActionGroups(sweepSection);
+  const diffs = [
+    ...comparePayloadKeys(docKeys, EVENT_PAYLOAD_KEYS),
+    ...compareVariants(),
+    ...compareActionGroups(actionGroups, EVENT_PAYLOAD_VARIANTS.sweep),
+  ];
 
   if (diffs.length > 0) {
     process.stderr.write(`\n✗ 发现 ${diffs.length} 处 payload 键集不一致：\n`);
