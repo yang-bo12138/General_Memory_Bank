@@ -36,7 +36,6 @@ import * as publicApi from '../../src/index.js';
 import { MemoryStore } from '../../src/store/MemoryStore.js';
 import { EventWriter } from '../../src/store/events.js';
 import { type PinStore, pin as pinImpl } from '../../src/store/pin.js';
-import * as recallModule from '../../src/store/recall.js';
 import { MemoryLogger } from '../../src/util/log.js';
 
 /** 一个固定的时间基准（所有时刻都相对它推算）。 */
@@ -350,11 +349,12 @@ describe('P1-T10 · 门面的边界（公开面 / 错误透出 / 只读）', () 
     expect(exported).toContain('DEFAULT_PIN_FACTOR');
 
     // ⇒ 阶段 1 的公开入口**不导**它。
+    // ⚠️ **本条只断言「导出面」**：它与「这个函数本身还在不在」**无关**
+    //   ⇒ 那个函数将来被删（阶段 1 终裁：ADR-P1-T07-DEC D-1「阶段 1 不实现它」，
+    //     连同 `CONTEXT_ENTITY_NAMES_SQL` 一起删）时，本条**照样成立**。
+    //   ⇒ 「recall.ts 里也没有这个函数」由**该文件的属主**在 `tests/unit/recall.test.ts` 里守
+    //     （那是他的文件域；本文件不越界断言别人的实现细节）。
     expect(exported).not.toContain('extractEntityNames');
-
-    // ⚠️ **「没进导出面」≠「这个函数不存在」**：它仍然从 `src/store/recall.ts` 独立导出
-    //   （阶段 2 的实体名入口会用上它）⇒ 本条守的是「**公开入口**的边界」，不是「删掉它」。
-    expect(typeof recallModule.extractEntityNames).toBe('function');
   });
 
   it('★ 底层抛出的 MemoryError 原样透出（code / details / message 逐字段与直接调实现相同）', () => {
