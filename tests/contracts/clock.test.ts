@@ -129,8 +129,10 @@ describe('P0-T05 · §11.2 的错误类型体系', () => {
     expect(METHODS_THROWING_READONLY_VIOLATION).toHaveLength(16);
   });
 
-  it('ALIAS_CONFLICT 刻意不是异常，而是走 warnings', () => {
-    expect(WARNING_ONLY_CASES).toEqual(['ALIAS_CONFLICT']);
+  it('ALIAS_CONFLICT / ALIAS_TARGET_NOT_LINKED 刻意不是异常，而是走 warnings', () => {
+    // ⚠️ 两条 warning 码**三处必须相等**（ADR-P1-T07-DEC D-3/R2）：
+    //   `src/core/errors.ts` ①、scripts/check-contract-ids.ts ②、DESIGN §11.2 ③。
+    expect(WARNING_ONLY_CASES).toEqual(['ALIAS_CONFLICT', 'ALIAS_TARGET_NOT_LINKED']);
   });
 
   it('ERROR_SEMANTICS 与两张名单一致', () => {

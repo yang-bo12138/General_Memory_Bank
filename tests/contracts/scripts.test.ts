@@ -345,16 +345,25 @@ describe('P0-T07 · §11.2 的六组表达方式（逐名比对，不是计数�
     expect(EXPECTED_READONLY_WRITE_METHODS).toHaveLength(16);
   });
 
-  it('`ALIAS_CONFLICT` 刻意不是异常 ⇒ 不在任何抛错分组里', () => {
-    expect(EXPECTED_WARNING_ONLY_CASES).toEqual(['ALIAS_CONFLICT']);
+  it('`ALIAS_CONFLICT` / `ALIAS_TARGET_NOT_LINKED` 刻意不是异常 ⇒ 不在任何抛错分组里', () => {
+    // ⚠️ 两条 warning 码**三处必须相等**（ADR-P1-T07-DEC D-3/R2）：
+    //   ① 本文件的 `EXPECTED_WARNING_ONLY_CASES`（scripts/check-contract-ids.ts）
+    //   ② `src/core/errors.ts` 的 `WARNING_ONLY_CASES`
+    //   ③ DESIGN §11.2 对照表最后一行（须用反引号包住，解析器才读得到）
+    expect(EXPECTED_WARNING_ONLY_CASES).toEqual(['ALIAS_CONFLICT', 'ALIAS_TARGET_NOT_LINKED']);
     for (const group of Object.values(EXPECTED_MISSING_EXPRESSION_GROUPS)) {
       expect(group).not.toContain('ALIAS_CONFLICT');
+      expect(group).not.toContain('ALIAS_TARGET_NOT_LINKED');
     }
     expect(EXPECTED_READONLY_WRITE_METHODS).not.toContain('ALIAS_CONFLICT');
+    expect(EXPECTED_READONLY_WRITE_METHODS).not.toContain('ALIAS_TARGET_NOT_LINKED');
     expect(METHODS_THROWING_NOT_FOUND).not.toContain('ALIAS_CONFLICT');
+    expect(METHODS_THROWING_NOT_FOUND).not.toContain('ALIAS_TARGET_NOT_LINKED');
     expect(METHODS_THROWING_CONFLICT).not.toContain('ALIAS_CONFLICT');
+    expect(METHODS_THROWING_CONFLICT).not.toContain('ALIAS_TARGET_NOT_LINKED');
     expect(METHODS_THROWING_READONLY_VIOLATION).not.toContain('ALIAS_CONFLICT');
-    expect(WARNING_ONLY_CASES).toEqual(['ALIAS_CONFLICT']);
+    expect(METHODS_THROWING_READONLY_VIOLATION).not.toContain('ALIAS_TARGET_NOT_LINKED');
+    expect(WARNING_ONLY_CASES).toEqual(['ALIAS_CONFLICT', 'ALIAS_TARGET_NOT_LINKED']);
   });
 
   it('`missingIds` 锚点：承载它的方法必须在 NOT_FOUND 分组里', () => {

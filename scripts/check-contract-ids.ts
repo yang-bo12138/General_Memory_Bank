@@ -134,8 +134,19 @@ export const EXPECTED_READONLY_WRITE_METHODS: readonly string[] = [
  *
  * ⚠️ `ALIAS_CONFLICT` **刻意不是异常** ⇒ 它**不在**任何抛错分组里，
  *   只出现在 `WARNING_ONLY_CASES`（§11.2 末段）。
+ * ⚠️ `ALIAS_TARGET_NOT_LINKED` 同理（ADR-P1-T07-DEC D-3/R2）：
+ *   「别名目标实体建了、但**不**与本条记忆关联」是**有意**的边界，
+ *   但它有代价（只声明别名、不点名实体 ⇒ 图谱路查不到 ⇒ 静默达不到召回目的）
+ *   ⇒ **边界可以存在，但必须可观测** ⇒ 走 `warnings`，同样**不抛错**。
+ *
+ * ⚠️ **三处必须完全相等**（本脚本会 `compareNameSets` 两两比对）：
+ *   ① 本数组；② `src/core/errors.ts` 的 `WARNING_ONLY_CASES`；③ DESIGN §11.2 对照表最后一行。
+ *   ⇒ **漏改任何一处，门禁立刻报红**（这是有意的：新增 warning 码必须三处同时到位）。
  */
-export const EXPECTED_WARNING_ONLY_CASES: readonly string[] = ['ALIAS_CONFLICT'];
+export const EXPECTED_WARNING_ONLY_CASES: readonly string[] = [
+  'ALIAS_CONFLICT',
+  'ALIAS_TARGET_NOT_LINKED',
+];
 
 /** 从 §5 的「跨参数校验」块里数出条目。 */
 export function parseSection5ValidationCount(markdown: string): number[] {
