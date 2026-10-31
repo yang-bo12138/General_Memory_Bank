@@ -187,6 +187,30 @@ describe('intensity（§4.1）', () => {
     // 而实现（带 min(1,·)）必须把它夹回 1
     expect(intensity(negativeTauWithElapsed, elapsedMs)).toBe(1);
   });
+
+  it('★ QA 最小探针 2：τ < 0 **且** Δt < 0 ⇒ intensity 仍是有限值且 ∈ (0, 1]', () => {
+    // ⚠️ 上一条只覆盖了「τ<0 且 Δt=0」与「τ<0 且 Δt>0」两格；
+    //   这里补上**两个都为负**的那一格（now 早于 last_access ⇒ 时钟回拨）。
+    const negativeTau = memory({ stability: -1, pin_factor: 1, last_access: 1000 });
+    const nowInThePast = 0; // Δt = 0 - 1000 = -1000 < 0
+
+    const value = intensity(negativeTau, nowInThePast);
+
+    // 性质：无论输入多离谱，intensity 恒有限且 ∈ (0, 1]
+    expect(Number.isFinite(value)).toBe(true);
+    expect(value).toBeGreaterThan(0);
+    expect(value).toBeLessThanOrEqual(1);
+
+    // ⚠️ 手算闭合：Δt 被 `max(0, ·)` 钳到 0 ⇒ -0 / (-1 天) = 0 ⇒ exp(0) = 1 ⇒ min(1, 1) = 1
+    expect(value).toBe(1);
+
+    // ★ 负控：若「Δt 下钳」被删 ⇒ Δt = -1000 ⇒ -Δt/τ = 1000 / (-86400000) < 0
+    //   ⇒ exp(负数) < 1 ⇒ 值**不是** 1 ⇒ 上面那条 `toBe(1)` 会失败
+    //   （这一格能分辨「下钳在不在」，而 τ<0 且 Δt=0 那格分辨不了 ⇒ 这就是它的价值）
+    const withoutDeltaClamp = Math.exp(-(nowInThePast - negativeTau.last_access) / days(-1));
+    expect(withoutDeltaClamp).not.toBe(1);
+    expect(withoutDeltaClamp).toBeLessThan(1);
+  });
 });
 
 // ─────────────────────────────────────────────────────────────
