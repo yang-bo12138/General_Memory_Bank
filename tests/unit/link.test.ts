@@ -122,13 +122,49 @@ describe('P1-T05 · link（§4.5 的四步）', () => {
       link(store, '不存在甲', '关联', '不存在乙', null, undefined, { createMissing: false }),
     );
     expect(error.code).toBe('NOT_FOUND');
-    // 性质：差集装的是缺失的端点名
-    expect(error.details.missingIds).toEqual(['不存在甲', '不存在乙']);
+    // 性质：差集装的是缺失的**端点实体名**
+    // ⚠️ v2.1 勘误（ADR-P1-C 冲突 2）：用 `missingEntityNames`，**不是 `missingIds`**
+    //   —— 后者的语义是「行 id 差集」（§11.2 的 FK 兜底句把它绑在 id 上），
+    //   装名字会让同一个键在 touch/linkByIds（装 id）与 link（装名字）下表达两件事
+    //   ⇒ 违反 §14.3.1 的 C36（同一件事不得有两套词）。
+    expect(error.details.missingEntityNames).toEqual(['不存在甲', '不存在乙']);
+    // ★ 负控：`missingIds` **不该**出现在端点缺失这条路径上
+    //   （若实现仍用 `missingIds` 装名字 ⇒ 上面这条会失败 ⇒ 守卫得住）
+    expect(error.details.missingIds).toBeUndefined();
 
     // ★ **零写入**：禁止「一边自动建、一边抛错」的混合策略
     expect(countRows(db, 'entities')).toBe(0);
     expect(countRows(db, 'edges')).toBe(0);
     expect(countRows(db, 'events')).toBe(0);
+  });
+
+  it('★ link 对不存在的 memoryId ⇒ NOT_FOUND 且 details 带 missingIds（§11.2 自校验）', () => {
+    const { db, store } = createTestStore();
+
+    // ⚠️ 不自校验的话 ⇒ 撞 `edges.memory_id` 的外键 ⇒ `SQLITE_CONSTRAINT_FOREIGNKEY`
+    //   ⇒ 被转译成 NOT_FOUND 但 **details 里没有 missingIds** ⇒ 违反 §11.2 的自校验清单。
+    const error = expectMemoryError(() => link(store, '张三', '关联', '李四', '不存在的记忆id'));
+    expect(error.code).toBe('NOT_FOUND');
+    expect(error.details.missingIds).toEqual(['不存在的记忆id']);
+    // ★ 负控：不是未类型化的 SQLite 错误码
+    expect(error.code).not.toBe('SQLITE_CONSTRAINT_FOREIGNKEY');
+    // ★ 零写入：端点实体也不能被留下
+    expect(countRows(db, 'entities')).toBe(0);
+    expect(countRows(db, 'edges')).toBe(0);
+  });
+
+  it('★ linkByIds 对不存在的 memoryId ⇒ NOT_FOUND 且 details 带 missingIds', () => {
+    const { db, store } = createTestStore();
+    insertEntity(db, 'e-existing', '张三');
+    insertEntity(db, 'e-other', '李四');
+
+    const error = expectMemoryError(() =>
+      linkByIds(store, 'e-existing', '关联', 'e-other', '不存在的记忆id'),
+    );
+    expect(error.code).toBe('NOT_FOUND');
+    expect(error.details.missingIds).toEqual(['不存在的记忆id']);
+    expect(error.code).not.toBe('SQLITE_CONSTRAINT_FOREIGNKEY');
+    expect(countRows(db, 'edges')).toBe(0);
   });
 
   it('★ linkByIds 对不存在的 entityId ⇒ NOT_FOUND（不是裸的 FK 错误码）', () => {

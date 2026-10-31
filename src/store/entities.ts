@@ -38,11 +38,22 @@ export interface MergeEntitiesResult {
   targetId: string;
   /** 改指到目标实体的记忆关联条数（§4.9.2 步骤 1）。 */
   movedMemories: number;
-  /** 从源实体迁到目标实体上的边条数（§4.9.2 步骤 2）。 */
+  /** 从源实体迁到目标实体上的**因冲突而被折叠掉**的边条数（§4.9.2 步骤 2）。 */
   mergedEdges: number;
   /** 合并后被清掉的自环条数（§4.9.2 步骤 2b）。 */
   droppedSelfLoops: number;
-  /** 被合并实体的主名（已降级为目标的别名）。 */
+  /**
+   * 被合并实体的主名（已降级为目标的别名）。
+   *
+   * ⚠️ **与事件 payload 的同名键不同义**（v2.1 勘误 / ADR-P1-C 冲突 1 与 F-3）：
+   *   · 本字段（**函数返回值**）= **源主名的字符串**；
+   *   · `events(type='alias', payload)` 里的 `aliasAdded` = **布尔**（是否动过别名映射），
+   *     而源主名本体记在 payload 的 `alias` 键上。
+   *   ⇒ 裁决（ADR-P1-C 冲突 1）：选「布尔」这一边，理由是 C36
+   *     （同一件事不得有两套词）——`alias` 一键贯穿 `set` / `merge` 两个 action。
+   *   ⇒ **待办**：本字段名与 payload 同名不同义，建议改名为 `sourceName: string`；
+   *     改名会动调用方，故先在此显式声明差异，不静默留坑。
+   */
   aliasAdded: string;
 }
 
@@ -258,10 +269,18 @@ export function mergeEntities(
     db.prepare('DELETE FROM entities WHERE id = @sourceId').run({ sourceId });
 
     // ── 步骤 5：记事件 ──
-    // ⚠️ `aliasAdded` 记**布尔**（`src/core/events.types.ts` 的 `AliasEventPayload`
-    //   把它声明为 `boolean`）；被降级的主名本体记在 `alias` 键上
-    //   （§4.9.2 步骤 5 的伪代码写的是 `aliasAdded: sourceName`，
-    //    与本仓库的类型声明不一致 ⇒ 以类型声明为准，名字另存 `alias` 键，信息不丢）。
+    // ⚠️ `aliasAdded` 记**布尔**、被降级的主名本体记在 `alias` 键上
+    //   —— 这是 **ADR-P1-C 冲突 1 的正式裁决**（不是「以类型声明为准」的临时妥协）：
+    //   §4.9.2 步骤 5 的原稿写 `aliasAdded: sourceName`（字符串），
+    //   与 `src/core/events.types.ts` 的 `aliasAdded?: boolean` 直接冲突
+    //   ⇒ 同一个键名两处两套语义。
+    //   ⇒ 裁决选「布尔」，理由是 §14.3.1 的 **C36**（同一件事不得有两套词）：
+    //     若 `merge` 用 `aliasAdded` 装名字、`set` 用 `alias` 装别名，
+    //     「别名名」这件事就被劈成两半，读事件的人得先看 `action` 才知道读哪个键。
+    //   ⇒ 现在 `alias` 一键贯穿两个 action：`set` ⇒ 被设置的别名；
+    //     `merge` ⇒ 被降级的源主名。
+    //   ⇒ **信息一条不丢**：合并会删掉源实体行 ⇒ 源主名在库里只剩「别名表」与「事件」两处，
+    //     `alias` 键保住名字、`aliasAdded` 键说明「确实动过别名映射」。
     const payload: AliasEventPayload = {
       action: 'merge',
       sourceId,
