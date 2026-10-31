@@ -20,6 +20,8 @@ import {
   EXPECTED_READONLY_WRITE_METHODS,
   EXPECTED_WARNING_ONLY_CASES,
   checkContracts,
+  checkWarningOnlyRoster,
+  extractCodeLikeNames,
   parseSection5ValidationCount,
   parseSection6Params,
   parseSection7_1WriteMethods,
@@ -380,6 +382,70 @@ describe('P0-T07 · §11.2 的六组表达方式（逐名比对，不是计数�
     const semantics = parseSection11_2Methods(markdown);
     expect(semantics.get('warning_only')).toContain('ALIAS_CONFLICT');
     expect(semantics.get('warning_only')).toContain('write');
+  });
+});
+
+/**
+ * §11.2「不抛错，走 `write()` 的 `warnings」那一格的**「= 方向」守卫**。
+ *
+ * ⚠️ **为什么这一格需要「= 方向」**（实测漏洞）：
+ *   既有守卫只查了「白名单 ⊆ 文档名册」（少一个码 ⇒ 报红）
+ *   ⇒ **文档名册里多出来的东西**（陈旧码名）**没人管**
+ *   ⇒ 那一格可以**无成本**地堆积垃圾，而门禁照样绿
+ *   ⇒ 读者却会以为那一格就是权威清单。
+ *
+ * ⚠️ **为什么只比「码形态」的项**：
+ *   那一列**合法地**混着方法名（`write`）⇒ 朴素地比全列会**恒红**
+ *   ⇒ 按形态过滤（首字母大写）后，方法名被剔除、码被保留。
+ */
+describe('P1 收官 · §11.2 warnings 名册的「= 方向」守卫（第三处相等）', () => {
+  const roster = (): string[] => parseSection11_2Methods(markdown).get('warning_only') ?? [];
+
+  it('正向：文档那一格的码形态项恰好就是那两个（白名单加了第三个却忘了写进文档 ⇒ 这里必须红）', () => {
+    expect(extractCodeLikeNames(roster())).toEqual(['ALIAS_CONFLICT', 'ALIAS_TARGET_NOT_LINKED']);
+    expect(checkWarningOnlyRoster(roster(), EXPECTED_WARNING_ONLY_CASES)).toEqual([]);
+  });
+
+  it('★ 负控：码形态过滤器必须把方法名（小写开头）滤掉、把码名留下', () => {
+    expect(extractCodeLikeNames(['write', 'ALIAS_CONFLICT', 'ALIAS_TARGET_NOT_LINKED'])).toEqual([
+      'ALIAS_CONFLICT',
+      'ALIAS_TARGET_NOT_LINKED',
+    ]);
+    // ⚠️ 「首字母大写」这个判据**不能**退化成「出现在白名单里」
+    //   （那是循环论证：白名单漏了的码会降级成「非码形态」⇒ 门禁反而看不见它）。
+    expect(extractCodeLikeNames(['ALIAS_STALE'])).toEqual(['ALIAS_STALE']);
+  });
+
+  it('★ 负控：喂进一个多出来的码名 ⇒ 守卫必须报红并点名它', () => {
+    const broken = [...roster(), 'ALIAS_STALE'];
+    const diffs = checkWarningOnlyRoster(broken, EXPECTED_WARNING_ONLY_CASES);
+    expect(diffs.length).toBeGreaterThan(0);
+    expect(diffs.map((d) => d.reason).join(' ')).toContain('ALIAS_STALE');
+  });
+
+  it('★ 负控：喂进一个少掉的码名 ⇒ 守卫必须报红并点名它', () => {
+    const broken = roster().filter((name) => name !== 'ALIAS_TARGET_NOT_LINKED');
+    const diffs = checkWarningOnlyRoster(broken, EXPECTED_WARNING_ONLY_CASES);
+    expect(diffs.length).toBeGreaterThan(0);
+    expect(diffs.map((d) => d.reason).join(' ')).toContain('ALIAS_TARGET_NOT_LINKED');
+  });
+
+  it('★ 负控：守卫真的接在 checkContracts 上（往文档那一格塞一个陈旧码 ⇒ 整体检查必须报红）', () => {
+    // ⚠️ **不改 `docs/design/DESIGN-v2.md`**（那是正文，不是测试的靶子）⇒ 只改**内存里的副本**。
+    const anchor = '别名目标未关联 `ALIAS_TARGET_NOT_LINKED`）';
+    // ⚠️ 锚点必须**唯一** ⇒ 否则这个负控可能在改错的地方（⇒ 假绿）。
+    expect(markdown.split(anchor)).toHaveLength(2);
+    const doctored = markdown.replace(
+      anchor,
+      '别名目标未关联 `ALIAS_TARGET_NOT_LINKED`；陈旧码 `ALIAS_STALE`）',
+    );
+    const diffs = checkContracts(doctored);
+    expect(diffs.length).toBeGreaterThan(0);
+    expect(diffs.map((d) => d.reason).join(' ')).toContain('ALIAS_STALE');
+  });
+
+  it('★ 负控：正向路径必须仍然全绿（守卫不是恒红）', () => {
+    expect(checkContracts(markdown)).toEqual([]);
   });
 });
 
