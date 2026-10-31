@@ -722,7 +722,12 @@
   - `tokenize("猫粮")` == `"猫粮"`；`tokenize("config")` == `"config"`；`tokenize("1.2.3")` == `"1 2 3"`。
   - `buildMatchQuery("猫")` ⇒ `{ matchSql: null, fallbackLike: "猫" }`。
   - `buildMatchQuery("a")` ⇒ `{ matchSql: null, fallbackLike: null }`。
-  - `buildMatchQuery("猫粮")` ⇒ `matchSql` 含 `AND`；`buildMatchQuery("她喜欢猫粮并且用PG15")` ⇒ 含 `OR`。
+  - `buildMatchQuery("猫粮")` ⇒ 走 **AND 支（≤3 个 bigram）**，条件个数 == 1（`tokenize("猫粮")` 只有 1 个 bigram ⇒  
+    单条件时 `join(' AND ')` **不产生 `AND` 字面量**，实测 `matchSql` == `'"猫粮"'`）；  
+    `buildMatchQuery("她喜欢猫粮并且用PG15")` ⇒ token 数 > 3 ⇒ 走 **OR 支**，`matchSql` 含 `OR`。  
+    ⚠️ **v2.1 勘误**：原稿写「`matchSql` 含 `AND`」——那是**计划稿措辞错**，实现与设计稿 §10.2 一致  
+    （§10.2 原文：`safeTokens.map(escapeFts5).join(' AND ')`，≤3 走 AND、>3 走 OR）。  
+    ⇒ 验收判据按「**走哪支 + 条件个数**」写，不要按「字符串里有没有 AND 字面量」写。
   - `escapeLike("50%")` ⇒ `"50\\%"`；`escapeFts5('a"b')` ⇒ `'"a""b"'`。
   - 端到端：`write("ＡＢＣ")` 后 `recall("abc")` **能命中**（全角转半角生效），  
     且 `write("abc")` 判为**完全重复**（hash 相同）。
@@ -823,6 +828,16 @@
 **关键实现要点**：
 
 - **`link` 的四步不可颠倒**：
+  0. ★ **`memoryId` 存在性自校验**（ADR-P1-R2 裁决 ③：次序以**原则**为准，不以步骤编号为准）——
+     传入的 `memoryId` 若不存在 ⇒ 抛 `NOT_FOUND`（`details.missingIds = [memoryId]`），
+     **且该记忆必须是 `deleted = 0`**（软删记忆不得作为证据）。
+     ⚠️ **为何它在最前**：软删自校验是**业务前提**（软删记忆不是有效证据），
+     不是「顺手做的健壮性检查」⇒ 它比任何 id 层面的比较都更基础。
+     ⚠️ **为何它排在自环校验之前**：`memoryId` 不存在是「你给的证据不存在」，
+     自环是「你想连的两个端点是同一个」——**两条错误的性质不同**，
+     调用方看到哪一个，决定了他该改哪一处。
+     ⇒ 因此：**先 `memoryId` 存在性（+ 软删）自校验，后自环校验**；
+     若两条同时成立，**报 `memoryId` 那条**（证据不存在比连错更基础）。
   1. **名称 → entity_id 解析**（`resolveEntity`）；两端各解析一次，**结果先落在两个「可能为 null」的变量里**。  
      ⚠️ **不要写成 `@subjectId = resolveEntity(...) ?? 步骤2建出的id`**——步骤 1 就引用了步骤 2 的产物，  
      步骤 2 此时还没执行。正确形状是「步骤 1 解析出两个 Raw，步骤 2 建实体后回填」。
@@ -1013,6 +1028,15 @@
   冲突时**两个通道都要**：返回值 `warnings` 追加 `{ code:'ALIAS_CONFLICT', alias, currentEntityId, intendedEntityId }`  
   **且**按 §8.1 记一条磁盘日志。  
   ⇒ **磁盘日志给人排障，`warnings` 才是调用方能看见的**；只记日志等于静默。
+  ⚠️ ★ **`entityAliases[].name` 的目标实体不存在 ⇒ 建，但不隐含关联**（ADR-P1-R2 裁决 ①）：
+  `name` 走与 `input.entities` **同一套 a→b 归一**（`resolveEntity` 命中主名或别名 ⇒ 用该 id；
+  未命中 ⇒ 按 b 步 UPSERT **新建**实体），但**新建的实体不进 `@linkedEntityIds`**，
+  ⇒ **不与本条记忆建立 `memory_entities` 关联**。
+  ⇒ **代价（明写）**：只声明别名、不在 `entities` 里点名该实体的调用方，
+  会「别名建好了但这条记忆不进图谱路」⇒ **静默达不到召回目的**。
+  ⇒ **缓解**：文档必须写明「关联只能由 `entities` 表达」；
+  ⚠️ 若将来要在写路径给「只声明别名未声明关联」加一条 `warnings`，
+  **必须同步改 `scripts/check-contract-ids.ts` 的 `EXPECTED_WARNING_ONLY_CASES` 白名单**（否则门禁变红）。
 - **步骤 2：归一化与完全重复检测**：  
   `@normText = normalize(input.content)`；`@newHash = sha1(@normText)`。  
   ⚠️ **落库用原文**（保留大小写与全角），只有 hash 用归一化形式。  
@@ -1233,14 +1257,33 @@
   - **五项加权和 == `Hit.score`**（误差 ≤ 1e-9）——§4.13.1 硬约束①的**可测恒等式**。
   - **权重和恒为 1.0**（参数表改动也不能破坏）。
   - `includeArchived: false` ⇒ 结果中**无** `intensity ≤ ARCHIVE_LINE` 的项；  
-    `includeArchived: true` ⇒ **可以有**。
+    `includeArchived: true` ⇒ **可以有**。  
+    ⚠️ **v2.1 勘误（ADR-P1-T08-GAP）**：归档模式下**强度精筛整体不执行**（不是「阈值改成 0.0」）——
+    精筛是**严格大于**，阈值取 0.0 会把「intensity 因 exp 下溢成恰好 0.0」的行挡掉
+    （下溢条件 Δt/τ > 745 天，而小 `stability` 的记忆几十小时就能下溢）
+    ⇒ 那些行**已被 SQL 粗筛放进来了**却在应用层被悄悄丢掉 ⇒「显式查询归档层」名存实亡。  
+    ⇒ **新口径**：归档模式只保留 `deleted = 0`，**三路一致**（文本路 / 向量路 / 图谱路都不做强度精筛）。  
+    ⇒ 负控：构造一条 `intensity` 恰为 0.0 的记忆 ⇒ 归档模式下**必须能被召回**。  
+  - ★ **`entityNames` 入口与互斥**（ADR-P1-T08-GAP）：  
+    `RecallOptions.entityNames?: string[]`（调用方抽好的实体**名**），与 `entityIds` **互斥**——
+    同时给 ⇒ 抛 `MemoryError.INVALID_INPUT`；**两者都不传 ⇒ 图谱路为空**（退化为文本路 + 向量路）。  
+    ⚠️ **库内不得做实体抽取**：不得出现「拿 context 扫 `entities`/`entity_aliases` 表」的代码——
+    它与 ADR-2 冲突（实体抽取归属调用方）、与 §4.6 步骤 1 的 O(log n) 成本模型冲突、
+    且会把向量路的缺席连带成图谱路的缺席。  
+    ⚠️ `entityNames` 里解析不到的名字（`resolveEntity` 返回 null）**不进图谱路**，但仍参与文本路检索。  
+  - ★ **`SELECT m.*` 不得出现**（ADR-P1-T08-GAP）：`memories.embedding` 是 768×4 = 3KB 的 BLOB，
+    每路预取 100 行 ⇒ `m.*` 会把 ~300KB/路/次搬进 JS 侧，而召回链路里**没有一处需要向量本身**
+    ⇒ 三路查询必须**显式列出用到的列**，且列集合**不含 `embedding`**。  
   - `includeArchived: true` 时**文本路与图谱路不受 `routedIds` 约束**（阶段 2 后加断言）。
   - `normBm25` 三分支各有一个单测：LIKE 兜底 ⇒ 全 1.0；FTS 命中 ⇒ sigmoid 形状正确；无文本命中 ⇒ 全 0.0。
   - **纯向量命中的候选 `raw_bm25` 为 null，且不参与中位数计算**  
     （⇒ 文本路全命中时，median 逐位不变）。
   - `graphProximity` 对「只被文本路召回但实体确实相交」的候选 == 1.0。
   - `cos` 钳制到 `[0,1]`（`min(1, max(0, dot))`）。
-  - 候选去重后同 id 只出现一次，但 `fromText`/`fromVector`/`fromGraph` 三个来源标记都保留。
+  - 候选去重后同 id 只出现一次，但 `fromText`/`fromVector`/`fromGraph` 三个来源标记都保留。  
+    ⚠️ 三个都是**布尔**、**不参与任何计算**（尤其**不参与 `graphProximity`**）；
+    ⚠️ **per-hit 层 ≠ call 级层**：`fromVector`（这一条来自向量路吗）与
+    `explain.routes.vector.ran`（整条向量路本次跑没跑）是两个层级。  
   - `explain: true` ⇒ **恰好一条** `recall` 事件；`diagnostics: true` ⇒ **零条** `recall` 事件但有 `explain` 块。
   - `recall` **不写 `memories`**（除 `reinforce: true` 的加固，见 P1-T06）。
 - **软阈值**：
@@ -1284,10 +1327,15 @@
      ⚠️ `get` **刻意不抛 NOT_FOUND**，返回 `MemoryView | null`（§11.2：「查不到」是常态不是异常）。
 - **基线验收的构造**（因 D-10：v1.0 代码不在库内）：
   - 采集两套 golden：① 「四开关全关 + `VECTOR_ROUTER='flat'`」；② 「全开」。
-  - 断言：**①** 的 `write` / `recall` / `touch` / `get` / `stats` 输出**逐位相同**于  
+  - 断言：**①** 的 `write` / `recall` / `touch` / `get` 输出**逐位相同**于  
     「按 v1.0 语义手写的参考实现」的输出（参考实现作为测试夹具放在 `tests/baseline/ref-v1.ts`，  
     是**纯函数重算**而非第二套库）。
   - ⚠️ 参考实现的规模必须小（几百条语料）——它的作用是**逐位比对**，不是性能测试。
+  - ⚠️ **v2.1 勘误（ADR-P1-R2 裁决 8）**：原稿把 `stats` 也列进基线断言，但 **`stats` 不在阶段 1 的
+    10 个方法内**（§3.1 方法归位表：阶段 1 = write/recall/touch/get/pin/unpin/link/linkByIds/setAlias/mergeEntities），
+    且**当前未实现** ⇒ 阶段 1 的基线断言**只覆盖 `write`/`recall`/`touch`/`get` 四个**；
+    `stats` 的基线断言**顺延**到它被实现的那个阶段。
+    ⇒ 本阶段**不实现 `stats`**（实现它会把阶段 1 的范围扩到方法清单之外）。
 
 **验收标准**：
 
@@ -1295,9 +1343,14 @@
   - `get` 对软删记录返回对象且 `deleted === true`、`deletedAt` 非 null；对硬删返回 `null`。
   - `get` 的 `entities` 是**名称数组**、按名称升序。
   - `get` 的 `layer` 与 `intensity` 与注入 `now` 严格对应（改 `now` ⇒ `intensity` 变、`layer` 可能变）。
-  - **基线断言**：四开关全关 + `VECTOR_ROUTER='flat'` 时，`write`/`recall`/`touch`/`get`/`stats`  
-    的可观测输出与参考实现**逐位相同**（数组逐元素 `deepEqual`，含 id 序列与每个数值）。
-  - ⚠️ **`ARCHIVAL_CACHE` 计入基线组**（关掉 = 走慢路但结果相同，不纳入则「逐位一致」在字面上不成立）。
+  - **基线断言**：四开关全关 + `VECTOR_ROUTER='flat'` 时，`write`/`recall`/`touch`/`get`  
+    的可观测输出与参考实现**逐位相同**（数组逐元素 `deepEqual`，含 id 序列与每个数值）。  
+    ⚠️ 用 `toEqual` 逐位比，**不用 `toBeCloseTo`**——浮点差异必须查清来源，不许放宽成近似比较。  
+    ⚠️ **基线条件只有这一套**：`VECTOR_ROUTER` 是三值选择器（'auto'/'ivf'/'flat'），
+    只能说「设为 flat」、不能「关闭」；**`'auto'` 不构成基线条件**（它的实际走向随库规模变）。  
+    ⚠️ **`ARCHIVAL_CACHE` 计入基线组**（关掉 = 走慢路但结果相同，不纳入则「逐位一致」在字面上不成立）。  
+  - ⚠️ **基线测试自身必须有负控**：参考实现里故意写错一个公式 ⇒ 基线测试必须变红并指向该差异（ADR-P1-R2 裁决 8）。  
+    「验收工具本身必须被验收」——一个永远为真的基线断言等于没有基线。
 - **软阈值**：无。
 
 **常见坑**：
@@ -1309,6 +1362,58 @@
 
 ---
 
+
+#### P1-T10 · 门面 `MemoryStore` 与 `src/index.ts` 导出面收口
+
+**目标**：把阶段 1 的 10 个公开方法**接到一个可调用的公共入口**上，让阶段 1 的成果真的能被外部用起来。
+
+> **为什么必须有这个任务**（ADR-P1-R2 裁决 6 / F-10）：  
+> DESIGN §12 把 10 个公开方法归给阶段 1，但 P1-T01~T09 的文件清单里**没有任何一项提到
+> `MemoryStore.ts` 或 `index.ts`** ⇒ 按原计划走完阶段 1，**公共入口一个方法都调不到**。  
+> §14.3 边界原则 1「每个承诺都要能指到**唯一**代码路径」：  
+> 阶段 1 承诺了 10 个方法，就必须有一条路径能调到它们。
+
+**文件**：
+
+- `src/store/MemoryStore.ts`（新建）
+- `src/index.ts`（扩导出面）
+- `tests/unit/memory-store.test.ts`（新建）
+
+**前置依赖**：P1-T05 ~ P1-T09（10 个方法齐备）。
+
+**关键实现要点**：
+
+- **门面只做委托、零业务逻辑**：不校验参数、不取时钟、不开事务、不算任何派生值
+  （`intensity` / `layer` / `effectiveStability` 都在库内部现算，门面不许自己算）。
+- **暴露且只暴露 10 个方法**：`write` / `recall` / `touch` / `get` / `pin` / `unpin` /
+  `link` / `linkByIds` / `setAlias` / `mergeEntities`。
+  ⚠️ **`stats` 不在其中**（§3.1 方法归位表，阶段 1 不含它）⇒ **本任务不实现 `stats`**。
+- **签名从现有实现抄，不许臆测**：以 `src/store/*.ts` 的真实导出为准。
+- **C37 时钟契约**：`src/` 下除 `src/core/clock.ts` 外不得出现 `Date.now()`
+  ⇒ 门面不得自己取时钟，`now` 一律由调用方逐次传入。
+- `src/index.ts` **保留阶段 0 的全部导出**（那是 P0 的契约，不得删），并追加
+  `MemoryStore` 与 10 个方法用到的公共类型（按 `src/` 里的真实类型名导）。
+- 支持 `readonly` 配置与 `params` 覆盖。
+
+**验收标准**：
+
+- **硬断言**：
+  - 10 个方法**每一个**都能从门面调到并拿到预期形状的返回（真调一次，不是断言方法存在）。
+  - 门面对底层抛出的 `MemoryError` **原样透出**（`code` 与 `details` 都在），不许包成通用 Error。
+  - `readonly` 打开的库上，写类方法抛 `MemoryError.READONLY_VIOLATION`
+    （依赖 `SQLITE_READONLY → READONLY_VIOLATION` 的错误映射落地，见 `src/core/errors.ts`）。
+  - `src/index.ts` 的导出面**至少**包含 `MemoryStore` 与 §6 的公开类型；
+    且阶段 0 的既有导出**一条不少**（回归保护）。
+  - 门面上**不得**出现第 11 个公开方法（防止方法清单悄悄扩张）。
+- **软阈值**：无。
+
+**常见坑**：
+
+- ⚠️ 门面里顺手加了参数校验 ⇒ 同一套校验有**两份实现** ⇒ 必然漂移。
+- ⚠️ 门面自己算 `intensity` ⇒ 时间派生值有两份算法 ⇒ 读取时现算的契约被破坏。
+- ⚠️ 导出面把阶段 0 的导出删了「以免重复」⇒ P0 的契约被悄悄削掉。
+
+---
 
 ### 阶段 2 · 向量分桶与路由
 
@@ -1526,6 +1631,12 @@
   - ★ **集合相等断言**（v2.1 新增 / ADR-P1-C 裁决 7 的交接项）：  
     「库内所有 `embedding IS NOT NULL` 且 `deleted = 0` 的记忆，其 id 集合
     与 `vector_cell_members` 的 `memory_id` 集合**相等**」。  
+    ⚠️ **左侧是「全库」扫描的结果，不是「本次写入的批次」**（ADR-P1-R2 裁决 7 补充）——
+    若左侧只取本批次，断言就退化成「本批写的东西都进桶了」，
+    **恰好放不过阶段 1 遗留的那笔欠账**（有向量、无桶归属的旧记忆）。
+    ⇒ 左侧口径必须写成：`SELECT id FROM memories WHERE embedding IS NOT NULL AND deleted = 0`（全库）。  
+    ⚠️ **断言时点**：必须在**启动对账（§9.3.2 ③）/ 首次重训的全量重分配（§4.15.5 重建步骤 ②）之后**、
+    **且在对外提供 IVF 向量路之前**执行——「先对账、后开路」，顺序不可换。  
     ⚠️ **必须是集合相等，不是条数相等**（§9.3.2 ③ 的三条判据：
     双向 EXCEPT + COUNT==COUNT(DISTINCT) + 唯一索引）——
     只比条数会漏掉「A 多一条、B 少一条」这种**总数相同但内容不同**的情况。  
