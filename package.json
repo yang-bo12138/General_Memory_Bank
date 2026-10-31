@@ -31,9 +31,10 @@
     "check:payload-keys": "tsx scripts/check-payload-keys.ts",
     "check:clock": "tsx scripts/check-clock.ts",
     "check:anchor": "tsx scripts/check-anchor.ts",
+    "check:bucket-write": "tsx scripts/check-bucket-write.ts",
     "check:contract-ids": "tsx scripts/check-contract-ids.ts",
     "check:clamp": "tsx scripts/check-clamp.ts",
-    "verify": "pnpm run typecheck && pnpm run lint && pnpm run test && pnpm run check:params && pnpm run check:payload-keys && pnpm run check:clock && pnpm run check:anchor && pnpm run check:contract-ids && pnpm run check:doc-counts && pnpm run check:clamp",
+    "verify": "pnpm run typecheck && pnpm run lint && pnpm run test && pnpm run check:params && pnpm run check:payload-keys && pnpm run check:clock && pnpm run check:anchor && pnpm run check:bucket-write && pnpm run check:contract-ids && pnpm run check:doc-counts && pnpm run check:clamp",
     "ci": "pnpm run verify",
     "check:doc-counts": "tsx scripts/check-doc-counts.ts"
   },

@@ -8,16 +8,34 @@
  * ⚠️ **这类错误比缺行更危险**：缺行会报错，而**错列会静默地校验通过**。
  * ⇒ 脚本里这五行的**路径写死为常量**，不接受配置。
  *
- * ⚠️ 本脚本在阶段 0 只做**清单自身**的校验（三列结构 + 五行内容与写死常量一致）；
- *   「动作关键词是否出现在管辖路径的代码块内」需要真实实现文件，阶段 1 起才有对象可查
- *   （届时把 `EXPECTED_ANCHOR_ROWS` 的路径映射到实际文件即可）。
+ * ⚠️ **本脚本查两件事**（P2-T04 落地）：
+ *   ① **清单自身**的校验：三列结构 + 五行内容与写死常量一致 + **每条规则的管辖路径条数**
+ *      与写死的期望值一致（C31：分母必须是外部写死的期望值 ⇒ 不能用「实际命中几个」当分母）；
+ *   ② **动作关键词是否真的落在管辖路径上**（P2-T04 新增）：
+ *      每条规则的每个管辖路径，都有一个**写死的落点**（`ANCHOR_PATH_BINDINGS`）
+ *      ⇒ 落点里必须出现该规则的**动作关键词**。
+ *
+ * ⚠️ **落点有三种**（`AnchorPathKind`）——**不同规则的「路径」性质不同**，硬套一种会误报：
+ *   · `code` ⇒ 落点是**实现文件**（可选：某个函数体）⇒ 关键词必须出现在**代码**里
+ *     （注释不算 ⇒ 见 `scripts/lib/code-span.ts` 的涂白口径）；
+ *   · `doc` ⇒ 落点是**设计稿小节** ⇒ 关键词必须出现在那一节里
+ *     （有的规则的「路径」本身就是设计稿的表 / 面板 / 状态表 ⇒ 没有代码落点）；
+ *   · `pending` ⇒ **该路径的实现尚未存在**（阶段 N）⇒ **记为「待补」并写进输出**，
+ *     **不判红**（判红就是误报）——但也**不许静默跳过**（否则「待补」会变成「没人管」）。
  *
  * 用法：`pnpm exec tsx scripts/check-anchor.ts`
  */
 
 import { resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
+import {
+  containsAnchorKeyword,
+  normalizeAnchorLabel,
+  parseAnchorKeywords,
+  parseAnchorPathLabels,
+} from './lib/anchor-match.js';
+import { extractFunctionBody, readSourceFile } from './lib/code-span.js';
 import {
   extractSection,
   isSeparatorRow,
@@ -133,6 +151,355 @@ export interface AnchorDiff {
   reason: string;
 }
 
+// ─────────────────────── 动作关键词的落点（P2-T04 新增） ───────────────────────
+
+/**
+ * 落点类型。
+ *
+ * ⚠️ **为什么有三种**：不同规则的「管辖路径」性质不同 ——
+ *   有的路径是**实现代码**（§4.9 的三条写路径），
+ *   有的路径**本身就是设计稿的表 / 面板 / 状态表**（§7.2 面板 1、ADR-16），
+ *   还有的路径**实现尚未存在**（§4.9.1 的 `updateContent` 属阶段 4）。
+ *   ⇒ 硬套一种 ⇒ 要么误报、要么把「还没做」当成「做错了」。
+ */
+export type AnchorPathKind = 'code' | 'doc' | 'pending';
+
+/** 一条管辖路径的**落点**（**写死**）。 */
+export interface AnchorPathBinding {
+  /** 设计稿锚定表第三列里的路径标签（**规范化后**逐字一致）。 */
+  label: string;
+  /** 落点类型。 */
+  kind: AnchorPathKind;
+  /** `kind === 'code'`：源文件（相对仓库根）。 */
+  file?: string;
+  /** `kind === 'code'`：该路径对应的**函数体**符号；省略 = 整个文件。 */
+  symbol?: string;
+  /** `kind === 'doc'`：设计稿小节的标题（逐字）。 */
+  heading?: string;
+  /** `kind === 'pending'`：**为什么**还没有落点（必须写明 ⇒ 不许静默跳过）。 */
+  pendingReason?: string;
+}
+
+/** 一条规则的落点集合。 */
+export interface AnchorRuleBinding {
+  /** 规则名（§14.3.1 锚定表第一列，逐字）。 */
+  rule: string;
+  /** 管辖路径的落点（**条数写死**）。 */
+  paths: readonly AnchorPathBinding[];
+}
+
+/**
+ * ★ **写死的期望值**：每条规则的**管辖路径条数**（C31 的分母）。
+ *
+ * ⚠️ **不能用「实际命中几个」当分母** ⇒ 脚本被删一半仍全绿。
+ * ⚠️ 这五个数与 §14.3.1 锚定表第三列的项数**逐条一致**（4 / 6 / 6 / 7 / 4）。
+ */
+export const EXPECTED_ANCHOR_PATH_COUNTS: readonly (readonly [string, number])[] = [
+  ['桶归属同步', 4],
+  ['探针覆盖', 6],
+  ['reinforce 边界', 6],
+  ['向量路缺席', 7],
+  ['切分触发量', 4],
+];
+
+/**
+ * ★ **写死的**落点表：每条规则的每个管辖路径，落在**哪里**。
+ *
+ * ⚠️ **为什么逐条写死**：错列会**静默地**校验到错误的落点上
+ *   ⇒ 「每个承诺指到唯一代码路径」（§14.3 边界原则 1）在机器可检的层面落地。
+ * ⚠️ **落点的选择理由**（逐条）：
+ *   · 「桶归属同步」⇒ 三条**写路径**的实现代码（P2-T03-b 已挂接），
+ *     第四条（§4.9.1 的 `updateContent`）**属阶段 4** ⇒ `pending`；
+ *   · 「探针覆盖」⇒ 它的动作是**可测的性质**（吻合率 / 只漏不错）⇒ 落在**设计稿小节**，
+ *     而 §4.9 步骤 3a2 的向量路候选**尚未接通**（T05/T06）⇒ `pending`；
+ *   · 「reinforce 边界」⇒ 多数是**设计稿小节**；§0.2.2（「共激活建立率」）
+ *     与 §0.2.3（「调用方应当怎么做」）是**面向人的散文**，正文里没有字面的动作关键词
+ *     ⇒ 它们的落点分别是**它们描述的那段代码**：
+ *     `src/store/touch.ts`（共激活边的建立入口）与 `src/store/recall.ts`
+ *     （`recall({ reinforce: true })` 的开关与「不建共激活边」的边界）；
+ *   · 「向量路缺席」⇒ 多数是**设计稿小节**；§0.2.3 ④ 的落点是
+ *     `src/core/flags.ts`（`mode` / `absent` / `inRetrain` 的定义处）；
+ *   · 「切分触发量」⇒ §4.12.4 / §6 两节；§3 的 `cluster_snapshot_meta`
+ *     当前只有 `max_raw_ratio`（对外名 `maxRawComponentRatio` 属阶段 3 的收敛）、
+ *     §7.2 面板 7（簇快照面板）**属阶段 4** ⇒ 两条 `pending`。
+ */
+export const ANCHOR_PATH_BINDINGS: readonly AnchorRuleBinding[] = [
+  {
+    rule: '桶归属同步',
+    paths: [
+      {
+        label: '§4.9 步骤 2',
+        kind: 'code',
+        file: 'src/store/write.ts',
+        symbol: 'handleExactRepeat',
+      },
+      { label: '§4.9 步骤 3c ②', kind: 'code', file: 'src/store/merge.ts', symbol: 'mergeMemory' },
+      { label: '§4.9 步骤 4', kind: 'code', file: 'src/store/write.ts', symbol: 'createMemory' },
+      {
+        label: '§4.9.1 步骤 4',
+        kind: 'pending',
+        pendingReason:
+          '§4.9.1 的 updateContent 属阶段 4：src/store/updateContent.ts 尚未建 ' +
+          '（建一个「只改正文、不写桶」的空壳 = 假绿，同 P1-T07 对空壳 assignBucket 的处置）',
+      },
+    ],
+  },
+  {
+    rule: '探针覆盖',
+    paths: [
+      {
+        label: '§4.15.3 选型表',
+        kind: 'doc',
+        heading: '#### 4.15.3 本版实现：主库内的两级 k-means 分桶（IVF）',
+      },
+      {
+        label: '§4.15.4 ②③',
+        kind: 'doc',
+        heading: '#### 4.15.4 分桶对打分的影响：**连候选池都不变**',
+      },
+      { label: '§4.6 步骤 2c', kind: 'doc', heading: '### 4.6 三路召回与融合打分' },
+      {
+        label: '§4.9 步骤 3a2',
+        kind: 'pending',
+        pendingReason:
+          '§4.9 步骤 3a2 的写入路径向量路候选尚未接通（阶段 2 的 T05/T06）' +
+          '⇒ 「只漏不错」这条性质在代码里还没有可观测的落点',
+      },
+      { label: 'ADR-16', kind: 'doc', heading: '## 13. 设计决策记录（ADR 摘要）' },
+      { label: 'ADR-17', kind: 'doc', heading: '## 13. 设计决策记录（ADR 摘要）' },
+    ],
+  },
+  {
+    rule: 'reinforce 边界',
+    paths: [
+      { label: '§4.2', kind: 'doc', heading: '### 4.2 稳定度增长（记忆加固）' },
+      { label: '§4.6 步骤 4', kind: 'doc', heading: '### 4.6 三路召回与融合打分' },
+      { label: '§6', kind: 'doc', heading: '## 6. 接口设计（TypeScript 同步 API）' },
+      {
+        label: '§8.4',
+        kind: 'doc',
+        heading: '### 8.4 事件类型与发射点对照表（枚举必须逐个落地）',
+      },
+      {
+        label: '§0.2.2',
+        kind: 'code',
+        file: 'src/store/touch.ts',
+      },
+      {
+        label: '§0.2.3',
+        kind: 'code',
+        file: 'src/store/recall.ts',
+      },
+    ],
+  },
+  {
+    rule: '向量路缺席',
+    paths: [
+      { label: '§4.6 步骤 0d', kind: 'doc', heading: '### 4.6 三路召回与融合打分' },
+      { label: '§4.6 步骤 2c', kind: 'doc', heading: '### 4.6 三路召回与融合打分' },
+      { label: '§4.15.6', kind: 'doc', heading: '#### 4.15.6 可复现性的口径' },
+      { label: '§6', kind: 'doc', heading: '## 6. 接口设计（TypeScript 同步 API）' },
+      { label: '§7.2 面板 1', kind: 'doc', heading: '### 7.2 功能面板' },
+      { label: '§7.3 状态表', kind: 'doc', heading: '### 7.3 状态与错误呈现' },
+      { label: '§0.2.3 ④', kind: 'code', file: 'src/core/flags.ts' },
+    ],
+  },
+  {
+    rule: '切分触发量',
+    paths: [
+      { label: '§4.12.4 ③', kind: 'doc', heading: '#### 4.12.4 超大簇的三层防护' },
+      { label: '§6', kind: 'doc', heading: '## 6. 接口设计（TypeScript 同步 API）' },
+      {
+        label: '§3 cluster_snapshot_meta',
+        kind: 'pending',
+        pendingReason:
+          '§3 的 cluster_snapshot_meta 当前只有 max_raw_ratio（触发量）' +
+          '⇒ 对外名 maxRawComponentRatio 属阶段 3 的收敛（README 的 C35 行）',
+      },
+      {
+        label: '§7.2 面板 7',
+        kind: 'pending',
+        pendingReason: '§7.2 面板 7（簇快照面板）属阶段 4 的实现范围',
+      },
+    ],
+  },
+];
+
+/** 一条管辖路径的判定结果。 */
+export interface AnchorPathOutcome {
+  /** 规则名。 */
+  rule: string;
+  /** 路径标签。 */
+  label: string;
+  /** 落点类型。 */
+  kind: AnchorPathKind;
+  /** 判定结果。 */
+  status: 'ok' | 'pending' | 'missing';
+  /** 说明（命中了哪个关键词 / 为什么待补 / 缺了什么）。 */
+  detail: string;
+}
+
+/**
+ * 判定「动作关键词是否落在管辖路径上」。
+ *
+ * @param rows §14.3.1 锚定表的行（每行三列）
+ * @param options `repoRoot`（读源码用）、`designDoc`（读设计稿用）、
+ *   以及可选的 `bindings`（**默认用写死的落点表**；单测可传入改过的副本做负控）
+ * @returns 逐条判定结果 + 不一致清单
+ */
+export function checkAnchorPathBindings(
+  rows: string[][],
+  options: {
+    repoRoot: string;
+    designDoc: string;
+    bindings?: readonly AnchorRuleBinding[];
+  },
+): { outcomes: AnchorPathOutcome[]; diffs: AnchorDiff[] } {
+  const diffs: AnchorDiff[] = [];
+  const outcomes: AnchorPathOutcome[] = [];
+  const bindings = options.bindings ?? ANCHOR_PATH_BINDINGS;
+
+  for (const [rule, expectedCount] of EXPECTED_ANCHOR_PATH_COUNTS) {
+    const row = rows.find((candidate) => normalizeAnchorLabel(candidate[0] ?? '') === rule);
+    if (row === undefined) {
+      diffs.push({ reason: `锚定表里没有「${rule}」这一行` });
+      continue;
+    }
+
+    const keywords = parseAnchorKeywords(row[1] ?? '');
+    const labels = parseAnchorPathLabels(row[2] ?? '');
+    const binding = bindings.find((candidate) => candidate.rule === rule);
+    if (binding === undefined) {
+      diffs.push({ reason: `「${rule}」没有写死的落点表（ANCHOR_PATH_BINDINGS 里缺这一条）` });
+      continue;
+    }
+
+    // ── ① 路径条数：文档侧与落点侧**都要**等于写死的期望值（C31）──
+    if (labels.length !== expectedCount) {
+      diffs.push({
+        reason:
+          `「${rule}」的管辖路径条数不一致：设计稿解析出 ${labels.length} 条，` +
+          `写死的期望是 ${expectedCount} 条`,
+      });
+    }
+    if (binding.paths.length !== expectedCount) {
+      diffs.push({
+        reason:
+          `「${rule}」的落点条数不一致：落点表里有 ${binding.paths.length} 条，` +
+          `写死的期望是 ${expectedCount} 条`,
+      });
+    }
+
+    // ── ② 路径标签**逐条**一致（不只比数量）──
+    const bindingLabels = binding.paths.map((path) => path.label);
+    for (const label of labels) {
+      if (!bindingLabels.includes(label)) {
+        diffs.push({ reason: `「${rule}」的落点表里没有「${label}」这条路径` });
+      }
+    }
+    for (const label of bindingLabels) {
+      if (!labels.includes(label)) {
+        diffs.push({ reason: `「${rule}」的落点表多出「${label}」这条路径` });
+      }
+    }
+
+    // ── ③ 逐条判定：关键词是否落在该路径上 ──
+    for (const path of binding.paths) {
+      const outcome = judgeAnchorPath(rule, path, keywords, options);
+      outcomes.push(outcome);
+      if (outcome.status === 'missing') {
+        diffs.push({ reason: `「${rule}」的「${path.label}」：${outcome.detail}` });
+      }
+    }
+  }
+
+  return { outcomes, diffs };
+}
+
+/**
+ * 判定**一条**路径：关键词是否落在它的落点里。
+ *
+ * ⚠️ **关键词从设计稿那一行现解析**（不是另写一份 ⇒ C36）。
+ */
+function judgeAnchorPath(
+  rule: string,
+  path: AnchorPathBinding,
+  keywords: readonly string[],
+  options: { repoRoot: string; designDoc: string },
+): AnchorPathOutcome {
+  if (path.kind === 'pending') {
+    return {
+      rule,
+      label: path.label,
+      kind: path.kind,
+      status: 'pending',
+      detail: path.pendingReason ?? '（未写明待补原因）',
+    };
+  }
+
+  if (path.kind === 'doc') {
+    const heading = path.heading ?? '';
+    let section: string;
+    try {
+      section = extractSection(options.designDoc, heading);
+    } catch {
+      return {
+        rule,
+        label: path.label,
+        kind: path.kind,
+        status: 'missing',
+        detail: `设计稿里找不到小节「${heading}」`,
+      };
+    }
+    const hit = keywords.find((keyword) => containsAnchorKeyword(section, keyword));
+    return {
+      rule,
+      label: path.label,
+      kind: path.kind,
+      status: hit === undefined ? 'missing' : 'ok',
+      detail: hit === undefined ? '该小节里没有出现任何动作关键词' : `命中关键词「${hit}」`,
+    };
+  }
+
+  const file = path.file ?? '';
+  let source: string;
+  try {
+    source = readSourceFile(options.repoRoot, file);
+  } catch {
+    return {
+      rule,
+      label: path.label,
+      kind: path.kind,
+      status: 'missing',
+      detail: `实现文件不存在：${file}`,
+    };
+  }
+
+  let haystack = source;
+  if (path.symbol !== undefined) {
+    const body = extractFunctionBody(source, path.symbol);
+    if (body === undefined) {
+      return {
+        rule,
+        label: path.label,
+        kind: path.kind,
+        status: 'missing',
+        detail: `${file} 里找不到函数体「${path.symbol}」`,
+      };
+    }
+    haystack = body;
+  }
+
+  const hit = keywords.find((keyword) => containsAnchorKeyword(haystack, keyword));
+  return {
+    rule,
+    label: path.label,
+    kind: path.kind,
+    status: hit === undefined ? 'missing' : 'ok',
+    detail: hit === undefined ? '该落点里没有出现任何动作关键词' : `命中关键词「${hit}」`,
+  };
+}
+
 /** 比对锚定表与写死的期望。 */
 export function compareAnchorRows(rows: string[][]): AnchorDiff[] {
   const diffs: AnchorDiff[] = [];
@@ -198,6 +565,37 @@ function main(): void {
   }
 
   process.stdout.write('\n✓ 跨节锚定清单：5 行 × 3 列，且与写死的期望一致\n');
+
+  // ── 动作关键词是否落在管辖路径上（P2-T04）──
+  const repoRoot = resolve(fileURLToPath(new URL('..', import.meta.url)));
+  const { outcomes, diffs: pathDiffs } = checkAnchorPathBindings(rows, {
+    repoRoot,
+    designDoc: markdown,
+  });
+
+  const pending = outcomes.filter((outcome) => outcome.status === 'pending');
+  const ok = outcomes.filter((outcome) => outcome.status === 'ok');
+  process.stdout.write(
+    `\n  动作关键词落点：${ok.length} 条命中 / ${pending.length} 条待补 / ${outcomes.length} 条合计\n`,
+  );
+  if (pending.length > 0) {
+    // ⚠️ **待补必须写进输出**（不许静默跳过）⇒ 否则「待补」会变成「没人管」。
+    process.stdout.write('  待补（实现尚未存在 ⇒ 记为待补，不判红）：\n');
+    for (const outcome of pending) {
+      process.stdout.write(`    · ${outcome.rule} → ${outcome.label}：${outcome.detail}\n`);
+    }
+  }
+
+  if (pathDiffs.length > 0) {
+    process.stderr.write(`\n✗ 发现 ${pathDiffs.length} 处动作关键词落点不一致：\n`);
+    for (const diff of pathDiffs) {
+      process.stderr.write(`    ${diff.reason}\n`);
+    }
+    process.exitCode = 1;
+    return;
+  }
+
+  process.stdout.write('\n✓ 每条规则的每个管辖路径上，都出现了该规则的动作关键词\n');
 
   // ── §8.4 硬规则条数（QA 复核 F-03：此前只有不在 verify 链里的脚本守着）──
   const section84 = extractSection(markdown, SECTION_8_4_HEADING);
