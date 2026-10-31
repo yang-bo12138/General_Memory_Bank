@@ -43,10 +43,11 @@
     "@biomejs/biome": "^1.9.4",
     "@types/better-sqlite3": "^7.6.11",
     "@types/node": "^22.10.2",
-    "tsup": "^8.3.5",
+    "tsup": "^9.0.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
-    "vitest": "^2.1.8"
+    "vitest": "^4.1.12",
+    "vite": "^7.3.7"
   },
   "keywords": ["memory", "sqlite", "fts5", "forgetting-curve", "knowledge-graph"]
 }
