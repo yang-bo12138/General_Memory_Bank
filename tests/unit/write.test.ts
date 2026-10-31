@@ -16,8 +16,8 @@ import { describe, expect, it } from 'vitest';
 import { MS_PER_DAY } from '../../src/core/decay.js';
 import { MemoryError } from '../../src/core/errors.js';
 import { EVENT_PAYLOAD_VARIANTS } from '../../src/core/events.types.js';
-import { blobToVector } from '../../src/store/merge.js';
-import { type WriteStore, write } from '../../src/store/write.js';
+import { blobToVector, vectorToBlob } from '../../src/store/merge.js';
+import { type WriteStore, compareMergeCandidates, write } from '../../src/store/write.js';
 import { LOG_ACTIONS, MemoryLogger } from '../../src/util/log.js';
 import { countRows, createTestStore, readEvents } from '../fixtures/graph-store.js';
 
@@ -111,6 +111,33 @@ function linkedEntityIdsOf(db: TestDb, memoryId: string): string[] {
     .prepare('SELECT entity_id FROM memory_entities WHERE memory_id = ? ORDER BY entity_id')
     .all(memoryId) as Array<{ entity_id: string }>;
   return rows.map((row) => row.entity_id);
+}
+
+/**
+ * 直接插一条**带向量**的记忆（用于构造「两个候选」的场景）。
+ *
+ * ⚠️ **为什么不用 `write()` 造候选**：候选的 id 必须**写死**才能比较两次运行的结果
+ *   （`write()` 生成随机 UUID ⇒ 两次运行的 id 不同 ⇒ 比不了）。
+ */
+function insertCandidate(
+  db: TestDb,
+  id: string,
+  content: string,
+  tokens: string,
+  vector: number[] | null,
+): void {
+  db.prepare(
+    `INSERT INTO memories (id, kind, content, content_tokens, content_hash, embedding,
+                           stability, difficulty, created_at, last_access, access_count,
+                           deleted, deleted_at)
+     VALUES (@id, 'fact', @content, @tokens, @hash, @embedding, 1, 0.5, 0, 0, 0, 0, NULL)`,
+  ).run({
+    id,
+    content,
+    tokens,
+    hash: `hash-${id}`,
+    embedding: vector === null ? null : vectorToBlob(vector),
+  });
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -717,5 +744,329 @@ describe('P1-T07 · growStability 仍是全库唯一的 stability 写入点', ()
       .filter((line) => !/UPDATE\s+memories\s+SET\s+stability\s*=/i.test(line))
       .join('\n');
     expect(findStabilityWriteSites(withoutWrite)).toHaveLength(0);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+// 裁决 C / D / E / F / G（主理人 2026-10-31 签字）
+// ─────────────────────────────────────────────────────────────
+
+describe('P1-T07 · 裁决 C：别名目标实体与 input.entities 同等对待', () => {
+  it('★ 只给 entityAliases（entities 为空）⇒ 目标实体被建出来 + 本条记忆关联到它 + 返回值含它', () => {
+    const { db, store } = createWriteContext();
+
+    // ⚠️ `entities` **故意为空**：这条断言守的是「只声明别名」时目标实体仍然要被建出来、
+    //   **并且**与本条记忆建立 `memory_entities` 关联（裁决 C）。
+    const result = write(store, {
+      content: '张三住在北京',
+      entityAliases: [{ name: '张三', aliases: ['老张'] }],
+    });
+
+    const zhangSanId = entityIdOf(db, '张三');
+    // 性质：实体被创建（库里只有这一个）
+    expect(countRows(db, 'entities')).toBe(1);
+    // 性质：别名挂到了它身上
+    const aliasRow = db
+      .prepare('SELECT entity_id FROM entity_aliases WHERE alias = ?')
+      .get('老张') as {
+      entity_id: string;
+    };
+    expect(aliasRow.entity_id).toBe(zhangSanId);
+    // 性质：★ 本条记忆**关联到它**（否则图谱路查不到任何关系）
+    expect(linkedEntityIdsOf(db, result.id)).toEqual([zhangSanId]);
+    // 性质：★ 返回值的 `entityIds`（write 事件 payload）含它
+    const event = readEvents(db, 'write')[0];
+    expect(event?.payload.entityIds).toEqual([zhangSanId]);
+  });
+
+  it('★ entityAliases 的 name 指向**别名** ⇒ 解析到同一个 id，不新建第二个实体', () => {
+    const { db, store } = createWriteContext();
+
+    write(store, {
+      content: '张三住在北京',
+      entities: ['张三'],
+      entityAliases: [{ name: '张三', aliases: ['老张'] }],
+    });
+    const entitiesBefore = countRows(db, 'entities');
+
+    // ⚠️ name = 「老张」是**别名** ⇒ a→b 归一必须解析到**同一个**实体（不新建）
+    const second = write(store, {
+      content: '张三喜欢喝奶茶',
+      entities: ['张三'],
+      entityAliases: [{ name: '老张', aliases: ['老张头'] }],
+    });
+
+    // 性质：「老张头」挂在**张三**这个实体上
+    const aliasRow = db
+      .prepare('SELECT entity_id FROM entity_aliases WHERE alias = ?')
+      .get('老张头') as {
+      entity_id: string;
+    };
+    expect(aliasRow.entity_id).toBe(entityIdOf(db, '张三'));
+    // 性质：**没有新建第二个实体**
+    expect(countRows(db, 'entities')).toBe(entitiesBefore);
+    // 性质：第二条记忆同样关联到那个实体（别名目标与 input.entities 同等对待）
+    expect(linkedEntityIdsOf(db, second.id)).toEqual([entityIdOf(db, '张三')]);
+  });
+});
+
+describe('P1-T07 · 裁决 D：候选排序是**全序**（四级 tie-break）', () => {
+  it('★ 四级排序：overlap 降 → cos 降 → bm25 升 → id 升', () => {
+    const base = { id: 'b', overlap: 2, cos: 0.95, bm25: -1.5 };
+
+    // 性质：实体重叠多的优先
+    expect(compareMergeCandidates({ ...base, overlap: 3 }, base)).toBeLessThan(0);
+    // 性质：重叠相同 ⇒ 余弦大的优先
+    expect(compareMergeCandidates({ ...base, cos: 0.99 }, base)).toBeLessThan(0);
+    // 性质：余弦也相同 ⇒ BM25 小的优先（BM25 越小越相关）
+    expect(compareMergeCandidates({ ...base, bm25: -2 }, base)).toBeLessThan(0);
+    // 性质：★ 前三级全同 ⇒ **id 小的优先**（这一级是「可复现」的唯一保证）
+    expect(compareMergeCandidates({ ...base, id: 'a' }, base)).toBeLessThan(0);
+    // 性质：四键全等 ⇒ 判为「同一个候选」
+    expect(compareMergeCandidates(base, { ...base })).toBe(0);
+    // 性质：没有向量可比（`-Infinity`）⇒ **排最后**，而不是当成 0
+    expect(
+      compareMergeCandidates({ ...base, cos: Number.NEGATIVE_INFINITY }, base),
+    ).toBeGreaterThan(0);
+  });
+
+  it('★ 全序性：id 不同的两个候选**必须**能定出先后（去掉 id 级就会红）', () => {
+    const candidates = [
+      { id: 'a', overlap: 2, cos: 0.95, bm25: -1.5 },
+      { id: 'b', overlap: 2, cos: 0.95, bm25: -1.5 },
+      { id: 'c', overlap: 2, cos: 0.95, bm25: -1.5 },
+    ];
+
+    for (const a of candidates) {
+      for (const b of candidates) {
+        if (a.id === b.id) {
+          continue;
+        }
+        const forward = compareMergeCandidates(a, b);
+        const backward = compareMergeCandidates(b, a);
+        // 性质：**不能判成相同**（否则「先命中谁」取决于遍历顺序 ⇒ 不可复现）
+        expect(forward).not.toBe(0);
+        // 性质：反对称
+        expect(Math.sign(forward)).toBe(-Math.sign(backward));
+      }
+    }
+
+    // 负控：★ **去掉 id 那一级**的话，两个只有 id 不同的候选就判成「相同」——
+    //   ⇒ 这就是「id 级不可省」的证明（也是这条断言会红的原因）。
+    const withoutIdLevel = (
+      x: (typeof candidates)[number],
+      y: (typeof candidates)[number],
+    ): number => {
+      if (x.overlap !== y.overlap) {
+        return y.overlap - x.overlap;
+      }
+      if (x.cos !== y.cos) {
+        return y.cos - x.cos;
+      }
+      if (x.bm25 !== y.bm25) {
+        return x.bm25 - y.bm25;
+      }
+      return 0;
+    };
+    expect(withoutIdLevel(candidates[0]!, candidates[1]!)).toBe(0);
+  });
+
+  it('★ 行为：两个同分候选（重叠数相同、余弦相同）⇒ 恒定选中同一条，连跑两次一致', () => {
+    /** 造一个「两个候选 + 一个新写入」的场景（候选的 id **写死** ⇒ 两次运行完全可比）。 */
+    const scenario = (): {
+      db: TestDb;
+      store: WriteStore;
+      params: ReturnType<typeof createTestStore>['params'];
+    } => {
+      const context = createWriteContext();
+      const { db, store, params } = context;
+      const vector = unitVector(params.EMBED_DIM, 0);
+
+      // 两个候选：正文不同（⇒ hash 不同），但**前 3 个 bigram 相同**、向量相同、关联同样的两个实体
+      insertCandidate(
+        db,
+        'mem-a',
+        '张三喜欢猫粮和狗粮',
+        '张三 三喜 喜欢 欢猫 猫粮 粮和 和狗 狗粮',
+        vector,
+      );
+      insertCandidate(
+        db,
+        'mem-b',
+        '张三喜欢鱼粮和鸟粮',
+        '张三 三喜 喜欢 欢鱼 鱼粮 粮和 和鸟 鸟粮',
+        vector,
+      );
+      db.prepare('INSERT INTO entities (id, name, type, created_at) VALUES (?, ?, ?, ?)').run(
+        'ent-zhang',
+        '张三',
+        'concept',
+        0,
+      );
+      db.prepare('INSERT INTO entities (id, name, type, created_at) VALUES (?, ?, ?, ?)').run(
+        'ent-li',
+        '李四',
+        'concept',
+        0,
+      );
+      for (const memoryId of ['mem-a', 'mem-b']) {
+        db.prepare('INSERT INTO memory_entities (memory_id, entity_id) VALUES (?, ?)').run(
+          memoryId,
+          'ent-zhang',
+        );
+        db.prepare('INSERT INTO memory_entities (memory_id, entity_id) VALUES (?, ?)').run(
+          memoryId,
+          'ent-li',
+        );
+      }
+      return context;
+    };
+
+    const first = scenario();
+    const firstResult = write(first.store, {
+      content: '张三喜欢喝茶',
+      entities: ['张三', '李四'],
+      embedding: unitVector(first.params.EMBED_DIM, 0),
+    });
+    // 性质：合并到了**某一条**候选上（不是新建）
+    expect(firstResult.merged).toBe(true);
+    expect(['mem-a', 'mem-b']).toContain(firstResult.id);
+    // 性质：库里仍然只有两条（两条候选 + 新的那条合并进了其中一条）
+    expect(countRows(first.db, 'memories')).toBe(2);
+
+    // 性质：★ **连跑两次结果一致**（同样的输入 ⇒ 合并同一条 ⇒ 可复现）
+    const second = scenario();
+    const secondResult = write(second.store, {
+      content: '张三喜欢喝茶',
+      entities: ['张三', '李四'],
+      embedding: unitVector(second.params.EMBED_DIM, 0),
+    });
+    expect(secondResult.id).toBe(firstResult.id);
+  });
+});
+
+describe('P1-T07 · 裁决 E：alias 等于主名（含它自己那个实体的主名）⇒ 冲突', () => {
+  it('★ alias 等于**它自己那个实体的主名** ⇒ 跳过 + warnings + 日志，别名表不写', () => {
+    const { db, store, logger } = createWriteContext();
+
+    write(store, { content: '张三住在北京', entities: ['张三'] });
+    const zhangSanId = entityIdOf(db, '张三');
+
+    const result = write(store, {
+      content: '张三喜欢喝奶茶',
+      entities: ['张三'],
+      entityAliases: [{ name: '张三', aliases: ['张三'] }],
+    });
+
+    // 性质：冲突被报出来（**不是**幂等成功）
+    expect(result.warnings).toHaveLength(1);
+    expect(result.warnings[0]?.code).toBe('ALIAS_CONFLICT');
+    expect(result.warnings[0]?.alias).toBe('张三');
+    expect(result.warnings[0]?.currentEntityId).toBe(zhangSanId);
+    expect(result.warnings[0]?.intendedEntityId).toBe(zhangSanId);
+    // 性质：★ 别名表**没有**写入（主名不许同时当别名）
+    const row = db.prepare('SELECT entity_id FROM entity_aliases WHERE alias = ?').get('张三');
+    expect(row).toBeUndefined();
+    // 性质：记了磁盘日志
+    expect(logger.ofLevel('warn').length).toBeGreaterThan(0);
+  });
+});
+
+describe('P1-T07 · 裁决 F：退化情形（< 2 个 bigram）只有实体重叠能成立', () => {
+  it('★ 退化：余弦够高但实体重叠 < 2 ⇒ **不合并**（候选确实被找到了）', () => {
+    const { db, store, params } = createWriteContext();
+    const vector = unitVector(params.EMBED_DIM, 0);
+
+    write(store, { content: '说好的明天见', entities: ['张三'], embedding: vector, now: 0 });
+    const second = write(store, {
+      content: '好的',
+      entities: ['李四'],
+      embedding: vector,
+      now: MS_PER_DAY,
+    });
+
+    // 性质：★ 候选**确实被找到了**（否则「没合并」可能只是因为压根没候选 ⇒ 测不到退化条款）
+    const ftsRows = db
+      .prepare('SELECT rowid FROM mem_fts WHERE mem_fts MATCH ?')
+      .all('好的') as Array<{
+      rowid: number;
+    }>;
+    expect(ftsRows.length).toBeGreaterThan(0);
+
+    // 性质：**不合并**（退化时 cos 通道不单独成立）
+    expect(second.merged).toBe(false);
+    expect(countRows(db, 'memories')).toBe(2);
+    expect(readEvents(db, 'merge')).toHaveLength(0);
+  });
+
+  it('★ 退化：实体重叠 ≥ 2 ⇒ 合并（这时不需要 cos）', () => {
+    const { db, store, params } = createWriteContext();
+    const vector = unitVector(params.EMBED_DIM, 0);
+
+    write(store, {
+      content: '说好的明天见',
+      entities: ['张三', '李四'],
+      embedding: vector,
+      now: 0,
+    });
+    const second = write(store, {
+      content: '好的',
+      entities: ['张三', '李四'],
+      embedding: vector,
+      now: MS_PER_DAY,
+    });
+
+    // 性质：合并（实体重叠数达标 ⇒ 证据成立）
+    expect(second.merged).toBe(true);
+    expect(countRows(db, 'memories')).toBe(1);
+  });
+});
+
+describe('P1-T07 · 裁决 G：入参越界一律 INVALID_INPUT（details.reason 分类）', () => {
+  it('★ confidence 越界 ⇒ INVALID_INPUT，details.reason = confidence', () => {
+    const { db, store } = createWriteContext();
+
+    const error = expectMemoryError(() =>
+      write(store, { content: '一个事实', entities: ['张三'], confidence: 1.5 }),
+    );
+    expect(error.code).toBe('INVALID_INPUT');
+    expect(error.details.reason).toBe('confidence');
+    // 性质：库内**没有**这条记录（校验在写库之前）
+    expect(countRows(db, 'memories')).toBe(0);
+  });
+
+  it('★ kind 不在枚举内 ⇒ INVALID_INPUT，details.reason = kind', () => {
+    const { db, store } = createWriteContext();
+
+    const error = expectMemoryError(() =>
+      write(store, { content: '一个事实', entities: ['张三'], kind: 'bogus' as never }),
+    );
+    expect(error.code).toBe('INVALID_INPUT');
+    expect(error.details.reason).toBe('kind');
+    expect(countRows(db, 'memories')).toBe(0);
+  });
+
+  it('★ mediaRef 单独给（不给 mediaType）⇒ INVALID_INPUT，details.reason = media', () => {
+    const { db, store } = createWriteContext();
+
+    const error = expectMemoryError(() =>
+      write(store, { content: '一个事实', entities: ['张三'], mediaRef: 'photo.jpg' }),
+    );
+    expect(error.code).toBe('INVALID_INPUT');
+    expect(error.details.reason).toBe('media');
+    expect(countRows(db, 'memories')).toBe(0);
+  });
+
+  it('★ 负控：emotion 越界是**钳制**不是抛错（别和 confidence 写混）', () => {
+    const { db, store } = createWriteContext();
+
+    const result = write(store, { content: '一个事实', entities: ['张三'], emotion: 5 });
+
+    // 性质：写成功了（emotion 按 §4.3 钳制，不抛错）
+    expect(result.merged).toBe(false);
+    expect(countRows(db, 'memories')).toBe(1);
+    // 性质：emotion 被钳到 [0,1]
+    const event = readEvents(db, 'write')[0];
+    expect(event?.payload.emotion).toBe(1);
   });
 });

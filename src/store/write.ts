@@ -358,8 +358,26 @@ function cosineOf(a: Float32Array | null, b: Float32Array | null): number | null
 interface ResolvedEntities {
   /** 本次写入关联的 canonical `entity_id` 列表（按 id 去重）。 */
   linkedEntityIds: string[];
-  /** 名称 → id 的映射（供步骤 1c 解析 `entityAliases[].name`）。 */
-  byName: Map<string, string>;
+  /** 已进 `linkedEntityIds` 的 id 集合（去重用）。 */
+  seen: Set<string>;
+}
+
+/**
+ * 把一个实体 id 计入「本次写入关联的实体」（按 id 去重）。
+ *
+ * ⚠️ **裁决 C：别名声明的目标实体也必须进这个列表**——
+ *   §4.9 步骤 1c 说 name 的解析结果是「命中既有实体**或** b 步新建」，
+ *   而 b 步的产物天然是 `@linkedEntityIds` 的一员
+ *   ⇒ 别名目标实体与 `input.entities` **同等对待**：都要与本条记忆建立 `memory_entities` 关联。
+ *   ⇒ 否则「只给 `entityAliases`、不给 `entities`」的调用会得到一条**没有任何实体关联**的记忆
+ *   （正文写了、别名也挂了，但图谱路查不到任何关系）。
+ */
+function linkEntityId(resolved: ResolvedEntities, entityId: string): void {
+  if (resolved.seen.has(entityId)) {
+    return;
+  }
+  resolved.seen.add(entityId);
+  resolved.linkedEntityIds.push(entityId);
 }
 
 /**
@@ -395,27 +413,27 @@ function resolveEntities(
   names: readonly string[],
   now: number,
 ): ResolvedEntities {
-  const linkedEntityIds: string[] = [];
-  const seen = new Set<string>();
-  const byName = new Map<string, string>();
+  const resolved: ResolvedEntities = { linkedEntityIds: [], seen: new Set<string>() };
 
   for (const name of names) {
     const existingId = resolveEntity(db, name);
     const entityId = existingId === null ? upsertEntity(db, name, now) : existingId;
-    byName.set(name, entityId);
-    if (!seen.has(entityId)) {
-      seen.add(entityId);
-      linkedEntityIds.push(entityId);
-    }
+    linkEntityId(resolved, entityId);
   }
-  return { linkedEntityIds, byName };
+  return resolved;
 }
 
 /**
- * 步骤 1c：解析 `entityAliases[].name` 指向的 `entity_id`。
+ * 步骤 1c：解析 `entityAliases[].name` 指向的 `entity_id`（裁决 C）。
  *
- * ⚠️ **一项只描述一个实体** ⇒ `@thisEntityId` 是**单个**值；
- *   不要拿 `@linkedEntityIds` 当它用（那是步骤 1 全部名称的汇总，可能多个）。
+ * ⚠️ **与 `input.entities` 走同一套 a→b 归一**：
+ *   先 `resolveEntity`（**主名或别名都算命中**——它内部就是先查主名表、再查别名表）
+ *   ⇒ 命中就用该 id；未命中 ⇒ 按 b 步 UPSERT 新建实体。
+ *   ⇒ **两种情况都要把结果计入 `@linkedEntityIds`**（`linkEntityId`）——
+ *   「与 input.entities 同等对待 ⇒ 与本条记忆建立 memory_entities 关联」。
+ *
+ * ⚠️ **一项只描述一个实体** ⇒ 返回值是**单个** id；
+ *   不要拿 `@linkedEntityIds` 当它用（那是汇总，可能多个）。
  */
 function resolveAliasTargetEntityId(
   db: Database.Database,
@@ -423,17 +441,10 @@ function resolveAliasTargetEntityId(
   resolved: ResolvedEntities,
   now: number,
 ): string {
-  const mapped = resolved.byName.get(name);
-  if (mapped !== undefined) {
-    return mapped;
-  }
   const existing = resolveEntity(db, name);
-  if (existing !== null) {
-    return existing;
-  }
-  // ⚠️ 该名字既不在本次 `input.entities` 里、也不是任何既有实体 ⇒ 按步骤 1b 建一个。
-  //   否则这次声明的别名会**无处可挂**（静默丢弃）。
-  return upsertEntity(db, name, now);
+  const entityId = existing === null ? upsertEntity(db, name, now) : existing;
+  linkEntityId(resolved, entityId);
+  return entityId;
 }
 
 /**
@@ -555,6 +566,54 @@ function computeEntityOverlap(
 }
 
 /**
+ * 候选排序用的键（裁决 D）。
+ *
+ * ⚠️ **四个键缺一不可**：前三个都是「浮点 / 计数」，两个候选完全同分是常事；
+ *   没有第四级（`id`）⇒ 选中谁取决于**遍历顺序**（FTS 的物理行序）
+ *   ⇒ 同样输入不可复现 ⇒ 重放会得到不同结果（§12：排序必须有全序 tie-break）。
+ */
+export interface MergeCandidateKey {
+  /** 候选记忆 id（最后一级 tie-break：升序）。 */
+  id: string;
+  /** 实体重叠数（**降序**：越大越优先）。 */
+  overlap: number;
+  /** 余弦相似度（**降序**；`-Infinity` = 没有向量可比 ⇒ 排最后）。 */
+  cos: number;
+  /** FTS 的 BM25 原始分（**升序**：越小越相关）。 */
+  bm25: number;
+}
+
+/**
+ * 候选排序（裁决 D）：**entityOverlap 降序 → cos 降序（null 排最后）→ raw_bm25 升序 → id 升序**。
+ *
+ * ⚠️ **为什么最后一级必须是 `id`**：前三级全同分时，若不定序
+ *   ⇒ 「选中谁」取决于 BM25 结果的**物理顺序**（不保证稳定）
+ *   ⇒ 同一份输入两次运行可能合并到不同记忆 ⇒ 合并是**不可逆的正文改写**
+ *   （只能靠 `content_history` 兜底）⇒ 这不是「小瑕疵」，是「行为不可复现」。
+ *
+ * ⚠️ **`-Infinity` 的处理**：`cos` 为 `null`（没有向量可比）时记 `-Infinity`；
+ *   比较时**先判「是否相等」再算差值** ⇒ 两个 `-Infinity` 不会算出 `NaN`
+ *   （`NaN` 会让所有比较都为 false ⇒ 排序静默退化）。
+ *
+ * @returns `< 0` 表示 `a` 优先；`> 0` 表示 `b` 优先；`0` 表示**四键全等**（同一个候选）。
+ */
+export function compareMergeCandidates(a: MergeCandidateKey, b: MergeCandidateKey): number {
+  if (a.overlap !== b.overlap) {
+    return b.overlap - a.overlap;
+  }
+  if (a.cos !== b.cos) {
+    return b.cos - a.cos;
+  }
+  if (a.bm25 !== b.bm25) {
+    return a.bm25 - b.bm25;
+  }
+  if (a.id === b.id) {
+    return 0;
+  }
+  return a.id < b.id ? -1 : 1;
+}
+
+/**
  * 步骤 3a / 3b / 3c 的前半：找候选并判定是否该合并。
  *
  * ⚠️ **`@dedupSql` 必须显式构造，绝不复用 `buildMatchQuery`**：
@@ -593,13 +652,15 @@ function findMergeCandidate(
   const dedupSql = tokens.slice(0, 3).map(escapeFts5).join(' AND ');
   // ⚠️ **候选不足 2 个 bigram 时**（如「好的」）`AND` 退化为单条件、候选相关性骤降
   //   ⇒ 此时**要求实体重叠数达标**才允许合并（§4.9 步骤 3a 的退化条款），**不要放宽**。
+  // ⚠️ **裁决 F 的精确口径**：退化时合并判定**收敛为** `entityOverlap ≥ DEDUP_ENTITY_MIN`，
+  //   **cos 通道不单独成立**（非退化时仍是「entityOverlap ≥ N **或** cos ≥ DEDUP_COS_MIN」）。
   const textRouteDegenerate = tokens.length < 2;
 
   const rows = db.prepare(FIND_CANDIDATES_SQL).all({ dedupSql }) as Array<
     MemoryStateRow & { raw_bm25: number }
   >;
 
-  let best: { state: MergeMemoryState; overlap: number; cos: number } | undefined;
+  let best: { state: MergeMemoryState; key: MergeCandidateKey } | undefined;
   for (const row of rows) {
     const overlap = computeEntityOverlap(db, row.id, linkedEntityIds);
     const cos = cosineOf(vector, row.embedding === null ? null : blobToVector(row.embedding));
@@ -608,20 +669,17 @@ function findMergeCandidate(
     if (!entityOk && !cosOk) {
       continue;
     }
-    const cosValue = cos ?? Number.NEGATIVE_INFINITY;
-    if (
-      best === undefined ||
-      overlap > best.overlap ||
-      (overlap === best.overlap && cosValue > best.cos)
-    ) {
-      best = { state: row, overlap, cos: cosValue };
+    const key: MergeCandidateKey = {
+      id: row.id,
+      overlap,
+      // ⚠️ 没有向量可比 ⇒ 记 `-Infinity` ⇒ **排在最后**（而不是当成 0）。
+      cos: cos ?? Number.NEGATIVE_INFINITY,
+      bm25: row.raw_bm25,
+    };
+    if (best === undefined || compareMergeCandidates(key, best.key) < 0) {
+      best = { state: row, key };
     }
   }
-  // ⚠️ **多个候选同时达标时的选取规则**（设计稿未规定 ⇒ 这里定死并写明）：
-  //   「实体重叠数多者优先；重叠数相同则余弦大者优先；再相同则取 FTS 排序靠前者」。
-  //   ⇒ 规则**确定**（同样的输入永远合并同一条）⇒ 重放与复现不会漂移。
-  //   ⚠️ **不要改成「取第一条达标的就合并」**：那会让「先命中哪个候选」取决于 BM25 抖动，
-  //   而合并是**不可逆**的正文改写（只能靠 `content_history` 兜底）。
   return best?.state;
 }
 
@@ -954,13 +1012,20 @@ export function write(store: WriteStore, input: WriteInput): WriteResult {
 }
 
 /**
- * 校验 `kind` / `mediaRef` + `mediaType` 的组合（§3 的库层 CHECK 的应用层前置）。
+ * 校验 `kind` / `confidence` / `mediaRef` + `mediaType`（§3 的库层 CHECK 的应用层前置）。
  *
  * ⚠️ **不校验就会让裸的 SQLite 错误码穿给调用方**（§11.2）：
  *   `memories.media_type` 与 `media_ref` 必须同生同死（库层 CHECK），
- *   `kind` 必须在枚举内（库层 CHECK）⇒ 这两处的 CHECK 违规都会被
- *   `translateSqliteError` **原样抛出**（清单之外的错误码不转译），
+ *   `kind` 必须在枚举内、`confidence` 必须落在 [0,1]（都是库层 CHECK）
+ *   ⇒ 这些 CHECK 违规都会被 `translateSqliteError` **原样抛出**（清单之外的错误码不转译），
  *   调用方拿到的是一个未类型化的错误 ⇒ 比一个 `INVALID_INPUT` 难处理得多。
+ *
+ * ⚠️ **裁决 G：`details` 用扁平的 `reason` 键**（`'kind'` / `'confidence'` / `'media'`），
+ *   与向量校验那三处（`'dim'` / `'nan'` / `'zero'`）**同一族词**——
+ *   ⇒ 调用方可以只认 `details.reason` 一个键就分清是哪一类入参问题。
+ *
+ * ⚠️ **别和 `emotion` 写混**：`emotion` 按 §4.3 **钳制**（不抛错）；
+ *   `confidence` **不钳制**——越界就是**调用方的 bug**，静默改写等于替调用方撒谎。
  *
  * @throws {MemoryError} `INVALID_INPUT`
  */
@@ -968,32 +1033,33 @@ export function assertWriteInputValid(input: WriteInput): void {
   if (!MEMORY_KINDS.includes(input.kind ?? 'fact')) {
     throw MemoryError.invalidInput(
       `kind 必须是 ${MEMORY_KINDS.join(' / ')} 之一（§3 的 memories.kind CHECK 约束）`,
-      { kind: { current: input.kind, reason: 'not in enum' } },
+      { reason: 'kind', current: input.kind ?? null },
     );
   }
   const { mediaRef, mediaType } = input;
   if (mediaRef !== undefined && mediaType === undefined) {
     throw MemoryError.invalidInput(
       'mediaRef 与 mediaType 必须同时给或同时不给（§3：二者同生同死，由库层 CHECK 强制）',
-      { media: { current: mediaRef, reason: 'mediaRef 与 mediaType 必须成对出现' } },
+      { reason: 'media', current: mediaRef },
     );
   }
   if (mediaRef === undefined && mediaType !== undefined) {
     throw MemoryError.invalidInput(
       'mediaRef 与 mediaType 必须同时给或同时不给（§3：二者同生同死，由库层 CHECK 强制）',
-      { media: { current: mediaType, reason: 'mediaRef 与 mediaType 必须成对出现' } },
+      { reason: 'media', current: mediaType },
     );
   }
   if (mediaType !== undefined && !MEDIA_TYPES.includes(mediaType)) {
     throw MemoryError.invalidInput(
       `mediaType 必须是 ${MEDIA_TYPES.join(' / ')} 之一（§3 的 media_type CHECK 约束）`,
-      { mediaType: { current: mediaType, reason: 'not in enum' } },
+      { reason: 'media', current: mediaType },
     );
   }
   const confidence = input.confidence ?? DEFAULT_CONFIDENCE;
   if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
     throw MemoryError.invalidInput('confidence 必须落在 [0, 1]（§3 的 CHECK 约束）', {
-      confidence: { current: input.confidence, reason: 'out of range' },
+      reason: 'confidence',
+      current: input.confidence ?? null,
     });
   }
 }
