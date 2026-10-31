@@ -118,9 +118,18 @@ export interface WriteInput {
  *
  * ⚠️ **刻意不是异常**（§11.2 末）：别名冲突时**记忆本身已经写成功**，
  *   只有附属的别名映射没落库。抛异常会让调用方重试 `write()` ⇒ 同一事实被写两遍。
+ *
+ * ⚠️ **做成可辨识联合（discriminated union）而不是「一堆可选字段」**：
+ *   两个变体的字段集**互不重叠**（`alias` vs `name`）⇒
+ *   写成可选字段的话，调用方得自己记住「哪个 code 能读哪个键」⇒ 两套取值逻辑（C36）。
  */
-export interface WriteWarning {
-  /** 目前唯一来源是 §4.9 步骤 1c 的别名冲突。 */
+export type WriteWarning = AliasConflictWarning | AliasTargetNotLinkedWarning;
+
+/**
+ * `ALIAS_CONFLICT`：别名已存在且指向**别的**实体 ⇒ 跳过、不覆盖（§4.9 步骤 1c）。
+ */
+export interface AliasConflictWarning {
+  /** 警告码（可辨识联合的判别键）。 */
   code: 'ALIAS_CONFLICT';
   /** 冲突的别名。 */
   alias: string;
@@ -128,6 +137,27 @@ export interface WriteWarning {
   currentEntityId: string;
   /** 本次想指向谁（调用方若要改，请显式调 `setAlias`）。 */
   intendedEntityId: string;
+}
+
+/**
+ * `ALIAS_TARGET_NOT_LINKED`：别名目标实体**建好了**，但**没有**跟本条记忆建立关联。
+ *
+ * ⚠️ **为什么需要这条 warning**（ADR-P1-T07-DEC 的 D-3/R2）：
+ *   「建但不隐含关联」是**有意**的边界（关联只由 `input.entities` 表达 ⇒ §14.3 边界原则 1），
+ *   但它有代价：调用方只声明 `entityAliases`、不点名实体 ⇒
+ *   **别名建好了、本条记忆却不与该实体关联** ⇒ 图谱路查不到它 ⇒ **静默达不到召回目的**。
+ *   ⇒ **边界可以存在，但必须可观测** ⇒ 这里回一条 warning（并按 §8.1 记一条磁盘日志）。
+ *
+ * ⚠️ **一个 `name` 一条**（不是每个别名一条）：
+ *   报的是「**这个实体**没跟这条记忆关联」，不是「这两个别名有问题」。
+ */
+export interface AliasTargetNotLinkedWarning {
+  /** 边界提示码。 */
+  code: 'ALIAS_TARGET_NOT_LINKED';
+  /** 调用方在 `entityAliases[].name` 里写的那个实体名。 */
+  name: string;
+  /** 该实体的 id（**已经建出来了**——它确实存在，只是没跟本条记忆关联）。 */
+  entityId: string;
 }
 
 /** §6 的 `write()` 返回值。 */
@@ -358,8 +388,28 @@ function cosineOf(a: Float32Array | null, b: Float32Array | null): number | null
 interface ResolvedEntities {
   /** 本次写入关联的 canonical `entity_id` 列表（按 id 去重）。 */
   linkedEntityIds: string[];
-  /** 名称 → id 的映射（供步骤 1c 解析 `entityAliases[].name`）。 */
-  byName: Map<string, string>;
+  /** 已进 `linkedEntityIds` 的 id 集合（去重用）。 */
+  seen: Set<string>;
+}
+
+/**
+ * 把一个实体 id 计入「本次写入关联的实体」（按 id 去重）。
+ *
+ * ⚠️ **只有 `input.entities` 走这个函数**（ADR-P1-T07-DEC 的 D-3/R2「建，但不隐含关联」）：
+ *   `@linkedEntityIds` 的定义是「a 步与 b 步的结果汇总」⇒ **只来自 `input.entities`**。
+ *   ⇒ `entityAliases` 只声明**命名**（谁是谁的别名），**不声明关联**（这条记忆关于谁）。
+ *   ⇒ 别名目标实体走 `resolveAliasTargetEntityId`（**建，但不进这里**）。
+ *
+ * ⚠️ **不要**为了「让别名也对召回生效」而在这里把别名目标也塞进来：
+ *   那样就有**两处**能表达「这条记忆跟 X 有关」⇒ §14.3 边界原则 1（每个承诺都要能指到唯一代码路径）就破了。
+ *   ⇒ 想让别名对召回生效，**必须把实体名同时写进 `input.entities`**。
+ */
+function linkEntityId(resolved: ResolvedEntities, entityId: string): void {
+  if (resolved.seen.has(entityId)) {
+    return;
+  }
+  resolved.seen.add(entityId);
+  resolved.linkedEntityIds.push(entityId);
 }
 
 /**
@@ -395,45 +445,53 @@ function resolveEntities(
   names: readonly string[],
   now: number,
 ): ResolvedEntities {
-  const linkedEntityIds: string[] = [];
-  const seen = new Set<string>();
-  const byName = new Map<string, string>();
+  const resolved: ResolvedEntities = { linkedEntityIds: [], seen: new Set<string>() };
 
   for (const name of names) {
     const existingId = resolveEntity(db, name);
     const entityId = existingId === null ? upsertEntity(db, name, now) : existingId;
-    byName.set(name, entityId);
-    if (!seen.has(entityId)) {
-      seen.add(entityId);
-      linkedEntityIds.push(entityId);
-    }
+    linkEntityId(resolved, entityId);
   }
-  return { linkedEntityIds, byName };
+  return resolved;
 }
 
 /**
  * 步骤 1c：解析 `entityAliases[].name` 指向的 `entity_id`。
  *
- * ⚠️ **一项只描述一个实体** ⇒ `@thisEntityId` 是**单个**值；
- *   不要拿 `@linkedEntityIds` 当它用（那是步骤 1 全部名称的汇总，可能多个）。
+ * ⚠️ **建，但不隐含关联**（口径出处：**ADR-P1-T07-DEC 的 D-3/R2**；
+ *   主理人 2026-10-31 改判，历史引用「ADR-P1-R2 裁决 ①」指向同一条现行口径）：
+ *   · **建**：`entityAliases[].name` 是调用方**显式点名**的实体，
+ *     而写路径的既定语义就是「写入路径负责建实体」（步骤 1b 对 `input.entities` 里的未知名字也是建）
+ *     ⇒ **同一个调用方语义在两个字段上必须表现一致**。
+ *     ⇒ 不建 ⇒ 这次声明的别名**无处可挂**（`entity_aliases.entity_id` 无处指）
+ *     ⇒ **静默丢弃** ⇒ 违背 §4.9 步骤 1c「不要静默」的总原则。
+ *   · **不关联**：**无论命中既有实体还是新建，都不进 `@linkedEntityIds`**
+ *     ⇒ 不与本条记忆建立 `memory_entities` 关联，也不出现在 write 事件的 `entityIds` 里。
+ *     ⇒ 理由：**`entities` 是「这条记忆跟 X 有关」的**唯一**表达机制**
+ *     ⇒ 若 `entityAliases` 也能顺带建立关联，就有**两处**能表达同一件事
+ *     ⇒ §14.3 边界原则 1（每个承诺都要能指到唯一代码路径）就破了。
+ *
+ * ⚠️ **代价（明写在这里，别让它变成静默）**：调用方若**只**声明 `entityAliases`、
+ *   却没把该实体名放进 `input.entities` ⇒ 别名映射建好了，
+ *   但**本条记忆不与该实体关联** ⇒ 图谱路查不到它 ⇒ **静默达不到召回目的**。
+ *   ⇒ 想让别名对召回生效，**必须把实体名同时写进 `input.entities`**。
+ *   ⇒ **代价必须可观测** ⇒ 由 `syncEntityAliases` 回一条 `ALIAS_TARGET_NOT_LINKED`
+ *     （**边界可以存在，但必须可观测**；主理人 2026-10-31 终裁）。
+ *
+ * ⚠️ **若「新建实体」与 `input.entities` 里的同名实体是同一个** ⇒ 那时它**因 `input.entities`
+ *   而被关联**（走 `entities` 那条路径）⇒ 这是对的，
+ *   **不要因此把别名路径的关联也打开**（那正是本函数**不**做 `linkEntityId` 的原因）。
+ *
+ * ⚠️ **与 `input.entities` 走同一套 a→b 归一**：
+ *   先 `resolveEntity`（**主名或别名都算命中**——它内部就是先查主名表、再查别名表）
+ *   ⇒ 命中就用该 id；未命中 ⇒ 按 b 步 UPSERT 新建实体。
+ *
+ * ⚠️ **一项只描述一个实体** ⇒ 返回值是**单个** id；
+ *   不要拿 `@linkedEntityIds` 当它用（那是汇总，可能多个）。
  */
-function resolveAliasTargetEntityId(
-  db: Database.Database,
-  name: string,
-  resolved: ResolvedEntities,
-  now: number,
-): string {
-  const mapped = resolved.byName.get(name);
-  if (mapped !== undefined) {
-    return mapped;
-  }
+function resolveAliasTargetEntityId(db: Database.Database, name: string, now: number): string {
   const existing = resolveEntity(db, name);
-  if (existing !== null) {
-    return existing;
-  }
-  // ⚠️ 该名字既不在本次 `input.entities` 里、也不是任何既有实体 ⇒ 按步骤 1b 建一个。
-  //   否则这次声明的别名会**无处可挂**（静默丢弃）。
-  return upsertEntity(db, name, now);
+  return existing === null ? upsertEntity(db, name, now) : existing;
 }
 
 /**
@@ -482,18 +540,24 @@ function detectAliasConflict(
  *
  * ⚠️ **写入用 `ON CONFLICT(alias) DO NOTHING`**（与 `setAlias` 的 `DO UPDATE` **不统一是刻意的**）：
  *   写路径是批量补别名，不该覆盖别人的正确映射；覆盖是 `setAlias` 的职责（§4.9.2）。
+ *
+ * ⚠️ **`linkedEntityIds` 只用来判断「要不要回报边界」**（`ALIAS_TARGET_NOT_LINKED`）：
+ *   别名目标**绝不**因此进关联（关联只由 `input.entities` 表达 ⇒ D-3/R2），
+ *   但「没关联」这件事**必须可观测**（否则调用方以为「声明了别名 = 这条记忆关于这个人」）。
  */
 function syncEntityAliases(
   store: WriteStore,
   entries: ReadonlyArray<{ name: string; aliases: string[] }>,
-  resolved: ResolvedEntities,
+  linkedEntityIds: readonly string[],
   now: number,
 ): WriteWarning[] {
   const warnings: WriteWarning[] = [];
   const db = store.db;
 
   for (const entry of entries) {
-    const intendedEntityId = resolveAliasTargetEntityId(db, entry.name, resolved, now);
+    // ⚠️ 这里**不**把 `intendedEntityId` 计入 `@linkedEntityIds`：
+    //   关联只由 `input.entities` 表达（ADR-P1-T07-DEC 的 D-3/R2「建，但不隐含关联」）。
+    const intendedEntityId = resolveAliasTargetEntityId(db, entry.name, now);
     for (const alias of entry.aliases) {
       const currentEntityId = detectAliasConflict(db, alias, intendedEntityId);
       if (currentEntityId !== null) {
@@ -506,6 +570,32 @@ function syncEntityAliases(
         `INSERT INTO entity_aliases (alias, entity_id) VALUES (@alias, @entityId)
          ON CONFLICT(alias) DO NOTHING`,
       ).run({ alias, entityId: intendedEntityId });
+    }
+
+    // ⚠️ **边界必须可观测**（D-3/R2 的代价明写）：
+    //   别名目标实体**建好了**，但本条记忆**没有**跟它关联 ⇒ 图谱路（§4.6 步骤 2b）查不到它
+    //   ⇒ 调用方若以为「声明了别名就等于这条记忆关于这个人」，就会**静默达不到召回目的**。
+    //   ⇒ 这里回一条 `ALIAS_TARGET_NOT_LINKED`（并按 §8.1 记一条磁盘日志）。
+    //
+    // ⚠️ **判定按实体 id，不按名字**：调用方可能用**别名**点名同一个实体
+    //   （`entities: ['老张']` + `entityAliases: [{ name: '张三', ... }]`）
+    //   ⇒ 那个实体**确实**被关联了 ⇒ **不该**报这条 warning。
+    //
+    // ⚠️ **一个 `name` 一条**（不是每个别名一条）：
+    //   报的是「**这个实体**没跟这条记忆关联」，不是「这两个别名有问题」⇒
+    //   `{ name:'张三', aliases:['老张','小张'] }` ⇒ **1 条**，不是 2 条。
+    if (!linkedEntityIds.includes(intendedEntityId)) {
+      warnings.push({
+        code: 'ALIAS_TARGET_NOT_LINKED',
+        name: entry.name,
+        entityId: intendedEntityId,
+      });
+      store.logger.warn(LOG_ACTIONS.write, {
+        name: entry.name,
+        now,
+        entityId: intendedEntityId,
+        linked: false,
+      });
     }
   }
   return warnings;
@@ -555,6 +645,54 @@ function computeEntityOverlap(
 }
 
 /**
+ * 候选排序用的键（裁决 D）。
+ *
+ * ⚠️ **四个键缺一不可**：前三个都是「浮点 / 计数」，两个候选完全同分是常事；
+ *   没有第四级（`id`）⇒ 选中谁取决于**遍历顺序**（FTS 的物理行序）
+ *   ⇒ 同样输入不可复现 ⇒ 重放会得到不同结果（§12：排序必须有全序 tie-break）。
+ */
+export interface MergeCandidateKey {
+  /** 候选记忆 id（最后一级 tie-break：升序）。 */
+  id: string;
+  /** 实体重叠数（**降序**：越大越优先）。 */
+  overlap: number;
+  /** 余弦相似度（**降序**；`-Infinity` = 没有向量可比 ⇒ 排最后）。 */
+  cos: number;
+  /** FTS 的 BM25 原始分（**升序**：越小越相关）。 */
+  bm25: number;
+}
+
+/**
+ * 候选排序（裁决 D）：**entityOverlap 降序 → cos 降序（null 排最后）→ raw_bm25 升序 → id 升序**。
+ *
+ * ⚠️ **为什么最后一级必须是 `id`**：前三级全同分时，若不定序
+ *   ⇒ 「选中谁」取决于 BM25 结果的**物理顺序**（不保证稳定）
+ *   ⇒ 同一份输入两次运行可能合并到不同记忆 ⇒ 合并是**不可逆的正文改写**
+ *   （只能靠 `content_history` 兜底）⇒ 这不是「小瑕疵」，是「行为不可复现」。
+ *
+ * ⚠️ **`-Infinity` 的处理**：`cos` 为 `null`（没有向量可比）时记 `-Infinity`；
+ *   比较时**先判「是否相等」再算差值** ⇒ 两个 `-Infinity` 不会算出 `NaN`
+ *   （`NaN` 会让所有比较都为 false ⇒ 排序静默退化）。
+ *
+ * @returns `< 0` 表示 `a` 优先；`> 0` 表示 `b` 优先；`0` 表示**四键全等**（同一个候选）。
+ */
+export function compareMergeCandidates(a: MergeCandidateKey, b: MergeCandidateKey): number {
+  if (a.overlap !== b.overlap) {
+    return b.overlap - a.overlap;
+  }
+  if (a.cos !== b.cos) {
+    return b.cos - a.cos;
+  }
+  if (a.bm25 !== b.bm25) {
+    return a.bm25 - b.bm25;
+  }
+  if (a.id === b.id) {
+    return 0;
+  }
+  return a.id < b.id ? -1 : 1;
+}
+
+/**
  * 步骤 3a / 3b / 3c 的前半：找候选并判定是否该合并。
  *
  * ⚠️ **`@dedupSql` 必须显式构造，绝不复用 `buildMatchQuery`**：
@@ -593,13 +731,27 @@ function findMergeCandidate(
   const dedupSql = tokens.slice(0, 3).map(escapeFts5).join(' AND ');
   // ⚠️ **候选不足 2 个 bigram 时**（如「好的」）`AND` 退化为单条件、候选相关性骤降
   //   ⇒ 此时**要求实体重叠数达标**才允许合并（§4.9 步骤 3a 的退化条款），**不要放宽**。
+  // ⚠️ **裁决 F 的精确口径**：退化时合并判定**收敛为** `entityOverlap ≥ DEDUP_ENTITY_MIN`，
+  //   **cos 通道不单独成立**（非退化时仍是「entityOverlap ≥ N **或** cos ≥ DEDUP_COS_MIN」）。
+  //   口径出处：ADR-P1-R2 裁决 ①（待架构师最终措辞确认）。
+  //   ⚠️ **架构师已出终稿**（ADR-P1-T07-DEC 的 D-6，三分支）：
+  //     `n=0`（0 个 bigram）⇒ **文本路整体不执行**（无候选 ⇒ 不合并，**不是**退化态）——
+  //     上面 `tokens.length === 0` 时直接 `return undefined` 就是这一支；
+  //     `n=1`（退化态）⇒ **只认实体重叠**，cos 通道（**合并资格**）整条不生效；
+  //     `n≥2` ⇒ 「实体重叠达标 **或** cos 达标」。
+  //   ⚠️ 补充一句容易写反的地方：退化态**不是**「两条判据里有一条成立就合并」，
+  //   而是「**只认实体重叠**」——候选面已不可信 ⇒ 不能拿余弦去合并。
+  //   ⚠️ 「cos 通道不生效」说的是**合并资格**，**不是排序**：
+  //   退化态下 cos 仍然参与 tie-break 的第二级（见 `compareMergeCandidates`）。
+  //   ⚠️ 阈值用**参数** `DEDUP_ENTITY_MIN`（默认 2）而不是写死 2：
+  //   设计稿的字面「≥ 2」只是这个参数的**默认值**，判据本身应当与步骤 c 的实体判据同源。
   const textRouteDegenerate = tokens.length < 2;
 
   const rows = db.prepare(FIND_CANDIDATES_SQL).all({ dedupSql }) as Array<
     MemoryStateRow & { raw_bm25: number }
   >;
 
-  let best: { state: MergeMemoryState; overlap: number; cos: number } | undefined;
+  let best: { state: MergeMemoryState; key: MergeCandidateKey } | undefined;
   for (const row of rows) {
     const overlap = computeEntityOverlap(db, row.id, linkedEntityIds);
     const cos = cosineOf(vector, row.embedding === null ? null : blobToVector(row.embedding));
@@ -608,20 +760,17 @@ function findMergeCandidate(
     if (!entityOk && !cosOk) {
       continue;
     }
-    const cosValue = cos ?? Number.NEGATIVE_INFINITY;
-    if (
-      best === undefined ||
-      overlap > best.overlap ||
-      (overlap === best.overlap && cosValue > best.cos)
-    ) {
-      best = { state: row, overlap, cos: cosValue };
+    const key: MergeCandidateKey = {
+      id: row.id,
+      overlap,
+      // ⚠️ 没有向量可比 ⇒ 记 `-Infinity` ⇒ **排在最后**（而不是当成 0）。
+      cos: cos ?? Number.NEGATIVE_INFINITY,
+      bm25: row.raw_bm25,
+    };
+    if (best === undefined || compareMergeCandidates(key, best.key) < 0) {
+      best = { state: row, key };
     }
   }
-  // ⚠️ **多个候选同时达标时的选取规则**（设计稿未规定 ⇒ 这里定死并写明）：
-  //   「实体重叠数多者优先；重叠数相同则余弦大者优先；再相同则取 FTS 排序靠前者」。
-  //   ⇒ 规则**确定**（同样的输入永远合并同一条）⇒ 重放与复现不会漂移。
-  //   ⚠️ **不要改成「取第一条达标的就合并」**：那会让「先命中哪个候选」取决于 BM25 抖动，
-  //   而合并是**不可逆**的正文改写（只能靠 `content_history` 兜底）。
   return best?.state;
 }
 
@@ -903,7 +1052,14 @@ export function write(store: WriteStore, input: WriteInput): WriteResult {
     const resolved = resolveEntities(db, input.entities ?? [], at);
 
     // ── 步骤 1c：`entityAliases` 同步 ──
-    const warnings = syncEntityAliases(store, input.entityAliases ?? [], resolved, at);
+    // ⚠️ `linkedEntityIds` 只用来判断「别名目标有没有被关联」⇒ 回报 `ALIAS_TARGET_NOT_LINKED`；
+    //   **绝不**因此把别名目标加进关联（关联只由 `input.entities` 表达）。
+    const warnings = syncEntityAliases(
+      store,
+      input.entityAliases ?? [],
+      resolved.linkedEntityIds,
+      at,
+    );
 
     // ── 步骤 2：完全重复检测 ──
     const existing = findByHash(db, newHash);
@@ -954,13 +1110,20 @@ export function write(store: WriteStore, input: WriteInput): WriteResult {
 }
 
 /**
- * 校验 `kind` / `mediaRef` + `mediaType` 的组合（§3 的库层 CHECK 的应用层前置）。
+ * 校验 `kind` / `confidence` / `mediaRef` + `mediaType`（§3 的库层 CHECK 的应用层前置）。
  *
  * ⚠️ **不校验就会让裸的 SQLite 错误码穿给调用方**（§11.2）：
  *   `memories.media_type` 与 `media_ref` 必须同生同死（库层 CHECK），
- *   `kind` 必须在枚举内（库层 CHECK）⇒ 这两处的 CHECK 违规都会被
- *   `translateSqliteError` **原样抛出**（清单之外的错误码不转译），
+ *   `kind` 必须在枚举内、`confidence` 必须落在 [0,1]（都是库层 CHECK）
+ *   ⇒ 这些 CHECK 违规都会被 `translateSqliteError` **原样抛出**（清单之外的错误码不转译），
  *   调用方拿到的是一个未类型化的错误 ⇒ 比一个 `INVALID_INPUT` 难处理得多。
+ *
+ * ⚠️ **裁决 G：`details` 用扁平的 `reason` 键**（`'kind'` / `'confidence'` / `'media'`），
+ *   与向量校验那三处（`'dim'` / `'nan'` / `'zero'`）**同一族词**——
+ *   ⇒ 调用方可以只认 `details.reason` 一个键就分清是哪一类入参问题。
+ *
+ * ⚠️ **别和 `emotion` 写混**：`emotion` 按 §4.3 **钳制**（不抛错）；
+ *   `confidence` **不钳制**——越界就是**调用方的 bug**，静默改写等于替调用方撒谎。
  *
  * @throws {MemoryError} `INVALID_INPUT`
  */
@@ -968,32 +1131,33 @@ export function assertWriteInputValid(input: WriteInput): void {
   if (!MEMORY_KINDS.includes(input.kind ?? 'fact')) {
     throw MemoryError.invalidInput(
       `kind 必须是 ${MEMORY_KINDS.join(' / ')} 之一（§3 的 memories.kind CHECK 约束）`,
-      { kind: { current: input.kind, reason: 'not in enum' } },
+      { reason: 'kind', current: input.kind ?? null },
     );
   }
   const { mediaRef, mediaType } = input;
   if (mediaRef !== undefined && mediaType === undefined) {
     throw MemoryError.invalidInput(
       'mediaRef 与 mediaType 必须同时给或同时不给（§3：二者同生同死，由库层 CHECK 强制）',
-      { media: { current: mediaRef, reason: 'mediaRef 与 mediaType 必须成对出现' } },
+      { reason: 'media', current: mediaRef },
     );
   }
   if (mediaRef === undefined && mediaType !== undefined) {
     throw MemoryError.invalidInput(
       'mediaRef 与 mediaType 必须同时给或同时不给（§3：二者同生同死，由库层 CHECK 强制）',
-      { media: { current: mediaType, reason: 'mediaRef 与 mediaType 必须成对出现' } },
+      { reason: 'media', current: mediaType },
     );
   }
   if (mediaType !== undefined && !MEDIA_TYPES.includes(mediaType)) {
     throw MemoryError.invalidInput(
       `mediaType 必须是 ${MEDIA_TYPES.join(' / ')} 之一（§3 的 media_type CHECK 约束）`,
-      { mediaType: { current: mediaType, reason: 'not in enum' } },
+      { reason: 'media', current: mediaType },
     );
   }
   const confidence = input.confidence ?? DEFAULT_CONFIDENCE;
   if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
     throw MemoryError.invalidInput('confidence 必须落在 [0, 1]（§3 的 CHECK 约束）', {
-      confidence: { current: input.confidence, reason: 'out of range' },
+      reason: 'confidence',
+      current: input.confidence ?? null,
     });
   }
 }
