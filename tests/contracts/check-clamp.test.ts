@@ -156,6 +156,37 @@ export function intensity(memory: { last_access: number }, now?: number): number
 }
 `;
 
+/**
+ * **`Math.exp` 被提取成中间变量**（等价、合法）⇒ 守卫必须**放行**。
+ *
+ * ⚠️ 这是 **min 侧**的对称缺口（与 `INTERMEDIATE_VARIABLE` 互为镜像）：
+ *   max 侧认得中间变量（`elapsedMs`），min 侧若只认 `Math.exp(` 的**字面**，
+ *   则 `Math.min(1, decay)` 的实参里没有 `exp(` ⇒ **误报**。
+ *   ⇒ 「守卫不误伤好的」这条契约，必须**两侧对称**才成立。
+ */
+const EXP_EXTRACTED = `
+export function intensity(memory: { last_access: number }, now?: number): number {
+  const elapsedMs = Math.max(0, now - memory.last_access);
+  const decay = Math.exp(-elapsedMs / 1000);
+  return Math.min(1, decay);
+}
+`;
+
+/**
+ * ★ **绕过变体 + `Math.exp` 被提取成中间变量** ⇒ 必须判「Δt 下钳没生效」。
+ *
+ * ⚠️ 关键：**判红的理由必须是对的那条**（max 没生效），
+ *   而不是「找不到 exp」这种**顺带**结论（那会把 min 一起误报）。
+ */
+const BYPASS_WITH_EXP_EXTRACTED = `
+export function intensity(memory: { last_access: number }, now?: number): number {
+  const elapsedMs = now - memory.last_access;
+  const unrelated = Math.max(0, 42);
+  const decay = Math.exp(-elapsedMs / 1000);
+  return Math.min(1, decay);
+}
+`;
+
 /** 缺哪一道（返回规格里的 `method`）。 */
 function missingMethods(source: string): string[] {
   return scanClamps(source).missing.map((spec) => spec.method);
@@ -260,6 +291,23 @@ describe('F-08 ③ · check-clamp（intensity() 的两道钳制）', () => {
     const result = scanClamps(INLINE_MAX);
     expect(result.missing).toEqual([]);
     expect(result.unguarded).toEqual([]);
+  });
+
+  it('★ 不误报：`Math.exp` 被提取成中间变量（`const decay = Math.exp(…)`）必须**放行**', () => {
+    // ⚠️ 这是 min 侧的对称缺口：`Math.min(1, decay)` 的实参里**没有** `Math.exp(` 的字面
+    //   ⇒ 只认字面就会**误报** ⇒ max 侧放行、min 侧误杀 ⇒ 契约只兑现了一半
+    const result = scanClamps(EXP_EXTRACTED);
+    expect(result.missing).toEqual([]);
+    expect(result.unguarded).toEqual([]);
+  });
+
+  it('★ 绕过 + `Math.exp` 被提取成中间变量 ⇒ 判「Δt 下钳没生效」，且**不**顺带误报 min', () => {
+    const result = scanClamps(BYPASS_WITH_EXP_EXTRACTED);
+    // ⚠️ 判红的**理由**必须是对的那条：max 没生效
+    expect(result.unguarded.map((spec) => spec.method)).toEqual(['max']);
+    // ⚠️ min 侧此时是**真的**在夹 exp ⇒ 不得被顺带误报
+    expect(result.unguarded.map((spec) => spec.method)).not.toContain('min');
+    expect(result.missing).toEqual([]);
   });
 
   it('C31 自洽：规格表的条数与写死的期望一致（守卫的「分母」不许漂）', () => {
