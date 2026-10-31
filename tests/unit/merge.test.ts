@@ -947,14 +947,18 @@ function auditCandidateSql(sql: string): CandidateSqlVerdict {
 }
 
 /**
- * 从 `write.ts` 里抠出 `FIND_CANDIDATES_SQL` 的模板字面量内容。
+ * 从 `dedupCandidates.ts` 里抠出 `FIND_TEXT_CANDIDATES_SQL` 的模板字面量内容。
  *
  * ⚠️ **必须抠出字面量再判**：直接对整份源码做正则，会被**注释里的话**满足
  *   （例如「不要写 `ORDER BY bm25(mem_fts) ASC`」这句话本身就是那个形状）
  *   ⇒ 断言会永远绿，却什么都没守住。
+ *
+ * ⚠️ **P2-T07 之后这段 SQL 搬了家**（从 `src/store/write.ts` 挪到
+ *   `src/store/dedupCandidates.ts` —— 候选收集与候选判定分家，§14.3 边界原则 1）
+ *   ⇒ 本断言跟着搬（**守卫的对象没变，只是它的位置变了**）。
  */
 function extractCandidateSql(source: string): string {
-  const match = /const\s+FIND_CANDIDATES_SQL\s*=\s*`([\s\S]*?)`;/.exec(source);
+  const match = /const\s+FIND_TEXT_CANDIDATES_SQL\s*=\s*`([\s\S]*?)`;/.exec(source);
   return match?.[1] ?? '';
 }
 
@@ -1015,7 +1019,7 @@ describe('P1-T07 · 步骤 3a 的候选查询口径', () => {
   });
 
   it('★ 静态：候选 SQL 写死 `MATCH` + `bm25 ASC` + `LIMIT 3`，且**不复用** buildMatchQuery', () => {
-    const source = readFileSync(join(SRC_ROOT, 'store', 'write.ts'), 'utf8');
+    const source = readFileSync(join(SRC_ROOT, 'store', 'dedupCandidates.ts'), 'utf8');
 
     const verdict = auditCandidateSql(extractCandidateSql(source));
     // 性质：走 FTS 全文检索
@@ -1032,7 +1036,7 @@ describe('P1-T07 · 步骤 3a 的候选查询口径', () => {
   });
 
   it('★ 负控：把 LIMIT / bm25 排序 / buildMatchQuery 改掉 ⇒ 检查必须报出来', () => {
-    const source = readFileSync(join(SRC_ROOT, 'store', 'write.ts'), 'utf8');
+    const source = readFileSync(join(SRC_ROOT, 'store', 'dedupCandidates.ts'), 'utf8');
     const sql = extractCandidateSql(source);
 
     // ① 候选面放大到 50 ⇒ 必须被抓
