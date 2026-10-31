@@ -28,7 +28,7 @@ import {
   passesIntensityFilter,
 } from '../../src/core/scoring.js';
 import { tokenize } from '../../src/core/tokenize.js';
-import { extractEntityNames, recall } from '../../src/store/recall.js';
+import { recall } from '../../src/store/recall.js';
 import { countRows, createTestStore, readEvents } from '../fixtures/graph-store.js';
 
 /** 固定的「现在」（epoch 毫秒）——**全部时间都从它推导**，不写真死的天数常量。 */
@@ -142,6 +142,60 @@ function snapshotMemories(db: Database.Database): unknown[] {
          FROM memories ORDER BY id`,
     )
     .all();
+}
+
+/**
+ * 截取源码里「某个 SQL 常量的模板字符串」（供源码级的负控用）。
+ *
+ * ⚠️ **为什么按「常量名 + 反引号」精确切片**，而不是正则扫全文：
+ *   注释里也会出现 `SELECT m.*` 这类**举例文本**（设计稿口径的引用），
+ *   用正则扫全文会把**注释**当成 SQL ⇒ 负控变成「恒红」的摆设。
+ *   ⇒ 只取「`const X = \`` 到下一个反引号」之间的那一段模板字面量本身。
+ *
+ * @param source 源码全文
+ * @param name SQL 常量名
+ * @returns 该常量的模板字面量
+ */
+function sqlBlock(source: string, name: string): string {
+  const marker = `const ${name} = \``;
+  const from = source.indexOf(marker);
+  if (from < 0) {
+    throw new Error(`源码里找不到 SQL 常量 ${name}`);
+  }
+  const to = source.indexOf('`;', from);
+  if (to < 0) {
+    throw new Error(`SQL 常量 ${name} 的模板字面量没有闭合`);
+  }
+  return source.slice(from, to);
+}
+
+/**
+ * 取出源码里**全部** SQL 常量的模板字面量（供负控②逐条扫）。
+ *
+ * ⚠️ **为什么按「`const X = \`` 开头逐个切」**：正则扫全文会把**注释里的举例**
+ *   （如「`SELECT m.*` 是伪代码」）也当成 SQL ⇒ 负控变成「恒红」的摆设。
+ *   ⇒ 只认「以 `const ` 开头的常量声明」，且只取它的反引号字面量。
+ *
+ * @param source 源码全文
+ * @returns 全部 SQL 常量的字面量（按源码顺序）
+ */
+function sqlBlocks(source: string): Array<{ name: string; sql: string }> {
+  const blocks: Array<{ name: string; sql: string }> = [];
+  const pattern = /const ([A-Z_0-9]+) = `/g;
+  let matched = pattern.exec(source);
+  while (matched !== null) {
+    const name = matched[1];
+    const to = source.indexOf('`;', matched.index);
+    if (to < 0) {
+      break;
+    }
+    const sql = source.slice(matched.index + matched[0].length, to);
+    if (sql.includes('SELECT')) {
+      blocks.push({ name: name ?? '', sql });
+    }
+    matched = pattern.exec(source);
+  }
+  return blocks;
 }
 
 /**
@@ -836,23 +890,65 @@ describe('P1-T08 · 步骤 1 的实体名**归一**（库不抽取；ADR-P1-T08-
     ).toThrowError(/互斥/);
   });
 
-  it('★ `extractEntityNames` 是**独立**辅助函数（不在流水线里）：能找到上下文里的已知实体名/别名', () => {
+  it('★ 负控①：不给 entityIds 也不给 entityNames ⇒ 图谱路为空，且**实体表根本没被扫**', () => {
     const { db, store } = createTestStore();
+    // ⚠️ **把实体表塞满**：库里有一大堆「名字出现在上下文里」的实体 ——
+    //   若实现里还留着「扫全表找名字」的路径，它就会把它们捞出来 ⇒ 图谱路会跑起来。
+    for (let index = 0; index < 200; index += 1) {
+      seedEntity(db, `e-bulk-${index}`, `批量实体${index}`);
+    }
     seedEntity(db, 'e-zhang', '张三');
-    db.prepare('INSERT INTO entity_aliases (alias, entity_id) VALUES (?, ?)').run(
-      '老张',
-      'e-zhang',
+    seedMemory(db, { id: 'm-zhang', content: '张三住在北京' });
+    linkEntity(db, 'm-zhang', 'e-zhang');
+
+    const before = countRows(db, 'entities');
+    const result = recall(store, { context: '张三住在哪里', topN: 8, explain: true, now: NOW });
+
+    // 性质：图谱路为空（调用方没点名 ⇒ 库里有多少实体都不相干）。
+    expect(result.explain?.routes.graph.ran).toBe(false);
+    expect(result.explain?.routes.graph.candidates).toBe(0);
+    // 性质：实体表**没被写**（查询路径禁止写库）。
+    expect(countRows(db, 'entities')).toBe(before);
+    // 性质：文本路照常。
+    expect(result.explain?.routes.text.ran).toBe(true);
+    const hit = result.hits.find((item) => item.id === 'm-zhang');
+    expect(hit?.fromText).toBe(true);
+    expect(hit?.fromGraph).toBe(false);
+
+    // ★ **负控①的另一半**：流水线的 SQL 里**根本没有实体表**（连「扫」的代码都不存在）。
+    //   ⇒ 这一条断言把「库内抽取」这条路径**从源码层面钉死**：
+    //   谁再加回 `SELECT ... FROM entities` 扫全表，这条立刻变红。
+    const source = readFileSync(
+      fileURLToPath(new URL('../../src/store/recall.ts', import.meta.url)),
+      'utf8',
+    );
+    expect(source).not.toContain('FROM entities');
+    expect(source).not.toContain('entity_aliases');
+    expect(source).not.toContain('instr(');
+  });
+
+  it('★ 负控②：**全部** SQL 常量里没有一条在扫实体表抽名字', () => {
+    const source = readFileSync(
+      fileURLToPath(new URL('../../src/store/recall.ts', import.meta.url)),
+      'utf8',
     );
 
-    // 性质：辅助函数能找到上下文里的**主名**与**别名**（只认库里已有的名字）。
-    expect(extractEntityNames(db, '张三住在哪里')).toContain('张三');
-    expect(extractEntityNames(db, '老张住在哪里')).toContain('老张');
-    expect(extractEntityNames(db, '查无此人')).toHaveLength(0);
+    const blocks = sqlBlocks(source);
+    // 前置：确实扫到了 SQL 常量（否则下面的循环是**空判** = 没有守卫）。
+    expect(blocks.length).toBeGreaterThan(0);
 
-    // ★ 关键性质：**它不在流水线里** —— 调用方即使不把结果塞进 `entityNames`，
-    //   召回也**不会**因为「上下文里有已知实体名」而跑起图谱路。
-    const result = recall(store, { context: '张三住在哪里', topN: 8, explain: true, now: NOW });
-    expect(result.explain?.routes.graph.ran).toBe(false);
+    for (const block of blocks) {
+      // ⚠️ 负控：任何一条 SQL 同时出现「实体表」与「子串匹配」⇒ 它就是在**扫全表找名字**
+      //   ⇒ 库内抽取复活 ⇒ 这条变红。
+      const touchesEntityTable =
+        block.sql.includes('FROM entities') || block.sql.includes('FROM entity_aliases');
+      const doesSubstringMatch = block.sql.includes('instr(');
+      expect({ name: block.name, touchesEntityTable, doesSubstringMatch }).toEqual({
+        name: block.name,
+        touchesEntityTable: false,
+        doesSubstringMatch: false,
+      });
+    }
   });
 });
 
@@ -992,6 +1088,72 @@ describe('P1-T08 · 步骤 4 的事件与诊断（§4.6 步骤 4 / §8.4）', ()
     // 性质：`hitIds` 与 `scores` 一一对应且与返回结果一致。
     expect(payload.hitIds).toEqual(result.hits.map((hit) => hit.id));
     expect(payload.scores).toEqual(result.hits.map((hit) => hit.score));
+  });
+
+  it('★ 负控③：三个 `from*` 标记与**实际来源**一致；向量路缺席时 `fromVector` 恒 false', () => {
+    const { db, store } = createTestStore();
+    seedEntity(db, 'e-zhang', '张三');
+    // `m-text`：**只**被文本路命中（内容含「张三」，但不挂实体）。
+    seedMemory(db, { id: 'm-text', content: '张三住在北京' });
+    // `m-both`：被文本路**与**图谱路同时命中（挂了上下文实体）。
+    seedMemory(db, { id: 'm-both', content: '张三喜欢猫' });
+    linkEntity(db, 'm-both', 'e-zhang');
+
+    const result = recall(store, {
+      context: '张三住哪里',
+      entityNames: ['张三'],
+      topN: 8,
+      explain: true,
+      now: NOW,
+    });
+
+    const textOnly = result.hits.find((hit) => hit.id === 'm-text');
+    const both = result.hits.find((hit) => hit.id === 'm-both');
+    expect(textOnly).toBeDefined();
+    expect(both).toBeDefined();
+
+    // 性质：标记**逐条**与来源一致。
+    expect(textOnly?.fromText).toBe(true);
+    expect(textOnly?.fromGraph).toBe(false);
+    expect(both?.fromText).toBe(true);
+    expect(both?.fromGraph).toBe(true);
+
+    for (const hit of result.hits) {
+      // 性质：**至少一个**为 true（能进候选集必然来自某一路）。
+      expect(hit.fromText || hit.fromVector || hit.fromGraph).toBe(true);
+      // ⚠️ 负控：本阶段向量路**整路缺席** ⇒ `fromVector` 恒 `false`
+      //   （**不是**「进了向量路但向量分为 0」那种降级 —— 两者语义完全不同）。
+      expect(hit.fromVector).toBe(false);
+      // ⚠️ 负控：`from*` **不参与任何计算** ⇒ 把 `fromGraph` 当成 `graphProximity`
+      //   的判据（§4.6 步骤 3：那是按**实体交集**现算的）⇒ `m-text` 的 graphPart 会错。
+      expect(textOnly?.breakdown?.graphPart).toBe(0);
+    }
+  });
+
+  it('★ 负控④：三条路的查询都**显式列名**，且**不含 embedding**', () => {
+    const source = readFileSync(
+      fileURLToPath(new URL('../../src/store/recall.ts', import.meta.url)),
+      'utf8',
+    );
+
+    for (const name of ['TEXT_FTS_SQL', 'TEXT_LIKE_SQL', 'GRAPH_SQL']) {
+      const sql = sqlBlock(source, name);
+      expect(sql).toContain('SELECT');
+      // ⚠️ 负控：写 `m.*` ⇒ `embedding`（768×4 = 3KB/行）会被搬进 JS 侧
+      //   （100 行/路 ⇒ ≈300KB/路/次，三路近 1MB/次），而召回链路里没有一处需要向量本身。
+      expect(sql).not.toMatch(/m\.\*/);
+      expect(sql).not.toContain('embedding');
+    }
+
+    // 运行时：命中记录里**没有向量字段**（§6 的 `MemoryView` 只给 `hasEmbedding` 布尔）。
+    const { db, store } = createTestStore();
+    seedMemory(db, { id: 'm1', content: '张三住在北京' });
+    const result = recall(store, { context: '张三住哪里', topN: 8, explain: true, now: NOW });
+    const hit = result.hits[0];
+    expect(hit).toBeDefined();
+    expect(Object.keys(hit ?? {})).not.toContain('embedding');
+    expect(Object.keys(hit ?? {})).not.toContain('vector');
+    expect(hit?.hasEmbedding).toBe(false);
   });
 
   it('★ vectorUsed 恒带该键且本阶段恒为 false（向量路整路缺席）', () => {

@@ -32,7 +32,7 @@
  */
 
 import { resolveNow } from './clock.js';
-import { MS_PER_DAY, effectiveStability } from './decay.js';
+import { MS_PER_DAY, archiveSpanFactor, effectiveStability } from './decay.js';
 import { MemoryError } from './errors.js';
 import type { Params } from './params.js';
 
@@ -768,7 +768,12 @@ export function coarseGateWindow(
     pin_factor: params.MAX_PIN_FACTOR,
     last_access: 0,
   });
-  const archiveSpanDays = Math.log(1 / params.ARCHIVE_LINE);
+  // ⚠️ **归档跨度不自己算**（C36：同一件事不得有两套公式）：
+  //   `ln(1 / ARCHIVE_LINE)` 的唯一权威是 `decay.ts` 的 `archiveSpanFactor()`
+  //   （`archiveAt()` 与本函数是同一公式的正反两面）⇒ 这里直接调用，不重写一遍。
+  //   ⚠️ 历史上这个式子有三份副本（decay.ts / db/migrate.ts / 本文件）
+  //   ⇒ 改一处不改另一处 ⇒ 粗筛窗口与归档时刻差一截，**且不报错**。
+  const archiveSpanDays = archiveSpanFactor(params.ARCHIVE_LINE);
 
   return {
     enabled: true,

@@ -115,7 +115,7 @@
 | 3 | `MS_PER_DAY` 定义下沉 + F-08 ③ 静态守卫（`scripts/check-clamp.ts`） | 工程师-3 | `decay.ts` `util/time.ts` `log.ts` `package.json` | 进行中 |
 | 4 | P1-T09 基线等价验收 | QA | `tests/baseline/ref-v1.ts` `v1-equivalence.test.ts`（新） | 进行中 |
 | 5 | ADR-P1-T07-DEC 的 D-3 改写 + `ALIAS_TARGET_NOT_LINKED` 三处同步 + `MS_PER_DAY` 分层裁决 | 架构师 | `docs/design/**` `scripts/check-contract-ids.ts` | 进行中 |
-| — | `extractEntityNames` 纳入导出面 | 工程师（线A） | `src/index.ts` | 进行中 |
+| — | `extractEntityNames` 纳入导出面 | 工程师（线A） | `src/index.ts` | **已撤回**（ADR-P1-T07-DEC D-1：阶段 1 不实现；导出面已撤回，原文保留见 `docs/design/adr-p1-t07-decisions.md`） |
 
 ---
 

@@ -87,6 +87,12 @@
 也**不需要**动 `src/core/errors.ts` 的方法级语义表（`recall` 不是 `NOT_FOUND`/`CONFLICT` 类方法）。
 
 **C-1.3（software-engineer-5，二选一，我推荐 A）**
+
+> ⚠️ **本条已被 `ADR-P1-T07-DEC` 的 D-1 取代（阶段 1 不实现）**：C-1.3 只是「二选一、推荐 A」的**建议**，不是裁决；
+> 主理人最终定案为 **B（直接删除）** —— `extractEntityNames` **不在阶段 1 实现**，
+> 也不进入 `src/index.ts` 导出面。以下原文保留为历史记录，**不据此实现**。
+> 权威依据：`DESIGN-v2.md` §4.6 步骤 1 正文（1185 行），见 `docs/design/adr-p1-t07-decisions.md` 的 D-1。
+
 - **A（推荐）**：把 `extractContextEntityNames` + `CONTEXT_ENTITY_NAMES_SQL` 改造成**独立的公开辅助函数**
   `extractEntityNames(db, context): string[]`（导出到 `src/index.ts`），
   文档写明：① **不在召回流水线内**；② 成本 = 每次调用 **O(#实体 + #别名) 行扫描**；
