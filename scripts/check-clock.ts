@@ -25,6 +25,10 @@ import { join, relative, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { CLOCK_EXEMPT_METHODS } from '../src/core/clock.js';
+import { extractSection, readDesignDoc } from './lib/design-doc.js';
+
+/** §11.1 的标题（**逐字**）。 */
+const SECTION_11_1_HEADING = '### 11.1 时钟注入机制（Testing & Simulation）';
 
 /**
  * ★ **写死的期望值**（C31）：允许读真实时钟的文件白名单。
@@ -537,6 +541,59 @@ export function evaluateExpectations(result: ClockScanResult): string[] {
   return failures;
 }
 
+/**
+ * ★ **§11.1 的豁免清单 ↔ 代码清单的双向比对**（v2.1 / P2 QA 第二轮 F2 修正）。
+ *
+ * ⚠️ **为什么必须补这条**（「门禁只做了一半」的典型盲区）：
+ *   §11.1 是 C37 的**权威清单**（「不接收 `now` 的方法必须在本表显式列出并写明理由」
+ *   ⇒ 设计稿写着「**本节已列全**」）。
+ *   ⇒ 但此前 `check-clock.ts` **只扫代码**（谁读了 `Date.now()`）⇒
+ *   ⇒ **设计稿那一侧零比对** ⇒ 把 §11.1 的清单改错（漏一个 / 多一个 / 换成别的名字）
+ *   ⇒ **三门全绿**（QA 实测：§11.1 换成 `qaBogus` ⇒ check:clock / check:contract-ids /
+ *     clock.test.ts **全部绿**）。
+ *   ⇒ ⇒ 后果：C37 的「**本表已列全**」这句话**无人守** ⇒ 文档级契约可被无声破坏。
+ *
+ * ⇒ 本函数做**双向**比对：§11.1 列出的每个方法 ⇒ 代码里必须存在；
+ *   代码里的每个豁免方法 ⇒ §11.1 必须列出。
+ *
+ * @param designMarkdown 设计稿全文
+ * @returns 每一处差异（空数组 = 一致）
+ */
+export function compareClockExemptLists(designMarkdown: string): string[] {
+  const diffs: string[] = [];
+  const section = extractSection(designMarkdown, SECTION_11_1_HEADING);
+  // ⚠️ 清单出现在「（本节已列全：`a` / `b` / `c`）」这一句里。
+  //   ⇒ **只取「本节已列全：」之后、到「——」或「）」之前**的那一段
+  //   （理由写在「——」之后 ⇒ 不能把它当成方法名 ⇒ 否则会把理由里的
+  //   `updated_at` 之类也当成方法名 ⇒ 误报）。
+  const listedMatch = /本节已列全[：:]([^）]*)/u.exec(section);
+  if (listedMatch === null) {
+    diffs.push('§11.1 里找不到「本节已列全：…」那句 ⇒ 权威清单无法解析');
+    return diffs;
+  }
+  const listPart = (listedMatch[1] ?? '').split('——')[0] ?? '';
+  const docNames = [
+    ...new Set(
+      [...listPart.matchAll(/`([A-Za-z_][A-Za-z0-9_]*)`/g)].map((match) => match[1] ?? ''),
+    ),
+  ]
+    .filter((name) => name !== '')
+    .sort();
+  const codeNames = Object.keys(CLOCK_EXEMPT_METHODS).sort();
+
+  for (const name of docNames) {
+    if (!codeNames.includes(name)) {
+      diffs.push(`§11.1 列了 \`${name}\`，但代码的 CLOCK_EXEMPT_METHODS 里没有它`);
+    }
+  }
+  for (const name of codeNames) {
+    if (!docNames.includes(name)) {
+      diffs.push(`代码的 CLOCK_EXEMPT_METHODS 里有 \`${name}\`，但 §11.1 的清单里没列`);
+    }
+  }
+  return diffs;
+}
+
 /** 主流程：扫描并按写死的期望值校验。 */
 function main(): void {
   const rootIndex = process.argv.indexOf('--root');
@@ -557,6 +614,17 @@ function main(): void {
   }
 
   let failed = false;
+
+  // ⚠️ **F2**：§11.1 的权威清单 ↔ 代码清单**双向**比对（设计稿那一侧此前无人守）
+  const exemptDiffs = compareClockExemptLists(readDesignDoc());
+  if (exemptDiffs.length > 0) {
+    failed = true;
+    process.stderr.write(`\n✗ §11.1 的豁免清单与代码不一致（${exemptDiffs.length} 处）：\n`);
+    for (const reason of exemptDiffs) {
+      process.stderr.write(`    ${reason}\n`);
+    }
+    process.stderr.write('  ⇒ §11.1 是 C37 的权威清单（「本节已列全」）⇒ 两边必须逐名一致。\n');
+  }
 
   if (result.violations.length > 0) {
     failed = true;

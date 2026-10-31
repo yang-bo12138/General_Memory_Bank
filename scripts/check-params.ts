@@ -30,9 +30,26 @@ import {
 const SECTION_5_HEADING = '## 5. 参数表（集中配置）';
 
 /** 从 §5 的两张表里解析出「参数名 → 默认值」。 */
-export function parseSection5Params(markdown: string): Map<string, DefaultValue> {
+/**
+ * §5 参数表 → 参数名 → 默认值，**外加「解析不出来」的名单**。
+ *
+ * ⚠️⚠️ **v2.1（P2 QA 第二轮 F1 修正）——「静默跳过」是这里最危险的写法**：
+ *   原实现遇到 `parseDefaultCell` 返回 `undefined` 就 `continue` ⇒
+ *   ⇒ **整行被静默跳过** ⇒ 而 §5 是参数的**权威表**（G26 原话）
+ *   ⇒ ⇒ 「设计稿承诺了、代码没做」这一整类在 §5 上**隐形**
+ *   ⇒   （QA 实测：§5 加一行默认值 `1e-8` ⇒ `check:params` / `check:doc-counts` / 单测 **全绿**）
+ *   ⇒ ⇒ 而且这个盲区是**单向的**（代码加键 ⇒ 红；§5 加行 ⇒ 可能绿）⇒ 最坏的那种。
+ *   ⇒ ⇒ 现在：**解析不出来的参数名进 `unparsed` 名单** ⇒ 由 `check:params` **显式报错**。
+ *   ⇒   （第一道防线是 `parseDefaultCell` 认得更多写法；第二道防线是这份名单 ⇒ 双保险。）
+ */
+export function parseSection5ParamsWithUnparsed(markdown: string): {
+  params: Map<string, DefaultValue>;
+  /** 认不出来的参数名（默认值那格无法解析）⇒ **必须**报出来，不许静默跳过。 */
+  unparsed: string[];
+} {
   const section = extractSection(markdown, SECTION_5_HEADING);
   const result = new Map<string, DefaultValue>();
+  const unparsed: string[] = [];
 
   for (const row of parseAllTableRows(section)) {
     {
@@ -50,13 +67,20 @@ export function parseSection5Params(markdown: string): Map<string, DefaultValue>
       }
       const value = parseDefaultCell(defaultCell);
       if (value === undefined) {
+        // ⚠️ **不静默跳过** ⇒ 记下来 ⇒ 由门禁报错。
+        unparsed.push(`${name}（默认值那格写的是「${defaultCell.trim()}」）`);
         continue;
       }
       result.set(name, value);
     }
   }
 
-  return result;
+  return { params: result, unparsed };
+}
+
+/** §5 参数表 → 参数名 → 默认值（**只取能解析出来的**；解析不出来的见 `parseSection5ParamsWithUnparsed`）。 */
+export function parseSection5Params(markdown: string): Map<string, DefaultValue> {
+  return parseSection5ParamsWithUnparsed(markdown).params;
 }
 
 /** 一处差异。 */
@@ -117,12 +141,30 @@ export function compareParams(
 /** 主流程。 */
 function main(): void {
   const markdown = readDesignDoc();
-  const docParams = parseSection5Params(markdown);
+  const { params: docParams, unparsed } = parseSection5ParamsWithUnparsed(markdown);
   const codeParams = DEFAULT_PARAMS as unknown as Record<string, DefaultValue>;
 
   process.stdout.write('G26 · §5 表 ↔ DEFAULT_PARAMS 逐键逐值比对\n');
   process.stdout.write(`  §5 解析出的参数条数：${docParams.size}\n`);
   process.stdout.write(`  DEFAULT_PARAMS 的键数：${PARAM_KEYS.length}\n`);
+
+  // ⚠️⚠️ **F1 的第二道防线**：§5 里有**认不出来的默认值写法** ⇒ **必须报红**。
+  //   （第一道防线：`parseDefaultCell` 认得更多写法 ⇒ 常见的写法正常参与比对。
+  //     第二道防线：这一条 ⇒ 将来出现新写法时，**绝不静默跳过整行**。）
+  if (unparsed.length > 0) {
+    process.stderr.write(
+      `\n✗ §5 表里有 ${unparsed.length} 个参数的默认值**无法解析**（不许静默跳过）：\n`,
+    );
+    for (const item of unparsed) {
+      process.stderr.write(`    ${item}\n`);
+    }
+    process.stderr.write(
+      '  ⇒ 这些参数**没有参与**逐键逐值比对 ⇒ 门禁对它们**完全失明**。\n' +
+        '  ⇒ 请把默认值写成可解析的形式（字符串用单引号 / true / false / 数字 / 科学计数法），\n' +
+        '  ⇒ 或在 `scripts/lib/design-doc.ts` 的 `parseDefaultCell` 里补上该写法的解析。\n',
+    );
+    process.exit(1);
+  }
 
   const diffs = compareParams(docParams, codeParams);
 
