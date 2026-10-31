@@ -188,11 +188,16 @@ describe('intensity（§4.1）', () => {
     expect(intensity(negativeTauWithElapsed, elapsedMs)).toBe(1);
   });
 
-  it('★ QA 最小探针 2：τ < 0 **且** Δt < 0 ⇒ intensity 仍是有限值且 ∈ (0, 1]', () => {
+  it('★ 反例：漏掉 `max(0, Δt)` ⇒ τ<0 且 Δt<0 时会算出 exp(负数) ≈ 0.368（钳制必须真的在起作用）', () => {
     // ⚠️ 上一条只覆盖了「τ<0 且 Δt=0」与「τ<0 且 Δt>0」两格；
     //   这里补上**两个都为负**的那一格（now 早于 last_access ⇒ 时钟回拨）。
-    const negativeTau = memory({ stability: -1, pin_factor: 1, last_access: 1000 });
-    const nowInThePast = 0; // Δt = 0 - 1000 = -1000 < 0
+    //
+    // ⚠️ **必须用越界输入（τ<0）是故意的**：生产域里 `stability` 恒 ≥ 0，
+    //   而在生产域内两道钳制**互为冗余** ⇒ 根本不存在能区分它们的输入
+    //   ⇒ 越界输入是这条探针的**必要条件**，不是「不严谨的取值」。
+    //   （推导来自 engineer 的转交；数值取 1 天 ⇒ 负控值恰好是 exp(-1) ≈ 0.36787944117144233。）
+    const negativeTau = memory({ stability: -1, pin_factor: 1, last_access: days(1) });
+    const nowInThePast = 0; // Δt = 0 - 1 天 = -1 天 < 0
 
     const value = intensity(negativeTau, nowInThePast);
 
@@ -204,10 +209,11 @@ describe('intensity（§4.1）', () => {
     // ⚠️ 手算闭合：Δt 被 `max(0, ·)` 钳到 0 ⇒ -0 / (-1 天) = 0 ⇒ exp(0) = 1 ⇒ min(1, 1) = 1
     expect(value).toBe(1);
 
-    // ★ 负控：若「Δt 下钳」被删 ⇒ Δt = -1000 ⇒ -Δt/τ = 1000 / (-86400000) < 0
-    //   ⇒ exp(负数) < 1 ⇒ 值**不是** 1 ⇒ 上面那条 `toBe(1)` 会失败
-    //   （这一格能分辨「下钳在不在」，而 τ<0 且 Δt=0 那格分辨不了 ⇒ 这就是它的价值）
+    // ★ 负控：若「Δt 下钳」被删 ⇒ Δt = -1 天 ⇒ -Δt/τ = -(-1 天) / (-1 天) = -1
+    //   ⇒ exp(-1) ≈ 0.36787944117144233 ⇒ **不是** 1（且 `min(1, ·)` 夹不住它 —— 它在 1 以下）
+    //   ⇒ 上面那条 `toBe(1)` 会失败 ⇒ 这条断言对「下钳在不在」有分辨力。
     const withoutDeltaClamp = Math.exp(-(nowInThePast - negativeTau.last_access) / days(-1));
+    expect(withoutDeltaClamp).toBeCloseTo(Math.exp(-1), 12);
     expect(withoutDeltaClamp).not.toBe(1);
     expect(withoutDeltaClamp).toBeLessThan(1);
   });
