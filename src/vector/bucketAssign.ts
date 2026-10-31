@@ -36,6 +36,16 @@
  * ⚠️ **表名不外泄**：本模块是 `vector_cell_members` 的**唯一写入点**；
  *   读取点只有两处 —— 本模块（计数 / 归属查询）与 `src/vector/ivf.ts`（桶内检索）
  *   ⇒ 流水线永远不引用表名（§4.6 步骤 2c）。
+ *
+ * ⚠️ **T05 的硬前置（本模块的依赖，不是本模块的活）**：
+ *   §4.15.5 要求「重训 + 重分配桶归属」**必须同事务**
+ *   ⇒ 而 `src/vector/centroids.ts` 的 `saveCentroidModel()` **自己开事务**
+ *     （`db.transaction(...)`）⇒ better-sqlite3 的事务**不能嵌套**
+ *     ⇒ 它**放不进**调用方的事务 ⇒ 「重训 + 重分配同事务」当前**做不到**。
+ *   ⇒ 而做不到的后果是 F8：**重训会经 `ON DELETE CASCADE` 清空全库桶归属**
+ *     ⇒ 向量路候选集瞬间为空、**且不报错**。
+ *   ⇒ **T05 开始前必须先把 `saveCentroidModel` 改成事务透明**（自己不开事务，由调用方开）。
+ *   ⇒ 本模块**不依赖** `saveCentroidModel`（它只读中心模型）⇒ 改那处不影响本模块。
  */
 
 import type Database from 'better-sqlite3';
@@ -261,6 +271,154 @@ function readMembership(db: Database.Database, memoryId: string): string | null 
     .prepare('SELECT fine_id FROM vector_cell_members WHERE memory_id = ?')
     .get(memoryId) as { fine_id: string } | undefined;
   return row?.fine_id ?? null;
+}
+
+// ─────────────────────────── 集合相等口径（§9.3.2 ③） ───────────────────────────
+
+/**
+ * 桶归属与活记忆的**集合差异**（§9.3.2 ③ 的对账口径）。
+ *
+ * ⚠️ **四条判据各抓一类问题**（§9.3.2 ③ 末）：
+ *   ① `missing`（库侧有向量、桶侧无归属）⇒ 抓「**少**」；
+ *   ② `orphans`（桶侧有归属、记忆行已不存在）⇒ 抓「**脏行**」；
+ *   ③ `vectorless`（桶侧有归属、记忆已无向量）⇒ 抓「**脏行**」；
+ *   ④ `duplicates`（一条记忆挂了多个桶）⇒ 抓「**多**」。
+ *   ⇒ **只做 ①是不够的**：只做 ① 会漏「多」与「脏行」；
+ *     而 ④ 是**唯一索引**（`idx_vcm_memory_unique`）从**源头**堵住的那一类
+ *     （索引挡得住「写进去」，挡不住「历史脏数据」）。
+ */
+export interface BucketMembershipDiff {
+  /**
+   * 库侧有向量（且未软删）、桶侧**无归属** ⇒ **该补**（§9.3.2 ③ 的「库侧有、桶侧无」）。
+   *
+   * ⚠️ **库侧口径是「全库」扫描**（ADR-P1-T07-DEC D-12）：
+   *   `SELECT id FROM memories WHERE embedding IS NOT NULL AND deleted = 0`
+   *   ⇒ **不是**「本次写入的批次」——若只取本批次，这项就退化成
+   *   「本批写的东西都进桶了」⇒ **恰好放不过阶段 1 遗留的欠账**
+   *   （有向量、无桶归属的旧记忆）⇒ 阶段 2 什么都没写也会**假绿**。
+   */
+  missing: string[];
+  /**
+   * 桶侧有归属、但 **JOIN 不到 `memories` 行** ⇒ **真孤儿** ⇒ **该删**（§9.3.2 ③ 三分支之一）。
+   *
+   * ⚠️ **桶侧必须用 LEFT JOIN**（§9.3.2 ③）：用 INNER JOIN 的话真孤儿会被一并放过
+   *   ⇒ 对账永远「通过」⇒ 孤儿永久滞留。
+   */
+  orphans: string[];
+  /**
+   * 桶侧有归属、但记忆是**软删**（`deleted = 1`）⇒ **跳过，不删**（§9.3.2 ②/③）。
+   *
+   * ⚠️ **一刀切删掉就是永久漏召**：软删记忆仍可 `restore`（§8.2 也要求软删保留向量）
+   *   ⇒ 桶行被删 ⇒ `restore()` 回来后那条记忆**永久进不了向量路**
+   *   ⇒ 静默、永久、不报错——正是本库反复强调的「唯一的静默失效点」。
+   */
+  softDeleted: string[];
+  /**
+   * 桶侧有归属、但记忆的向量已置 `NULL` ⇒ **该删**（§9.3.2 ③ 三分支的第三支）。
+   *
+   * ⚠️ 无向量的记忆**不该在桶里**：它占着桶的成员名额 ⇒ 桶计数偏大
+   *   ⇒ `p95BucketSize` / `maxBucketSize` / 兜底切分判定量**全部偏**。
+   */
+  vectorless: string[];
+  /**
+   * 一条记忆挂了**多于一个**桶 ⇒ 重复归属（§9.3.2 ③ 的判据 ②）。
+   *
+   * ⚠️ **集合比较单独用看不见它**：对账的键是 `memory_id`
+   *   ⇒ 一条记忆同时挂两个桶时，它在**两侧都出现** ⇒ 双向差集**查不出它**
+   *   ⇒ 必须另配 `COUNT(*) == COUNT(DISTINCT memory_id)`（本项就是那个判据）。
+   */
+  duplicates: string[];
+}
+
+/**
+ * 算「桶归属 ↔ 活记忆」的**集合差异**（§9.3.2 ③ 的对账口径）。
+ *
+ * ⚠️ **两侧各取 id 集合，绝不用 COUNT 比条数**：
+ *   条数相同但**成员不同**（一条漏了、另一条多了）完全可能
+ *   ⇒ 「条数对得上」会让人以为对账通过 ⇒ 漏召永久存在且无人发现。
+ *
+ * ⚠️ **本函数只算差异，不改库**（对账的「补 / 删」是调用方的事）
+ *   ⇒ 启动对账（§9.3.2 ③）与本轮的硬断言**共用这一个口径**（C36：同一件事两套实现必然漂移）。
+ *
+ * @param db 库句柄
+ * @returns 集合差异（四类）
+ */
+export function diffBucketMembership(db: Database.Database): BucketMembershipDiff {
+  // ⚠️ **库侧：全库扫描**（ADR-P1-T07-DEC D-12）。
+  //   ⚠️ **列名是 `id`，不是 `memory_id`**：`memories` 的主键叫 `id`
+  //   ⇒ 抄成 `SELECT memory_id FROM memories` 会直接 SQL 报错。
+  const liveRows = db
+    .prepare('SELECT id FROM memories WHERE embedding IS NOT NULL AND deleted = 0')
+    .all() as Array<{ id: string }>;
+
+  // ⚠️ **桶侧：LEFT JOIN**（不丢硬删孤儿，§9.3.2 ③）。
+  const bucketRows = db
+    .prepare(
+      'SELECT vcm.memory_id AS memoryId, m.id AS foundId, m.deleted AS deleted, ' +
+        'm.embedding AS embedding ' +
+        'FROM vector_cell_members vcm LEFT JOIN memories m ON m.id = vcm.memory_id',
+    )
+    .all() as Array<{
+    memoryId: string;
+    foundId: string | null;
+    deleted: number | null;
+    embedding: Buffer | null;
+  }>;
+
+  // ⚠️ **判据 ②：COUNT(*) == COUNT(DISTINCT memory_id)**（抓「多」）。
+  const duplicateRows = db
+    .prepare('SELECT memory_id FROM vector_cell_members GROUP BY memory_id HAVING COUNT(*) > 1')
+    .all() as Array<{ memory_id: string }>;
+
+  const bucketIds = new Set(bucketRows.map((row) => row.memoryId));
+  const missing = liveRows.map((row) => row.id).filter((id) => !bucketIds.has(id));
+
+  const orphans: string[] = [];
+  const softDeleted: string[] = [];
+  const vectorless: string[] = [];
+  for (const row of bucketRows) {
+    if (row.foundId === null) {
+      // ⚠️ JOIN 不到 `memories` 行 ⇒ **真孤儿**（硬删且 FK 未开）⇒ 该删。
+      orphans.push(row.memoryId);
+      continue;
+    }
+    if (row.deleted === 1) {
+      // ⚠️ **软删 ⇒ 跳过，不删**（§9.3.2 ②：软删不删桶归属）。
+      softDeleted.push(row.memoryId);
+      continue;
+    }
+    if (row.embedding === null) {
+      // ⚠️ 无向量却还占着桶 ⇒ 该摘掉（§9.3.2 ③ 第三支）。
+      vectorless.push(row.memoryId);
+    }
+  }
+
+  return {
+    missing,
+    orphans,
+    softDeleted,
+    vectorless,
+    duplicates: duplicateRows.map((row) => row.memory_id),
+  };
+}
+
+/**
+ * 判断桶归属与活记忆**是否一致**（§9.3.2 ③ 的「集合相等」口径）。
+ *
+ * ⚠️ **软删的记忆不算「不一致」**（§9.3.2 ②：软删保留桶归属）
+ *   ⇒ `softDeleted` 里有东西**是正常的**。
+ * ⚠️ **其余四类任一非空 ⇒ 不一致**（少 / 脏行 / 多）。
+ *
+ * @param diff `diffBucketMembership()` 的结果
+ * @returns 是否一致
+ */
+export function isBucketMembershipConsistent(diff: BucketMembershipDiff): boolean {
+  return (
+    diff.missing.length === 0 &&
+    diff.orphans.length === 0 &&
+    diff.vectorless.length === 0 &&
+    diff.duplicates.length === 0
+  );
 }
 
 /**

@@ -55,6 +55,8 @@ import { MemoryLogger } from '../../src/util/log.js';
  *   而**不是**悄悄跟着换口径（那会让基线「静默地不再是基线」）。
  */
 import { MS_PER_DAY } from '../../src/util/time.js';
+import type { BucketAssignContext } from '../../src/vector/bucketAssign.js';
+import { createUntrainedBucketContext } from '../fixtures/bucket-store.js';
 import {
   REF_FORMULAS,
   REF_MS_PER_DAY,
@@ -374,13 +376,30 @@ interface RealRun {
 /** 建一个全新的内存库 + store 上下文。 */
 function createWorld(): {
   db: Database.Database;
-  store: { db: Database.Database; params: Params; events: EventWriter; logger: MemoryLogger };
+  store: {
+    db: Database.Database;
+    params: Params;
+    events: EventWriter;
+    logger: MemoryLogger;
+    buckets: BucketAssignContext;
+  };
 } {
   const db = new Database(':memory:');
   createSchema(db);
   const logger = new MemoryLogger();
   const events = new EventWriter(db, { readonly: false, logger, now: () => 0 });
-  return { db, store: { db, params: BASELINE_PARAMS, events, logger } };
+  // ⚠️ `buckets` 是桶归属上下文（§9.3.0 的唯一写入点）：这里给「**尚未训练**」的
+  //   ⇒ 写入路径不会落桶归属 ⇒ v1 / v2 的等价性比对不受影响（v1 根本没有桶表）。
+  return {
+    db,
+    store: {
+      db,
+      params: BASELINE_PARAMS,
+      events,
+      logger,
+      buckets: createUntrainedBucketContext(db),
+    },
+  };
 }
 
 /** 读全部事件（按落库顺序）。 */

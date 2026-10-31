@@ -20,7 +20,9 @@ import { normalize } from '../../src/core/tokenize.js';
 import { blobToVector } from '../../src/store/merge.js';
 import { type WriteStore, write } from '../../src/store/write.js';
 import { MemoryLogger } from '../../src/util/log.js';
+import { createUntrainedBucketContext } from '../fixtures/bucket-store.js';
 import { countRows, createTestStore, readEvents } from '../fixtures/graph-store.js';
+import { findMembershipWriteSites, stripCommentLines } from '../helpers/bucketWriteScan.js';
 
 /** 测试用的库句柄类型（内存 SQLite）。 */
 type TestDb = ReturnType<typeof createTestStore>['db'];
@@ -30,9 +32,18 @@ function createWriteContext(): {
   db: TestDb;
   store: WriteStore;
   params: ReturnType<typeof createTestStore>['params'];
+  logger: MemoryLogger;
 } {
   const { db, store, params } = createTestStore();
-  return { db, store: { ...store, logger: new MemoryLogger() }, params };
+  const logger = new MemoryLogger();
+  return {
+    db,
+    // ⚠️ `buckets` 是桶归属上下文（§9.3.0 的唯一写入点）：这里给「**尚未训练**」的
+    //   ⇒ 写入路径不会落桶归属（对应「分桶尚未训练 ⇒ 向量路整体缺席」）。
+    store: { ...store, logger, buckets: createUntrainedBucketContext(db) },
+    params,
+    logger,
+  };
 }
 
 /** 造一个单位向量（第 `index` 个分量为 1）。 */
@@ -698,51 +709,77 @@ describe('P1-T07 · 唯一合并写入点（§9.3.0.1）', () => {
 });
 
 // ─────────────────────────────────────────────────────────────
-// 阶段 1 的桶归属豁免（ADR《P1 冲突裁决》冲突 7 的裁决）
+// P2-T03-b · 桶归属纪律（**取代** P1-T07 的「阶段 1 不入桶」豁免）
 // ─────────────────────────────────────────────────────────────
 
 /**
- * P1-T07 · 阶段 1 **不入桶**。
+ * P2-T03-b · 桶归属**只能**经 `assignBucket` / `unassignBucket` 走（§9.3.0）。
  *
- * ⚠️ **为什么要有这条断言**：ADR《P1 冲突裁决》冲突 7 的裁决是
- *   「阶段 1 照写 `memories.embedding`、**不写** `vector_cell_members`」，
- *   并明确「**不得**实现空壳 `assignBucket`」——空壳函数 = 死函数 = 假绿，
- *   还会让「四条路径都调了 `assignBucket`」这类静态断言**假通过**。
- *   ⇒ 阶段 1 的代码里**不许出现**桶表与桶分配调用；
- *   ⇒ 这笔欠账由**阶段 2**（P2-T03 + 桶训练）清偿（启动对账 / 首次重训），
- *     并由阶段 2 的硬断言兜住：「`embedding IS NOT NULL` 且 `deleted = 0` 的记忆 id 集合
- *     == `vector_cell_members.memory_id` 集合」（**集合相等**，不是条数相等）。
+ * ⚠️ **为什么这条断言要「反转」而不是删掉**：P1-T07 的 ADR 冲突 7 裁决是
+ *   「阶段 1 照写 `memories.embedding`、**不写** `vector_cell_members`」——
+ *   那条豁免**只对阶段 1 有效**；阶段 2 挂接后**豁免本身失效**
+ *   ⇒ 断言必须改成守**新**的纪律。
+ *   ⚠️ **删掉 = 闸门消失 = 后门无阻力**（这正是 §9.3.0 说的
+ *   「注释提醒会漏读、后续新增路径又会忘」的反面教材）。
+ *
+ * ⚠️ **新纪律是两条，合起来才完整**：
+ *   ① **不许写裸的桶表 SQL**（`INSERT INTO` / `UPDATE` / `DELETE FROM vector_cell_members`）
+ *      ⇒ 哪怕是 `INSERT OR REPLACE` 也不行（§4.15.5 明写它**不能**替代
+ *        「先 DELETE 旧归属、再 INSERT 新归属」）；
+ *   ② **必须调 `assignBucket` / `unassignBucket`**（四条路径一条都不能漏）
+ *      ⇒ 只守 ① 的话，「谁都不调」也能过闸门。
  */
-describe('P1-T07 · 阶段 1 不入桶（ADR 冲突 7 的裁决）', () => {
+describe('P2-T03-b · 桶归属只能经 assignBucket / unassignBucket 走', () => {
   /** 本测试文件所在目录（ESM 下没有 `__dirname`）。 */
   const HERE = fileURLToPath(new URL('.', import.meta.url));
   /** 仓库的 `src/store/` 目录。 */
   const STORE_ROOT = resolve(HERE, '../../src/store');
+  /** 仓库的 `src/` 目录（对照用）。 */
+  const SRC_ROOT = resolve(HERE, '../../src');
 
-  /**
-   * 剥掉注释行，只留可执行行。
-   *
-   * ⚠️ **必须剥注释**：源码的说明文字里大量出现 `assignBucket` / `vector_cell_members`
-   *   这些词（它们是「阶段 2 才写」的**说明**）⇒ 不剥注释的话扫描器会把说明文字
-   *   当成实现 ⇒ 既误报、又测不出真问题。
-   */
-  function stripCommentLines(source: string): string {
-    return source
-      .split('\n')
-      .filter((rawLine) => {
-        const trimmed = rawLine.trim();
-        return !(
-          trimmed.startsWith('//') ||
-          trimmed.startsWith('*') ||
-          trimmed.startsWith('/*') ||
-          trimmed.endsWith('*/')
-        );
-      })
-      .join('\n');
-  }
+  it('★ 静态：write.ts / merge.ts 的**代码**里没有裸的桶表 SQL', () => {
+    for (const name of ['write.ts', 'merge.ts']) {
+      const source = readFileSync(join(STORE_ROOT, name), 'utf8');
 
-  it('★ 阶段 1：向量**写进库了**，但桶表**一条不写**（欠账显式留给阶段 2）', () => {
-    const { db, store, params } = createWriteContext();
+      // 性质：**一条裸写都没有**（写入只允许经 `src/vector/bucketAssign.ts`）
+      expect(findMembershipWriteSites(source)).toEqual([]);
+    }
+  });
+
+  it('★ 静态：write.ts / merge.ts 的**代码**里确实调了 assignBucket / unassignBucket', () => {
+    for (const name of ['write.ts', 'merge.ts']) {
+      const source = readFileSync(join(STORE_ROOT, name), 'utf8');
+      const code = stripCommentLines(source);
+
+      // 性质：**确实调了**（只守「没有裸 SQL」的话，「谁都不调」也能过闸门）
+      //   ⚠️ **要求带括号**（`assignBucket(`）：import 行里也有这个词
+      //     ⇒ 不带括号会把「只是 import 了」当成「调用了」⇒ 断言假绿。
+      expect(code).toMatch(/\bassignBucket\s*\(/);
+      expect(code).toMatch(/\bunassignBucket\s*\(/);
+    }
+  });
+
+  it('★ 负控：注入一个裸 INSERT ⇒ 扫描必须报出来（闸门不是摆设）', () => {
+    const source = readFileSync(join(STORE_ROOT, 'write.ts'), 'utf8');
+
+    // ① 注入 ⇒ 剥完注释仍能扫到 ⇒ 闸门会判红
+    const injected = `${source}\nexport function rogue(db: Database.Database): void {\n  db.prepare('INSERT INTO vector_cell_members (fine_id, memory_id) VALUES (?, ?)').run('a', 'b');\n}\n`;
+    expect(findMembershipWriteSites(injected).length).toBeGreaterThan(0);
+
+    // ② 对照：**未注入**的原文扫不到 ⇒ 说明上面命中的确是「注入的那一处」
+    expect(findMembershipWriteSites(source)).toEqual([]);
+  });
+
+  it('★ 对照：「剥注释」这一步是有效的（说明上面那条不是因为「源码里没这个词」）', () => {
+    // ⚠️ `src/vector/ivf.ts` 的**注释**里大量出现 `vector_cell_members`，
+    //   而它的**代码**里只有 `SELECT`（合法）⇒ 剥完注释后扫不到。
+    const source = readFileSync(join(SRC_ROOT, 'vector', 'ivf.ts'), 'utf8');
+    expect(source).toContain('vector_cell_members');
+    expect(findMembershipWriteSites(source)).toEqual([]);
+  });
+
+  it('★ 分桶**尚未训练**时：向量写进库了、桶表一条不写，**而且写路径记了日志**', () => {
+    const { db, store, params, logger } = createWriteContext();
 
     write(store, {
       content: '李四喜欢猫粮',
@@ -751,39 +788,22 @@ describe('P1-T07 · 阶段 1 不入桶（ADR 冲突 7 的裁决）', () => {
       now: 0,
     });
 
-    // 性质：向量**真的落库了**（阶段 1 照写 `embedding`，不是「不写向量」）
+    // 性质：向量**真的落库了**（不是「不写向量」）
     const withVector = db
       .prepare('SELECT COUNT(*) AS n FROM memories WHERE embedding IS NOT NULL AND deleted = 0')
       .get() as { n: number };
     expect(withVector.n).toBe(1);
 
-    // 性质：桶表**一条都没有**（阶段 1 不入桶 ⇒ 欠账留给阶段 2 的启动对账 / 首次重训）
+    // 性质：桶表**一条都没有**
+    //   ⚠️ **原因变了**：不是「阶段 1 不入桶」（那条豁免已退役），
+    //   而是「**分桶尚未训练**」⇒ 没有可归属的桶（§4.15.3）。
     expect(countRows(db, 'vector_cell_members')).toBe(0);
-  });
 
-  it('★ 静态：write.ts / merge.ts 的**代码**里没有桶表、也没有桶分配调用', () => {
-    for (const name of ['write.ts', 'merge.ts']) {
-      const source = readFileSync(join(STORE_ROOT, name), 'utf8');
-      const code = stripCommentLines(source);
-
-      // 性质：代码里不碰桶表
-      expect(code).not.toContain('vector_cell_members');
-      // 性质：代码里没有「分配桶 / 回收桶」的调用（空壳 `assignBucket` 也算违规）
-      expect(code).not.toMatch(/\bassignBucket\b/);
-      expect(code).not.toMatch(/\bunassignBucket\b/);
-    }
-  });
-
-  it('★ 负控：注入一个 assignBucket 调用 ⇒ 检查必须报出来（闸门不是摆设）', () => {
-    const source = readFileSync(join(STORE_ROOT, 'write.ts'), 'utf8');
-
-    // ① 注入 ⇒ 剥完注释仍能扫到 ⇒ 闸门会判红
-    const injected = `${source}\nexport function rogue(): void {\n  assignBucket('id', vector);\n}\n`;
-    expect(stripCommentLines(injected)).toMatch(/\bassignBucket\b/);
-
-    // ② 对照：**原文**（含注释）里确实有这些词 ⇒ 说明「剥注释」这一步是有效的
-    //   ⇒ 上面两条断言不是因为「源码里根本没有这个词」才通过的。
-    expect(source).toContain('assignBucket');
+    // 性质：★ **可观测**（§9.3.2 ① 的静默失效点不能静默）
+    //   ⇒ 「库里有向量、桶侧无归属」这件事必须留下一条日志
+    //     ⇒ 否则它就是那个「静默、永久、不报错」的失效点。
+    const warns = logger.ofLevel('warn');
+    expect(warns.some((line) => line.fields.reason === 'bucket-not-trained')).toBe(true);
   });
 });
 

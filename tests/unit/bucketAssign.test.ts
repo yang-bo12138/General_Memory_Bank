@@ -13,8 +13,8 @@
  *   ⇒ 凡是能靠 `assignBucket` 造出来的数据，本文件都**不**手工 INSERT。
  */
 
-import { readFileSync, readdirSync, statSync } from 'node:fs';
-import { join, relative, resolve, sep } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import type Database from 'better-sqlite3';
@@ -37,6 +37,11 @@ import {
   insertMemory,
   pseudoUnitVector,
 } from '../fixtures/vector.js';
+import {
+  findMembershipWriteSites,
+  scanSourceTree,
+  stripCommentLines,
+} from '../helpers/bucketWriteScan.js';
 
 /** 一个固定的时间基准。 */
 const T0 = 1_700_000_000_000;
@@ -518,76 +523,11 @@ describe('P2-T03-a · 静态断言：桶归属只有一个写入点', () => {
   const ALLOWED_FILE = 'vector/bucketAssign.ts';
 
   /** 递归列出目录下的 `.ts` 实现文件（排除测试与声明）。 */
-  function listSourceFiles(root: string): string[] {
-    const out: string[] = [];
-    const walk = (dir: string): void => {
-      for (const entry of readdirSync(dir)) {
-        const full = join(dir, entry);
-        if (statSync(full).isDirectory()) {
-          walk(full);
-          continue;
-        }
-        if (full.endsWith('.ts') && !full.endsWith('.test.ts') && !full.endsWith('.d.ts')) {
-          out.push(full);
-        }
-      }
-    };
-    walk(root);
-    return out;
-  }
-
-  /**
-   * 剥掉**整行注释**，保留行结构（行号才对得上）。
-   *
-   * ⚠️ **必须先剥注释**：源码的说明文字里大量出现
-   *   `INSERT INTO vector_cell_members` / `vector_cell_members` 这些词
-   *   （它们是「唯一写入点」的**说明**）⇒ 不剥注释的话扫描器把说明文字当实现
-   *   ⇒ 既误报、又测不出真问题。
-   * ⚠️ **保留行结构**（用空行替换而不是删行）：否则行号会漂移 ⇒ 报错定位不到位置。
-   */
-  function stripCommentLines(source: string): string {
-    return source
-      .split('\n')
-      .map((rawLine) => {
-        const trimmed = rawLine.trim();
-        const isComment =
-          trimmed.startsWith('//') ||
-          trimmed.startsWith('*') ||
-          trimmed.startsWith('/*') ||
-          trimmed.endsWith('*/');
-        return isComment ? '' : rawLine;
-      })
-      .join('\n');
-  }
-
-  /**
-   * 扫出**真正写** `vector_cell_members` 的位置（裸 INSERT / UPDATE / DELETE FROM）。
-   *
-   * ⚠️ **只认写、不认读**：`SELECT ... FROM vector_cell_members` 是合法的
-   *   （`src/vector/ivf.ts` 的桶内检索就在读它）⇒ 正则只匹配三种写动词。
-   */
-  function findMembershipWriteSites(source: string): number[] {
-    const code = stripCommentLines(source);
-    const pattern =
-      /\b(?:INSERT\s+(?:OR\s+\w+\s+)?INTO|UPDATE|DELETE\s+FROM)\s+vector_cell_members\b/gi;
-    const sites: number[] = [];
-    let match = pattern.exec(code);
-    while (match !== null) {
-      sites.push(code.slice(0, match.index).split('\n').length);
-      match = pattern.exec(code);
-    }
-    return sites;
-  }
-
   it('★ src/** 里写 vector_cell_members 的地方只有 vector/bucketAssign.ts', () => {
-    const hits: Array<{ file: string; line: number }> = [];
-
-    for (const file of listSourceFiles(SRC_ROOT)) {
-      const source = readFileSync(file, 'utf8');
-      for (const line of findMembershipWriteSites(source)) {
-        hits.push({ file: relative(SRC_ROOT, file).split(sep).join('/'), line });
-      }
-    }
+    // ⚠️ **扫描器是共享的**（`tests/helpers/bucketWriteScan.ts`）
+    //   ⇒ `tests/unit/merge.test.ts` 的「write.ts / merge.ts 不得有裸桶表 SQL」用的是同一份
+    //   ⇒ 两份正则会漂移 ⇒ 闸门静默失效（C36）。
+    const hits = scanSourceTree(SRC_ROOT);
 
     // 性质：**每一处都在白名单文件里**（不多 ⇒ 没有第二个后门）
     for (const hit of hits) {
