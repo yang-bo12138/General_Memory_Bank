@@ -17,12 +17,229 @@ import { MS_PER_DAY } from '../../src/core/decay.js';
 import { MemoryError } from '../../src/core/errors.js';
 import { EVENT_PAYLOAD_VARIANTS } from '../../src/core/events.types.js';
 import { blobToVector, vectorToBlob } from '../../src/store/merge.js';
-import { type WriteStore, compareMergeCandidates, write } from '../../src/store/write.js';
+import {
+  type AliasConflictWarning,
+  type WriteStore,
+  type WriteWarning,
+  compareMergeCandidates,
+  write,
+} from '../../src/store/write.js';
 import { LOG_ACTIONS, MemoryLogger } from '../../src/util/log.js';
 import { countRows, createTestStore, readEvents } from '../fixtures/graph-store.js';
 
 /** 测试用的库句柄类型（内存 SQLite）。 */
 type TestDb = ReturnType<typeof createTestStore>['db'];
+
+/** 本测试文件所在目录（ESM 下没有 `__dirname`）。 */
+const HERE = fileURLToPath(new URL('.', import.meta.url));
+/** 仓库的 `src/` 目录。 */
+const SRC_ROOT = resolve(HERE, '../../src');
+
+/**
+ * 把源码里的**注释**与**字符串/模板字符串字面量**挖空（长度不变 ⇒ 下标仍对齐）。
+ *
+ * ⚠️ **为什么审计器必须先剥它们**：本文件此前踩过同一个坑——
+ *   注释里出现的 `ORDER BY bm25(mem_fts) ASC` 会**抢先命中**源码里的 SQL 字面量
+ *   ⇒ 断言始终为绿 ⇒ 闸门形同虚设。
+ * ⇒ 任何「源码里有没有某个字面量」的判断，都必须只在**代码**上做。
+ */
+function stripCommentsAndStrings(source: string): string {
+  const out = source.split('');
+  const blank = (from: number, to: number): void => {
+    for (let index = from; index < to; index += 1) {
+      if (out[index] !== '\n') {
+        out[index] = ' ';
+      }
+    }
+  };
+  let index = 0;
+  while (index < source.length) {
+    const char = source[index];
+    const next = source[index + 1];
+    // 行注释
+    if (char === '/' && next === '/') {
+      const end = source.indexOf('\n', index);
+      const stop = end === -1 ? source.length : end;
+      blank(index, stop);
+      index = stop;
+      continue;
+    }
+    // 块注释
+    if (char === '/' && next === '*') {
+      const end = source.indexOf('*/', index + 2);
+      const stop = end === -1 ? source.length : end + 2;
+      blank(index, stop);
+      index = stop;
+      continue;
+    }
+    // 字符串 / 模板字符串
+    if (char === "'" || char === '"' || char === '`') {
+      let cursor = index + 1;
+      while (cursor < source.length) {
+        if (source[cursor] === '\\') {
+          cursor += 2;
+          continue;
+        }
+        if (source[cursor] === char) {
+          break;
+        }
+        cursor += 1;
+      }
+      const stop = Math.min(cursor + 1, source.length);
+      blank(index, stop);
+      index = stop;
+      continue;
+    }
+    index += 1;
+  }
+  return out.join('');
+}
+
+/** 取某个具名函数的**函数体范围**（`{` 到配对的 `}`）；找不到返回 `undefined`。 */
+function functionBodyRangeOf(
+  code: string,
+  name: string,
+): { start: number; end: number } | undefined {
+  const match = new RegExp(`function\\s+${name}\\s*\\(`).exec(code);
+  if (match === null) {
+    return undefined;
+  }
+  const open = code.indexOf('{', match.index);
+  if (open === -1) {
+    return undefined;
+  }
+  let depth = 0;
+  for (let index = open; index < code.length; index += 1) {
+    if (code[index] === '{') {
+      depth += 1;
+    } else if (code[index] === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        return { start: open, end: index };
+      }
+    }
+  }
+  return undefined;
+}
+
+/** 取某个具名函数的**函数体**文本；找不到返回 `undefined`。 */
+function functionBodyOf(code: string, name: string): string | undefined {
+  const range = functionBodyRangeOf(code, name);
+  return range === undefined ? undefined : code.slice(range.start, range.end + 1);
+}
+
+/**
+ * 找出源码里**调用** `linkEntityId(...)` 的位置（**排除定义处**）。
+ *
+ * ⚠️ **必须排除定义处**：`function linkEntityId(` 本身也匹配这个模式
+ *   ⇒ 不排除的话，「调用点数量」恒为 1 ⇒ 守卫生效不了。
+ */
+function findLinkEntityCallSites(source: string): number[] {
+  const code = stripCommentsAndStrings(source);
+  const sites: number[] = [];
+  const pattern = /linkEntityId\s*\(/g;
+  let match = pattern.exec(code);
+  while (match !== null) {
+    const before = code.slice(Math.max(0, match.index - 24), match.index);
+    if (!/function\s+$/.test(before)) {
+      sites.push(match.index);
+    }
+    match = pattern.exec(code);
+  }
+  return sites;
+}
+
+/**
+ * 落在 `resolveEntities`（= `input.entities` 那条路径）**之外**的 `linkEntityId` 调用点。
+ *
+ * ⚠️ **为什么这条守的是「关联只由 `entities` 表达」**：
+ *   `@linkedEntityIds` 只能由 `resolveEntities` 往里加
+ *   ⇒ 别名路径（步骤 1c）一旦也调 `linkEntityId`，就会多出**第二处**能表达
+ *   「这条记忆跟 X 有关」的地方 ⇒ §14.3 边界原则 1 就破了。
+ */
+function linkEntityCallSitesOutsideEntities(source: string): number[] {
+  const code = stripCommentsAndStrings(source);
+  const range = functionBodyRangeOf(code, 'resolveEntities');
+  if (range === undefined) {
+    return [];
+  }
+  return findLinkEntityCallSites(source).filter((site) => site < range.start || site > range.end);
+}
+
+/**
+ * 在**内存中的源码副本**里，往别名目标解析函数里塞一次 `linkEntityId(...)` 调用。
+ *
+ * ⚠️ **只改内存副本，不碰磁盘上的 `src/`**：
+ *   在测试里就地改源文件会让 CI 跑完之后留下**脏工作树**
+ *   （后续提交会把这次变异一起带进去 ⇒ 事故）。
+ *
+ * ⚠️ **切片用原始源码**（不是剥过注释的副本）：
+ *   `stripCommentsAndStrings` **长度不变** ⇒ 下标在原文里同样成立
+ *   ⇒ 变异后的副本仍然是「原文件 + 一处改动」，而不是「原文件 + 注释被抹掉」。
+ */
+function injectAliasTargetLink(source: string): string {
+  const code = stripCommentsAndStrings(source);
+  const range = functionBodyRangeOf(code, 'resolveAliasTargetEntityId');
+  if (range === undefined) {
+    return source;
+  }
+  const body = source.slice(range.start, range.end + 1);
+  const mutatedBody = body.replace(
+    /\{/,
+    '{\n  linkEntityId({ linkedEntityIds: [], seen: new Set<string>() }, name);',
+  );
+  return source.slice(0, range.start) + mutatedBody + source.slice(range.end + 1);
+}
+
+/**
+ * `write()` 里 `resolveEntities(...)` 的**实参文本**。
+ *
+ * ⚠️ 这条守的是「**关联只由 `input.entities` 表达**」的**调用点**那一半：
+ *   `resolveEntities` 是**唯一**能往 `@linkedEntityIds` 里加东西的地方
+ *   ⇒ 它的实参**只能**是 `input.entities`，**不得**混进 `entityAliases[].name`。
+ */
+function resolveEntitiesArgs(source: string): string | undefined {
+  const code = stripCommentsAndStrings(source);
+  const body = functionBodyOf(code, 'write');
+  if (body === undefined) {
+    return undefined;
+  }
+  const at = body.indexOf('resolveEntities(');
+  if (at === -1) {
+    return undefined;
+  }
+  let depth = 0;
+  for (let index = at + 'resolveEntities'.length; index < body.length; index += 1) {
+    const char = body[index];
+    if (char === '(') {
+      depth += 1;
+    } else if (char === ')') {
+      depth -= 1;
+      if (depth === 0) {
+        return body.slice(at + 'resolveEntities('.length, index);
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * 在**内存中的源码副本**里，把 `entityAliases[].name` 混进 `resolveEntities` 的实参
+ * （= 模拟「别名目标也算关联」的旧口径）。
+ */
+function injectAliasNamesIntoEntities(source: string): string {
+  const code = stripCommentsAndStrings(source);
+  const body = functionBodyOf(code, 'write');
+  if (body === undefined) {
+    return source;
+  }
+  const at = code.indexOf(body);
+  const mutatedBody = body.replace(
+    /input\.entities \?\? \[\]/,
+    '[...(input.entities ?? []), ...(input.entityAliases ?? []).map((entry) => entry.name)]',
+  );
+  return source.slice(0, at) + mutatedBody + source.slice(at + body.length);
+}
 
 /** 取出捕获到的 `MemoryError`（失败时给出可读的原因）。 */
 function expectMemoryError(fn: () => unknown): MemoryError {
@@ -111,6 +328,15 @@ function linkedEntityIdsOf(db: TestDb, memoryId: string): string[] {
     .prepare('SELECT entity_id FROM memory_entities WHERE memory_id = ? ORDER BY entity_id')
     .all(memoryId) as Array<{ entity_id: string }>;
   return rows.map((row) => row.entity_id);
+}
+
+/**
+ * 取「别名冲突」那一类 warning（`WriteWarning` 是**可辨识联合** ⇒ 这里做**显式收窄**）。
+ *
+ * ⚠️ 不用 `as` 断言硬转：那会把「类型收窄」变成「相信类型」⇒ 字段名写错也照样绿。
+ */
+function aliasConflictOf(warning: WriteWarning | undefined): AliasConflictWarning | undefined {
+  return warning !== undefined && warning.code === 'ALIAS_CONFLICT' ? warning : undefined;
 }
 
 /**
@@ -387,9 +613,9 @@ describe('P1-T07 · entityAliases 同步（§4.9 步骤 1c）', () => {
     // 性质：**调用方看得见**（warnings 是「调用方能看见的通道」）
     expect(result.warnings).toHaveLength(1);
     expect(result.warnings[0]?.code).toBe('ALIAS_CONFLICT');
-    expect(result.warnings[0]?.alias).toBe('老张');
-    expect(result.warnings[0]?.currentEntityId).toBe(zhangSanId);
-    expect(result.warnings[0]?.intendedEntityId).toBe(zhangSanfengId);
+    expect(aliasConflictOf(result.warnings[0])?.alias).toBe('老张');
+    expect(aliasConflictOf(result.warnings[0])?.currentEntityId).toBe(zhangSanId);
+    expect(aliasConflictOf(result.warnings[0])?.intendedEntityId).toBe(zhangSanfengId);
 
     // 性质：**既有映射没有被覆盖**（覆盖是 `setAlias` 的职责，两处不能统一）
     const row = db.prepare('SELECT entity_id FROM entity_aliases WHERE alias = ?').get('老张') as {
@@ -448,8 +674,8 @@ describe('P1-T07 · entityAliases 同步（§4.9 步骤 1c）', () => {
     // 性质：主名优先 ⇒ 冲突被报出来
     expect(result.warnings).toHaveLength(1);
     expect(result.warnings[0]?.code).toBe('ALIAS_CONFLICT');
-    expect(result.warnings[0]?.alias).toBe('张三');
-    expect(result.warnings[0]?.currentEntityId).toBe(zhangSanId);
+    expect(aliasConflictOf(result.warnings[0])?.alias).toBe('张三');
+    expect(aliasConflictOf(result.warnings[0])?.currentEntityId).toBe(zhangSanId);
     expect(logger.ofLevel('warn').length).toBeGreaterThan(0);
 
     // 性质：没有把主名写进别名表（那会让 §4.5 的解析顺序出现两个答案）
@@ -662,11 +888,6 @@ describe('P1-T07 · 新建事实的事件（§8.4 的 write 行）', () => {
 // ─────────────────────────────────────────────────────────────
 
 describe('P1-T07 · growStability 仍是全库唯一的 stability 写入点', () => {
-  /** 本测试文件所在目录（ESM 下没有 `__dirname`）。 */
-  const HERE = fileURLToPath(new URL('.', import.meta.url));
-  /** 仓库的 `src/` 目录。 */
-  const SRC_ROOT = resolve(HERE, '../../src');
-
   /** 递归列出目录下的 `.ts` 实现文件（排除测试与声明）。 */
   function listSourceFiles(root: string): string[] {
     const out: string[] = [];
@@ -751,19 +972,19 @@ describe('P1-T07 · growStability 仍是全库唯一的 stability 写入点', ()
 // 裁决 C / D / E / F / G（主理人 2026-10-31 签字）
 // ─────────────────────────────────────────────────────────────
 
-describe('P1-T07 · 裁决 C：别名目标实体与 input.entities 同等对待', () => {
-  it('★ 只给 entityAliases（entities 为空）⇒ 目标实体被建出来 + 本条记忆关联到它 + 返回值含它', () => {
-    const { db, store } = createWriteContext();
+describe('P1-T07 · 裁决 C：别名目标实体「建，但不隐含关联」', () => {
+  it('★ 只给 entityAliases（entities 为空）⇒ 目标实体**被建出来** + 本条记忆**不**关联它 + 回报 ALIAS_TARGET_NOT_LINKED', () => {
+    const { db, store, logger } = createWriteContext();
 
     // ⚠️ `entities` **故意为空**：这条断言守的是「只声明别名」时目标实体仍然要被建出来、
-    //   **并且**与本条记忆建立 `memory_entities` 关联（裁决 C）。
+    //   **但不得**与本条记忆建立关联（ADR-P1-T07-DEC 的 D-3/R2「建，但不隐含关联」）。
     const result = write(store, {
       content: '张三住在北京',
       entityAliases: [{ name: '张三', aliases: ['老张'] }],
     });
 
     const zhangSanId = entityIdOf(db, '张三');
-    // 性质：实体被创建（库里只有这一个）
+    // 性质：实体被创建（库里只有这一个）——**显式点名的实体不许被静默丢弃**
     expect(countRows(db, 'entities')).toBe(1);
     // 性质：别名挂到了它身上
     const aliasRow = db
@@ -772,11 +993,122 @@ describe('P1-T07 · 裁决 C：别名目标实体与 input.entities 同等对待
       entity_id: string;
     };
     expect(aliasRow.entity_id).toBe(zhangSanId);
-    // 性质：★ 本条记忆**关联到它**（否则图谱路查不到任何关系）
+    // 性质：★ 本条记忆**不**关联它（关联只由 `input.entities` 表达）
+    expect(linkedEntityIdsOf(db, result.id)).toEqual([]);
+    // 性质：★ write 事件的 `payload.entityIds` **不含**它
+    //   ⚠️ 落点是**事件 payload**，不是 `WriteResult`——`WriteResult` 里**没有** `entityIds` 字段。
+    const event = readEvents(db, 'write')[0];
+    expect(event?.payload.entityIds).toEqual([]);
+    // 性质：★ 库里也**没有** `memory_entities` 关联行（不是「事件里没带、库里却建了」）
+    expect(countRows(db, 'memory_entities')).toBe(0);
+
+    // 性质：★ `warnings` 里出现 `ALIAS_TARGET_NOT_LINKED`
+    //   （**边界可以存在，但必须可观测**：别名建好了、本条记忆却不与它关联
+    //   ⇒ 图谱路查不到 ⇒ 静默达不到召回目的 ⇒ 必须回报给调用方）
+    const notLinked = result.warnings.filter((w) => w.code === 'ALIAS_TARGET_NOT_LINKED');
+    expect(notLinked).toHaveLength(1);
+    expect(result.warnings).toContainEqual({
+      code: 'ALIAS_TARGET_NOT_LINKED',
+      name: '张三',
+      entityId: zhangSanId,
+    });
+    // 性质：★ 磁盘日志里也有（§8.1：两个通道都要）
+    const warns = logger.ofLevel('warn');
+    expect(warns.length).toBeGreaterThan(0);
+    expect(warns.some((line) => line.fields.name === '张三')).toBe(true);
+
+    // ⚠️ **工具自检**：上面的「为空」断言不能是**空断言**——
+    //   ⇒ 同一个库里再写一条**带 `entities`** 的记忆 ⇒ 同一个查询必须能查得出关联行。
+    //   （否则「查不到」可能只是因为查询写错了，而不是因为真的没关联。）
+    const linked = write(store, { content: '张三喜欢喝奶茶', entities: ['张三'] });
+    expect(linkedEntityIdsOf(db, linked.id)).toEqual([zhangSanId]);
+  });
+
+  it('★ 静态守卫：`linkEntityId` 的**唯一**调用点在 `resolveEntities` 里（关联只由 `entities` 表达）', () => {
+    const source = readFileSync(join(SRC_ROOT, 'store', 'write.ts'), 'utf8');
+
+    // 性质：★ 全文件**恰好一处**调用点（`@linkedEntityIds` 只能由 `entities` 那条路径往里加）
+    expect(findLinkEntityCallSites(source)).toHaveLength(1);
+    // 性质：★ 别名路径（步骤 1c）**没有**第二处调用点
+    expect(linkEntityCallSitesOutsideEntities(source)).toEqual([]);
+    // 性质：★ `resolveEntities` 的实参**只有** `input.entities`（不得混进别名目标名）
+    expect(resolveEntitiesArgs(source)).toContain('input.entities');
+    expect(resolveEntitiesArgs(source) ?? '').not.toContain('entityAliases');
+
+    // ⚠️ **负控 ①**：往**被审对象本身**（`resolveAliasTargetEntityId` 的函数体）里
+    //   塞一次 `linkEntityId(...)` 调用 ⇒ 守卫必须立刻改判。
+    //   ⇒ 这一步只改**内存中的源码副本**，磁盘上的 `src/` 一个字都不动
+    //   （就地改源码会让 CI 留下脏工作树）。
+    const mutatedLink = injectAliasTargetLink(source);
+    // 变异确实落到被审对象上了（否则下面那条断言就是空断言）
+    expect(mutatedLink).not.toBe(source);
+    // 性质：★ 守卫在变异后**改判** ⇒ 闸门不是摆设
+    expect(findLinkEntityCallSites(mutatedLink)).toHaveLength(2);
+    expect(linkEntityCallSitesOutsideEntities(mutatedLink)).toHaveLength(1);
+
+    // ⚠️ **负控 ②**：把 `entityAliases[].name` 混进 `resolveEntities` 的实参
+    //   （= 「别名目标也算关联」的旧口径）⇒ 实参守卫必须立刻改判。
+    const mutatedArgs = injectAliasNamesIntoEntities(source);
+    expect(mutatedArgs).not.toBe(source);
+    expect(resolveEntitiesArgs(mutatedArgs) ?? '').toContain('entityAliases');
+  });
+
+  it('★ 反向：`entities` 里显式点名 ⇒ 该实体**被关联** + 别名挂到它身上 + **没有新建第二个实体** + **没有** ALIAS_TARGET_NOT_LINKED', () => {
+    const { db, store } = createWriteContext();
+
+    // ⚠️ 这条是上一条的**反向用例**：守住「关联**只**由 `entities` 表达」这条边界。
+    //   同一个实体名同时出现在 `entities` 与 `entityAliases[].name` 里
+    //   ⇒ 它**因 `entities` 而被关联**（不是因别名路径）。
+    const result = write(store, {
+      content: '张三住在北京',
+      entities: ['张三'],
+      entityAliases: [{ name: '张三', aliases: ['老张'] }],
+    });
+
+    const zhangSanId = entityIdOf(db, '张三');
+    // 性质：★ 被关联（走 `input.entities` 那条路径）
     expect(linkedEntityIdsOf(db, result.id)).toEqual([zhangSanId]);
-    // 性质：★ 返回值的 `entityIds`（write 事件 payload）含它
+    // 性质：★ write 事件的 `payload.entityIds` 含它
     const event = readEvents(db, 'write')[0];
     expect(event?.payload.entityIds).toEqual([zhangSanId]);
+    // 性质：别名挂到了**同一个**实体上
+    const aliasRow = db
+      .prepare('SELECT entity_id FROM entity_aliases WHERE alias = ?')
+      .get('老张') as {
+      entity_id: string;
+    };
+    expect(aliasRow.entity_id).toBe(zhangSanId);
+    // 性质：★ **没有新建第二个实体**（别名路径与 `entities` 路径解析到同一个 id）
+    expect(countRows(db, 'entities')).toBe(1);
+    // 性质：关联行只有一条（不会因两条路径各写一条而重复）
+    expect(countRows(db, 'memory_entities')).toBe(1);
+    // 性质：★ **没有** `ALIAS_TARGET_NOT_LINKED`
+    //   （它**确实**被关联了 ⇒ 边界没发生 ⇒ 不该回报边界）
+    expect(result.warnings.filter((w) => w.code === 'ALIAS_TARGET_NOT_LINKED')).toHaveLength(0);
+    // 性质：一条 warning 都没有（别名既不冲突、边界也没发生）
+    expect(result.warnings).toHaveLength(0);
+  });
+
+  it('★ 一个 name 声明多个别名 ⇒ **只产生一条** ALIAS_TARGET_NOT_LINKED（不是每个别名一条）', () => {
+    const { db, store } = createWriteContext();
+
+    const result = write(store, {
+      content: '张三住在北京',
+      entityAliases: [{ name: '张三', aliases: ['老张', '小张'] }],
+    });
+
+    // 性质：★ **一条**（报的是「这个实体没跟这条记忆关联」，不是「这两个别名有问题」）
+    expect(result.warnings).toHaveLength(1);
+    expect(result.warnings[0]?.code).toBe('ALIAS_TARGET_NOT_LINKED');
+    // 性质：两个别名**都**挂上去了（少挂一个才是 bug）
+    const zhangSanId = entityIdOf(db, '张三');
+    const aliases = db
+      .prepare('SELECT alias, entity_id FROM entity_aliases ORDER BY alias')
+      .all() as Array<{ alias: string; entity_id: string }>;
+    expect(aliases).toEqual([
+      { alias: '小张', entity_id: zhangSanId },
+      { alias: '老张', entity_id: zhangSanId },
+    ]);
   });
 
   it('★ entityAliases 的 name 指向**别名** ⇒ 解析到同一个 id，不新建第二个实体', () => {
@@ -805,7 +1137,7 @@ describe('P1-T07 · 裁决 C：别名目标实体与 input.entities 同等对待
     expect(aliasRow.entity_id).toBe(entityIdOf(db, '张三'));
     // 性质：**没有新建第二个实体**
     expect(countRows(db, 'entities')).toBe(entitiesBefore);
-    // 性质：第二条记忆同样关联到那个实体（别名目标与 input.entities 同等对待）
+    // 性质：第二条记忆关联到那个实体（**因 `input.entities` 表达**，不是因别名路径）
     expect(linkedEntityIdsOf(db, second.id)).toEqual([entityIdOf(db, '张三')]);
   });
 });
@@ -961,9 +1293,9 @@ describe('P1-T07 · 裁决 E：alias 等于主名（含它自己那个实体的�
     // 性质：冲突被报出来（**不是**幂等成功）
     expect(result.warnings).toHaveLength(1);
     expect(result.warnings[0]?.code).toBe('ALIAS_CONFLICT');
-    expect(result.warnings[0]?.alias).toBe('张三');
-    expect(result.warnings[0]?.currentEntityId).toBe(zhangSanId);
-    expect(result.warnings[0]?.intendedEntityId).toBe(zhangSanId);
+    expect(aliasConflictOf(result.warnings[0])?.alias).toBe('张三');
+    expect(aliasConflictOf(result.warnings[0])?.currentEntityId).toBe(zhangSanId);
+    expect(aliasConflictOf(result.warnings[0])?.intendedEntityId).toBe(zhangSanId);
     // 性质：★ 别名表**没有**写入（主名不许同时当别名）
     const row = db.prepare('SELECT entity_id FROM entity_aliases WHERE alias = ?').get('张三');
     expect(row).toBeUndefined();

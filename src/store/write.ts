@@ -118,9 +118,18 @@ export interface WriteInput {
  *
  * ⚠️ **刻意不是异常**（§11.2 末）：别名冲突时**记忆本身已经写成功**，
  *   只有附属的别名映射没落库。抛异常会让调用方重试 `write()` ⇒ 同一事实被写两遍。
+ *
+ * ⚠️ **做成可辨识联合（discriminated union）而不是「一堆可选字段」**：
+ *   两个变体的字段集**互不重叠**（`alias` vs `name`）⇒
+ *   写成可选字段的话，调用方得自己记住「哪个 code 能读哪个键」⇒ 两套取值逻辑（C36）。
  */
-export interface WriteWarning {
-  /** 目前唯一来源是 §4.9 步骤 1c 的别名冲突。 */
+export type WriteWarning = AliasConflictWarning | AliasTargetNotLinkedWarning;
+
+/**
+ * `ALIAS_CONFLICT`：别名已存在且指向**别的**实体 ⇒ 跳过、不覆盖（§4.9 步骤 1c）。
+ */
+export interface AliasConflictWarning {
+  /** 警告码（可辨识联合的判别键）。 */
   code: 'ALIAS_CONFLICT';
   /** 冲突的别名。 */
   alias: string;
@@ -128,6 +137,27 @@ export interface WriteWarning {
   currentEntityId: string;
   /** 本次想指向谁（调用方若要改，请显式调 `setAlias`）。 */
   intendedEntityId: string;
+}
+
+/**
+ * `ALIAS_TARGET_NOT_LINKED`：别名目标实体**建好了**，但**没有**跟本条记忆建立关联。
+ *
+ * ⚠️ **为什么需要这条 warning**（ADR-P1-T07-DEC 的 D-3/R2）：
+ *   「建但不隐含关联」是**有意**的边界（关联只由 `input.entities` 表达 ⇒ §14.3 边界原则 1），
+ *   但它有代价：调用方只声明 `entityAliases`、不点名实体 ⇒
+ *   **别名建好了、本条记忆却不与该实体关联** ⇒ 图谱路查不到它 ⇒ **静默达不到召回目的**。
+ *   ⇒ **边界可以存在，但必须可观测** ⇒ 这里回一条 warning（并按 §8.1 记一条磁盘日志）。
+ *
+ * ⚠️ **一个 `name` 一条**（不是每个别名一条）：
+ *   报的是「**这个实体**没跟这条记忆关联」，不是「这两个别名有问题」。
+ */
+export interface AliasTargetNotLinkedWarning {
+  /** 边界提示码。 */
+  code: 'ALIAS_TARGET_NOT_LINKED';
+  /** 调用方在 `entityAliases[].name` 里写的那个实体名。 */
+  name: string;
+  /** 该实体的 id（**已经建出来了**——它确实存在，只是没跟本条记忆关联）。 */
+  entityId: string;
 }
 
 /** §6 的 `write()` 返回值。 */
@@ -365,12 +395,14 @@ interface ResolvedEntities {
 /**
  * 把一个实体 id 计入「本次写入关联的实体」（按 id 去重）。
  *
- * ⚠️ **裁决 C：别名声明的目标实体也必须进这个列表**——
- *   §4.9 步骤 1c 说 name 的解析结果是「命中既有实体**或** b 步新建」，
- *   而 b 步的产物天然是 `@linkedEntityIds` 的一员
- *   ⇒ 别名目标实体与 `input.entities` **同等对待**：都要与本条记忆建立 `memory_entities` 关联。
- *   ⇒ 否则「只给 `entityAliases`、不给 `entities`」的调用会得到一条**没有任何实体关联**的记忆
- *   （正文写了、别名也挂了，但图谱路查不到任何关系）。
+ * ⚠️ **只有 `input.entities` 走这个函数**（ADR-P1-T07-DEC 的 D-3/R2「建，但不隐含关联」）：
+ *   `@linkedEntityIds` 的定义是「a 步与 b 步的结果汇总」⇒ **只来自 `input.entities`**。
+ *   ⇒ `entityAliases` 只声明**命名**（谁是谁的别名），**不声明关联**（这条记忆关于谁）。
+ *   ⇒ 别名目标实体走 `resolveAliasTargetEntityId`（**建，但不进这里**）。
+ *
+ * ⚠️ **不要**为了「让别名也对召回生效」而在这里把别名目标也塞进来：
+ *   那样就有**两处**能表达「这条记忆跟 X 有关」⇒ §14.3 边界原则 1（每个承诺都要能指到唯一代码路径）就破了。
+ *   ⇒ 想让别名对召回生效，**必须把实体名同时写进 `input.entities`**。
  */
 function linkEntityId(resolved: ResolvedEntities, entityId: string): void {
   if (resolved.seen.has(entityId)) {
@@ -424,27 +456,42 @@ function resolveEntities(
 }
 
 /**
- * 步骤 1c：解析 `entityAliases[].name` 指向的 `entity_id`（裁决 C）。
+ * 步骤 1c：解析 `entityAliases[].name` 指向的 `entity_id`。
+ *
+ * ⚠️ **建，但不隐含关联**（口径出处：**ADR-P1-T07-DEC 的 D-3/R2**；
+ *   主理人 2026-10-31 改判，历史引用「ADR-P1-R2 裁决 ①」指向同一条现行口径）：
+ *   · **建**：`entityAliases[].name` 是调用方**显式点名**的实体，
+ *     而写路径的既定语义就是「写入路径负责建实体」（步骤 1b 对 `input.entities` 里的未知名字也是建）
+ *     ⇒ **同一个调用方语义在两个字段上必须表现一致**。
+ *     ⇒ 不建 ⇒ 这次声明的别名**无处可挂**（`entity_aliases.entity_id` 无处指）
+ *     ⇒ **静默丢弃** ⇒ 违背 §4.9 步骤 1c「不要静默」的总原则。
+ *   · **不关联**：**无论命中既有实体还是新建，都不进 `@linkedEntityIds`**
+ *     ⇒ 不与本条记忆建立 `memory_entities` 关联，也不出现在 write 事件的 `entityIds` 里。
+ *     ⇒ 理由：**`entities` 是「这条记忆跟 X 有关」的**唯一**表达机制**
+ *     ⇒ 若 `entityAliases` 也能顺带建立关联，就有**两处**能表达同一件事
+ *     ⇒ §14.3 边界原则 1（每个承诺都要能指到唯一代码路径）就破了。
+ *
+ * ⚠️ **代价（明写在这里，别让它变成静默）**：调用方若**只**声明 `entityAliases`、
+ *   却没把该实体名放进 `input.entities` ⇒ 别名映射建好了，
+ *   但**本条记忆不与该实体关联** ⇒ 图谱路查不到它 ⇒ **静默达不到召回目的**。
+ *   ⇒ 想让别名对召回生效，**必须把实体名同时写进 `input.entities`**。
+ *   ⇒ **代价必须可观测** ⇒ 由 `syncEntityAliases` 回一条 `ALIAS_TARGET_NOT_LINKED`
+ *     （**边界可以存在，但必须可观测**；主理人 2026-10-31 终裁）。
+ *
+ * ⚠️ **若「新建实体」与 `input.entities` 里的同名实体是同一个** ⇒ 那时它**因 `input.entities`
+ *   而被关联**（走 `entities` 那条路径）⇒ 这是对的，
+ *   **不要因此把别名路径的关联也打开**（那正是本函数**不**做 `linkEntityId` 的原因）。
  *
  * ⚠️ **与 `input.entities` 走同一套 a→b 归一**：
  *   先 `resolveEntity`（**主名或别名都算命中**——它内部就是先查主名表、再查别名表）
  *   ⇒ 命中就用该 id；未命中 ⇒ 按 b 步 UPSERT 新建实体。
- *   ⇒ **两种情况都要把结果计入 `@linkedEntityIds`**（`linkEntityId`）——
- *   「与 input.entities 同等对待 ⇒ 与本条记忆建立 memory_entities 关联」。
  *
  * ⚠️ **一项只描述一个实体** ⇒ 返回值是**单个** id；
  *   不要拿 `@linkedEntityIds` 当它用（那是汇总，可能多个）。
  */
-function resolveAliasTargetEntityId(
-  db: Database.Database,
-  name: string,
-  resolved: ResolvedEntities,
-  now: number,
-): string {
+function resolveAliasTargetEntityId(db: Database.Database, name: string, now: number): string {
   const existing = resolveEntity(db, name);
-  const entityId = existing === null ? upsertEntity(db, name, now) : existing;
-  linkEntityId(resolved, entityId);
-  return entityId;
+  return existing === null ? upsertEntity(db, name, now) : existing;
 }
 
 /**
@@ -493,18 +540,24 @@ function detectAliasConflict(
  *
  * ⚠️ **写入用 `ON CONFLICT(alias) DO NOTHING`**（与 `setAlias` 的 `DO UPDATE` **不统一是刻意的**）：
  *   写路径是批量补别名，不该覆盖别人的正确映射；覆盖是 `setAlias` 的职责（§4.9.2）。
+ *
+ * ⚠️ **`linkedEntityIds` 只用来判断「要不要回报边界」**（`ALIAS_TARGET_NOT_LINKED`）：
+ *   别名目标**绝不**因此进关联（关联只由 `input.entities` 表达 ⇒ D-3/R2），
+ *   但「没关联」这件事**必须可观测**（否则调用方以为「声明了别名 = 这条记忆关于这个人」）。
  */
 function syncEntityAliases(
   store: WriteStore,
   entries: ReadonlyArray<{ name: string; aliases: string[] }>,
-  resolved: ResolvedEntities,
+  linkedEntityIds: readonly string[],
   now: number,
 ): WriteWarning[] {
   const warnings: WriteWarning[] = [];
   const db = store.db;
 
   for (const entry of entries) {
-    const intendedEntityId = resolveAliasTargetEntityId(db, entry.name, resolved, now);
+    // ⚠️ 这里**不**把 `intendedEntityId` 计入 `@linkedEntityIds`：
+    //   关联只由 `input.entities` 表达（ADR-P1-T07-DEC 的 D-3/R2「建，但不隐含关联」）。
+    const intendedEntityId = resolveAliasTargetEntityId(db, entry.name, now);
     for (const alias of entry.aliases) {
       const currentEntityId = detectAliasConflict(db, alias, intendedEntityId);
       if (currentEntityId !== null) {
@@ -517,6 +570,32 @@ function syncEntityAliases(
         `INSERT INTO entity_aliases (alias, entity_id) VALUES (@alias, @entityId)
          ON CONFLICT(alias) DO NOTHING`,
       ).run({ alias, entityId: intendedEntityId });
+    }
+
+    // ⚠️ **边界必须可观测**（D-3/R2 的代价明写）：
+    //   别名目标实体**建好了**，但本条记忆**没有**跟它关联 ⇒ 图谱路（§4.6 步骤 2b）查不到它
+    //   ⇒ 调用方若以为「声明了别名就等于这条记忆关于这个人」，就会**静默达不到召回目的**。
+    //   ⇒ 这里回一条 `ALIAS_TARGET_NOT_LINKED`（并按 §8.1 记一条磁盘日志）。
+    //
+    // ⚠️ **判定按实体 id，不按名字**：调用方可能用**别名**点名同一个实体
+    //   （`entities: ['老张']` + `entityAliases: [{ name: '张三', ... }]`）
+    //   ⇒ 那个实体**确实**被关联了 ⇒ **不该**报这条 warning。
+    //
+    // ⚠️ **一个 `name` 一条**（不是每个别名一条）：
+    //   报的是「**这个实体**没跟这条记忆关联」，不是「这两个别名有问题」⇒
+    //   `{ name:'张三', aliases:['老张','小张'] }` ⇒ **1 条**，不是 2 条。
+    if (!linkedEntityIds.includes(intendedEntityId)) {
+      warnings.push({
+        code: 'ALIAS_TARGET_NOT_LINKED',
+        name: entry.name,
+        entityId: intendedEntityId,
+      });
+      store.logger.warn(LOG_ACTIONS.write, {
+        name: entry.name,
+        now,
+        entityId: intendedEntityId,
+        linked: false,
+      });
     }
   }
   return warnings;
@@ -654,6 +733,18 @@ function findMergeCandidate(
   //   ⇒ 此时**要求实体重叠数达标**才允许合并（§4.9 步骤 3a 的退化条款），**不要放宽**。
   // ⚠️ **裁决 F 的精确口径**：退化时合并判定**收敛为** `entityOverlap ≥ DEDUP_ENTITY_MIN`，
   //   **cos 通道不单独成立**（非退化时仍是「entityOverlap ≥ N **或** cos ≥ DEDUP_COS_MIN」）。
+  //   口径出处：ADR-P1-R2 裁决 ①（待架构师最终措辞确认）。
+  //   ⚠️ **架构师已出终稿**（ADR-P1-T07-DEC 的 D-6，三分支）：
+  //     `n=0`（0 个 bigram）⇒ **文本路整体不执行**（无候选 ⇒ 不合并，**不是**退化态）——
+  //     上面 `tokens.length === 0` 时直接 `return undefined` 就是这一支；
+  //     `n=1`（退化态）⇒ **只认实体重叠**，cos 通道（**合并资格**）整条不生效；
+  //     `n≥2` ⇒ 「实体重叠达标 **或** cos 达标」。
+  //   ⚠️ 补充一句容易写反的地方：退化态**不是**「两条判据里有一条成立就合并」，
+  //   而是「**只认实体重叠**」——候选面已不可信 ⇒ 不能拿余弦去合并。
+  //   ⚠️ 「cos 通道不生效」说的是**合并资格**，**不是排序**：
+  //   退化态下 cos 仍然参与 tie-break 的第二级（见 `compareMergeCandidates`）。
+  //   ⚠️ 阈值用**参数** `DEDUP_ENTITY_MIN`（默认 2）而不是写死 2：
+  //   设计稿的字面「≥ 2」只是这个参数的**默认值**，判据本身应当与步骤 c 的实体判据同源。
   const textRouteDegenerate = tokens.length < 2;
 
   const rows = db.prepare(FIND_CANDIDATES_SQL).all({ dedupSql }) as Array<
@@ -961,7 +1052,14 @@ export function write(store: WriteStore, input: WriteInput): WriteResult {
     const resolved = resolveEntities(db, input.entities ?? [], at);
 
     // ── 步骤 1c：`entityAliases` 同步 ──
-    const warnings = syncEntityAliases(store, input.entityAliases ?? [], resolved, at);
+    // ⚠️ `linkedEntityIds` 只用来判断「别名目标有没有被关联」⇒ 回报 `ALIAS_TARGET_NOT_LINKED`；
+    //   **绝不**因此把别名目标加进关联（关联只由 `input.entities` 表达）。
+    const warnings = syncEntityAliases(
+      store,
+      input.entityAliases ?? [],
+      resolved.linkedEntityIds,
+      at,
+    );
 
     // ── 步骤 2：完全重复检测 ──
     const existing = findByHash(db, newHash);
