@@ -104,10 +104,55 @@ function functionBodyRangeOf(
   if (match === null) {
     return undefined;
   }
-  const open = code.indexOf('{', match.index);
+  // ⚠️ **必须先配平参数列表的括号**：参数里可能含**内联对象类型**
+  //   （如 `ReadonlyArray<{ name: string; aliases: string[] }>`）
+  //   ⇒ 直接取签名后的第一个 `{` 会取到**类型字面量**的那个 `{`
+  //   ⇒ 配平出来的是一段类型文本，不是函数体（这个坑踩过一次）。
+  const parenOpen = match.index + match[0].length - 1;
+  let parenDepth = 0;
+  let parenClose = -1;
+  for (let index = parenOpen; index < code.length; index += 1) {
+    const char = code[index];
+    if (char === '(') {
+      parenDepth += 1;
+    } else if (char === ')') {
+      parenDepth -= 1;
+      if (parenDepth === 0) {
+        parenClose = index;
+        break;
+      }
+    }
+  }
+  if (parenClose === -1) {
+    return undefined;
+  }
+  // ⚠️ **返回类型也可能是内联对象类型**（`): { a: string } {`）⇒
+  //   若第一个 `{` 配平后紧跟着另一个 `{`，说明第一个是**类型字面量** ⇒ 跳过它。
+  let open = code.indexOf('{', parenClose);
   if (open === -1) {
     return undefined;
   }
+  const firstClose = matchingBrace(code, open);
+  if (firstClose === -1) {
+    return undefined;
+  }
+  if (
+    code
+      .slice(firstClose + 1)
+      .trimStart()
+      .startsWith('{')
+  ) {
+    open = code.indexOf('{', firstClose + 1);
+    if (open === -1) {
+      return undefined;
+    }
+  }
+  const end = matchingBrace(code, open);
+  return end === -1 ? undefined : { start: open, end };
+}
+
+/** 从 `open` 处的 `{` 出发，找到**配对**的 `}` 的下标；找不到返回 -1。 */
+function matchingBrace(code: string, open: number): number {
   let depth = 0;
   for (let index = open; index < code.length; index += 1) {
     if (code[index] === '{') {
@@ -115,11 +160,11 @@ function functionBodyRangeOf(
     } else if (code[index] === '}') {
       depth -= 1;
       if (depth === 0) {
-        return { start: open, end: index };
+        return index;
       }
     }
   }
-  return undefined;
+  return -1;
 }
 
 /** 取某个具名函数的**函数体**文本；找不到返回 `undefined`。 */
@@ -189,6 +234,44 @@ function injectAliasTargetLink(source: string): string {
     '{\n  linkEntityId({ linkedEntityIds: [], seen: new Set<string>() }, name);',
   );
   return source.slice(0, range.start) + mutatedBody + source.slice(range.end + 1);
+}
+
+/**
+ * 在**内存中的源码副本**里，把「要不要回报 `ALIAS_TARGET_NOT_LINKED`」的判定改成**恒真**。
+ *
+ * ⚠️ **只改内存副本，不碰磁盘上的 `src/`**（就地改源码会让 CI 留下脏工作树）。
+ * ⚠️ **恒真是最阴的一种错**：它不会让任何断言报红，除非有人专门去问
+ *   「这条判定到底看不看 `linkedEntityIds`」⇒ 所以要有机器检。
+ */
+function injectAlwaysTrueWarning(source: string): string {
+  const code = stripCommentsAndStrings(source);
+  const range = functionBodyRangeOf(code, 'syncEntityAliases');
+  if (range === undefined) {
+    return source;
+  }
+  const body = source.slice(range.start, range.end + 1);
+  const mutatedBody = body.replace(
+    /if\s*\(\s*!\s*linkedEntityIds\s*\.\s*includes\s*\([^)]*\)\s*\)/,
+    'if (true)',
+  );
+  return source.slice(0, range.start) + mutatedBody + source.slice(range.end + 1);
+}
+
+/**
+ * 「要不要回报 `ALIAS_TARGET_NOT_LINKED`」这条判定**是不是条件式**。
+ *
+ * ⚠️ **为什么要机器检这条**：判定写成恒真（`if (true)`）⇒ **每一次**写入都回报
+ *   「这个实体没跟本条记忆关联」⇒ 与事实相反 ⇒ 调用方被**持续误导**
+ *   （而所有「正向」断言仍然全绿 ⇒ 典型的真空）。
+ *   ⇒ 判定必须**真的**看 `linkedEntityIds`。
+ */
+function aliasTargetWarningIsConditional(source: string): boolean {
+  const code = stripCommentsAndStrings(source);
+  const body = functionBodyOf(code, 'syncEntityAliases');
+  if (body === undefined) {
+    return false;
+  }
+  return /linkedEntityIds\s*\.\s*includes\s*\(/.test(body);
 }
 
 /**
@@ -1051,6 +1134,23 @@ describe('P1-T07 · 裁决 C：别名目标实体「建，但不隐含关联」'
     const mutatedArgs = injectAliasNamesIntoEntities(source);
     expect(mutatedArgs).not.toBe(source);
     expect(resolveEntitiesArgs(mutatedArgs) ?? '').toContain('entityAliases');
+  });
+
+  it('★ 静态守卫：「要不要回报 ALIAS_TARGET_NOT_LINKED」这条判定**必须**是条件式（不得恒真）', () => {
+    const source = readFileSync(join(SRC_ROOT, 'store', 'write.ts'), 'utf8');
+
+    // 性质：★ 判定确实看 `linkedEntityIds`（**不是**恒真）
+    expect(aliasTargetWarningIsConditional(source)).toBe(true);
+
+    // ⚠️ **负控**：把判定改成恒真（`if (true)`）⇒ 守卫必须立刻改判。
+    //   ⇒ 只改**内存中的源码副本**，磁盘上的 `src/` 一个字都不动。
+    //   ⚠️ 这一条是**关键**：恒真不会让任何「正向」断言变红
+    //   （每次写入都多报一条 warning 时，正向用例照样可能全绿）⇒ 必须有这条守卫。
+    const mutated = injectAlwaysTrueWarning(source);
+    // 变异确实落到被审对象上了（否则下面那条断言就是空断言）
+    expect(mutated).not.toBe(source);
+    // 性质：★ 守卫在变异后**改判** ⇒ 闸门不是摆设
+    expect(aliasTargetWarningIsConditional(mutated)).toBe(false);
   });
 
   it('★ 反向：`entities` 里显式点名 ⇒ 该实体**被关联** + 别名挂到它身上 + **没有新建第二个实体** + **没有** ALIAS_TARGET_NOT_LINKED', () => {
