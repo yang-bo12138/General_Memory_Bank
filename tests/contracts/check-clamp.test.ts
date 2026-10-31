@@ -107,6 +107,55 @@ export function somethingElse(): number {
 }
 `;
 
+/**
+ * ★ **绕过变体**：删掉 Δt 钳制，再补一个**无关的** `Math.max(0, …)`。
+ *
+ * ⚠️ 这是「只验模式存在」的那条守卫**堵不住**的洞：
+ *   函数体内**确实**有 `Math.max(0, …)` ⇒ 存在性检查通过，
+ *   但那道钳制**根本没夹 Δt** ⇒ Δt 钳制事实上已经没了。
+ */
+const UNRELATED_MAX = `
+export function intensity(memory: { last_access: number }, now?: number): number {
+  const elapsedMs = now - memory.last_access;
+  const unrelated = Math.max(0, 42);
+  return Math.min(1, Math.exp(-elapsedMs / 1000));
+}
+`;
+
+/**
+ * ★ **绕过变体**：`Math.min(1, …)` 夹的是**无关的**东西，返回值根本没被夹。
+ */
+const UNRELATED_MIN = `
+export function intensity(memory: { last_access: number }, now?: number): number {
+  const elapsedMs = Math.max(0, now - memory.last_access);
+  const unrelated = Math.min(1, 42);
+  return Math.exp(-elapsedMs / 1000);
+}
+`;
+
+/**
+ * **中间变量写法**（等价、合法）⇒ 守卫必须**放行**。
+ *
+ * ⚠️ 这是「不误报」的守卫：`Math.max(0, deltaMs)` 的第二个实参里**没有** `last_access`
+ *   ⇒ 「第二个实参必须含 last_access」那种 token 判据会**误报**；
+ *   ⇒ 数据流判据（exp 的实参引用了被 max(0,·) 赋值的 `elapsedMs`）才放得过。
+ */
+const INTERMEDIATE_VARIABLE = `
+export function intensity(memory: { last_access: number }, now?: number): number {
+  const deltaMs = now - memory.last_access;
+  const elapsedMs = Math.max(0, deltaMs);
+  return Math.min(1, Math.exp(-elapsedMs / 1000));
+}
+`;
+
+/** **内联写法**（等价、合法）⇒ 守卫必须**放行**。 */
+const INLINE_MAX = `
+export function intensity(memory: { last_access: number }, now?: number): number {
+  const delta = now - memory.last_access;
+  return Math.min(1, Math.exp(-Math.max(0, delta) / 1000));
+}
+`;
+
 /** 缺哪一道（返回规格里的 `method`）。 */
 function missingMethods(source: string): string[] {
   return scanClamps(source).missing.map((spec) => spec.method);
@@ -181,6 +230,36 @@ describe('F-08 ③ · check-clamp（intensity() 的两道钳制）', () => {
     expect(result.bodyLines).toBeNull();
     // ⚠️ 「没扫到」必须等于「全部缺失」⇒ 否则删掉整个函数也会显示全绿
     expect(result.missing).toHaveLength(EXPECTED_REQUIRED_CLAMP_COUNT);
+  });
+
+  it('★ 反例：删掉 Δt 钳制、补一个**无关的** `Math.max(0, …)` ⇒ 守卫必须判「存在但没生效」', () => {
+    // ⚠️ 这是「只验模式存在」的那条守卫堵不住的洞：
+    //   函数体内**确实**有 `Math.max(0, …)` ⇒ 存在性检查会通过
+    //   ⇒ 但那道钳制根本没夹 Δt ⇒ 事实上等于把 Δt 钳制删了
+    const result = scanClamps(UNRELATED_MAX);
+    // ⚠️ 它**不是**「缺失」（调用确实在）⇒ 必须落在 `unguarded` 而不是 `missing`
+    expect(result.missing).toEqual([]);
+    expect(result.unguarded.map((spec) => spec.method)).toContain('max');
+  });
+
+  it('★ 反例：`Math.min(1, …)` 夹的是无关的东西 ⇒ 守卫必须判「存在但没生效」', () => {
+    const result = scanClamps(UNRELATED_MIN);
+    expect(result.missing).toEqual([]);
+    expect(result.unguarded.map((spec) => spec.method)).toContain('min');
+  });
+
+  it('★ 不误报：中间变量写法（`Math.max(0, deltaMs)`）必须**放行**', () => {
+    // ⚠️ 「第二个实参里必须含 last_access」那种 token 判据会在这里**误报**
+    //   ⇒ 数据流判据才放得过 ⇒ 这条是「守卫别过紧」的保证
+    const result = scanClamps(INTERMEDIATE_VARIABLE);
+    expect(result.missing).toEqual([]);
+    expect(result.unguarded).toEqual([]);
+  });
+
+  it('★ 不误报：内联写法（`Math.exp(-Math.max(0, delta) / tau)`）必须**放行**', () => {
+    const result = scanClamps(INLINE_MAX);
+    expect(result.missing).toEqual([]);
+    expect(result.unguarded).toEqual([]);
   });
 
   it('C31 自洽：规格表的条数与写死的期望一致（守卫的「分母」不许漂）', () => {
