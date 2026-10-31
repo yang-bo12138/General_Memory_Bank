@@ -28,6 +28,7 @@
 import { readFileSync } from 'node:fs';
 
 import Database from 'better-sqlite3';
+import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 
 import { isBaselineConfig } from '../../src/core/flags.js';
@@ -38,10 +39,12 @@ import { type MemoryKind, type MemoryView, get } from '../../src/store/get.js';
 import { link } from '../../src/store/link.js';
 import { type RecallResult, recall } from '../../src/store/recall.js';
 import { type TouchOutcome, touch } from '../../src/store/touch.js';
-import { type WriteResult, write } from '../../src/store/write.js';
+import { type WriteResult, type WriteWarning, write } from '../../src/store/write.js';
 import { MemoryLogger } from '../../src/util/log.js';
+import { MS_PER_DAY } from '../../src/util/time.js';
 import {
   REF_FORMULAS,
+  REF_MS_PER_DAY,
   REF_V1_PARAMS,
   type RefV1Model,
   type RefV1RecallEvidence,
@@ -51,6 +54,7 @@ import {
   refEntityName,
   refGet,
   refRecall,
+  refResolveEntityId,
   refTouch,
   refWrite,
 } from './ref-v1.js';
@@ -62,10 +66,20 @@ import {
 /** 语料的基准时刻（固定值 ⇒ 完全确定）。 */
 const T0 = 1_700_000_000_000;
 
-/** 一天（毫秒）。 */
-const DAY = 86_400_000;
-
-/** 一小时（毫秒）。 */
+/**
+ * 一小时（毫秒）—— **这是语料自己的时间粒度，不是库的时间常量**。
+ *
+ * ⚠️ **为什么它可以留在测试文件里**（而 `MS_PER_DAY` 不行）：
+ *   `MS_PER_DAY` 是**库的一个键**（§4.1 公式里的「天 → 毫秒」换算）⇒ 仓库里有
+ *   **唯一定义处**（`src/util/time.ts`，C36 收敛后的结果）⇒ 测试文件里再写一份
+ *   就是「同一个键两处两套定义」⇒ 将来库改了、基线不跟着改 ⇒ 基线**静默地**
+ *   不再是基线。
+ *   ⇒ 这里**从库 import**（`import { MS_PER_DAY } from '../../src/util/time.js'`）。
+ *
+ * ⚠️ 而 `HOUR`（一小时）**不是库的键**：它既不在 `src/util/time.ts` 里，
+ *   也不在 §4.1 / §4.6 的任何公式里 ⇒ 它只是「本语料把召回放在写完 1 小时后」
+ *   这个**排期选择** ⇒ 留在测试文件里没问题，但必须写明它是语料粒度。
+ */
 const HOUR = 3_600_000;
 
 /**
@@ -97,12 +111,30 @@ type CorpusStep =
       source?: string;
       now: number;
     }
-  | { op: 'recall'; context: string; topN?: number; now: number }
+  | {
+      op: 'recall';
+      context: string;
+      topN?: number;
+      /**
+       * 调用方抽好的实体**名**（ADR-P1-T08-GAP 缺口①：库不抽取实体）。
+       *
+       * ⚠️ **这里传的名字 = v1.0 会从上下文里抽到的那一组** ⇒ 图谱路的**输入**
+       *   与 v1.0 等价 ⇒ 基线比的仍然是「同样的输入下行为是否逐位一致」。
+       */
+      entityNames?: string[];
+      /** 以「名字」表达的 `entityIds`（§4.6 步骤 1 的分支②：跳过名称解析）。 */
+      entityIdsByName?: string[];
+      /** 是否显式查询归档层（归档模式**跳过强度精筛**）。 */
+      includeArchived?: boolean;
+      /** 这条召回**预期为空**（归档线以下 ⇒ 非归档模式下被精筛挡掉）。 */
+      expectEmpty?: boolean;
+      now: number;
+    }
   | { op: 'touch'; targets: number[]; now: number }
   | { op: 'get'; target: number; now: number };
 
 /**
- * 语料（**17 次写 + 5 次召回 + 3 次 touch + 5 次 get**）。
+ * 语料（**17 次写 + 8 次召回 + 3 次 touch + 6 次 get**）。
  *
  * ⚠️ **每一条语料都对应一个必须被守住的语义**（否则那条用例是空跑）：
  *   · 写 0/1：新建 + 「首因优待」（`DIFFICULTY_FIRST`）；
@@ -111,13 +143,16 @@ type CorpusStep =
  *   · 写 12/13：**别名冲突**（§4.9 步骤 1c；`ALIAS_CONFLICT` 进 `warnings`）；
  *   · 写 14：**不构成合并**（去重查询串没命中 ⇒ 新建）；
  *   · 写 15/16：**置信度惩罚**与**情绪加权**（§4.3 的两个初值公式）；
- *   · 召 17：**OR 宽松路**（> 3 个 token）；
- *   · 召 18/19/20：**AND 精确路**；
+ *   · 召 17：**OR 宽松路**（> 3 个 token）+ **图谱路**（传 `entityNames`）；
+ *   · 召 18/19/20：**AND 精确路**（`周会` / `PostgreSQL` 也带图谱路）；
  *   · 召 21：**LIKE 单字兜底路**（`normBm25` 恒为 1.0）；
- *   · touch 22：**跨天加固**（`spacing` 生效）；
- *   · touch 23：**同日守卫**（`intervalDays < 1` ⇒ **不增长**，`stabilityDelta = 0`）；
- *   · touch 24：**大间隔**（`spacing` 触 `SPACING_CAP`）；
- *   · get 25~29：**不同 `now` 下的 `intensity` / `layer`** 与「不存在的 id ⇒ `null`」。
+ *   · 召 22：**`entityIds` 分支**（§4.6 步骤 1 的分支②：跳过名称解析）；
+ *   · 召 23：**图谱路为空**（分支④：两个都不传 ⇒ 退化为「文本路 + 向量路」）；
+ *   · 召 24/25：**归档口径**（`includeArchived` ⇒ 跳过强度精筛 ⇒ 与非归档模式**结果不同**）；
+ *   · touch 26：**跨天加固**（`spacing` 生效）；
+ *   · touch 27：**同日守卫**（`intervalDays < 1` ⇒ **不增长**，`stabilityDelta = 0`）；
+ *   · touch 28：**大间隔**（`spacing` 触 `SPACING_CAP`）；
+ *   · get 29~34：**不同 `now` 下的 `intensity` / `layer`** 与「不存在的 id ⇒ `null`」。
  *
  * ⚠️ **时间轴为什么这样排**（这是本文件最容易踩空的地方）：
  *   召回的**强度精筛**是 `intensity > ARCHIVE_LINE`（0.05）⇒
@@ -126,6 +161,8 @@ type CorpusStep =
  *   ⇒ 若把召回放在「几天后」，召回会返回**空集** ⇒ 基线「全绿」但**什么都没验**。
  *   ⇒ 因此：写入集中在 **17 秒**内、召回放在 **1 小时**后（此时强度 ≈ 0.96，存活），
  *     而 touch 放在 **2 天后 / 2 天后 1 秒 / 40 天后**（分别覆盖跨天加固、同日守卫、大间隔）。
+ *   ⇒ 唯二的「晚召」是召 24/25（`40 天后`）：它们**故意**落在归档线以下，
+ *     用来钉住「归档模式跳过强度精筛」这条口径（归档模式命中、非归档模式空）。
  */
 const CORPUS: CorpusStep[] = [
   { op: 'write', content: '张三住在北京', kind: 'fact', entities: ['张三'], now: T0 },
@@ -209,19 +246,53 @@ const CORPUS: CorpusStep[] = [
     emotion: 0.8,
     now: T0 + 16_000,
   },
-  { op: 'recall', context: '张三住哪里', topN: 5, now: T0 + HOUR },
-  { op: 'recall', context: '周会', topN: 5, now: T0 + HOUR + 1000 },
+  // ⚠️ **图谱路**：传 `entityNames` ⇒ 库只做「名字 → entity_id」的归一（库不抽取实体）。
+  //   `['张三']` 正是 v1.0 会从「张三住哪里」里抽到的那一组 ⇒ 两侧图谱路输入等价。
+  { op: 'recall', context: '张三住哪里', topN: 5, entityNames: ['张三'], now: T0 + HOUR },
+  { op: 'recall', context: '周会', topN: 5, entityNames: ['周会'], now: T0 + HOUR + 1000 },
+  // ⚠️ **图谱路为空**（分支④：「咖啡」里没有「咖啡机」⇒ v1.0 也抽不到实体 ⇒ 两侧都空）。
   { op: 'recall', context: '咖啡', topN: 3, now: T0 + HOUR + 2000 },
-  { op: 'recall', context: 'PostgreSQL', topN: 5, now: T0 + HOUR + 3000 },
-  { op: 'recall', context: '猫', topN: 5, now: T0 + HOUR + 4000 },
-  { op: 'touch', targets: [0, 1], now: T0 + 2 * DAY },
-  { op: 'touch', targets: [0], now: T0 + 2 * DAY + 1000 },
-  { op: 'touch', targets: [3, 4], now: T0 + 40 * DAY },
-  { op: 'get', target: 0, now: T0 + 2 * DAY + HOUR },
-  { op: 'get', target: 1, now: T0 + 41 * DAY },
-  { op: 'get', target: 6, now: T0 + 41 * DAY },
-  { op: 'get', target: 13, now: T0 + 41 * DAY },
-  { op: 'get', target: -1, now: T0 + 41 * DAY },
+  {
+    op: 'recall',
+    context: 'PostgreSQL',
+    topN: 5,
+    entityNames: ['PostgreSQL'],
+    now: T0 + HOUR + 3000,
+  },
+  { op: 'recall', context: '猫', topN: 5, entityNames: ['猫'], now: T0 + HOUR + 4000 },
+  // ⚠️ **分支②**：传 `entityIds` ⇒ 完全跳过名称解析（等价于「调用方自己解析好了」）。
+  {
+    op: 'recall',
+    context: '张三喜欢猫',
+    topN: 5,
+    entityIdsByName: ['张三'],
+    now: T0 + HOUR + 5000,
+  },
+  { op: 'touch', targets: [0, 1], now: T0 + 2 * MS_PER_DAY },
+  { op: 'touch', targets: [0], now: T0 + 2 * MS_PER_DAY + 1000 },
+  { op: 'touch', targets: [3, 4], now: T0 + 40 * MS_PER_DAY },
+  // ⚠️ **归档口径**（ADR-P1-T08-GAP 小口径③）：40 天后「咖啡机」那条的强度已降到归档线以下
+  //   ⇒ 非归档模式被**强度精筛**挡掉（空集）、归档模式**跳过精筛**（命中）。
+  //   ⇒ 这一对召回是「归档模式不做强度精筛」这条口径的**判别力**所在。
+  {
+    op: 'recall',
+    context: '咖啡机',
+    topN: 5,
+    includeArchived: true,
+    now: T0 + 40 * MS_PER_DAY + HOUR,
+  },
+  {
+    op: 'recall',
+    context: '咖啡机',
+    topN: 5,
+    expectEmpty: true,
+    now: T0 + 40 * MS_PER_DAY + HOUR + 1000,
+  },
+  { op: 'get', target: 0, now: T0 + 2 * MS_PER_DAY + HOUR },
+  { op: 'get', target: 1, now: T0 + 41 * MS_PER_DAY },
+  { op: 'get', target: 6, now: T0 + 41 * MS_PER_DAY },
+  { op: 'get', target: 13, now: T0 + 41 * MS_PER_DAY },
+  { op: 'get', target: -1, now: T0 + 41 * MS_PER_DAY },
   // ⚠️ **时钟回拨**：`now` 早于 `last_access` ⇒ `Δt` 被 `max(0, ·)` 钳到 0 ⇒
   //   强度恒为 1（§4.1 的第一重钳制；F-08 的正域不可观测 ⇒ 这里专门钉住它）。
   { op: 'get', target: 0, now: T0 },
@@ -424,8 +495,8 @@ function runRealCorpus(): RealRun {
       const first = writtenIds[0];
       const second = writtenIds[1];
       if (first !== undefined && second !== undefined) {
-        link(store, '张三', '喜欢', '猫', second, T0 + 19 * DAY);
-        link(store, '张三', '住在', '北京', first, T0 + 19 * DAY);
+        link(store, '张三', '喜欢', '猫', second, T0 + 19 * MS_PER_DAY);
+        link(store, '张三', '住在', '北京', first, T0 + 19 * MS_PER_DAY);
       }
       edgesSeeded = true;
     }
@@ -471,9 +542,29 @@ function runRealCorpus(): RealRun {
           ftsRows: ftsRows.map((row) => ({ refId: row.realId, rawBm25: row.rawBm25 })),
           likeRows,
         });
+        // ⚠️ **实体归一由调用方做**（ADR-P1-T08-GAP 缺口①）：
+        //   · `entityNames` ⇒ 直接传名字（库逐名 `resolveEntity`，主名优先于别名）；
+        //   · `entityIdsByName` ⇒ 调用方自己解析好了 ⇒ 传 id（库**完全跳过**名称解析）；
+        //   · 两者都不传 ⇒ 图谱路为空（退化为「文本路 + 向量路」）。
+        //   ⇒ `entityIds` 与 `entityNames` **互斥** ⇒ 语料里不会同时给。
+        const entityIds =
+          step.entityIdsByName === undefined
+            ? undefined
+            : step.entityIdsByName.map((name) => {
+                const row = db.prepare('SELECT id FROM entities WHERE name = ?').get(name) as
+                  | { id?: unknown }
+                  | undefined;
+                if (row === undefined || typeof row.id !== 'string') {
+                  throw new Error(`语料引用了库里不存在的实体名：${name}`);
+                }
+                return row.id;
+              });
         const result = recall(store, {
           context: step.context,
           ...(step.topN === undefined ? {} : { topN: step.topN }),
+          ...(step.entityNames === undefined ? {} : { entityNames: step.entityNames }),
+          ...(entityIds === undefined ? {} : { entityIds }),
+          ...(step.includeArchived === undefined ? {} : { includeArchived: step.includeArchived }),
           // ⚠️ 用 `diagnostics` 而不是 `explain`：`diagnostics` 给同样的 `breakdown`，
           //   但**不写 `recall` 事件** ⇒ 事件流里只有真正的业务事件（§4.6 步骤 4）。
           diagnostics: true,
@@ -583,18 +674,63 @@ function normalizeEvents(
   }));
 }
 
+/**
+ * 归一化后的 `write` warning（**两个变体统一成一个形状**）。
+ *
+ * ⚠️ **为什么统一**：`WriteWarning` 是**可辨识联合**
+ *   （`AliasConflictWarning | AliasTargetNotLinkedWarning`，P1-T07 的 C 终裁之后），
+ *   两个变体的字段集**互不重叠** ⇒ 直接把联合摊平会让 TS 报错
+ *   ⇒ 这里把两个变体**归一到同一组键**，不存在的键填 `null`
+ *   ⇒ 两侧（参考实现 / 真实实现）走**同一个归一化函数** ⇒ 形状必然可比。
+ *
+ * ⚠️ **基线只覆盖 `ALIAS_CONFLICT`**：`ALIAS_TARGET_NOT_LINKED` 是 **v2.1 新增**的
+ *   边界提示（v1.0 没有这条 warning、也没有「建但不隐含关联」这条裁决）
+ *   ⇒ 它**不在「与 v1.0 逐位一致」的范围内** ⇒ 本语料不触发它
+ *   ⇒ 它由 `tests/unit/write.test.ts` 覆盖（软件工程师-4 的用例）。
+ */
+interface NormalizedWarning {
+  code: string;
+  /** `ALIAS_CONFLICT` 专有：冲突的别名。 */
+  alias: string | null;
+  /** `ALIAS_CONFLICT` 专有：库里现在指向谁（实体**名**）。 */
+  currentEntity: string | null;
+  /** `ALIAS_CONFLICT` 专有：本次想指向谁（实体**名**）。 */
+  intendedEntity: string | null;
+  /** `ALIAS_TARGET_NOT_LINKED` 专有：调用方写的实体名。 */
+  name: string | null;
+  /** `ALIAS_TARGET_NOT_LINKED` 专有：实体 id（归一化成实体**名**）。 */
+  entity: string | null;
+}
+
+/** 把一条 `write` warning 归一化（两个变体统一形状）。 */
+function normalizeWarning(warning: WriteWarning, resolver: IdResolver): NormalizedWarning {
+  if (warning.code === 'ALIAS_CONFLICT') {
+    return {
+      code: warning.code,
+      alias: warning.alias,
+      currentEntity: resolver.entityName(warning.currentEntityId),
+      intendedEntity: resolver.entityName(warning.intendedEntityId),
+      name: null,
+      entity: null,
+    };
+  }
+  return {
+    code: warning.code,
+    alias: null,
+    currentEntity: null,
+    intendedEntity: null,
+    name: warning.name,
+    entity: resolver.entityName(warning.entityId),
+  };
+}
+
 /** 归一化后的 `write` 输出。 */
 interface NormalizedWrite {
   op: 'write';
   merged: boolean;
   exact: boolean;
   content: string;
-  warnings: Array<{
-    code: string;
-    alias: string;
-    currentEntity: string;
-    intendedEntity: string;
-  }>;
+  warnings: NormalizedWarning[];
   events: NormalizedEvent[];
 }
 
@@ -739,6 +875,8 @@ function replayReference(model: RefV1Model, real: RealRun): RefRun {
             alias: warning.alias,
             currentEntity: refEntityName(model, warning.currentEntityId),
             intendedEntity: refEntityName(model, warning.intendedEntityId),
+            name: null,
+            entity: null,
           })),
           events: normalizeEvents(
             outcome.events.map((event) => ({
@@ -755,11 +893,27 @@ function replayReference(model: RefV1Model, real: RealRun): RefRun {
         if (evidence === undefined || evidence.kind !== 'recall') {
           throw new Error(`第 ${stepIndex} 步缺召回证据`);
         }
+        // ⚠️ **实体归一也是由入参驱动**（ADR-P1-T08-GAP 缺口①）：
+        //   参考实现**不从 `context` 里抽实体** ⇒ 两侧的图谱路输入必须由语料显式给出。
+        //   · `entityNames` ⇒ 参考实现逐名解析（主名优先于别名；解析不到**跳过**）；
+        //   · `entityIdsByName` ⇒ 语料给的是**名字**，这里翻译成参考实现自己的 id 空间
+        //     （与真实侧「调用方自己解析好了」的语义一致）。
+        const refEntityIds =
+          step.entityIdsByName === undefined
+            ? undefined
+            : step.entityIdsByName
+                .map((name) => refResolveEntityId(model, name))
+                .filter((entityId): entityId is string => entityId !== null);
         const outcome = refRecall(
           model,
           {
             context: step.context,
             ...(step.topN === undefined ? {} : { topN: step.topN }),
+            ...(step.entityNames === undefined ? {} : { entityNames: step.entityNames }),
+            ...(refEntityIds === undefined ? {} : { entityIds: refEntityIds }),
+            ...(step.includeArchived === undefined
+              ? {}
+              : { includeArchived: step.includeArchived }),
             now: step.now,
           },
           {
@@ -864,12 +1018,7 @@ function normalizeReal(real: RealRun): NormalizedStep[] {
           merged: output.result.merged,
           exact: output.result.exact,
           content: output.result.content,
-          warnings: output.result.warnings.map((warning) => ({
-            code: warning.code,
-            alias: warning.alias,
-            currentEntity: resolver.entityName(warning.currentEntityId),
-            intendedEntity: resolver.entityName(warning.intendedEntityId),
-          })),
+          warnings: output.result.warnings.map((warning) => normalizeWarning(warning, resolver)),
           events: normalizeEvents(real.eventsPerStep[stepIndex] ?? [], resolver),
         });
         break;
@@ -979,9 +1128,52 @@ function deepDiff(expected: unknown, actual: unknown, path = ''): string[] {
   return out;
 }
 
+/**
+ * 逐位比对的断言 —— **失败信息里必须指出「差在哪一条」**。
+ *
+ * ⚠️ **为什么不用 `expect(a).toEqual(b)` 直接比**：
+ *   vitest 的默认 diff 会把大数组**截断**（`…(1)`）⇒ 失败信息里只看得见
+ *   「两个大数组不相等」，**看不见「哪个字段、差了多少」**
+ *   ⇒ 负控的「红的理由」无法核对（负控就退化成「随便哪条红了就行」）。
+ *   ⇒ 这里先算出**逐条差异描述**（`deepDiff`）再断言
+ *   ⇒ 失败信息直接点名差异（`hits[0].breakdown.intensityPart: 参考 … ≠ 实现 …`）。
+ *
+ * ⚠️ **逐位比较仍然是 `toEqual` 的严格语义**（`Object.is` 级别的浮点比较），
+ *   **不是** `toBeCloseTo`（近似比较会把「权重差 1e-6」这种真漂移放过去）。
+ */
+function expectBitwiseEqual(expected: unknown, actual: unknown, label: string): void {
+  const diffs = deepDiff(expected, actual);
+  // ⚠️ **差异清单放进断言消息里**（而不是让 vitest 打印被截断的数组）：
+  //   vitest 对大数组只打印 `…(29)` ⇒ 失败信息里看不到「差在哪一条」
+  //   ⇒ 负控就退化成「随便哪条红了就行」。
+  expect(diffs.length, `${label} 的逐位差异（参考实现 vs 真实实现）：\n${diffs.join('\n')}`).toBe(
+    0,
+  );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // 七、用例
 // ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * 一个 import 说明符**是否指向 `src/**`**（库的运行时实现）。
+ *
+ * ⚠️ **为什么不能只做字符串匹配 `includes('src/')`**：`'../src'`（不带斜杠）会漏判
+ *   ⇒ 统一**解析成路径**再判（相对说明符相对 `ref-v1.ts` 解析；裸说明符是包 ⇒ 不算）。
+ */
+function importReachesSrc(specifier: string): boolean {
+  if (specifier.includes('src/')) {
+    return true;
+  }
+  if (!specifier.startsWith('.')) {
+    return false;
+  }
+  const resolved = new URL(
+    specifier.replace(/\.js$/, '.ts'),
+    new URL('./ref-v1.ts', import.meta.url),
+  );
+  return resolved.pathname.includes('/src/');
+}
 
 /** 语料只跑一次（**确定性**：全部时刻与内容都是写死的）。 */
 const REAL = runRealCorpus();
@@ -1020,28 +1212,101 @@ describe('P1-T09 · v1.0 基线等价（write / recall / touch / get）', () => 
 
   it('★ 参考实现不得 import 库的实现（否则基线是自证的）', () => {
     const source = readFileSync(new URL('./ref-v1.ts', import.meta.url), 'utf8');
-    const specifiers = [
-      ...[...source.matchAll(/\bfrom\s+'([^']+)'/g)].map((match) => match[1] ?? ''),
-      ...[...source.matchAll(/\bimport\s*\(\s*'([^']+)'\s*\)/g)].map((match) => match[1] ?? ''),
-    ];
-    // ⚠️ **直接依赖**：参考实现所在的文件不许 import `src/**`。
-    expect(specifiers.filter((specifier) => specifier.includes('src/'))).toEqual([]);
+    // ⚠️ **用 TypeScript 的 AST 扫，不做文本 grep**：
+    //   · 注释里写「按 §4.1 的 decay 公式」是**合法**的（`grep 'decay'` 会误判）；
+    //   · 字符串字面量里的 `'src/...'` 也不是 import。
+    //   ⇒ AST 只认**真正的 import 声明**与**真正的调用表达式** ⇒ 判定精确到行号。
+    const sourceFile = ts.createSourceFile('ref-v1.ts', source, ts.ScriptTarget.ESNext, true);
+    const lineOf = (node: ts.Node): number =>
+      sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1;
+
+    const imports: Array<{ specifier: string; line: number }> = [];
+    const clockReads: Array<{ text: string; line: number }> = [];
+    const visit = (node: ts.Node): void => {
+      if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
+        imports.push({ specifier: node.moduleSpecifier.text, line: lineOf(node) });
+      }
+      if (
+        ts.isCallExpression(node) &&
+        ts.isPropertyAccessExpression(node.expression) &&
+        node.expression.expression.getText(sourceFile) === 'Date' &&
+        node.expression.name.text === 'now'
+      ) {
+        clockReads.push({ text: 'Date.now()', line: lineOf(node) });
+      }
+      if (ts.isNewExpression(node) && node.expression.getText(sourceFile) === 'Date') {
+        clockReads.push({ text: 'new Date()', line: lineOf(node) });
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sourceFile);
+
+    // ⚠️ **直接依赖**：参考实现所在的文件不许 import `src/**` 的任何模块
+    //   （`src/core/decay.js` / `src/core/scoring.js` / `src/core/tokenize.js` /
+    //     `src/store/*.js` / `src/util/*.js` 一律不许）。
+    const directOffenders = imports
+      .filter((item) => importReachesSrc(item.specifier))
+      .map((item) => `第 ${item.line} 行：import ${item.specifier}`);
+    expect(directOffenders).toEqual([]);
+
     // ⚠️ **间接依赖**：它 import 的本地模块也不许（递归一层即可 —— 本地模块只有 golden 两个）。
-    const localSpecifiers = specifiers.filter(
-      (specifier) => specifier.startsWith('.') && !specifier.includes('node:'),
-    );
-    for (const specifier of localSpecifiers) {
+    for (const item of imports) {
+      if (!item.specifier.startsWith('.') || item.specifier.includes('node:')) {
+        continue;
+      }
       // ⚠️ TS 的 ESM 风格 import 写的是 `.js`，实际文件是 `.ts` ⇒ 解析时要换回来。
       const resolved = new URL(
-        specifier.replace(/\.js$/, '.ts'),
+        item.specifier.replace(/\.js$/, '.ts'),
         new URL('./ref-v1.ts', import.meta.url),
       );
       const localSource = readFileSync(resolved, 'utf8');
-      const localSpecifiers = [
-        ...[...localSource.matchAll(/\bfrom\s+'([^']+)'/g)].map((match) => match[1] ?? ''),
-      ];
-      expect(localSpecifiers.filter((item) => item.includes('src/'))).toEqual([]);
+      const localFile = ts.createSourceFile(
+        resolved.pathname,
+        localSource,
+        ts.ScriptTarget.ESNext,
+        true,
+      );
+      const localImports: string[] = [];
+      const localVisit = (node: ts.Node): void => {
+        if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
+          localImports.push(node.moduleSpecifier.text);
+        }
+        ts.forEachChild(node, localVisit);
+      };
+      localVisit(localFile);
+      expect(localImports.filter((specifier) => importReachesSrc(specifier))).toEqual([]);
     }
+  });
+
+  it('★ 参考实现不得读真实时钟（C37：时间一律从写死的 T0 推导）', () => {
+    const source = readFileSync(new URL('./ref-v1.ts', import.meta.url), 'utf8');
+    const sourceFile = ts.createSourceFile('ref-v1.ts', source, ts.ScriptTarget.ESNext, true);
+    const offenders: string[] = [];
+    const visit = (node: ts.Node): void => {
+      const line = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1;
+      if (
+        ts.isCallExpression(node) &&
+        ts.isPropertyAccessExpression(node.expression) &&
+        node.expression.expression.getText(sourceFile) === 'Date' &&
+        node.expression.name.text === 'now'
+      ) {
+        offenders.push(`第 ${line} 行：Date.now()`);
+      }
+      if (ts.isNewExpression(node) && node.expression.getText(sourceFile) === 'Date') {
+        offenders.push(`第 ${line} 行：new Date()`);
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sourceFile);
+    expect(offenders).toEqual([]);
+  });
+
+  it('★ 「天 → 毫秒」只有一个来源：参考实现的常量必须与库相等', () => {
+    // ⚠️ **为什么两边都要有**：库侧是**唯一定义处**（`src/util/time.ts`，C36 收敛后的结果）；
+    //   参考实现侧**不能 import 它**（否则基线自证）⇒ 两侧各有一份常量。
+    //   ⇒ 那就**显式断言两者相等** ⇒ 将来 `MS_PER_DAY` 改了，这条断言立刻变红
+    //   （而不是「基线静默地不再是基线」）。
+    expect(REF_MS_PER_DAY).toBe(MS_PER_DAY);
   });
 
   it('★ 语料本身有判别力：四条写入路径 + 冲突 + 同日守卫都出现了', () => {
@@ -1056,31 +1321,78 @@ describe('P1-T09 · v1.0 基线等价（write / recall / touch / get）', () => 
     expect(
       touches.some((step) => step.outcomes.some((outcome) => outcome.edgesReinforced > 0)),
     ).toBe(true);
-    // ⚠️ **反真空守卫**：召回**必须真的召回了东西**。
-    //   否则「召回逐位一致」这条断言会在**空集**上成立 ⇒ 绿得毫无意义
-    //   （本轮实测踩过：把召回放在写完 20 天后 ⇒ 全部被强度精筛掉 ⇒ 空集）。
-    const recalls = pick(REAL_STEPS, 'recall');
-    expect(recalls.length).toBeGreaterThan(0);
-    expect(recalls.every((step) => step.hits.length > 0)).toBe(true);
-    // ⚠️ 召回命中的**分数**必须互不相同（否则排序判据退化成「按 id 排」）。
-    const allScores = recalls.flatMap((step) => step.hits.map((hit) => hit.score));
-    expect(new Set(allScores).size).toBe(allScores.length);
+  });
+
+  it('★ 反真空守卫：召回必须真的召回东西，且归档口径必须可分辨', () => {
+    const corpusRecalls = CORPUS.filter((step) => step.op === 'recall');
+    const realRecalls = pick(REAL_STEPS, 'recall');
+    expect(realRecalls.length).toBe(corpusRecalls.length);
+    corpusRecalls.forEach((corpusStep, index) => {
+      const real = realRecalls[index];
+      expect(real).toBeDefined();
+      if (corpusStep.op !== 'recall' || real === undefined) {
+        return;
+      }
+      if (corpusStep.expectEmpty === true) {
+        // ⚠️ **这一条「预期为空」**：它是被**强度精筛**挡掉的 ⇒ 空集才是对的。
+        expect(real.hits.length).toBe(0);
+        return;
+      }
+      // ⚠️ **反真空守卫**：非归档的召回**必须真的召回了东西**。
+      //   否则「召回逐位一致」这条断言会在**空集**上成立 ⇒ 绿得毫无意义
+      //   （本轮实测踩过：把召回放在写完 20 天后 ⇒ 全部被强度精筛掉 ⇒ 空集）。
+      expect(real.hits.length).toBeGreaterThan(0);
+      // ⚠️ 命中分数必须**互不相同**（否则排序判据退化成「按 id 排」⇒ 分数这一项白比）。
+      const scores = real.hits.map((hit) => hit.score);
+      expect(new Set(scores).size).toBe(scores.length);
+    });
+
+    // ⚠️ **归档口径的判别力**：同一条查询，归档模式命中、非归档模式空
+    //   ⇒ 「归档模式跳过强度精筛」这条口径真的被两边守着（而不是两边都空）。
+    const archivedIndex = corpusRecalls.findIndex(
+      (step) => step.op === 'recall' && step.includeArchived === true,
+    );
+    const plainIndex = corpusRecalls.findIndex(
+      (step) => step.op === 'recall' && step.includeArchived !== true && step.context === '咖啡机',
+    );
+    expect(archivedIndex).toBeGreaterThanOrEqual(0);
+    expect(plainIndex).toBeGreaterThanOrEqual(0);
+    expect(realRecalls[archivedIndex]?.hits.length ?? 0).toBeGreaterThan(0);
+    expect(realRecalls[plainIndex]?.hits.length ?? -1).toBe(0);
+
+    // ⚠️ **图谱路必须真的被走过**（`fromGraph=true`），**也必须有走不到的召回**（`fromGraph=false`）：
+    //   两个分支都被语料覆盖 ⇒ 「图谱路为空」这条口径与「图谱路有候选」这条口径都被守着。
+    const fromGraphValues = realRecalls.flatMap((step) => step.hits.map((hit) => hit.fromGraph));
+    expect(fromGraphValues.some((value) => value === true)).toBe(true);
+    expect(fromGraphValues.some((value) => value === false)).toBe(true);
+    // ⚠️ `graphPart` 必须有**非零值**（图谱路对分数真的有贡献，而不是恒为 0 的摆设）。
+    const graphParts = realRecalls.flatMap((step) =>
+      step.hits.map((hit) => hit.breakdown.graphPart),
+    );
+    expect(graphParts.some((value) => value > 0)).toBe(true);
+    // ⚠️ **向量路必须整路缺席**（阶段 1）：`fromVector` 恒 false、`vectorPart` 恒 0。
+    expect(realRecalls.every((step) => step.hits.every((hit) => hit.fromVector === false))).toBe(
+      true,
+    );
+    expect(
+      realRecalls.every((step) => step.hits.every((hit) => hit.breakdown.vectorPart === 0)),
+    ).toBe(true);
   });
 
   it('★ write：merged / exact / content / warnings / entityIds 顺序逐位一致', () => {
-    expect(pick(REF_STEPS, 'write')).toEqual(pick(REAL_STEPS, 'write'));
+    expectBitwiseEqual(pick(REF_STEPS, 'write'), pick(REAL_STEPS, 'write'), 'write');
   });
 
   it('★ recall：命中顺序 / score / breakdown / fromText / fromVector / fromGraph 逐位一致', () => {
-    expect(pick(REF_STEPS, 'recall')).toEqual(pick(REAL_STEPS, 'recall'));
+    expectBitwiseEqual(pick(REF_STEPS, 'recall'), pick(REAL_STEPS, 'recall'), 'recall');
   });
 
   it('★ touch：受影响 id / stability 变化量 / edgesReinforced / 事件条数与类型序列逐位一致', () => {
-    expect(pick(REF_STEPS, 'touch')).toEqual(pick(REAL_STEPS, 'touch'));
+    expectBitwiseEqual(pick(REF_STEPS, 'touch'), pick(REAL_STEPS, 'touch'), 'touch');
   });
 
   it('★ get：全部字段逐位一致（含 intensity / layer / effectiveStability）', () => {
-    expect(pick(REF_STEPS, 'get')).toEqual(pick(REAL_STEPS, 'get'));
+    expectBitwiseEqual(pick(REF_STEPS, 'get'), pick(REAL_STEPS, 'get'), 'get');
   });
 
   it('★ 负控：参考实现的 initialDifficulty 公式被改错 ⇒ 基线比对必须变红（差分指向难度）', () => {

@@ -696,7 +696,7 @@ export function refEntityName(model: RefV1Model, entityId: string): string {
 }
 
 /** 解析实体名（**主名优先**，其次别名；§4.5 末尾的解析顺序）。 */
-function refResolveEntityId(model: RefV1Model, name: string): string | null {
+export function refResolveEntityId(model: RefV1Model, name: string): string | null {
   const primary = model.entities.get(name);
   if (primary !== undefined) {
     return primary.id;
@@ -1229,6 +1229,18 @@ export interface RefV1RecallInput {
   topN?: number;
   now: number;
   includeArchived?: boolean;
+  /**
+   * 调用方抽好的实体**名**列表（ADR-P1-T08-GAP 缺口①：**库不抽取实体**）。
+   *
+   * ⚠️ **与 `entityIds` 互斥**（两者装的是同一件事的两个阶段）。
+   */
+  entityNames?: string[];
+  /**
+   * 已解析好的 canonical `entity_id` 列表（**参考实现自己的 id 空间**）。
+   *
+   * ⚠️ 传入即**完全跳过**名称解析；`[]` = 「明确表示无实体」⇒ 图谱路转空。
+   */
+  entityIds?: string[];
 }
 
 /** `recall()` 需要的**引擎事实**。 */
@@ -1265,24 +1277,35 @@ export interface RefV1RecallOutcome {
   route: RefV1TextRoute;
 }
 
-/** §4.6 步骤 2：上下文里出现过的实体（**主名优先**）。 */
-function refContextEntityIds(model: RefV1Model, context: string): string[] {
-  if (context === '') {
+/**
+ * §4.6 步骤 1：把**调用方给的**名字 / id 归一成 `entity_id` 集合。
+ *
+ * ⚠️ **库不抽取实体**（ADR-P1-T08-GAP 缺口① / ADR-2）：
+ *   「上下文 → 实体名」由**调用方**完成 ⇒ 参考实现**不从 `context` 里抽实体**。
+ *   ⇒ 四个分支（**互斥**，不静默取舍）：
+ *     ① `entityIds` 与 `entityNames` **同传** ⇒ 由调用方负责报错（`INVALID_INPUT`）；
+ *     ② 只传 `entityIds` ⇒ **完全跳过**名称解析；`[]` = 「明确表示无实体」；
+ *     ③ 只传 `entityNames` ⇒ 逐名 `refResolveEntityId`（**主名优先**）；解析不到**跳过**；
+ *     ④ **都不传** ⇒ 图谱路为空（退化为「文本路 + 向量路」）。
+ *
+ * ⚠️ **为什么这一步必须由入参驱动**（本轮的一次真实漂移）：
+ *   旧口径（v1.0）是「库自己从上下文里抽实体」；新 main 按 ADR-P1-T08-GAP 缺口①
+ *   把抽取搬回调用方 ⇒ 若参考实现还按旧口径抽，**两侧对「图谱路有哪些候选」的
+ *   理解就不一致** ⇒ 表现为「`graphPart` 0 vs 0.15、`fromGraph` false vs true」，
+ *   而且**两边看起来都像正常的数** ⇒ 不报错、只会让基线假红。
+ */
+function refResolveContextEntityIds(model: RefV1Model, input: RefV1RecallInput): string[] {
+  if (input.entityIds !== undefined) {
+    return [...new Set(input.entityIds.filter((id) => id !== ''))];
+  }
+  if (input.entityNames === undefined) {
     return [];
   }
-  const names: string[] = [];
-  for (const entity of model.entities.values()) {
-    if (entity.name.length > 0 && context.includes(entity.name)) {
-      names.push(entity.name);
-    }
-  }
-  for (const alias of model.aliases.keys()) {
-    if (alias.length > 0 && context.includes(alias)) {
-      names.push(alias);
-    }
-  }
   const ids: string[] = [];
-  for (const name of names) {
+  for (const name of input.entityNames) {
+    if (name === '') {
+      continue;
+    }
     const entityId = refResolveEntityId(model, name);
     if (entityId !== null && !ids.includes(entityId)) {
       ids.push(entityId);
@@ -1309,11 +1332,19 @@ function refCoarseCutoffs(
   };
 }
 
-/** §4.6 步骤 2：粗筛 + 强度精筛 + 截断（**保留行上的其余字段**）。 */
+/**
+ * §4.6 步骤 2：粗筛 + 强度精筛 + 截断（**保留行上的其余字段**）。
+ *
+ * ⚠️ **归档模式不做强度精筛**（ADR-P1-T08-GAP 小口径③）：`archiveLine === null`
+ *   ⇒ **不调用**强度判定 ⇒ 被放行的记忆照常参与打分与排序。
+ *   ⇒ 原稿的「阈值 = 0.0」与「只过滤 `deleted = 0`」**在数值上不等价**：
+ *   精筛是**严格大于**，而 `intensity` 会因 `exp` **下溢成恰好 0.0** ⇒ 那些行
+ *   **已经被 SQL 捞进来了**却在应用层被悄悄丢掉 ⇒ 「显式查询归档层」名存实亡。
+ */
 function refFilterAndSlice<T extends { refId: string }>(
   model: RefV1Model,
   rows: readonly T[],
-  archiveLine: number,
+  archiveLine: number | null,
   now: number,
   cutoffs: { plain: number; pinned: number } | null,
 ): T[] {
@@ -1323,14 +1354,16 @@ function refFilterAndSlice<T extends { refId: string }>(
     if (record === undefined || record.deleted) {
       continue;
     }
-    const intensityValue = model.formulas.intensity(
-      record.stability,
-      record.pinFactor,
-      record.lastAccess,
-      now,
-    );
-    if (!(intensityValue > archiveLine)) {
-      continue;
+    if (archiveLine !== null) {
+      const intensityValue = model.formulas.intensity(
+        record.stability,
+        record.pinFactor,
+        record.lastAccess,
+        now,
+      );
+      if (!(intensityValue > archiveLine)) {
+        continue;
+      }
     }
     if (cutoffs !== null) {
       const limit = record.pinFactor > 1.0 ? cutoffs.pinned : cutoffs.plain;
@@ -1358,10 +1391,11 @@ export function refRecall(
   const at = input.now;
   const topN = formulas.clampTopN(input.topN, params.RECALL_TOP_N);
   const includeArchived = input.includeArchived === true;
-  const archiveLine = includeArchived ? 0 : params.ARCHIVE_LINE;
+  // ⚠️ **归档模式跳过强度精筛**（ADR-P1-T08-GAP 小口径③）⇒ 阈值取 `null`。
+  const archiveLine = includeArchived ? null : params.ARCHIVE_LINE;
 
-  // ── 步骤 1：上下文实体 ──
-  const contextEntityIds = refContextEntityIds(model, input.context);
+  // ── 步骤 1：实体归一（**由入参驱动**；库不抽取实体）──
+  const contextEntityIds = refResolveContextEntityIds(model, input);
 
   // ── 步骤 2a：文本路 ──
   const query = formulas.buildMatchQuery(input.context);
@@ -1376,6 +1410,11 @@ export function refRecall(
   }
 
   // ── 步骤 2b：图谱路 ──
+  // ⚠️ **顺序必须与实现一致**：实现的图谱路 SQL 是
+  //   `ORDER BY m.last_access DESC LIMIT 100` ⇒ 候选按「最近使用」降序。
+  //   ⇒ 参考实现也按 `lastAccess` 降序排（同值时按创建顺序 —— SQL 侧同值顺序未定义，
+  //   但**同值 ⇒ 同分 ⇒ 最终排序由 §4.6 步骤 4 的 id 字典序 tie-break 决定**，
+  //   所以这一步的顺序不影响可观测输出）。
   const graphRows: Array<{ refId: string }> = [];
   for (const refId of model.recordOrder) {
     const record = model.records.get(refId);
@@ -1387,6 +1426,16 @@ export function refRecall(
       graphRows.push({ refId });
     }
   }
+  graphRows.sort((left, right) => {
+    const leftRecord = model.records.get(left.refId);
+    const rightRecord = model.records.get(right.refId);
+    const leftAccess = leftRecord?.lastAccess ?? 0;
+    const rightAccess = rightRecord?.lastAccess ?? 0;
+    if (rightAccess !== leftAccess) {
+      return rightAccess - leftAccess;
+    }
+    return model.recordOrder.indexOf(left.refId) - model.recordOrder.indexOf(right.refId);
+  });
 
   // ── 步骤 2：粗筛 + 精筛 + 截断 ──
   const cutoffs = refCoarseCutoffs(params, at, includeArchived);
