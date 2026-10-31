@@ -321,6 +321,76 @@ export interface ContractDiff {
   reason: string;
 }
 
+/**
+ * 「**码形态**」判定：首字母大写 + 只含大写字母 / 数字 / 下划线。
+ *
+ * ⚠️ 为什么需要它：§11.2 那张表的第三列是「**涉及方法**」——
+ *   它**合法地**混着两类东西：方法名（小写开头，如 `write`）与错误 / 警告码（大写，如 `ALIAS_CONFLICT`）。
+ *   ⇒ 朴素地判「文档名册 == 白名单」会**恒红**（多一个 `write`）
+ *   ⇒ 只有先按**形态**把两类分开，才能对**码**这一类做集合相等。
+ *
+ * ⚠️ 形态判据选「首字母大写」而不是「出现在白名单里」：
+ *   后者是**循环论证**（拿答案去判答案）⇒ 一旦白名单漏了某个码，
+ *   它就会从「码形态」降级成「非码形态」⇒ 门禁反而**看不见**它。
+ */
+export function isCodeLikeName(name: string): boolean {
+  return /^[A-Z][A-Z0-9_]*$/.test(name);
+}
+
+/**
+ * 从一列名字里挑出**码形态**的项（去重 + 排序）。
+ *
+ * ★ **纯函数、可注入** ⇒ 负控可以直接喂**假名单**，
+ *   **不必去改 `docs/design/DESIGN-v2.md`**（那是正文，不是测试的靶子）。
+ *
+ * @param names 一列名字（例如 §11.2 那一格解析出来的结果）
+ * @returns 码形态的项（去重 + 升序）
+ */
+export function extractCodeLikeNames(names: readonly string[]): string[] {
+  return [...new Set(names.filter((name) => isCodeLikeName(name)))].sort();
+}
+
+/**
+ * 守卫：§11.2「不抛错，走 `write()` 的 `warnings`」那一格的**码形态名册**
+ *   必须与白名单**恰好相等**（集合相等，不是包含）。
+ *
+ * ⚠️ **它补的是哪个方向**（实测漏洞）：既有守卫只查了「白名单 ⊆ 文档名册」
+ *   （少一个码 ⇒ 报红）⇒ **文档名册里多出来的东西没人管**：
+ *   陈旧码名可以**无成本**地堆进那一格，而门禁照样绿
+ *   ⇒ 读者却会以为那一格就是权威清单。
+ *
+ * ⚠️ **为什么只比「码形态」的项**：那一列**合法地**含方法名（`write`）
+ *   ⇒ 朴素地比全列会**恒红**
+ *   （实测名册 = `["write", "ALIAS_CONFLICT", "ALIAS_TARGET_NOT_LINKED"]`）
+ *   ⇒ 按**形态**过滤后，方法名（小写开头）被自然剔除、码（大写开头）被完整保留
+ *   ⇒ 这个过滤既准确又不误伤。
+ *
+ * ⚠️ **期望侧不过滤**：期望侧是**权威名单** ⇒ 不该被同一个过滤器裁剪
+ *   （万一白名单里混进一个非码形态的项，「缺少」正是应该报的信号）。
+ *
+ * @param docNames 文档那一格解析出来的名字（含方法名）
+ * @param expected 白名单（`EXPECTED_WARNING_ONLY_CASES`）
+ * @returns 不一致清单（空 = 一致）
+ */
+export function checkWarningOnlyRoster(
+  docNames: readonly string[],
+  expected: readonly string[],
+): ContractDiff[] {
+  const actual = extractCodeLikeNames(docNames);
+  const want = [...new Set(expected)].sort();
+
+  return compareNameSets(
+    want,
+    actual,
+    '§11.2「不抛错，走 write() 的 warnings」那一行的**码形态名册**',
+  ).map((diff) => ({
+    reason:
+      `${diff.reason}` +
+      '（那一格是**机器读的名册**：每个反引号词都会被解析器收进去；' +
+      '码形态项 = 首字母大写 ⇒ 必须与白名单**恰好相等**，多一个少一个都算不一致）',
+  }));
+}
+
 /** 做全部检查，返回不一致清单。 */
 export function checkContracts(markdown: string): ContractDiff[] {
   const diffs: ContractDiff[] = [];
@@ -461,6 +531,13 @@ export function checkContracts(markdown: string): ContractDiff[] {
     ...compareNameSets(EXPECTED_WARNING_ONLY_CASES, WARNING_ONLY_CASES, '只走 warnings 的情形'),
   );
   const docWarningOnly = semantics.get('warning_only') ?? [];
+  // ⚠️ **「= 方向」的守卫**：文档名册里的**码形态项**必须与白名单**恰好相等**。
+  //   既有守卫只查了「白名单 ⊆ 文档名册」⇒ **多出来的东西**（陈旧码名）没人管。
+  diffs.push(...checkWarningOnlyRoster(docWarningOnly, EXPECTED_WARNING_ONLY_CASES));
+  // ⚠️ **逐码的定位提示**（⊆ 方向）：白名单里的每个码都必须在文档那一格里出现。
+  //   ⚠️ 它与上面那条**在「缺少」这一侧有意重叠**（不是重复登记）：
+  //     上面那条给**结构性**判据（名册 = 集合相等），这条给**逐码**的定位提示
+  //     （「是哪一个码不见了」）——门禁失败时**多一条线索**比少一条好。
   for (const caseName of EXPECTED_WARNING_ONLY_CASES) {
     if (!docWarningOnly.includes(caseName)) {
       diffs.push({
