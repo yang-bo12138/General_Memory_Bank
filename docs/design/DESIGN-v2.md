@@ -1126,19 +1126,46 @@ export function resolveEntity(db: Database, name: string): string | null {
 2. **向量只进入 `score`，不改变任何准入判定。** 它排的是名次，不是资格。
 
 ```
-输入：context（string）、topN（1~8，默认 5）、entityIds?、queryEmbedding?、includeArchived?、diffuseArchived?、reinforce?、explain?、now?
+输入：context（string）、topN（1~8，默认 5）、entityIds?、entityNames?、queryEmbedding?、includeArchived?、diffuseArchived?、reinforce?、explain?、now?
      ——字段全集以 §6 的 RecallOptions 为准。**不提供 source 过滤**（理由见 §6 字段说明）。
      queryEmbedding 缺省时由 MemoryConfig.embedder 现算（若也未配置，则本次不走向量路，见步骤 2c）。
+     ⚠️ **`entityIds` 与 `entityNames` 互斥**（同时给 ⇒ 抛 `INVALID_INPUT`）—— 见步骤 1。
 
 1) 实体抽取与别名消解
-   - 对上下文中抽取到的每个实体名称 n，调 `resolveEntity(db, n)`（§4.5 末尾，**唯一实现**）：
+   ⚠️ **v2.1 勘误：原稿只写了「对上下文中抽取到的每个实体名称 n」，没写「名字从哪来」——
+     这一步因此没有可实现的契约。下列三条把它写死（ADR-P1-T08-GAP-①）。**
+   - **实体名由调用方提供，库不内置 NER**（ADR-2）：
+     调用方把上下文里抽好的实体名放进 `RecallOptions.entityNames`；
+     库**只**负责「名字 → entity_id」的归一（别名消解），**不负责「上下文 → 名字」的抽取**。
+   - 对 `entityNames` 中的每个实体名称 n，调 `resolveEntity(db, n)`（§4.5 末尾，**唯一实现**）：
      返回 entity_id → 进图谱路；返回 null → **该名称仅参与文本路检索，不进入图谱路**
      （**查询路径禁止写库**：不得因为「名字不认识」就建实体）。
-   - 结果去重后得到 @entityIds；也支持调用方通过 `RecallOptions.entityIds` 直接传入已解析好的 entity_id 列表，
+   - 结果去重后得到 @entityIds；调用方也可以通过 `RecallOptions.entityIds` 直接传入已解析好的 entity_id 列表，
      此时完全跳过本步骤（不再做名称匹配）。传入空数组 [] 等价于「明确表示无实体」，图谱路转空。
+   - ⚠️ **`entityIds` 与 `entityNames` 互斥**：同时传 ⇒ 抛 `INVALID_INPUT`。
+     （两者装的是**同一件事的两个阶段**；库若做优先级取舍，取舍那一边的动作就是
+      **静默丢弃调用方的一半意图**——本设计一贯拒绝静默取舍（不静默回落 flat / 不静默走 ivf）；
+      且「`[]` = 明确无实体」的语义也只在互斥时才无歧义。）
+   - ⚠️ **两者都不传 ⇒ 图谱路为空**（本次调用退化为「文本路 + 向量路」）。
+     这是 ADR-2 明写并接受的代价：「调用方不传就退化为纯文本检索，**功能仍完整**」。
+     ⇒ **图谱路是「调用方显式点名才走」的路**，不是「库自己猜出来的路」。
    - 说明：entity_aliases.alias 为 PRIMARY KEY，`name` 与 `alias` 两次查询均为 O(log n) 索引查找，
      不再解析任何 JSON 数组列（`entities` 曾有的 `aliases` 冗余列已从 §3 删除，
      若保留它会退化为全表扫描）。
+
+   ★ **为什么「库内抽取」（拿上下文扫全表找名字）不算数——对实现者的硬约束**：
+   - **与 ADR-2 冲突**：库内做实体抽取 = 实体抽取归属搬回库里（哪怕实现成「对着自己的实体表做字典匹配」），
+     调用方就再也控制不了「哪些词算实体」——那正是 ADR-2 要挡的事。
+   - **与本步的成本模型冲突**：本步明写「两次查询均为 **O(log n) 索引查找**」
+     ⇒ 成本模型是「**按名字索引查**」，不是「扫全表找名字」。
+     库内抽取会把本步成本变成 **O(#实体 + #别名) 的行扫描**：10 万级实体上就是几十~几百毫秒，
+     **一次调用就吃掉 §12 的整个 P99 ≤ 200ms 预算**（而这是**每次 recall** 都要付的）。
+   - **与步骤 0 冲突**：路由只约束向量路。若把「实体抽取」挂在路由侧，
+     则「向量路缺席」（没配 embedder / 分桶未训练）会连带**图谱路一起消失**——
+     两条路被另一条路的前置条件绑死（本库最坏的一种耦合）。
+   ⇒ 库**可以**提供一个**独立的**便利查询（例如「按上下文匹配已知实体名」的辅助函数），
+     但它**必须由调用方显式调用**，绝不能成为 recall 流水线的隐式步骤。
+     （辅助函数若提供，必须在文档里写明它的成本：每次调用 O(#实体 + #别名) 行扫描。）
 
 0) 向量路的两级分桶路由（v2.0 新增；**只作用于向量路**）
    目的：把向量路的「扫 100 万条」变成「扫几千条」，且**保持精确**——
@@ -1224,8 +1251,34 @@ export function resolveEntity(db: Database, name: string): string | null {
    includeArchived 参数化（对应 §4.4「归档仅显式查询可见」）：
      - includeArchived = false（默认）：按下面 ARCHIVE_LINE 推导 @coarseCutoff，精筛剔除 intensity ≤ ARCHIVE_LINE 的项。
      - includeArchived = true：令 @coarseCutoff = 0（不设 last_access 粗筛），
-       精筛阈值 @archiveLine = 0.0，即只过滤 deleted = 0，归档记忆照常参与打分与排序。
+       **精筛阈值 @archiveLine 不参与判定**——归档模式下**不做强度精筛**，
+       只保留 deleted = 0，归档记忆照常参与打分与排序（它们的 intensity 分项照常算，可能接近 0）。
        ——这是「显式查询归档层」的唯一代码路径，也是 §4.4 那句话的落地实现。
+       ⚠️ **v2.1 勘误**：原稿写「精筛阈值 @archiveLine = 0.0，即只过滤 deleted = 0」——
+         这**两句在数值上不等价**：精筛是**严格大于**（`intensity > @archiveLine`），
+         阈值取 0.0 时会把**强度因 exp 下溢成恰好 0.0** 的记忆一并挡掉
+         （下溢条件：Δt / τ > 745 天；而 schema 只要求 `stability > 0`，
+          小 stability 的记忆几十小时就能下溢到 0）。
+         ⇒ 那些行**已经被 SQL 粗筛放进来了**（归档模式下 @coarseCutoff = 0，没有时间窗），
+         却在应用层被悄悄丢掉 ⇒「显式查询归档层」名存实亡。
+       ⇒ **本版口径：归档模式下强度精筛整体不执行**（不是「阈值改成 0」，是「不做这个判定」）。
+         ⇒ 三路一致（铁律①：准入闸门对三路一视同仁——归档模式下三路都**不**做强度精筛）。
+
+   ★ **三个字面量的归属（刻意硬编码，不进 §5 参数表）**（C26：硬编码必须在正文写明）
+   | 字面量 | 出现处 | 为什么不是参数 |
+   |---|---|---|
+   | `LIMIT 100` | 步骤 2a / 2b / 2c 的**预取**上限 | 它决定「**候选池有多大**」，不决定「谁有资格」；改它没有可验证的指标（改成 200 只会让精筛后的候选更多，不会让 topN 更准）；且它与同为硬编码的 `VECTOR_TOPK × VECTOR_OVERFETCH_FACTOR` 耦合 ⇒ 改一个必须改另一个 |
+   | `slice(0, 20)` | 步骤 2a / 2b 的**每路**候选上限 | 同上：它是「每路送进融合打分多少条」的**形状**参数，不是语义阈值；改它改的是「哪几条能参与排名」，无法用单一指标验证好坏 |
+   | `topN ∈ 1~8` | §6 `RecallOptions.topN` | 它是**公开 API 的取值域**，不是运行时旋钮：调小改的是「这次给你看几条」，与召回质量无关；放开上限会直接放大「向量只进 score」带来的 topN 自我强化风险（§0.2） |
+   ⇒ 三者与「五项权重」「normBm25 斜率 0.2」同构 ⇒ 改它们是一次**设计变更**，走 §13 的 ADR，不是运行时配置。
+   ⚠️ **实现时必须在代码里写明「这是刻意硬编码，不是漏做参数化」**（C26）。
+
+   ★ **`SELECT m.*` 是伪代码：只 SELECT 用到的列**（正文写的与实现做的必须一致）
+   - `memories.embedding` 是 **768 × 4 字节 = 3KB 的 BLOB**
+     （`schema/001_schema_v2.sql`：`embedding BLOB CHECK (embedding IS NULL OR length(embedding) % 4 = 0)`）。
+   - 每路预取 100 行 ⇒ `m.*` 会把 **100 × 3KB ≈ 300KB/路/次** 的向量原样搬进 JS 侧（三路合计近 1MB/次），
+     而召回链路里**没有一处需要向量本身**（向量路的 `cos` 由桶内点积算出，§6 `MemoryView` 也「刻意不返回向量本身」）。
+   - ⇒ 实现里必须**显式列出用到的列**，不得写 `m.*`。
 
    粗筛上界推导：intensity > ARCHIVE_LINE ⇔ now - last_access < effectiveStability × ln(1/ARCHIVE_LINE) × 86400000
      因 stability ≤ MAX_STABILITY、且 pin_factor ≤ MAX_PIN_FACTOR（§4.1），
@@ -1268,6 +1321,8 @@ export function resolveEntity(db: Database, name: string): string | null {
         前者行为依赖 FTS5 版本、后者恒不命中，两种都是没法测的静默错误。
       - 应用层精筛：过滤 intensity(m, now) > @archiveLine，再 slice(0, 20)。
         （@archiveLine = includeArchived ? 0.0 : ARCHIVE_LINE）
+        ⚠️ **归档模式下本精筛整体不执行**（`includeArchived = true` ⇒ 只保留 `deleted = 0`，
+          见步骤 2 的 includeArchived 参数化）——**不是「阈值改成 0」**。
       - ⚠️ **v2.0 不给文本路加任何路由约束**（不加 `AND m.id IN (@routedIds)`）。
         文本路是 FTS5 精确检索，加了会让**几何邻近否决词法精确**——
         一条在路由结果之外、但 BM25 极高的结果会被静默丢掉。
@@ -1283,6 +1338,8 @@ export function resolveEntity(db: Database, name: string): string | null {
         LIMIT 100;
       - 应用层精筛：过滤 intensity(m, now) > @archiveLine，再 slice(0, 20)。
         （entityIds 为空时直接跳过本查询，避免 IN () 语法错误）
+        ⚠️ **归档模式下本精筛整体不执行**（`includeArchived = true` ⇒ 只保留 `deleted = 0`，
+          见步骤 2 的 includeArchived 参数化）——**不是「阈值改成 0」**。
 
    c. 向量路（语义近邻，**v2.0 起走两级分桶 + 桶内精确点积**）：
    ⚠️ **v1.0 的 flat 全表扫描在 100 万条下不可用**：100 万 × 768 维点积 ≈ 500~1500ms，
@@ -1331,6 +1388,9 @@ export function resolveEntity(db: Database, name: string): string | null {
    - 应用层精筛：**① 先过滤 `cos ≥ VECTOR_MIN_COS`(0.25)** —— §5 明写「低于此余弦的条目
      **不进候选**（不是得 0 分，是根本不出现）」；**② 再过滤 intensity(m, now) > @archiveLine**；
      **③ 最后 slice(0, VECTOR_TOPK)**。
+     ⚠️ **归档模式下②整体不执行**（`includeArchived = true` ⇒ 只保留 `deleted = 0`，
+       见步骤 2 的 includeArchived 参数化）——**不是「阈值改成 0」**；
+       ① 与③ 与归档与否无关（前者管「像不像」，后者管「取几条」）。
      ⚠️ 三个过滤的**顺序不能换**：先按 cos 滤掉弱相关，再按强度滤掉归档，
      最后截断——若先按强度截断，会把 cos 更高但已被归档的候选切掉，挤掉本该保留的次优项。
    - ⚠️ **cos 必须钳制到 [0,1]**：向量已 L2 归一化 ⇒ 点积的理论范围是 [-1,1]，
@@ -3799,8 +3859,17 @@ export interface RecallOptions {
   queryEmbedding?: number[];                   // 查询向量，长度 == EMBED_DIM。不传则用 MemoryConfig.embedder
                                                //   对 context 现算；两者都没有 → 本次**不走向量路**
                                                //   （不是「向量分全 0」那种降级，见 §4.6 步骤 2c 与缺项规则）
-  entityIds?: string[];                        // 已解析好的 canonical entity_id 列表；传入则跳过 §4.6 步骤 1 的实体抽取
+  entityIds?: string[];                        // 已解析好的 canonical entity_id 列表；传入则跳过 §4.6 步骤 1 的**名称解析**
+                                               //   ⚠️ 与 `entityNames` **互斥**：同时传 ⇒ 抛 INVALID_INPUT（§4.6 步骤 1）
+                                               //   ⚠️ 传 [] = 「明确表示无实体」⇒ 图谱路转空（不是「没传」）
+  entityNames?: string[];                      // ★ v2.1 新增：调用方抽好的实体**名**列表（ADR-2：实体抽取归调用方，库不内置 NER）
+                                               //   库逐名调 `resolveEntity` 归一（别名消解）⇒ entity_id 集合 ⇒ 图谱路
+                                               //   ⚠️ 与 `entityIds` **互斥**：同时传 ⇒ 抛 INVALID_INPUT
+                                               //   ⚠️ 解析不到的名字（resolveEntity 返回 null）**不进图谱路**
+                                               //     （它只参与文本路检索，§4.6 步骤 1）
+                                               //   ⚠️ 与 `entityIds` **都不传** ⇒ 图谱路为空（退化为文本路 + 向量路，ADR-2 明写的代价）
   includeArchived?: boolean;                   // 默认 false；true 时召回包含归档层（intensity ≤ ARCHIVE_LINE），见 §4.4
+                                               //   ⚠️ 归档模式下**不做强度精筛**（只保留 deleted = 0）——见 §4.6 步骤 2 的 includeArchived 参数化
   diffuseArchived?: boolean;                   // 默认 true；false 时 diffused 也过滤归档（R-ARCH-DIFF 的例外通道，见 §4.7）
   reinforce?: boolean;                         // 是否同步加固稳定度，默认 false。
                                                //   ⚠️ **只加固，不写共激活边**（§4.11.2 裁决）：
@@ -3865,6 +3934,16 @@ export interface MemoryView {
 // 关键区分：score / breakdown 只对「某一次 recall」有意义，不属于记忆本身的属性
 export interface Hit extends MemoryView {
   score: number;
+  /** ★ v2.1 补齐（ADR-P1-T08-GAP-②）：本条记忆来自哪几路（§4.6 步骤 2.5 的三个来源标记）。
+   *  ⚠️ **三个都是布尔，且不参与任何计算**——尤其**不参与 `graphProximity`**
+   *    （那是 §4.6 步骤 3 按「实体交集」现算的，不是「被哪条路召回的」）。
+   *  ⚠️ **至少有一个为 true**：能进候选集必然来自某一路。
+   *  ⚠️ **per-hit 层 ≠ call 级层**：`fromVector`（这一条来自向量路吗）
+   *    与 `explain.routes.vector.ran`（整条向量路本次跑没跑）是**两个层级**——
+   *    单看 `from*` 区分不了「整条路缺席」与「这条路跑了但这条没进它的候选」（见 `breakdown.cos` 的缺项规则）。 */
+  fromText: boolean;
+  fromVector: boolean;
+  fromGraph: boolean;
   breakdown?: {
     intensityPart: number;
     vectorPart: number;                        // 0.25 × vectorSim。本次无 queryVec 或该条无 embedding 时为 0
