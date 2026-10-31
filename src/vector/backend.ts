@@ -77,6 +77,17 @@ export interface VectorBackend {
 
   upsert(id: string, vector: Float32Array): void; // upsert 语义：同 id 覆盖
   remove(id: string): void; // 硬删时调用；软删**不删**
-  rebuild(): void; // 全量重建
+  /**
+   * 全量重建**索引侧**。
+   *
+   * ⚠️ **边界（P2-T02 裁决，ADR-P1-T07-DEC D-13 同型纪律）**：
+   *   本方法只负责「**丢弃索引侧的增量状态**、让缓存失效」，
+   *   **不负责「重训中心 + 重分配桶归属」**——
+   *   那两件事会改写 `vector_coarse_cells` / `vector_fine_cells` / `vector_cell_members`
+   *   ⇒ 属于**主库写路径** ⇒ 归 store 层的 `rebuildVectorBuckets()`（§4.15.5），
+   *   且**必须与桶归属的重分配放在同一事务**（否则重训后 `vector_cell_members`
+   *   被外键 `ON DELETE CASCADE` 连带清空 ⇒ **向量路候选集瞬间为空且不报错**）。
+   */
+  rebuild(): void;
   stats(): { count: number; dimensions: number; backend: string; indexBytes: number };
 }

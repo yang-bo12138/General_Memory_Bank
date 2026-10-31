@@ -412,7 +412,11 @@ describe('P2-T01 · VectorBackend 契约与 flat 基线后端', () => {
       expect(stats.count).toBe(rows.length);
       expect(stats.dimensions).toBe(DIM);
       expect(stats.backend).toBe(FLAT_BACKEND_NAME);
-      expect(stats.indexBytes).toBe(rows.length * DIM * 4);
+      // ⚠️ `indexBytes` = **索引结构本体**的字节数（两个后端同一口径）：
+      //   **flat 后端没有索引**（每次全表精确扫描）⇒ 恒为 0。
+      //   ⇒ 刻意**不**断言「被扫向量的字节数」：那是**数据、不是索引**，
+      //   它随语料线性增长，而 ivf 的索引字节数是固定的 ⇒ 两者量级完全不同、不可比。
+      expect(stats.indexBytes).toBe(0);
     });
 
     it('rebuild() 丢弃索引侧增量，回到「以候选来源为准」', () => {

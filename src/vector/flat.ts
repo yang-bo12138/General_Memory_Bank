@@ -299,8 +299,14 @@ export class FlatVectorBackend implements VectorBackend {
    * 后端状态。
    *
    * ⚠️ `count` = **会被扫描的向量条数**（= 候选来源里未删且有向量的行数）；
-   *   `indexBytes` = 这些向量占用的字节数（`维度 × 4`，Float32 小端）。
-   *   ⚠️ 这两个数**实时**取自候选来源 ⇒ 与「此刻库里的样子」一致。
+   *   ⇒ 这个数**实时**取自候选来源 ⇒ 与「此刻库里的样子」一致。
+   *
+   * ⚠️⚠️ `indexBytes` = **索引结构本体**占用的字节数（**两个后端同一口径**）：
+   *   · **flat 后端没有索引**（每次全表精确扫描）⇒ **`indexBytes` 恒为 `0`**；
+   *   · ivf 后端 = **中心向量**的字节数（`中心数 × 维度 × 4`）⇒ **不随语料增长**。
+   *   ⇒ 为什么不把「被扫向量字节数」算进来：那**是数据、不是索引**
+   *   ⇒ 它**随语料线性增长**，而 ivf 的索引字节数是**固定的**
+   *   ⇒ 两个后端报出来的数**量级完全不同** ⇒ 放在一起比较毫无意义。
    */
   stats(): { count: number; dimensions: number; backend: string; indexBytes: number } {
     const config = this.assertInitialized();
@@ -315,7 +321,7 @@ export class FlatVectorBackend implements VectorBackend {
       count,
       dimensions: config.dimensions,
       backend: FLAT_BACKEND_NAME,
-      indexBytes: count * config.dimensions * 4,
+      indexBytes: 0,
     };
   }
 

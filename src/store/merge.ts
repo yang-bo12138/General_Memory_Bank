@@ -112,39 +112,18 @@ export interface MergeOutcome {
 /**
  * 把 `Float32Array` 编成可入库的 BLOB（**Float32 小端**，§3 的 `embedding` 列）。
  *
- * ⚠️ **显式按小端写**（`DataView.setFloat32(..., true)`）而不是直接 `Buffer.from(vec.buffer)`：
- *   后者写的是**平台字节序**，在大端平台上会写出一段「维度对、值全错」的向量
- *   ——而库里没有任何东西能发现它（余弦值看起来仍是合法数字）。
+ * ⚠️ **v2.1（P2-T02 后）：本文件不再持有实现，改为 re-export 向量层的唯一权威**。
+ *   权威实现 = `src/vector/centroids.ts` 的 `vectorToBlob` / `blobToVector`
+ *   （`memories.embedding` 与桶中心 `centroid` 是**同一格式** ⇒ 编解码必须**同源**）。
+ *   ⇒ 原来这里有一份**逐字节相同**的副本 ⇒ 改一处不改另一处 ⇒
+ *     「写入路径的向量」与「桶中心的向量」**字节序可能分叉**（一端小端、一端平台序）
+ *     ⇒ 而库里没有任何东西能发现它（余弦值看起来仍是合法数字）⇒ **静默劣化**。
+ *   ⇒ 保留本文件的这**两个导出名**（`src/store/write.ts` 从这里 import），
+ *     但**实现只有一份**（C36：同一件事不得有两套词）。
  */
-export function vectorToBlob(vector: Float32Array): Buffer {
-  const buffer = Buffer.allocUnsafe(vector.length * 4);
-  const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-  // ⚠️ 用 `forEach` 而不是 `for` + 下标：`noUncheckedIndexedAccess` 下
-  //   `vector[index]` 的类型是 `number | undefined`，而 TypedArray 的长度是精确的 ⇒
-  //   取不到 `undefined`；`forEach` 的回调参数直接是 `number`（不必写任何填充兜底）。
-  vector.forEach((value, index) => {
-    view.setFloat32(index * 4, value, true);
-  });
-  return buffer;
-}
+import { blobToVector, vectorToBlob } from '../vector/centroids.js';
 
-/**
- * 把库里的 `embedding` BLOB 读回 `Float32Array`（**小端**）。
- *
- * ⚠️ **必须显式逐个读**（而不是 `new Float32Array(buf.buffer, buf.byteOffset, n)`）：
- *   后者要求 `byteOffset` 是 4 的倍数，而 `Buffer` 的 `byteOffset` **不保证**对齐
- *   ⇒ 落在非对齐地址上会抛 `RangeError`（或在不同平台上读到错位的值）。
- */
-export function blobToVector(blob: Buffer): Float32Array {
-  const bytes = Buffer.from(blob);
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const count = Math.floor(bytes.byteLength / 4);
-  const vector = new Float32Array(count);
-  for (let index = 0; index < count; index += 1) {
-    vector[index] = view.getFloat32(index * 4, true);
-  }
-  return vector;
-}
+export { blobToVector, vectorToBlob };
 
 // ─────────────────────────── 实体关联补齐（步骤 2 与 3c ⑤ 共用） ───────────────────────────
 
