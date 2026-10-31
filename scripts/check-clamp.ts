@@ -379,12 +379,47 @@ function identifiersGuardedByMax(bodyText: string): Set<string> {
 }
 
 /**
+ * 「被 `Math.exp(…)` 赋值」的标识符 → 那些 exp 的实参。
+ *
+ * ⚠️ **为什么需要这张表**（对称性）：
+ *   `Math.max(0, …)` 侧已经做了标识符解析（`identifiersGuardedByMax`），
+ *   所以「把下钳夹住的值提取成中间变量」能放行；
+ *   而 `Math.exp(…)` 侧若只认**字面**，则 `Math.exp` 一被提取成中间变量
+ *   （`const decay = Math.exp(…);` ⇒ `Math.min(1, decay)`）就会**误报** ——
+ *   ⇒ **max 侧放行、min 侧误杀** ⇒ 不对称 ⇒ 守卫「不误伤好的」这条契约就只兑现了一半。
+ *   ⇒ 这张表把「min 的第二个实参所引用的那个标识符」解析回它背后的 exp 实参。
+ */
+function expArgumentsByIdentifier(bodyText: string): Map<string, string[]> {
+  const table = new Map<string, string[]>();
+  ASSIGNMENT_PATTERN.lastIndex = 0;
+  let match = ASSIGNMENT_PATTERN.exec(bodyText);
+  while (match !== null) {
+    const name = match[1] ?? '';
+    const expression = match[2] ?? '';
+    const expArguments = findMathCalls(expression)
+      .filter((call) => call.method === 'exp')
+      .map((call) => call.firstArgument);
+    if (name !== '' && expArguments.length > 0) {
+      table.set(name, expArguments);
+    }
+    match = ASSIGNMENT_PATTERN.exec(bodyText);
+  }
+  return table;
+}
+
+/**
  * 「被 `Math.min(1, …)` 夹住的那个 `Math.exp(…)`」的实参文本。
  *
  * ⚠️ 空数组 ⇒ **没有任何** `Math.min(1, …)` 夹住指数 ⇒ 强度上钳没生效。
+ *
+ * 两条路都算数（与 max 侧对称）：
+ * ① 第二个实参里**内联**含 `Math.exp(…)`；
+ * ② 第二个实参**引用**了某个「被 `Math.exp(…)` 赋值」的标识符
+ *    ⇒ 解析回那个标识符背后的 exp 实参。
  */
 function expArgumentsGuardedByMin(bodyText: string): string[] {
   const result: string[] = [];
+  const expByIdentifier = expArgumentsByIdentifier(bodyText);
   for (const call of findMathCalls(bodyText)) {
     if (call.method !== 'min' || Number(call.firstArgument) !== 1) {
       continue;
@@ -393,9 +428,18 @@ function expArgumentsGuardedByMin(bodyText: string): string[] {
     if (second === null) {
       continue;
     }
-    for (const expCall of findMathCalls(second)) {
-      if (expCall.method === 'exp') {
-        result.push(expCall.firstArgument);
+    // ① 内联
+    const inline = findMathCalls(second)
+      .filter((inner) => inner.method === 'exp')
+      .map((inner) => inner.firstArgument);
+    if (inline.length > 0) {
+      result.push(...inline);
+      continue;
+    }
+    // ② 经标识符解析（`const decay = Math.exp(…);` ⇒ `Math.min(1, decay)`）
+    for (const [name, expArguments] of expByIdentifier) {
+      if (new RegExp(`\\b${escapeRegExp(name)}\\b`).test(second)) {
+        result.push(...expArguments);
       }
     }
   }
