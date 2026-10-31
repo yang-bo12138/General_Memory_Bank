@@ -96,6 +96,208 @@ function expectedHash(content: string): string {
 }
 
 // ─────────────────────────────────────────────────────────────
+// 静态审计的公共工具（判据②：调用点必须在事务内）
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * 只保留「代码字符」：**注释与字符串内容**一律替换成空格。
+ *
+ * ⚠️ **长度不变**（只把非换行字符替成空格）⇒ 替换后的下标仍与原文一一对应
+ *   ⇒ 可以拿它做「下标落在某个区间内」的判断（区间来自原文的括号配对）。
+ *
+ * ⚠️ **为什么连字符串一起剥**：SQL 是模板字符串，里面有 `{` / `}`；
+ *   不剥的话花括号配对会数到 SQL 里的括号 ⇒ 区间算错 ⇒ 判据静默失效
+ *   （**这种错不会报任何错**，只会让闸门永远绿）。
+ *
+ * ⚠️ **本项目的 `src/` 里没有正则字面量**（已核）⇒ 扫描器不必处理「正则里的引号」这一族歧义。
+ */
+function codeOnly(source: string): string {
+  const out = source.split('');
+  const blank = (from: number, to: number): void => {
+    for (let index = from; index < to; index += 1) {
+      if (out[index] !== '\n') {
+        out[index] = ' ';
+      }
+    }
+  };
+  let index = 0;
+  while (index < source.length) {
+    const char = source[index];
+    const next = source[index + 1];
+    // 行注释
+    if (char === '/' && next === '/') {
+      const end = source.indexOf('\n', index);
+      const stop = end === -1 ? source.length : end;
+      blank(index, stop);
+      index = stop;
+      continue;
+    }
+    // 块注释
+    if (char === '/' && next === '*') {
+      const end = source.indexOf('*/', index + 2);
+      const stop = end === -1 ? source.length : end + 2;
+      blank(index, stop);
+      index = stop;
+      continue;
+    }
+    // 字符串 / 模板字符串
+    if (char === "'" || char === '"' || char === '`') {
+      let cursor = index + 1;
+      while (cursor < source.length) {
+        if (source[cursor] === '\\') {
+          cursor += 2;
+          continue;
+        }
+        if (source[cursor] === char) {
+          break;
+        }
+        cursor += 1;
+      }
+      blank(index, Math.min(cursor + 1, source.length));
+      index = Math.min(cursor + 1, source.length);
+      continue;
+    }
+    index += 1;
+  }
+  return out.join('');
+}
+
+/**
+ * 在「代码文本」里找某个标识符的**调用点**下标。
+ *
+ * ⚠️ **必须排除定义处**（`function <name>(` / `const <name> =`）——
+ *   否则「定义」会被当成「调用」，唯一性判据（只有一个调用点）就永远不成立。
+ * ⚠️ **import 不必特判**：`import { a, b } from '…'` 里没有 `(` ⇒ 天然不匹配。
+ */
+function findCallSites(code: string, name: string): number[] {
+  const pattern = new RegExp(`\\b${name}\\s*\\(`, 'g');
+  const sites: number[] = [];
+  let match = pattern.exec(code);
+  while (match !== null) {
+    const before = code.slice(Math.max(0, match.index - 40), match.index);
+    const isDefinition = /\b(?:function|const|let|var)\s+$/.test(before);
+    if (!isDefinition) {
+      sites.push(match.index);
+    }
+    match = pattern.exec(code);
+  }
+  return sites;
+}
+
+/** 从某个 `{` 开始做花括号配对，返回闭合 `}` 的下标（找不到返回 -1）。 */
+function matchBrace(code: string, openIndex: number): number {
+  let depth = 0;
+  for (let index = openIndex; index < code.length; index += 1) {
+    if (code[index] === '{') {
+      depth += 1;
+    } else if (code[index] === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        return index;
+      }
+    }
+  }
+  return -1;
+}
+
+/** 找出 `function <name>(` 的函数体范围（开/闭大括号下标）；找不到返回 `undefined`。 */
+function functionBodyRange(code: string, name: string): { start: number; end: number } | undefined {
+  const match = new RegExp(`function\\s+${name}\\s*\\(`).exec(code);
+  if (match === null) {
+    return undefined;
+  }
+  const braceIndex = code.indexOf('{', match.index);
+  if (braceIndex === -1) {
+    return undefined;
+  }
+  const end = matchBrace(code, braceIndex);
+  return end === -1 ? undefined : { start: braceIndex, end };
+}
+
+/** 找出 `runWriteTransaction(` 的**回调体**范围（开/闭大括号下标）。 */
+function transactionCallbackRange(code: string): { start: number; end: number } | undefined {
+  const match = /runWriteTransaction\s*\(/.exec(code);
+  if (match === null) {
+    return undefined;
+  }
+  const braceIndex = code.indexOf('{', match.index);
+  if (braceIndex === -1) {
+    return undefined;
+  }
+  const end = matchBrace(code, braceIndex);
+  return end === -1 ? undefined : { start: braceIndex, end };
+}
+
+/** 一处调用点（文件用仓库相对路径）。 */
+interface CallSite {
+  /** 仓库相对路径（如 `store/write.ts`）。 */
+  file: string;
+  /** 在「代码文本」里的下标。 */
+  index: number;
+}
+
+/** 判据②的审计结论。 */
+interface BackfillAudit {
+  /** 全 `src/` 树里 `backfillEmbeddingIfMissing(...)` 的调用点。 */
+  callSites: CallSite[];
+  /** 唯一调用点是否落在 `handleExactRepeat` 的函数体内。 */
+  insideHandler: boolean;
+  /** 全 `src/` 树里 `handleExactRepeat(...)` 的调用点。 */
+  handlerCallSites: CallSite[];
+  /** `handleExactRepeat` 的调用点是否落在 `runWriteTransaction` 的回调体内。 */
+  handlerInsideTransaction: boolean;
+}
+
+/**
+ * 审计「向量回填是否与 write 在同一事务内」。
+ *
+ * ⚠️ **为什么是两跳**：`backfillEmbeddingIfMissing(...)` 的**词法位置**在
+ *   `handleExactRepeat` 这个**函数体内**（不在 `runWriteTransaction` 的回调体内）
+ *   —— 但它在**运行期**是由事务回调调用的 ⇒ 事务性成立。
+ *   ⇒ 只做一跳（问「调用点是否在事务体里」）会得到**假红**；
+ *     只做零跳（问「调用点是否在 write.ts 里」）又太弱（事务外也能调）。
+ *   ⇒ 正确口径是：**调用点 → 所在函数 → 该函数的调用点 → 是否在事务回调体内**。
+ *
+ * @param sources 仓库相对路径 → 源码全文
+ */
+function auditBackfill(sources: ReadonlyMap<string, string>): BackfillAudit {
+  const codeByFile = new Map<string, string>();
+  const callSites: CallSite[] = [];
+  const handlerCallSites: CallSite[] = [];
+
+  for (const [file, source] of sources) {
+    const code = codeOnly(source);
+    codeByFile.set(file, code);
+    for (const index of findCallSites(code, 'backfillEmbeddingIfMissing')) {
+      callSites.push({ file, index });
+    }
+    for (const index of findCallSites(code, 'handleExactRepeat')) {
+      handlerCallSites.push({ file, index });
+    }
+  }
+
+  const writeCode = codeByFile.get('store/write.ts') ?? '';
+  const handlerRange = functionBodyRange(writeCode, 'handleExactRepeat');
+  const txRange = transactionCallbackRange(writeCode);
+
+  const insideHandler =
+    callSites.length === 1 &&
+    callSites[0]?.file === 'store/write.ts' &&
+    handlerRange !== undefined &&
+    (callSites[0]?.index ?? -1) > handlerRange.start &&
+    (callSites[0]?.index ?? -1) < handlerRange.end;
+
+  const handlerInsideTransaction =
+    handlerCallSites.length === 1 &&
+    handlerCallSites[0]?.file === 'store/write.ts' &&
+    txRange !== undefined &&
+    (handlerCallSites[0]?.index ?? -1) > txRange.start &&
+    (handlerCallSites[0]?.index ?? -1) < txRange.end;
+
+  return { callSites, insideHandler, handlerCallSites, handlerInsideTransaction };
+}
+
+// ─────────────────────────────────────────────────────────────
 // §4.9 步骤 3c：合并序列
 // ─────────────────────────────────────────────────────────────
 
@@ -582,5 +784,121 @@ describe('P1-T07 · 阶段 1 不入桶（ADR 冲突 7 的裁决）', () => {
     // ② 对照：**原文**（含注释）里确实有这些词 ⇒ 说明「剥注释」这一步是有效的
     //   ⇒ 上面两条断言不是因为「源码里根本没有这个词」才通过的。
     expect(source).toContain('assignBucket');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+// 判据②（QA 复核 P1-T07 收窄）：向量回填的调用点必须在 write 的**同一事务内**
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * P1-T07 · 判据②（可机器检）。
+ *
+ * ⚠️ **为什么要有这条**：§4.9 步骤 2 的向量回填「必须与本次写入同事务」
+ *   —— 若它在事务外执行，则「回填成功但本次写入回滚」⇒ 库里留下一条
+ *   **不属于任何一次成功写入**的向量（且不报任何错）。
+ *   ⇒ 这条判据从「口头约定」升级为「扫描器守着的断言」。
+ *
+ * ⚠️ **判据是两跳的**（理由见 `auditBackfill` 的注释）：
+ *   `backfillEmbeddingIfMissing(...)` 的词法位置在 `handleExactRepeat` 函数体内，
+ *   而 `handleExactRepeat(...)` 由 `write()` 的 `runWriteTransaction` 回调调用
+ *   ⇒ 运行期在同一事务内。
+ */
+describe('P1-T07 · 判据②：向量回填与 write 在同一事务内', () => {
+  /** 本测试文件所在目录（ESM 下没有 `__dirname`）。 */
+  const HERE = fileURLToPath(new URL('.', import.meta.url));
+  /** 仓库的 `src/` 目录。 */
+  const SRC_ROOT = resolve(HERE, '../../src');
+
+  /**
+   * 收集 `src/` 下**全部实现文件**（排除测试与声明）⇒ 相对路径 → 源码全文。
+   *
+   * ⚠️ **必须排除 `*.test.ts`**：`src/` 里有 `params.test.ts` / `flags.test.ts`
+   *   等测试文件，它们会直接调用被审计的函数 ⇒ 混进来会把「唯一调用点」判据弄假红。
+   */
+  function collectSources(): Map<string, string> {
+    const sources = new Map<string, string>();
+    const walk = (dir: string): void => {
+      for (const entry of readdirSync(dir)) {
+        const full = join(dir, entry);
+        if (statSync(full).isDirectory()) {
+          walk(full);
+          continue;
+        }
+        if (!full.endsWith('.ts') || full.endsWith('.test.ts') || full.endsWith('.d.ts')) {
+          continue;
+        }
+        sources.set(relative(SRC_ROOT, full).split(sep).join('/'), readFileSync(full, 'utf8'));
+      }
+    };
+    walk(SRC_ROOT);
+    return sources;
+  }
+
+  it('★ 回填的**唯一**调用点在 handleExactRepeat 内，而它由事务回调调用', () => {
+    const audit = auditBackfill(collectSources());
+
+    // 性质：全 `src/` 树里 `backfillEmbeddingIfMissing(...)` **只有一个调用点**
+    //   （定义处不算；import 不算）⇒ 不会出现「事务外也有一处在调」的漏网。
+    expect(audit.callSites).toHaveLength(1);
+    expect(audit.callSites[0]?.file).toBe('store/write.ts');
+
+    // 性质：它在 `handleExactRepeat` 的函数体内
+    expect(audit.insideHandler).toBe(true);
+
+    // 性质：`handleExactRepeat(...)` 也**只有一个**调用点，且落在 `runWriteTransaction` 的回调体内
+    //   ⇒ 运行期：回填与本次写入同事务。
+    expect(audit.handlerCallSites).toHaveLength(1);
+    expect(audit.handlerInsideTransaction).toBe(true);
+  });
+
+  it('★ 负控：把回填调用挪到事务外 ⇒ 判据②必须报出来（闸门不是摆设）', () => {
+    const sources = collectSources();
+    const original = sources.get('store/write.ts') ?? '';
+
+    // 注入一个模块顶层的调用（不在任何事务内）
+    const injected = `${original}\nexport function rogue(): void {\n  backfillEmbeddingIfMissing(db, 'id', null);\n}\n`;
+    const audit = auditBackfill(new Map(sources).set('store/write.ts', injected));
+
+    // 性质：「唯一调用点」不再成立 ⇒ 判据会红
+    expect(audit.callSites).toHaveLength(2);
+    // 性质：注入的那个不在 `handleExactRepeat` 体内 ⇒ 事务性判据也会红
+    expect(audit.insideHandler).toBe(false);
+  });
+
+  it('★ 负控：把 handleExactRepeat 的调用挪到事务外 ⇒ 判据②必须报出来', () => {
+    const sources = collectSources();
+    const original = sources.get('store/write.ts') ?? '';
+
+    // 注入一个模块顶层的 `handleExactRepeat(...)` 调用（绕过事务回调）
+    const injected = `${original}\nexport function rogue(): void {\n  handleExactRepeat(store, m, ctx);\n}\n`;
+    const audit = auditBackfill(new Map(sources).set('store/write.ts', injected));
+
+    // 性质：`handleExactRepeat` 的调用点不再唯一
+    expect(audit.handlerCallSites).toHaveLength(2);
+    // 性质：事务性判据判红
+    expect(audit.handlerInsideTransaction).toBe(false);
+  });
+
+  it('★ 工具自检：注释与字符串被正确剥离（否则整套静态判据都是假绿）', () => {
+    const sample = [
+      "const sql = 'SELECT {a} FROM t';",
+      '// 注释里的 handleExactRepeat( 应当被剥掉',
+      '/* 块注释里的 backfillEmbeddingIfMissing( 也应当被剥掉 */',
+      'const real = handleExactRepeat(store, m, ctx);',
+    ].join('\n');
+
+    const code = codeOnly(sample);
+    // 性质：字符串内容没了
+    expect(code).not.toContain('SELECT');
+    // 性质：注释里的字面量没了
+    expect(code).not.toContain('注释里的');
+    expect(code).not.toContain('块注释里的');
+    // 性质：只出现在注释里的那个名字也没了（它只写在注释里）
+    expect(code).not.toContain('backfillEmbeddingIfMissing');
+    // 性质：**代码**里的那一个还在，且**只有一个**调用点
+    expect(findCallSites(code, 'handleExactRepeat')).toHaveLength(1);
+    // 性质：长度不变（下标仍与原文对齐）
+    expect(code).toHaveLength(sample.length);
   });
 });
