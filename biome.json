@@ -38,7 +38,8 @@
       "dist/**",
       "coverage/**",
       "tests/golden/__captured__/**",
-      ".tmp/**"
+      ".tmp/**",
+      "docs/baseline/**"
     ]
   }
 }
