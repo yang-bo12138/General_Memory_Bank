@@ -28,6 +28,60 @@ const P: Params = DEFAULT_PARAMS;
 /** 一个固定的时间基准（测试里所有时刻都相对它推算）。 */
 const T0 = 1_700_000_000_000;
 
+/**
+ * DESIGN §6 的 `MemoryView` 字段清单（**逐字抄**，共 19 个）。
+ *
+ * ⚠️ **判定是「下界」（⊇）不是「等式」（===）**：§6 的原文是
+ *   「这里的字段必须覆盖 memories 表里**所有对外有意义的列**。少一个是『写进去了但读不出来』」
+ *   ⇒ 「多一个**派生**字段」（本实现里的 `effectiveStability`）**不违反**该约束。
+ *   ⇒ 断言只写「清单里的每个字段都在」，**刻意不写 `toHaveLength(19)`**：
+ *   字段集增删时这条断言应当继续成立（增字段 ⇒ 仍然 ⊇），写死个数会把它变成另一类锁死。
+ */
+const MEMORY_VIEW_FIELDS: readonly string[] = [
+  'id',
+  'content',
+  'hasEmbedding',
+  'kind',
+  'layer',
+  'intensity',
+  'stability',
+  'difficulty',
+  'entities',
+  'mediaRef',
+  'mediaType',
+  'createdAt',
+  'lastAccess',
+  'accessCount',
+  'pinFactor',
+  'confidence',
+  'source',
+  'deleted',
+  'deletedAt',
+];
+
+/**
+ * 各字段的期望 `typeof`（`mediaRef` / `mediaType` / `source` / `deletedAt` 允许为 `null`，
+ * 所以它们只断言「非 null 时的类型」；`entities` 是数组，单独断言）。
+ */
+const MEMORY_VIEW_FIELD_TYPES: Readonly<Record<string, 'number' | 'string' | 'boolean'>> = {
+  id: 'string',
+  content: 'string',
+  hasEmbedding: 'boolean',
+  kind: 'string',
+  layer: 'string',
+  intensity: 'number',
+  stability: 'number',
+  difficulty: 'number',
+  createdAt: 'number',
+  lastAccess: 'number',
+  accessCount: 'number',
+  pinFactor: 'number',
+  confidence: 'number',
+  source: 'string',
+  deleted: 'boolean',
+  deletedAt: 'number',
+};
+
 /** 建库（内存库，§3 的权威 DDL）。 */
 function openDatabase(): Database.Database {
   const db = new Database(':memory:');
@@ -213,6 +267,40 @@ describe('get 的 MemoryView（§6 / §4.1 末）', () => {
       expect(view?.hasEmbedding).toBe(true);
       expect(view?.deleted).toBe(false);
       expect(view?.deletedAt).toBeNull();
+    } finally {
+      db.close();
+    }
+  });
+
+  it('字段集**覆盖** §6 的 MemoryView 全部字段（下界判定：少一个 = 「写进去了但读不出来」）', () => {
+    const { db, store } = makeStore([{ id: 'm1', entityNames: ['王五', '张三'] }]);
+    try {
+      const view = get(store, 'm1', T0);
+      expect(view).not.toBeNull();
+      if (view === null) {
+        return;
+      }
+
+      // ① 清单里的每个字段都必须**在**（⊇ 下界，不是 == 等式）
+      for (const field of MEMORY_VIEW_FIELDS) {
+        expect(view).toHaveProperty(field);
+      }
+      // ② 派生字段 `effectiveStability` 也在（§4.1 末点名要的：= stability × pin_factor）
+      expect(view).toHaveProperty('effectiveStability');
+
+      // ③ 字段的**类型**也要对（少一个字段 / 类型错位都属于「读不出来」）
+      for (const [field, expected] of Object.entries(MEMORY_VIEW_FIELD_TYPES)) {
+        const value = (view as unknown as Record<string, unknown>)[field];
+        if (value === null) {
+          // ⚠️ `mediaRef` / `mediaType` / `source` / `deletedAt` 允许为 null（§3 的状态一致性约束）
+          continue;
+        }
+        expect(typeof value).toBe(expected);
+      }
+
+      // ④ `entities` 是**名称数组**且升序（不是 id 数组）
+      expect(Array.isArray(view.entities)).toBe(true);
+      expect(view.entities).toEqual(['张三', '王五']);
     } finally {
       db.close();
     }
