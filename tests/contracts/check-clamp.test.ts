@@ -77,6 +77,21 @@ export function intensity(memory: { last_access: number }, now?: number): number
 }
 `;
 
+/**
+ * 把钳制挪到**模块顶层常量**里（文件里仍然有 `Math.max(0, …)` / `Math.min(1, …)`）。
+ *
+ * ⚠️ 这一条是最阴的一种漂移：钳制**还在文件里**，只是搬到了 `intensity()` 外面
+ *   ⇒ 「全文件 grep 式的存在性扫描」照样通过 ⇒ 守卫就松了。
+ */
+const AT_MODULE_TOP_LEVEL = `
+const CLAMPED = Math.max(0, Math.min(1, 0.5));
+
+export function intensity(memory: { last_access: number }, now?: number): number {
+  const elapsedMs = now - memory.last_access;
+  return Math.exp(-elapsedMs / 1000);
+}
+`;
+
 /** 实参被改掉的变体（`Math.min(1, …)` ⇒ `Math.min(0.5, …)`）。 */
 const WRONG_ARGUMENT = `
 export function intensity(memory: { last_access: number }, now?: number): number {
@@ -145,6 +160,14 @@ describe('F-08 ③ · check-clamp（intensity() 的两道钳制）', () => {
     expect(missingMethods(INSIDE_A_COMMENT).sort()).toEqual(['max', 'min']);
     expect(INSIDE_A_COMMENT).toContain('Math.max(0,');
     expect(INSIDE_A_COMMENT).toContain('Math.min(1,');
+  });
+
+  it('★ 反例：把钳制挪到**模块顶层常量**里 ⇒ 守卫仍判缺（钳制还在文件里，但不在 intensity 里）', () => {
+    // ⚠️ 这是最阴的一种漂移：文件里确实还有两道钳制，只是搬到了 `intensity()` 外面
+    //   ⇒ 「全文件 grep 式的存在性扫描」照样通过 ⇒ 守卫就松了
+    expect(missingMethods(AT_MODULE_TOP_LEVEL).sort()).toEqual(['max', 'min']);
+    expect(AT_MODULE_TOP_LEVEL).toContain('Math.max(0,');
+    expect(AT_MODULE_TOP_LEVEL).toContain('Math.min(1,');
   });
 
   it('★ 反例：实参被改掉（min(1, …) ⇒ min(0.5, …)）⇒ 守卫判缺（证明判据是实参不是字符串）', () => {
