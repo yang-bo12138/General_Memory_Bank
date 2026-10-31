@@ -737,6 +737,13 @@ export interface CoarseGateWindow {
  *   §4.6 步骤 2 原话：「`includeArchived = true`：令 `@coarseCutoff = 0`（不设 last_access 粗筛），
  *   精筛阈值 `@archiveLine = 0.0`，即只过滤 `deleted = 0`」。
  *   ⇒ 这是「**显式查询归档层**」的唯一代码路径（§4.4「归档仅显式查询可见」）。
+ *   ⚠️⚠️ **「精筛阈值 0.0」这句原话已被 ADR 判为自相矛盾，实际口径是「归档模式整体不判强度」**：
+ *     `passesIntensityFilter` 是**严格大于**（`>`），而 `intensity = min(1, exp(-Δt/τ))`
+ *     在 Δt 足够大时**下溢成恰好 0.0** ⇒ 若真按「阈值 0.0」判，这些行会被挡掉，
+ *     可它们**已经被 SQL 捞进来了** ⇒ 「显式查询归档层」名存实亡。
+ *     ⇒ 归档模式下**不调用** `passesIntensityFilter`（见 `src/store/recall.ts` 的 `filterAndSlice`），
+ *       判据只有一条「只过滤 `deleted = 0`」。
+ *     ⇒ 本函数只管**粗筛**（`last_access` 下界）；粗筛与精筛是两件事，别混。
  *   ⚠️ **向量路必须服从同一个开关**（铁律①）：否则「显式查归档层」只对两路生效，
  *     而归档层的记忆**根本进不了向量路** ⇒ 归档层在语义上就只被部分看见。
  *   ⚠️ **取消粗筛的做法是「不绑这两个参数」（并把 SQL 里的粗筛片段去掉）**，
