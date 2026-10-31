@@ -35,8 +35,13 @@
  *   ⚠️ 一个**尚未落库**的 id（取行回调里没有它）**不会**因 `upsert` 而出现在结果里 ——
  *     因为它**还不是一条记忆**（没有 `last_access` / `pin_factor`，无法过闸门）。
  *
- * ── 契约边界的落法（§4.15.2）────────────────────────────────────────
- * · **只取候选 + 排序，不参与打分决策**：本后端不设任何相似度阈值
+ * ⚠️ **本模块同时是「两后端共享口径」的所在地**（P2-T02 起）：
+ *   候选行的形状（`VectorCandidateRow`）、粗筛窗口的判定（`passesTimeWindow`）、
+ *   命中项的排序（`compareHits`）**都只有这一份实现**，
+ *   `src/vector/ivf.ts` 直接复用它们
+ *   ⇒ flat 与 IVF 的候选口径**同源** ⇒ 「IVF 与 flat 逐位一致」才有意义。
+ *
+ * ── 契约边界的落法（§4.15.2）──────────────────────────────────────── * · **只取候选 + 排序，不参与打分决策**：本后端不设任何相似度阈值
  *   （`VECTOR_MIN_COS` 是 §4.6 准入闸门的事，不在这里）；
  * · **`filter` 只被「应用」，不被「推导」**：时间窗下界由 §4.6 步骤 2 统一构造后传入，
  *   本后端**照用**，不自己算窗口、不自己设阈值；
@@ -64,7 +69,16 @@ export const FLAT_BACKEND_NAME = 'flat';
 export const FLAT_ALL_BUCKETS = '__flat_all__';
 
 /**
- * 候选来源的一行。
+ * 候选来源的一行（**两后端共享的候选行形状**）。
+ *
+ * ⚠️ **本模块同时是「两后端共享口径」的所在地**（P2-T02 起）：
+ *   · `VectorCandidateRow` —— 候选行的形状（flat 与 IVF **同构**）；
+ *   · `passesTimeWindow()` —— 粗筛窗口的判定（**应用**调用方给的下界，不推导）；
+ *   · `compareHits()` —— 命中项的排序（相似度降序；同分按 id 升序）。
+ *   ⇒ 为什么放在**基线模块**里：flat 是**参照系** ⇒ 两后端的口径**必须同源**
+ *     ⇒ 否则「IVF 与 flat 逐位一致」这条断言本身就没有意义
+ *     （两套实现哪怕只差一个 `>=` 与 `>`，比对也会变成「实现之差」而不是「分桶之差」）。
+ *   ⚠️ **只有这一份实现**（C36：同一件事不得有两套词/两份实现）。
  *
  * ⚠️ **口径由取行的一方保证**（本后端不推导、也不重算）：
  * · `vector` **非空** ⇒ 取行方已过滤掉 `embedding IS NULL` 的行
@@ -75,7 +89,7 @@ export const FLAT_ALL_BUCKETS = '__flat_all__';
  *   （§4.15.2 的形状就是那样），所以「候选宇宙里只有活着的记忆」是**来源**的义务；
  * · `vector` 的维度必须等于 `config.dimensions`（否则是**接线错误**，本后端会抛错）。
  */
-export interface FlatVectorRow {
+export interface VectorCandidateRow {
   /** 记忆 id。 */
   id: string;
   /** 该记忆的向量（**已 L2 归一化**，与 `memories.embedding` 的存储口径一致）。 */
@@ -92,7 +106,7 @@ export interface FlatVectorRow {
  * ⚠️ 每次 `search()` / `stats()` 都会**重新调用**它 ⇒ 取行方拿到的必须是**活数据**
  *   （`last_access` 会被 `touch()` 改 ⇒ 快照会让粗筛窗口按旧时间判）。
  */
-export type FlatVectorRowSource = () => readonly FlatVectorRow[];
+export type FlatVectorRowSource = () => readonly VectorCandidateRow[];
 
 /** flat 后端的构造选项。 */
 export interface FlatVectorBackendOptions {
@@ -333,7 +347,7 @@ export class FlatVectorBackend implements VectorBackend {
  *   窗口由 §4.6 步骤 2 统一构造后传入（§4.15.2 契约：后端不决定谁有资格）。
  * ⚠️ `timeFloor` 缺省 ⇒ **不施加时间窗**（全量候选都算数）。
  */
-function passesTimeWindow(row: FlatVectorRow, filter: VectorFilter): boolean {
+export function passesTimeWindow(row: VectorCandidateRow, filter: VectorFilter): boolean {
   const timeFloor = filter.timeFloor;
   if (timeFloor === undefined) {
     return true;
@@ -354,7 +368,7 @@ function passesTimeWindow(row: FlatVectorRow, filter: VectorFilter): boolean {
  * ⚠️ **同分必须定死次序**：浮点同分是常态（尤其是被钳制到 0 的负余弦），
  *   不定次 ⇒ 同一批数据两次检索给出不同顺序 ⇒ 「逐位一致」这条断言无从谈起。
  */
-function compareHits(left: VectorHit, right: VectorHit): number {
+export function compareHits(left: VectorHit, right: VectorHit): number {
   if (left.score !== right.score) {
     return right.score - left.score;
   }
