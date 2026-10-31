@@ -16,7 +16,7 @@
 import Database from 'better-sqlite3';
 import { describe, expect, it } from 'vitest';
 
-import { MS_PER_DAY } from '../../src/core/decay.js';
+import { MS_PER_DAY, archiveAt, intensity } from '../../src/core/decay.js';
 import { MemoryError } from '../../src/core/errors.js';
 import { DEFAULT_PARAMS, type Params } from '../../src/core/params.js';
 import {
@@ -33,6 +33,7 @@ import {
   archiveFilterThreshold,
   assignGraphProximity,
   clampCos,
+  coarseGateWindow,
   cosineSimilarity,
   findMemoriesWithEntityIntersection,
   fuseScore,
@@ -707,5 +708,128 @@ describe('archiveFilterThreshold / passesIntensityFilter（§4.6 步骤 2）', (
     const wrong = (value: number, limit: number): boolean => value >= limit;
     expect(wrong(threshold, threshold)).toBe(true);
     expect(passesIntensityFilter(threshold, threshold)).toBe(false);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 粗筛窗口（§4.6 步骤 2 的两档窗口）—— 三路共用的唯一计算处
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('coarseGateWindow（§4.6 步骤 2 的两档窗口）', () => {
+  it('窗口跨度与 §4.6 的推导一致（普通 ≈539 天 / 被 pin ≈2696 天）', () => {
+    const now = 1_700_000_000_000;
+    const window = coarseGateWindow(P, now, false);
+
+    // ⚠️ 期望值写成**与公式同源的表达式**（不写死 539 / 2696）。
+    const plainSpanDays = P.MAX_STABILITY * Math.log(1 / P.ARCHIVE_LINE);
+    const pinnedSpanDays = P.MAX_STABILITY * P.MAX_PIN_FACTOR * Math.log(1 / P.ARCHIVE_LINE);
+
+    expect((now - window.coarseCutoff) / MS_PER_DAY).toBeCloseTo(plainSpanDays, 9);
+    expect((now - window.coarseCutoffPinned) / MS_PER_DAY).toBeCloseTo(pinnedSpanDays, 9);
+
+    // 与设计稿记的量级一致（539 / 2696 天）
+    expect(Math.round((now - window.coarseCutoff) / MS_PER_DAY)).toBe(539);
+    expect(Math.round((now - window.coarseCutoffPinned) / MS_PER_DAY)).toBe(2696);
+  });
+
+  it('被 pin 的窗口**更宽**（是普通窗口的 MAX_PIN_FACTOR 倍）', () => {
+    const now = 1_700_000_000_000;
+    const window = coarseGateWindow(P, now, false);
+    const plainSpan = now - window.coarseCutoff;
+    const pinnedSpan = now - window.coarseCutoffPinned;
+    expect(pinnedSpan / plainSpan).toBeCloseTo(P.MAX_PIN_FACTOR, 9);
+  });
+
+  it('★ `includeArchived = true` ⇒ 粗筛整体取消（enabled=false 且两个下界都是 0）', () => {
+    // ⚠️ §4.6 步骤 2 原话：「令 `@coarseCutoff = 0`（不设 last_access 粗筛）」。
+    const window = coarseGateWindow(P, 1_700_000_000_000, true);
+    expect(window.enabled).toBe(false);
+    expect(window.coarseCutoff).toBe(0);
+    expect(window.coarseCutoffPinned).toBe(0);
+  });
+
+  it('★ 形状恒定：两种模式的字段集完全相同（防止「有时多一个键」的副本漂移）', () => {
+    const withGate = coarseGateWindow(P, 1_700_000_000_000, false);
+    const withoutGate = coarseGateWindow(P, 1_700_000_000_000, true);
+    expect(Object.keys(withGate).sort()).toEqual(Object.keys(withoutGate).sort());
+    // ⚠️ 两个下界的**名字**与 SQL 的绑定名逐字相同 ⇒ 「名字即契约」，接错线一眼看得见。
+    expect(Object.keys(withGate).sort()).toEqual(['coarseCutoff', 'coarseCutoffPinned', 'enabled']);
+  });
+
+  it('★ 参数可调：改 `MAX_STABILITY` / `ARCHIVE_LINE` ⇒ 窗口跟着变（没被写死成 539/2696）', () => {
+    const now = 1_700_000_000_000;
+    const base = coarseGateWindow(P, now, false);
+
+    const weaker: Params = { ...P, MAX_STABILITY: P.MAX_STABILITY / 2 };
+    const weakerWindow = coarseGateWindow(weaker, now, false);
+    expect(now - weakerWindow.coarseCutoff).toBeLessThan(now - base.coarseCutoff);
+
+    const stricter: Params = { ...P, ARCHIVE_LINE: P.ARCHIVE_LINE / 2 };
+    const stricterWindow = coarseGateWindow(stricter, now, false);
+    // 归档线更低 ⇒ 归档得更早 ⇒ 粗筛窗口必须**更宽**（否则会误杀没到归档线的记忆）
+    expect(now - stricterWindow.coarseCutoff).toBeGreaterThan(now - base.coarseCutoff);
+  });
+
+  it('★ 同源自洽：窗口下界与 `archiveAt`（τ = MAX_STABILITY）关于 now 互为镜像', () => {
+    // ⚠️ 这是「闸门与衰减公式同源」的可测断言：
+    //   `archiveAt` = last_access + τ × ln(1/ARCHIVE_LINE) × 86400000（decay.ts）
+    //   `coarseCutoff` = now - τ_max × ln(1/ARCHIVE_LINE) × 86400000（本文件）
+    //   ⇒ 同一套公式 ⇒ 两者的跨度必须相等（用相对误差断言，避免大数相减的绝对误差）。
+    const now = 1_700_000_000_000;
+    const window = coarseGateWindow(P, now, false);
+
+    const spanFromArchiveAt =
+      archiveAt({ stability: P.MAX_STABILITY, pin_factor: 1, last_access: now }, P) - now;
+    const spanFromWindow = now - window.coarseCutoff;
+
+    expect(Math.abs(spanFromArchiveAt - spanFromWindow) / Math.abs(spanFromWindow)).toBeLessThan(
+      1e-12,
+    );
+  });
+
+  it('★ 粗筛是「粗」的上界：它**不会**挡掉精筛本该放行的记忆（两个口径不打架）', () => {
+    // ⚠️ 粗筛用 τ_max（普通 = MAX_STABILITY，被 pin = MAX_STABILITY × MAX_PIN_FACTOR），
+    //   精筛用每行自己的 τ ⇒ 粗筛的下界**永远不晚于**精筛的下界
+    //   ⇒ 粗筛挡掉的条目，精筛一定也挡 ⇒ 绝不会出现「明明没过归档线却召不回」。
+    const now = 1_700_000_000_000;
+    const window = coarseGateWindow(P, now, false);
+
+    const stabilities = [1, 7, 30, P.MAX_STABILITY];
+    const pinFactors = [1, 2, P.MAX_PIN_FACTOR];
+    const agesDays = [1, 100, 539, 540, 2696, 3000];
+
+    for (const stability of stabilities) {
+      for (const pinFactor of pinFactors) {
+        for (const ageDays of agesDays) {
+          const memory = {
+            stability,
+            pin_factor: pinFactor,
+            last_access: now - ageDays * MS_PER_DAY,
+          };
+          const passesCoarse =
+            pinFactor > 1.0
+              ? memory.last_access >= window.coarseCutoffPinned
+              : memory.last_access >= window.coarseCutoff;
+          if (!passesCoarse) {
+            // 粗筛挡掉 ⇒ 精筛（intensity ≤ 归档线）也一定挡掉
+            expect(intensity(memory, now)).toBeLessThanOrEqual(P.ARCHIVE_LINE);
+          }
+        }
+      }
+    }
+  });
+
+  it('★ 反例：另写一份窗口（用固定的 539 天）⇒ 改参数后与本函数不一致（必须被抓住）', () => {
+    const now = 1_700_000_000_000;
+    const window = coarseGateWindow(P, now, false);
+
+    // 错的实现：把 539 天写死（改参数表后不跟着变）
+    const hardcoded = now - 539 * MS_PER_DAY;
+    expect(hardcoded).not.toBeCloseTo(window.coarseCutoff, 0);
+
+    // 改参数后差距更明显（这才是「漂移」的真正危害：它悄悄变了）
+    const drifted = coarseGateWindow({ ...P, MAX_STABILITY: 90 }, now, false);
+    const driftedHardcoded = now - 539 * MS_PER_DAY;
+    expect(driftedHardcoded).not.toBeCloseTo(drifted.coarseCutoff, 0);
   });
 });
