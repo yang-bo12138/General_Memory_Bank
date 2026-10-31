@@ -291,10 +291,14 @@ function main(): number {
     restoreTarget(mutation);
     // ── 变异 ──
     applyMutation(mutation);
-    // ── 跑 ──
-    const result = runBaseline();
-    // ── 还原 + 校验（**必须逐字节**）──
-    restoreTarget(mutation);
+    // ── 跑（**还原必须保证一定发生**：哪怕跑测试抛异常，污染也不能留给下一组）──
+    let result: RunResult;
+    try {
+      result = runBaseline();
+    } finally {
+      restoreTarget(mutation);
+    }
+    // ── 还原校验（**必须逐字节**）──
     const restored = verifyRestored(mutation);
 
     const missingReason: string[] = [];
