@@ -1,16 +1,26 @@
 /**
  * `memory-ocean` —— 通用记忆库 v2.1（记忆海版）公共导出入口。
  *
- * ⚠️ **阶段 0（P0-T01~T06）的导出面刻意很小**：
- * DESIGN-v2.md §12 阶段 0 原文——「本阶段**不实现任何新机制**，只建开关与不变量测试。
- * 没有这个阶段，后面每个机制的『没改坏别的东西』都无法证明。」
+ * ⚠️ **本文件是「公开承诺」的清单**：导出的每一个名字都要能指到唯一代码路径
+ *   （§14.3 边界原则 1「每个承诺都要能指到唯一代码路径」）。
  *
- * ⇒ 本阶段只导出**不变量设施**（参数表 / 机制开关 / 事件流 / 错误类型 / 时钟契约），
- *   23 个公开方法的门面 `MemoryStore` 分属阶段 1~5（DEVELOPMENT-PLAN.md §3.1 方法归位表），
- *   **本阶段刻意不实现任何业务机制**。
+ * ## 导出面的两个阶段
+ *
+ * · **阶段 0（P0-T01~T06）** 只导出**不变量设施**（参数表 / 机制开关 / 事件流 /
+ *   错误类型 / 时钟契约）——
+ *   DESIGN-v2.md §12 阶段 0 原文「本阶段**不实现任何新机制**，只建开关与不变量测试。
+ *   没有这个阶段，后面每个机制的『没改坏别的东西』都无法证明。」
+ *   那时 23 个公开方法的门面 `MemoryStore` 分属阶段 1~5（DEVELOPMENT-PLAN.md §3.1 方法归位表），
+ *   **阶段 0 刻意不实现任何业务机制**。
+ * · **阶段 1（P1-T10 起）** 追加导出**门面 `MemoryStore`** 与它那 **10 个方法**用到的公共类型：
+ *   `write` / `recall` / `touch` / `get` / `pin` / `unpin` / `link` / `linkByIds` /
+ *   `setAlias` / `mergeEntities`。
+ *   ⇒ **只导这 10 个**：其余 13 个方法分属阶段 2~5，在各自阶段落地前**不进导出面**
+ *   （导出了却没实现 = 空承诺，比不导更糟）。
  *
  * ⇒ §14.3 边界原则 1「每个承诺都要能指到唯一代码路径」：
- *   阶段 0 只承诺「版本常量 + 阶段 0 的不变量设施」，这些都能指到唯一实现；
+ *   导出面只承诺「版本常量 + 不变量设施 + 阶段 1 的门面与其依赖的类型」，
+ *   这些都能指到唯一实现；
  *   不在此处声明一个「23 个方法齐全、但一个都没实现」的空接口。
  */
 
@@ -146,6 +156,34 @@ export {
   type EventStatement,
   type EventWriterOptions,
 } from './store/events.js';
+// ── 阶段 1（P1-T10）的门面与它那 10 个方法用到的公共类型 ──
+// ⚠️ 类型名**全部来自 `src/` 里已有的定义**（先 grep 再导），不自造别名。
+export { type MemoryConfig, MemoryStore } from './store/MemoryStore.js';
+export type { MergeEntitiesResult } from './store/entities.js';
+export type {
+  MediaType,
+  MemoryKind,
+  MemoryView,
+} from './store/get.js';
+export type { LinkOptions, LinkResult } from './store/link.js';
+export { DEFAULT_PIN_FACTOR } from './store/pin.js';
+export type {
+  RecallBreakdown,
+  RecallDiffused,
+  RecallExplain,
+  RecallHit,
+  RecallOptions,
+  RecallResult,
+  RecallRouteInfo,
+  RecallSuppressed,
+} from './store/recall.js';
+export type {
+  GrowStabilityOutcome,
+  TouchOptions,
+  TouchOutcome,
+  TouchReason,
+} from './store/touch.js';
+export type { WriteInput, WriteResult, WriteWarning } from './store/write.js';
 export {
   FileLogger,
   flattenField,
