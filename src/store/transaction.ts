@@ -44,6 +44,12 @@ export function runWriteTransaction<T>(db: Database.Database, body: () => T): T 
     if (error instanceof MemoryError) {
       throw error;
     }
-    throw translateSqliteError(error);
+    // ⚠️ **转译只有一份实现**：`src/core/errors.ts` 的 `translateSqliteError`。
+    //   本文件**刻意不自带映射表**（§14.3 边界原则 1：每个承诺指到唯一代码路径）——
+    //   两份映射表必然漂移，而这正是本库反复修的那类缺陷（ADR-P1-C 冲突 5）。
+    // ⚠️ **带上库路径**：`db.name` 是 better-sqlite3 暴露的库文件名
+    //   ⇒ 只读错误（§7.1）的 `details.path` 能指出「**是哪个**库只读」，
+    //   而不是只给一句 “attempt to write a readonly database”。
+    throw translateSqliteError(error, { path: db.name });
   }
 }

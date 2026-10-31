@@ -269,11 +269,36 @@ export interface SqliteErrorLike {
 }
 
 /**
+ * §7.1 / §11.2：**只读实例上的写操作** ⇒ `READONLY_VIOLATION`。
+ *
+ * ⚠️ **SQLite 把「只读」拆成了五个结果码**，但它们对调用方**语义完全一样**
+ *   （都是「这个库现在不能写」）⇒ 归一到**同一个** code：
+ *   否则调用方得为五个码各写一遍分支，而其中四个几乎不会出现。
+ *
+ * ⚠️ **不映射会怎样（这正是本条存在的理由）**：这五个码不在 §11.2 已列的三类里
+ *   ⇒ 走「清单之外原样抛出」那条路 ⇒ **裸的 SQLite 错误码穿到调用方**
+ *   （违反 §11.2「客户端只应看到本类」），
+ *   而且调用方拿到的是一个**未类型化的字符串**，无法判断「该换个实例还是该改配置」。
+ *
+ * ⚠️ **本清单是全库唯一的只读映射出处**（§14.3 边界原则 1：每个承诺指到唯一代码路径）：
+ *   store 层的事务包装（`src/store/transaction.ts`）**只调用** `translateSqliteError`，
+ *   **不得**自带第二份映射表 —— 两份映射表必然漂移（这正是本库反复修的那类缺陷）。
+ */
+export const READONLY_SQLITE_CODES: readonly string[] = [
+  'SQLITE_READONLY',
+  'SQLITE_READONLY_DBMOVED',
+  'SQLITE_READONLY_DIRECTORY',
+  'SQLITE_READONLY_RECOVERY',
+  'SQLITE_READONLY_CANTINIT',
+];
+
+/**
  * 把 SQLite 的错误码翻译成库对外的错误类型。
  *
  * ⚠️ **裸的 SQLite 错误码绝不能抛给调用方**（§4.9 步骤 2 并发兜底）：
  * · `SQLITE_CONSTRAINT_UNIQUE` ⇒ `MemoryError.CONFLICT`（**带 `details.conflictingId`**）；
- * · `SQLITE_BUSY` / `SQLITE_LOCKED` ⇒ `MemoryError.DATABASE_BUSY`。
+ * · `SQLITE_BUSY` / `SQLITE_LOCKED` ⇒ `MemoryError.DATABASE_BUSY`；
+ * · `SQLITE_READONLY` 等五个只读码 ⇒ `MemoryError.READONLY_VIOLATION`（§7.1）。
  *
  * · `SQLITE_CONSTRAINT_FOREIGNKEY` ⇒ `MemoryError.NOT_FOUND`：
  *   FK 违规的语义 =「**被引用的行不存在**」⇒ 复用既有的 `NOT_FOUND`，
@@ -284,7 +309,8 @@ export interface SqliteErrorLike {
  *   ⇒ 主路径自己校验（抛 `NOT_FOUND` + `details.missingIds`），本分支只保证「不穿裸错误码」。
  *
  * @param error 捕获到的错误
- * @param details 冲突详情（`CONFLICT` 时必须带 `conflictingId` / `conflictingEntityId`）
+ * @param details 冲突详情（`CONFLICT` 时必须带 `conflictingId` / `conflictingEntityId`）；
+ *                另可带 `path`（库文件路径）——**只给 READONLY 分支用**，见下。
  * @returns 规范化后的 `MemoryError`
  */
 export function translateSqliteError(
@@ -294,11 +320,15 @@ export function translateSqliteError(
   const candidate = error as SqliteErrorLike | null;
   const code = candidate?.code;
 
+  // ⚠️ **`path` 是「上下文」，只给 READONLY 分支用**：
+  //   它回答的是「**哪个**库只读」这个诊断问题，不是错误语义本身
+  //   ⇒ 别的分支**不带**它（免得同一个键在五类错误里含义漂移 ⇒ 违反 §14.3.1 的 C36）。
+  const { path: dbPath, ...rest } = details;
+
   if (code === 'SQLITE_CONSTRAINT_UNIQUE') {
-    const conflictingId =
-      typeof details.conflictingId === 'string' ? details.conflictingId : undefined;
+    const conflictingId = typeof rest.conflictingId === 'string' ? rest.conflictingId : undefined;
     const conflictingEntityId =
-      typeof details.conflictingEntityId === 'string' ? details.conflictingEntityId : undefined;
+      typeof rest.conflictingEntityId === 'string' ? rest.conflictingEntityId : undefined;
     const reason =
       conflictingId === undefined && conflictingEntityId === undefined
         ? 'conflictingId 缺失：调用方必须先查出冲突对象再转译（§11.2：否则调用方无法决定下一步）'
@@ -306,9 +336,7 @@ export function translateSqliteError(
     return new MemoryError(
       MemoryErrorCode.CONFLICT,
       '唯一性冲突：目标已存在（§4.8.1 / §4.9.1 / §4.9.2 的三个来源）',
-      reason === undefined
-        ? { ...details, conflictingId, conflictingEntityId }
-        : { ...details, reason },
+      reason === undefined ? { ...rest, conflictingId, conflictingEntityId } : { ...rest, reason },
     );
   }
 
@@ -317,7 +345,24 @@ export function translateSqliteError(
     return new MemoryError(
       MemoryErrorCode.NOT_FOUND,
       '外键约束失败：被引用的行不存在（§4.5 步骤 4：linkByIds 必须自己校验实体存在性，不能指望外键）',
-      details,
+      rest,
+    );
+  }
+
+  if (code !== undefined && READONLY_SQLITE_CODES.includes(code)) {
+    // ⚠️ **只读 ⇒ READONLY_VIOLATION**（§7.1）：
+    //   只读实例上的写操作是**调用方能自行处置**的一类失败（换个实例 / 改配置 / 先落盘），
+    //   必须给一个能分流的语义 code，而不是一个未类型化的字符串。
+    //   ⇒ `details` 带上库路径：调用方要能指出「是哪个库只读」，
+    //     而不是只拿到一句 “attempt to write a readonly database”。
+    const readonlyDetails: MemoryErrorDetails = { ...rest, sqliteCode: code };
+    if (typeof dbPath === 'string') {
+      readonlyDetails.path = dbPath;
+    }
+    return new MemoryError(
+      MemoryErrorCode.READONLY_VIOLATION,
+      '只读实例上执行了写操作（§7.1：只读拒绝必须按方法判定，不能靠调用方记得哪些参数算写）',
+      readonlyDetails,
     );
   }
 
@@ -325,7 +370,7 @@ export function translateSqliteError(
     return new MemoryError(
       MemoryErrorCode.DATABASE_BUSY,
       '并发等待超时（§9.1 的 busy_timeout = 5000）',
-      details,
+      rest,
     );
   }
 
