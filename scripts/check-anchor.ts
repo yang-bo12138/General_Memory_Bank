@@ -35,7 +35,7 @@ import {
   parseAnchorKeywords,
   parseAnchorPathLabels,
 } from './lib/anchor-match.js';
-import { extractFunctionBody, readSourceFile } from './lib/code-span.js';
+import { blankStrings, extractFunctionBody, readSourceFile } from './lib/code-span.js';
 import {
   extractSection,
   isSeparatorRow,
@@ -178,6 +178,18 @@ export interface AnchorPathBinding {
   heading?: string;
   /** `kind === 'pending'`：**为什么**还没有落点（必须写明 ⇒ 不许静默跳过）。 */
   pendingReason?: string;
+  /**
+   * `kind === 'code'`：**必须**命中的关键词（**全部**命中才算通过）。
+   *
+   * ⚠️ **为什么需要它**（P2 QA 验收 F3）：
+   *   规则的关键词是**弱 OR**（命中任一即可）⇒ 而「写入桶归属」与「删除桶归属」
+   *   是**两个不同的动作** ⇒ 把 `assignBucket` 换成假对象、**只留** `unassignBucket`
+   *   ⇒ 弱 OR 照样满足 ⇒ **锚定门禁分不清「写入」与「删除」**。
+   *   ⇒ ⇒ 逐个落点**写死它必须出现的动作** ⇒ 把弱 OR 收紧成「这条路径**必须**做这个动作」。
+   *
+   * ⚠️ **省略 = 沿用规则的弱 OR**（保持既有落点行为不变 ⇒ 不做无关改动）。
+   */
+  requiredKeywords?: readonly string[];
 }
 
 /** 一条规则的落点集合。 */
@@ -232,9 +244,25 @@ export const ANCHOR_PATH_BINDINGS: readonly AnchorRuleBinding[] = [
         kind: 'code',
         file: 'src/store/write.ts',
         symbol: 'handleExactRepeat',
+        // ⚠️ **必需关键词**（F3）：这条路径的语义是「**补写向量 ⇒ 同步入桶**」
+        //   ⇒ 必须出现 `assignBucket`（**写入**桶归属）⇒ 不能用「命中任一即可」的弱 OR
+        //   ⇒ 否则「把 assignBucket 换成假对象、只留 unassignBucket」也能过。
+        requiredKeywords: ['assignBucket'],
       },
-      { label: '§4.9 步骤 3c ②', kind: 'code', file: 'src/store/merge.ts', symbol: 'mergeMemory' },
-      { label: '§4.9 步骤 4', kind: 'code', file: 'src/store/write.ts', symbol: 'createMemory' },
+      {
+        label: '§4.9 步骤 3c ②',
+        kind: 'code',
+        file: 'src/store/merge.ts',
+        symbol: 'mergeMemory',
+        requiredKeywords: ['assignBucket'],
+      },
+      {
+        label: '§4.9 步骤 4',
+        kind: 'code',
+        file: 'src/store/write.ts',
+        symbol: 'createMemory',
+        requiredKeywords: ['assignBucket'],
+      },
       {
         label: '§4.9.1 步骤 4',
         kind: 'pending',
@@ -490,7 +518,37 @@ function judgeAnchorPath(
     haystack = body;
   }
 
-  const hit = keywords.find((keyword) => containsAnchorKeyword(haystack, keyword));
+  // ⚠️⚠️ **P2 QA 验收 F4**：**涂白字符串字面量**后再匹配
+  //   ⇒ 否则「动作关键词只出现在一个字符串里」也会被判绿
+  //   （例如 `const assignment = 'assignBucket(...)';` ⇒ 真调用已被删掉 ⇒ 承诺已失效却判绿）。
+  //   ⇒ ⚠️ **只对 `code` 落点做**：`doc` 落点**必须保留字符串**
+  //     （设计稿正文里 `'absent'` / `'reinforce'` 这类带引号的字面量**就是**动作关键词本身）。
+  const codeHaystack = blankStrings(haystack);
+
+  const hit = keywords.find((keyword) => containsAnchorKeyword(codeHaystack, keyword));
+  // ⚠️ **P2 QA 验收 F3**：若该落点**写死了必需关键词** ⇒ 必须**全部**命中才算通过。
+  //   ⇒ 把「弱 OR（命中任一即可）」收紧成「这条路径**必须**做这个动作」。
+  if (path.requiredKeywords !== undefined && path.requiredKeywords.length > 0) {
+    const missed = path.requiredKeywords.filter(
+      (keyword) => !containsAnchorKeyword(codeHaystack, keyword),
+    );
+    if (missed.length > 0) {
+      return {
+        rule,
+        label: path.label,
+        kind: path.kind,
+        status: 'missing',
+        detail: `该落点里缺少必需的动作关键词「${missed.join('」「')}」（命中任一即可的弱 OR 在此不成立）`,
+      };
+    }
+    return {
+      rule,
+      label: path.label,
+      kind: path.kind,
+      status: 'ok',
+      detail: `命中必需的动作关键词「${path.requiredKeywords.join('」「')}」`,
+    };
+  }
   return {
     rule,
     label: path.label,

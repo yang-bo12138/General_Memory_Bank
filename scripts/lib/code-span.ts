@@ -85,6 +85,63 @@ export function blankComments(source: string): string {
 }
 
 /**
+ * 把源码里的**字符串字面量**就地涂白（长度不变 ⇒ 下标与原文一一对应）。
+ *
+ * ⚠️ **为什么需要它**（P2 QA 验收 F4）：
+ *   `code` 落点的动作关键词**若只在字符串字面量里出现**，那条断言就**不成立** ——
+ *   例如 `const assignment = 'assignBucket(...)';` ⇒ 真调用被删了、只留一个字符串
+ *   ⇒ 而「动作出现在管辖路径上」这条承诺**已经失效** ⇒ 门禁却判绿。
+ *   ⇒ 涂白字符串 ⇒ 匹配只在**真正的代码位置**上生效。
+ *
+ * ⚠️ **只对 `code` 落点用**：`doc` 落点**必须保留字符串**
+ *   （设计稿正文里 `'absent'` / `'reinforce'` 这类**带引号的字面量**就是动作关键词本身）。
+ *
+ * ⚠️ 与 `blankComments` 的区别：那个**保留字符串**、涂白注释；这个**保留注释**、涂白字符串。
+ *   ⇒ 两者**顺序敏感**：若要「既无注释又无字符串」，需先涂白注释、再在**其结果上**涂白字符串
+ *   （涂白不会改变其它字符的下标 ⇒ 可直接串联）。
+ *
+ * @param source 源码文本
+ * @returns 字符串字面量被涂白后的文本（长度与入参相同）
+ */
+export function blankStrings(source: string): string {
+  const out = source.split('');
+  let index = 0;
+  let quote: string | undefined;
+
+  while (index < source.length) {
+    const char = source[index] ?? '';
+
+    if (quote !== undefined) {
+      // ⚠️ 在字符串里：只看转义（`\'`）与结束引号 ⇒ 字符串里的引号不会提前结束字符串。
+      out[index] = ' ';
+      if (char === '\\') {
+        if (index + 1 < source.length) {
+          out[index + 1] = ' ';
+        }
+        index += 2;
+        continue;
+      }
+      if (char === quote) {
+        quote = undefined;
+      }
+      index += 1;
+      continue;
+    }
+
+    if (char === "'" || char === '"' || char === '`') {
+      quote = char;
+      out[index] = ' ';
+      index += 1;
+      continue;
+    }
+
+    index += 1;
+  }
+
+  return out.join('');
+}
+
+/**
  * 取某个符号所在的**函数体**（花括号配对；注释已涂白）。
  *
  * ⚠️ **在涂白后的文本上配对花括号**：SQL 模板字符串里有 `{` / `}`，

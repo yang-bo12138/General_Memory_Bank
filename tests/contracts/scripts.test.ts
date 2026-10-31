@@ -408,6 +408,32 @@ describe('P2-T04 · 关键词与路径标签的口径', () => {
     expect(counts).toEqual(EXPECTED_ANCHOR_PATH_COUNTS.map(([, count]) => count));
   });
 
+  // ⚠️⚠️ **F5 的第三处锁死**（P2 QA 验收）——
+  //   `EXPECTED_ANCHOR_PATH_COUNTS`（分母）与 `EXPECTED_ANCHOR_ROWS`（期望行）
+  //   **在同一个文件里** ⇒ 可以**一起改** ⇒ QA 实测（M9）：
+  //   「设计稿删一条路径 + 落点表删条目 + 期望行同步改 + 分母改成实际命中数」⇒ **全绿**
+  //   ⇒ **「三处自洽」的漂移整类静默通过**。
+  //   ⇒ 唯一的治法是**加第三处**：这里把「期望行第三列的项数」**独立硬编码**
+  //   ⇒ ⇒ 要漂移就得改**三处**（设计稿 / 落点表+分母 / 本契约）⇒ ⇒ 而任何单处/两处的改动都会红。
+  it('★ F5：期望行的第三列项数与写死的分母**互相锁死**（第三处 ⇒ 同改两处会被抓住）', () => {
+    // ⚠️ 这里的数字是**独立硬编码**的（不是从 `EXPECTED_ANCHOR_PATH_COUNTS` 推导）
+    //   ⇒ 它与 `EXPECTED_ANCHOR_PATH_COUNTS` 构成**互锁**。
+    const expectedCountsFromRows = [4, 6, 6, 7, 4];
+    const countsFromConstants = EXPECTED_ANCHOR_PATH_COUNTS.map(([, count]) => count);
+    expect(countsFromConstants).toEqual(expectedCountsFromRows);
+
+    // 性质：**期望行本身**的第三列解析出的项数，也要逐条等于上面那组数
+    const perRowCounts = EXPECTED_ANCHOR_ROWS.map(
+      (row) => parseAnchorPathLabels(row[2] ?? '').length,
+    );
+    expect(perRowCounts).toEqual(expectedCountsFromRows);
+
+    // 性质：两条规则名也逐条对齐（防止「改数字不改规则名」）
+    expect(EXPECTED_ANCHOR_PATH_COUNTS.map(([rule]) => rule)).toEqual(
+      EXPECTED_ANCHOR_ROWS.map((row) => row[0] ?? ''),
+    );
+  });
+
   it('★ ASCII 关键词按**词边界**匹配（`mode` 不命中 `model`）', () => {
     expect(containsAnchorKeyword('mode: flat_auto', 'mode')).toBe(true);
     expect(containsAnchorKeyword('the model changed', 'mode')).toBe(false);

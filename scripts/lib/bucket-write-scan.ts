@@ -19,6 +19,8 @@
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 
+import { blankComments } from './code-span.js';
+
 /** 一处「裸的桶表写入」。 */
 export interface BucketWriteHit {
   /** 相对 `src/` 的路径（用 `/` 分隔，跨平台一致）。 */
@@ -28,25 +30,17 @@ export interface BucketWriteHit {
 }
 
 /**
- * 剥掉**整行注释**，保留行结构（行号才对得上）。
+ * 剥掉**注释**，保留行结构（行号才对得上）。
  *
- * ⚠️ **只处理整行注释**：本项目的 `src/` 里没有「代码后面跟注释再跟代码」这种需要
- *   精细解析的形态（`//` 出现在字符串里的地方极少，且都不在桶表 SQL 附近）。
- *   ⇒ 宁可漏也不误报：误报会把闸门变成噪声 ⇒ 大家开始忽略它。
+ * ⚠️ **v2.1（P2 QA 验收 F6 修正）**：原先这里是一份「只剥整行注释」的简化实现，
+ *   而它自己的 JSDoc 写着「**宁可漏也不误报**：误报会把闸门变成噪声」⇒
+ *   **实现与自述纪律相反**（QA 实测：多行块注释的**内容行**会被当成裸写 ⇒ 误报）。
+ *   ⇒ 改为**复用 `code-span.ts` 的 `blankComments`**（逐字符涂白、长度不变 ⇒ 下标一一对应）：
+ *   它正确处理多行块注释，且**保留字符串字面量**（桶表 SQL 若出现在字符串里**本就违规** ⇒ 该报）。
+ *   ⇒ ⚠️ `stripCommentLines` 这个名字被保留（导出面不变）⇒ 但它现在**不再只处理整行**。
  */
 export function stripCommentLines(source: string): string {
-  return source
-    .split('\n')
-    .map((rawLine) => {
-      const trimmed = rawLine.trim();
-      const isComment =
-        trimmed.startsWith('//') ||
-        trimmed.startsWith('*') ||
-        trimmed.startsWith('/*') ||
-        trimmed.endsWith('*/');
-      return isComment ? '' : rawLine;
-    })
-    .join('\n');
+  return blankComments(source);
 }
 
 /**
