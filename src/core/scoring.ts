@@ -640,18 +640,33 @@ export function cosineSimilarity(left: readonly number[], right: readonly number
  *
  * · `includeArchived = false`（默认）⇒ `ARCHIVE_LINE`（归档线，`0.05`）——
  *   精筛剔除 `intensity ≤ ARCHIVE_LINE` 的项。
- * · `includeArchived = true` ⇒ `0.0`——**只过滤 `deleted = 0`**，
- *   归档记忆照常参与打分与排序。
- *   ⇒ 这是「**显式查询归档层**」的唯一代码路径（§4.4「归档仅显式查询可见」）。
+ * · `includeArchived = true` ⇒ **抛错**（`INVALID_INPUT`），**不是**返回 `0.0`。
+ *
+ * ⚠️ **归档模式下强度精筛整体不执行**（不是「阈值改成 0.0」）：
+ *   正确形态是「**调用方根本不调用 `passesIntensityFilter`**」——
+ *   见 `src/store/recall.ts`：`includeArchived ? null : archiveFilterThreshold(params, false)`
+ *   ⇒ 归档层里 `archiveLine === null` ⇒ 精筛那段**整段不跑**。
+ *   ⚠️ **为什么不能返回 `0.0`**：`0.0` **仍然是阈值** ⇒ `intensity === 0` 的行照样被挡掉，
+ *     而归档层的语义是「**显式查询全部归档记忆**」（§4.4）⇒ 0.0 会**静默**少召回一批。
+ *     ⇒ 边界一旦存在，就让它**响**（抛错），而不是让它**静默**（少召回）。
  *
  * ⚠️ **`ARCHIVE_LINE` 来自参数表**（可调项），这里**不得**写死 `0.05`。
  *
  * @param params 生效参数
- * @param includeArchived 是否显式查询归档层
+ * @param includeArchived 是否显式查询归档层（`true` ⇒ 抛错：这一层**不该有阈值**）
  * @returns 精筛阈值
+ * @throws `INVALID_INPUT`（`includeArchived === true`）
  */
 export function archiveFilterThreshold(params: Params, includeArchived: boolean): number {
-  return includeArchived ? 0 : params.ARCHIVE_LINE;
+  if (includeArchived) {
+    // ⚠️ **抛错而不是返回 0.0**（见 JSDoc）：归档层没有阈值，
+    //   「用一个 0 阈值凑合」会让 `intensity === 0` 的归档记忆**静默**查不到。
+    throw MemoryError.invalidInput(
+      '归档模式不设强度精筛阈值：请在归档模式下不调用 passesIntensityFilter',
+      { reason: 'includeArchived' },
+    );
+  }
+  return params.ARCHIVE_LINE;
 }
 
 /**
@@ -660,6 +675,8 @@ export function archiveFilterThreshold(params: Params, includeArchived: boolean)
  * ⚠️ **严格大于**：设计稿原文是 `intensity > ARCHIVE_LINE`（不是 `≥`），
  *   写成 `≥` 会让「恰好落在归档线上」的记忆留在候选集里，
  *   而归档线本身是可调参数 ⇒ 调参时边界行为会悄悄反向。
+ *
+ * ⚠️ **归档模式下不调用本函数**（强度精筛整体不执行，见 `archiveFilterThreshold` 的 JSDoc）。
  *
  * @param intensityValue 候选的强度
  * @param threshold 阈值（`archiveFilterThreshold` 的输出）

@@ -129,8 +129,12 @@ describe('P0-T05 · §11.2 的错误类型体系', () => {
     expect(METHODS_THROWING_READONLY_VIOLATION).toHaveLength(16);
   });
 
-  it('ALIAS_CONFLICT 刻意不是异常，而是走 warnings', () => {
-    expect(WARNING_ONLY_CASES).toEqual(['ALIAS_CONFLICT']);
+  it('ALIAS_CONFLICT / ALIAS_TARGET_NOT_LINKED 刻意不是异常，而是走 warnings', () => {
+    // ⚠️ **两条都是「主体工作做成了，附属产出未生效」**（§11.2 末）⇒ 都不抛错：
+    //   · `ALIAS_CONFLICT`：别名冲突未覆盖；
+    //   · `ALIAS_TARGET_NOT_LINKED`：别名目标建好了，但没跟本条记忆关联
+    //     （ADR-P1-T07-DEC 的 D-3/R2 终裁：关联只由 `input.entities` 表达）。
+    expect(WARNING_ONLY_CASES).toEqual(['ALIAS_CONFLICT', 'ALIAS_TARGET_NOT_LINKED']);
   });
 
   it('ERROR_SEMANTICS 与两张名单一致', () => {
