@@ -327,8 +327,13 @@ function resolveVector(store: WriteStore, input: WriteInput): Float32Array | nul
   // ⚠️ **归一化走向量层的唯一权威**（`src/vector/dot.ts` 的 `normalizeNumbers`）。
   //   ⚠️⚠️ **必须用 `normalizeNumbers`（`number[]` 入口）而不是 `normalize`（`Float32Array` 入口）**：
   //     本路径的入参是**原始 double** ⇒ 归一化必须在 **double 域**里算、**之后**才截断成 float32；
-  //     而 `normalize` 的入参已经是 float32 ⇒ 两者**逐位不同**（实测 6 个分量全部不同）。
-  //     ⇒ 换成 `normalize` 会**逐位改变落库值** ⇒ **P1-T09 的基线逐位一致会红**。
+  //     而 `normalize` 的入参已经是 float32 ⇒ 两者**逐位不同**
+  //     （实测 768 维典型样例里 196/768 个分量逐位不同 ⇒ BLOB 层面 200/3072 字节不同）。
+  //     ⇒ 换成 `normalize` 会**逐位改变落库值** ⇒ 老库与新库的向量**不可比**
+  //     （余弦仍是合法数字 ⇒ **静默劣化**）。
+  //   ⇒ ⚠️ **这条口径的守卫是 `tests/unit/write.test.ts` 的「★ 写入路径的向量归一化口径」**，
+  //     **不是** P1-T09 的基线（基线语料**从不写 embedding** ⇒ 覆盖不到这一条 ⇒ 早期注释里
+  //     「基线会红」是**错的**，QA 实测：换口径后 746 条测试全绿）。
   //   ⇒ 归一化的校验（NaN/Inf、模长溢出、零向量）与实现**只有一份**，在向量层。
   return normalizeNumbers(raw);
 }

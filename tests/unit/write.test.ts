@@ -1511,3 +1511,82 @@ describe('P1-T07 · 裁决 G：入参越界一律 INVALID_INPUT（details.reason
     expect(event?.payload.emotion).toBe(1);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ★ 写入路径的向量归一化口径（**唯一**守住「写入口径 = double 域归一化」这条承诺的守卫）
+//
+// ⚠️⚠️ **为什么这条守卫必须存在、且不能靠基线**：
+//   `src/vector/dot.ts` 有**两个**归一化入口：
+//     · `normalize(v: Float32Array)`：入参**已经是 float32** ⇒ 在 float32 域算 norm；
+//     · `normalizeNumbers(raw: number[])`：入参是**原始 double** ⇒ 在 **double 域**算 norm、
+//       **之后**才截断成 float32。
+//   ⇒ 两者**逐位不同**（768 维典型样例里 196/768 个分量、BLOB 层面 200/3072 字节不同）
+//   ⇒ 而写入路径**必须**走 `normalizeNumbers`（§4.9 步骤 2 的 v1.0 既有口径），
+//     否则落库值逐位改变 ⇒ **老库与新库的向量不可比**（余弦仍是合法数字 ⇒ **静默劣化**）。
+//   ⇒ ⚠️ **P1-T09 的基线守不住这一条**：基线语料**从不写 embedding**
+//     ⇒ 口径从未被执行 ⇒ 换成 float32 口径后**基线照样全绿**（QA 实测 746 条一条没红）。
+//     ⇒ 本条守卫才是那个**真正存在**的守护。
+//
+// ⚠️ **向量必须含「小数成分」**：若用基向量（如 `unitVector`）⇒ 在两种口径下**逐位相同**
+//   ⇒ 断言会变成**真空的**（红不起来）⇒ 等于没有守卫。
+// ═══════════════════════════════════════════════════════════════════════════
+describe('★ 写入路径的向量归一化口径（§4.9 步骤 2）', () => {
+  /** 造一个含丰富小数成分的向量（**不是**基向量 ⇒ 两种口径下逐位不同）。 */
+  function fractionalVector(dim: number): number[] {
+    const vector = new Array<number>(dim);
+    for (let index = 0; index < dim; index += 1) {
+      // ⚠️ 用 `((i * 37) % 1000) / 1000 + 0.001` ⇒ 大量**不可被 float32 精确表示**的小数
+      vector[index] = ((index * 37) % 1000) / 1000 + 0.001;
+    }
+    return vector;
+  }
+
+  /** 按「double 域归一化 ⇒ 末尾截断成 float32」算出期望的落库 BLOB（写入路径的口径）。 */
+  function expectedBlob(raw: number[]): Buffer {
+    let sumSquares = 0;
+    for (const value of raw) {
+      sumSquares += value * value;
+    }
+    const norm = Math.sqrt(sumSquares);
+    const normalized = new Float32Array(raw.length);
+    for (let index = 0; index < raw.length; index += 1) {
+      normalized[index] = (raw[index] as number) / norm;
+    }
+    return vectorToBlob(normalized);
+  }
+
+  it('★ 落库的向量是「double 域归一化 + 末尾截断 float32」的**逐字节**结果（不是 float32 域归一化）', () => {
+    const { db, store, params } = createWriteContext();
+    const raw = fractionalVector(params.EMBED_DIM);
+
+    const result = write(store, { content: '一个带向量的事实', embedding: raw, now: 0 });
+
+    const stored = readMemoryRow(db, result.id).embedding;
+    expect(stored).not.toBeNull();
+
+    // 性质：**逐字节**相等（不是 `toBeCloseTo` ⇒ 那会放过逐位差异）
+    expect(Buffer.from(stored as Buffer)).toEqual(expectedBlob(raw));
+  });
+
+  it('★ 负控：换成「float32 域归一化」的口径 ⇒ 落库值**必须不同**（证明上一条不是真空断言）', () => {
+    const { db, store, params } = createWriteContext();
+    const raw = fractionalVector(params.EMBED_DIM);
+
+    const result = write(store, { content: '另一个带向量的事实', embedding: raw, now: 0 });
+
+    const stored = Buffer.from(readMemoryRow(db, result.id).embedding as Buffer);
+
+    // ⚠️ 另一个口径：先截断成 float32、**再**在 float32 域算 norm 并归一化
+    const asFloat32 = new Float32Array(raw);
+    let sumSquares = 0;
+    for (const value of asFloat32) {
+      sumSquares += value * value;
+    }
+    const norm = Math.sqrt(sumSquares);
+    const other = new Float32Array(Array.from(asFloat32, (value) => value / norm));
+
+    // 性质：两种口径**确实产出不同的字节** ⇒ 上一条的逐字节断言**有牙**
+    //   （若这里将来变成相等 ⇒ 说明夹具退化成了基向量 ⇒ 守卫会变真空 ⇒ 必须改夹具）
+    expect(Buffer.from(other.buffer)).not.toEqual(stored);
+  });
+});
