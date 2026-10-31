@@ -28,11 +28,28 @@
  *   而这类兜底掩盖的正是「有人传了 0 进来」这个真问题。
  */
 
+import { MS_PER_DAY } from '../util/time.js';
 import { resolveNow } from './clock.js';
 import type { Params } from './params.js';
 
-/** 一天的毫秒数（§4.1 / §4.5 公式里的 `86400000`）。 */
-export const MS_PER_DAY = 86400000;
+/**
+ * 一天的毫秒数 —— **re-export**（**定义**在 `src/util/time.ts`）。
+ *
+ * ⚠️ **为什么保留这个 re-export**（而不是直接删掉这个导出）：
+ *   既有代码从 `./decay.js` 导入它的地方有**一串**——
+ *   `src/index.ts`（门面线，已交付）、`src/core/scoring.ts`（recall 线，正在改）、
+ *   `src/core/stability.ts`，以及多个测试文件。
+ *   若直接删掉，这些 import 会**同时断掉** ⇒ 而它们分属**两条正在并行改动的线**
+ *   ⇒ 三方串行会让主线在中间态**编译不过**。
+ *   ⇒ 本次只做「**定义下沉、导出保留**」。
+ *
+ * ⚠️ **re-export 不是第二份定义** ⇒ 不会漂移（C36 禁的是「同一个键名两处两套语义」，
+ *   不是禁别名）：`MS_PER_DAY` 的**唯一定义**在 `src/util/time.ts`，
+ *   此处只是别名，值恒等于那一份。
+ *   ⇒ 待办：下一次统一收敛时，把这些 import 路径改成直接指向 `src/util/time.js`
+ *     （避免三方串行打断主线，故本次刻意不做）。
+ */
+export { MS_PER_DAY };
 
 /**
  * 强度衰减所需的记忆字段（§4.1）。

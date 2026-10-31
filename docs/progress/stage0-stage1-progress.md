@@ -106,16 +106,34 @@
 
 ---
 
-## 六、⏳ 进行中（阶段 1 收官，5 条线并行）
+## 六、⏳ 进行中（阶段 1 收官，6 条线并行）
 
 | # | 事项 | 负责人 | 文件域 | 状态 |
 |---|---|---|---|---|
-| 1 | P1-T07 六条口径落地（C 终裁 + 新增 warning `ALIAS_TARGET_NOT_LINKED`） | 工程师-4 | `write.ts` `merge.ts` `entities.ts` | 进行中 |
-| 2 | recall 打分层收尾（删 `archiveFilterThreshold` 的归档分支 + 归档跨度 import） | 工程师-5 | `scoring.ts` | 进行中 |
-| 3 | `MS_PER_DAY` 定义下沉 + F-08 ③ 静态守卫（`scripts/check-clamp.ts`） | 工程师-3 | `decay.ts` `util/time.ts` `log.ts` `package.json` | 进行中 |
-| 4 | P1-T09 基线等价验收 | QA | `tests/baseline/ref-v1.ts` `v1-equivalence.test.ts`（新） | 进行中 |
-| 5 | ADR-P1-T07-DEC 的 D-3 改写 + `ALIAS_TARGET_NOT_LINKED` 三处同步 + `MS_PER_DAY` 分层裁决 | 架构师 | `docs/design/**` `scripts/check-contract-ids.ts` | 进行中 |
-| — | `extractEntityNames` 纳入导出面 | 工程师（线A） | `src/index.ts` | **已撤回**（ADR-P1-T07-DEC D-1：阶段 1 不实现；导出面已撤回，原文保留见 `docs/design/adr-p1-t07-decisions.md`） |
+| 1 | P1-T07 六条口径落地（C 终裁 + 新增 warning `ALIAS_TARGET_NOT_LINKED`） | 工程师-4 | `write.ts` `merge.ts` `entities.ts` `errors.ts` | **已合并**（`90fec7c`）⇒ 剩 `errors.ts` 白名单 + `scoring.ts` 副本 |
+| 2 | recall 打分层收尾（删 `extractEntityNames` + 归档跨度 import + 负控②） | 工程师-5 | `recall.ts` `scoring.ts` `tests/unit/recall.test.ts` | 进行中（**主理人已终裁删除方向**） |
+| 3 | `MS_PER_DAY` 定义下沉 + F-08 ③ 静态守卫（`scripts/check-clamp.ts`） | 工程师-3 | `decay.ts` `util/time.ts` `log.ts` `package.json` | **已合并**（`b2281da` + `a00d944`） |
+| 4 | P1-T09 基线等价验收 | QA | `tests/baseline/ref-v1.ts` `v1-equivalence.test.ts`（新） | **已交付**（`6196a15`）⇒ 剩改名 + 四组实测 |
+| 5 | ADR-P1-T07-DEC 的 D-3 改写 + `ALIAS_TARGET_NOT_LINKED` 三处同步 + `MS_PER_DAY` 分层裁决 + `extractEntityNames` 阶段归属终裁 | 架构师 | `docs/design/**` `scripts/check-contract-ids.ts` | 进行中 |
+| 6 | **门禁盲区守卫**：源码实发 warning code ⊆ 白名单 | 工程师-2 | `scripts/check-contract-ids.ts` | 进行中（**主理人本轮新发现**） |
+| — | `extractEntityNames` 纳入导出面 | 工程师（线A） | `src/index.ts` | **已撤回**（`fc44abe`）⇒ 终裁：阶段 1 不实现 |
+
+### 6.1 ★ 本轮主理人裁决记录（三处 ADR/文档冲突的收敛）
+
+| # | 冲突 | 裁决 | 依据 |
+|---|---|---|---|
+| 1 | `extractEntityNames` 的阶段归属：ADR-P1-T08-GAP C-1.3「推荐 A 导出」**vs** ADR-P1-T07-DEC D-1「阶段 1 不实现」 | **阶段 1 不实现、不进导出面** | C-1.3 写的是「二选一，我推荐 A」⇒ 是**建议**；D-1（`2d85753`，**更晚**）是**正式裁决**；且 **DESIGN-v2.md §4.6 步骤 1 正文（:1185）已按 D-1 落笔**「⚠️ **阶段 1 不实现它**……⇒ **本节只留口子**」⇒ 正文即权威（C36：两份 ADR 口径相反本身就是缺陷） |
+| 2 | `ALIAS_TARGET_NOT_LINKED` 的三处同步 | **必须三处全改**：`src/core/errors.ts` 的 `WARNING_ONLY_CASES` + `scripts/check-contract-ids.ts` 的 `EXPECTED_WARNING_ONLY_CASES` + DESIGN §11.2 表格（**反引号包住**） | 门禁 `compareNameSets` 做三方比对 ⇒ 少一处即红 |
+| 3 | 基线参考实现的 `REF_MS_PER_DAY` 是否 import 库的 `MS_PER_DAY` | **不 import**（参考实现必须独立于被审对象） | 若 import，将来 `MS_PER_DAY` 改错 ⇒ 参考实现**跟着一起错** ⇒ 基线**静默**退化成「当前实现的语义」⇒ 循环论证。⇒ 改为加一条**漂移可见**的断言（两侧当前相等，但漂移会让基线立刻红） |
+
+### 6.2 ★ 本轮主理人新发现的门禁盲区（已派单修）
+
+**现象**：合并「工程师-4 的 C 终裁」后，`src/store/write.ts` 已发出**两个** warning code（`ALIAS_CONFLICT` + `ALIAS_TARGET_NOT_LINKED`），而三处白名单**全都还只有 `ALIAS_CONFLICT`** ⇒ **门禁仍全绿**。
+
+**根因**：`scripts/check-contract-ids.ts` 只做**三方互相比对**（白名单 ↔ 源码常量 ↔ 文档表格）⇒ **从不去检查「源码里实际发出的 warning code 集合」** ⇒ 新加一个 code 而忘了登记 ⇒ **门禁完全看不见**。
+
+⇒ 这是 **C36「同一件事不得有两套词」的经典漏洞**：warning code 这个「键」有**两处**来源（`src/store/write.ts` 的判别字面量 + `src/core/errors.ts` 的白名单数组），门禁只保证它们**各自与文档一致**，不保证它们**彼此一致**。
+⇒ **已派单**：补一条「源码实发 warning code ⊆ 白名单」的守卫 + **负控**（塞入未登记 code ⇒ 守卫必须报红）。
 
 ---
 
@@ -126,11 +144,16 @@
 | 1 | **阶段 1 不写桶归属**：有向量但无桶归属的记忆必然存在（阶段 1 没有细桶，桶行会被 FK 直接拒绝） | 阶段间交接 | P2-T03 的**集合相等硬断言**（左侧口径：**全库** `embedding IS NOT NULL AND deleted = 0`）+ 启动对账 + 首次重训 |
 | 2 | **静态断言只保证「阶段 1 不写桶」，不保证「阶段 2 写了桶」** | ⚠️ 静默失效点 | 必须靠 P2-T03 自己的集合相等断言兜底 |
 | 3 | `alias` 事件的 `aliasAdded` = **布尔**，源主名本体记在 `alias` 键（C36：同一件事不得有两套词） | 已裁决 | 已落地 |
-| 4 | `entityAliases[].name` 目标不存在 ⇒ **建但不隐含关联** ⇒ 只声明别名、不在 `entities` 点名的调用方**静默达不到召回目的** | ⚠️ 明写的代价 | 文档已写明；若要加 `warnings` 需同步改 `EXPECTED_WARNING_ONLY_CASES` 白名单 |
+| 4 | `entityAliases[].name` 目标不存在 ⇒ **建但不隐含关联** ⇒ 只声明别名、不在 `entities` 点名的调用方**静默达不到召回目的** | ⚠️ 明写的代价 | ✅ **已闭环**：新增 warning `ALIAS_TARGET_NOT_LINKED`（一个 `name` 一条）⇒ 边界可观测；**四处**白名单/镜像同步中（`errors.ts` + `check-contract-ids.ts` + DESIGN §11.2 + 两处测试镜像） |
 | 5 | 库未校验 `stability > 0`（F-08 ④） | 独立问题 | 阶段 2 的参数/校验面 |
-| 6 | `intensity()` 两道钳制在正常输入下**行为等价** ⇒ 行为层无解 | 已知方法论边界 | F-08 ③ 的**静态扫描**守卫（工程师-3 落地中） |
+| 6 | `intensity()` 两道钳制在正常输入下**行为等价** ⇒ 行为层无解 | 已知方法论边界 | ✅ **已闭环**：`scripts/check-clamp.ts`（**数据流判据**，堵住「补无关同形态调用」的绕过）+ 行为层探针（负 τ + 1 天偏移，分辨力 0.63） |
 | 7 | `LIMIT 100` / `slice(0,20)` / `topN ∈ 1~8` **刻意硬编码**，不进参数表 | 设计决定 | 改它们是设计变更，走 ADR |
 | 8 | `stats()` **不在阶段 1 的 10 个方法内**且未实现 ⇒ 基线断言顺延 | 计划口径 | 已收敛进 `DEVELOPMENT-PLAN.md` |
+| 9 | **`extractEntityNames` 阶段 1 不实现**（ADR-P1-T07-DEC D-1）⇒ 设计稿 §4.6 只留口子 | 已裁决 | ✅ 已落地（删除函数 + 删除导出 + 导出面守卫） |
+| 10 | 门禁**曾经**看不见「新增 warning code 未登记白名单」 | ⚠️ **静默失效点** | ✅ **已闭环**：`scripts/check-contract-ids.ts` 补「源码实发 warning code ⊆ 白名单」守卫 ⇒ **已在实战中生效**（登记缺失 ⇒ verify EXIT=1） |
+| 11 | 门禁只认 `code: 'XXX'` **字面量** ⇒ 动态实参（`code: someVar`）判不了 | 类型层加固 | **阶段 2**：把 `MemoryError` 构造签名收紧成 `code: MemoryErrorCode`（破坏性变更 ⇒ 走 ADR）。当前阶段 1 的 warning code 全是字面量 ⇒ **无实际风险** |
+| 12 | `archiveFilterThreshold(params, true)` 在归档模式下返回 `0.0` | ⚠️ **静默失效点** | ✅ **已改**：改为抛 `INVALID_INPUT`（0.0 仍是阈值 ⇒ 会把 `intensity === 0` 的归档记忆挡掉 ⇒ 静默少召回） |
+| 13 | 归档模式下**粗筛窗口取 0** ⇒ 候选池放大 | 性能 | **阶段 2**（向量路范畴）；阶段 1 的 `topN ∈ 1~8` + `LIMIT 100` 已兜住上限 |
 
 ---
 

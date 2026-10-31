@@ -16,13 +16,313 @@ import { describe, expect, it } from 'vitest';
 import { MS_PER_DAY } from '../../src/core/decay.js';
 import { MemoryError } from '../../src/core/errors.js';
 import { EVENT_PAYLOAD_VARIANTS } from '../../src/core/events.types.js';
-import { blobToVector } from '../../src/store/merge.js';
-import { type WriteStore, write } from '../../src/store/write.js';
+import { blobToVector, vectorToBlob } from '../../src/store/merge.js';
+import {
+  type AliasConflictWarning,
+  type WriteStore,
+  type WriteWarning,
+  compareMergeCandidates,
+  write,
+} from '../../src/store/write.js';
 import { LOG_ACTIONS, MemoryLogger } from '../../src/util/log.js';
 import { countRows, createTestStore, readEvents } from '../fixtures/graph-store.js';
 
 /** 测试用的库句柄类型（内存 SQLite）。 */
 type TestDb = ReturnType<typeof createTestStore>['db'];
+
+/** 本测试文件所在目录（ESM 下没有 `__dirname`）。 */
+const HERE = fileURLToPath(new URL('.', import.meta.url));
+/** 仓库的 `src/` 目录。 */
+const SRC_ROOT = resolve(HERE, '../../src');
+
+/**
+ * 把源码里的**注释**与**字符串/模板字符串字面量**挖空（长度不变 ⇒ 下标仍对齐）。
+ *
+ * ⚠️ **为什么审计器必须先剥它们**：本文件此前踩过同一个坑——
+ *   注释里出现的 `ORDER BY bm25(mem_fts) ASC` 会**抢先命中**源码里的 SQL 字面量
+ *   ⇒ 断言始终为绿 ⇒ 闸门形同虚设。
+ * ⇒ 任何「源码里有没有某个字面量」的判断，都必须只在**代码**上做。
+ */
+function stripCommentsAndStrings(source: string): string {
+  const out = source.split('');
+  const blank = (from: number, to: number): void => {
+    for (let index = from; index < to; index += 1) {
+      if (out[index] !== '\n') {
+        out[index] = ' ';
+      }
+    }
+  };
+  let index = 0;
+  while (index < source.length) {
+    const char = source[index];
+    const next = source[index + 1];
+    // 行注释
+    if (char === '/' && next === '/') {
+      const end = source.indexOf('\n', index);
+      const stop = end === -1 ? source.length : end;
+      blank(index, stop);
+      index = stop;
+      continue;
+    }
+    // 块注释
+    if (char === '/' && next === '*') {
+      const end = source.indexOf('*/', index + 2);
+      const stop = end === -1 ? source.length : end + 2;
+      blank(index, stop);
+      index = stop;
+      continue;
+    }
+    // 字符串 / 模板字符串
+    if (char === "'" || char === '"' || char === '`') {
+      let cursor = index + 1;
+      while (cursor < source.length) {
+        if (source[cursor] === '\\') {
+          cursor += 2;
+          continue;
+        }
+        if (source[cursor] === char) {
+          break;
+        }
+        cursor += 1;
+      }
+      const stop = Math.min(cursor + 1, source.length);
+      blank(index, stop);
+      index = stop;
+      continue;
+    }
+    index += 1;
+  }
+  return out.join('');
+}
+
+/** 取某个具名函数的**函数体范围**（`{` 到配对的 `}`）；找不到返回 `undefined`。 */
+function functionBodyRangeOf(
+  code: string,
+  name: string,
+): { start: number; end: number } | undefined {
+  const match = new RegExp(`function\\s+${name}\\s*\\(`).exec(code);
+  if (match === null) {
+    return undefined;
+  }
+  // ⚠️ **必须先配平参数列表的括号**：参数里可能含**内联对象类型**
+  //   （如 `ReadonlyArray<{ name: string; aliases: string[] }>`）
+  //   ⇒ 直接取签名后的第一个 `{` 会取到**类型字面量**的那个 `{`
+  //   ⇒ 配平出来的是一段类型文本，不是函数体（这个坑踩过一次）。
+  const parenOpen = match.index + match[0].length - 1;
+  let parenDepth = 0;
+  let parenClose = -1;
+  for (let index = parenOpen; index < code.length; index += 1) {
+    const char = code[index];
+    if (char === '(') {
+      parenDepth += 1;
+    } else if (char === ')') {
+      parenDepth -= 1;
+      if (parenDepth === 0) {
+        parenClose = index;
+        break;
+      }
+    }
+  }
+  if (parenClose === -1) {
+    return undefined;
+  }
+  // ⚠️ **返回类型也可能是内联对象类型**（`): { a: string } {`）⇒
+  //   若第一个 `{` 配平后紧跟着另一个 `{`，说明第一个是**类型字面量** ⇒ 跳过它。
+  let open = code.indexOf('{', parenClose);
+  if (open === -1) {
+    return undefined;
+  }
+  const firstClose = matchingBrace(code, open);
+  if (firstClose === -1) {
+    return undefined;
+  }
+  if (
+    code
+      .slice(firstClose + 1)
+      .trimStart()
+      .startsWith('{')
+  ) {
+    open = code.indexOf('{', firstClose + 1);
+    if (open === -1) {
+      return undefined;
+    }
+  }
+  const end = matchingBrace(code, open);
+  return end === -1 ? undefined : { start: open, end };
+}
+
+/** 从 `open` 处的 `{` 出发，找到**配对**的 `}` 的下标；找不到返回 -1。 */
+function matchingBrace(code: string, open: number): number {
+  let depth = 0;
+  for (let index = open; index < code.length; index += 1) {
+    if (code[index] === '{') {
+      depth += 1;
+    } else if (code[index] === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        return index;
+      }
+    }
+  }
+  return -1;
+}
+
+/** 取某个具名函数的**函数体**文本；找不到返回 `undefined`。 */
+function functionBodyOf(code: string, name: string): string | undefined {
+  const range = functionBodyRangeOf(code, name);
+  return range === undefined ? undefined : code.slice(range.start, range.end + 1);
+}
+
+/**
+ * 找出源码里**调用** `linkEntityId(...)` 的位置（**排除定义处**）。
+ *
+ * ⚠️ **必须排除定义处**：`function linkEntityId(` 本身也匹配这个模式
+ *   ⇒ 不排除的话，「调用点数量」恒为 1 ⇒ 守卫生效不了。
+ */
+function findLinkEntityCallSites(source: string): number[] {
+  const code = stripCommentsAndStrings(source);
+  const sites: number[] = [];
+  const pattern = /linkEntityId\s*\(/g;
+  let match = pattern.exec(code);
+  while (match !== null) {
+    const before = code.slice(Math.max(0, match.index - 24), match.index);
+    if (!/function\s+$/.test(before)) {
+      sites.push(match.index);
+    }
+    match = pattern.exec(code);
+  }
+  return sites;
+}
+
+/**
+ * 落在 `resolveEntities`（= `input.entities` 那条路径）**之外**的 `linkEntityId` 调用点。
+ *
+ * ⚠️ **为什么这条守的是「关联只由 `entities` 表达」**：
+ *   `@linkedEntityIds` 只能由 `resolveEntities` 往里加
+ *   ⇒ 别名路径（步骤 1c）一旦也调 `linkEntityId`，就会多出**第二处**能表达
+ *   「这条记忆跟 X 有关」的地方 ⇒ §14.3 边界原则 1 就破了。
+ */
+function linkEntityCallSitesOutsideEntities(source: string): number[] {
+  const code = stripCommentsAndStrings(source);
+  const range = functionBodyRangeOf(code, 'resolveEntities');
+  if (range === undefined) {
+    return [];
+  }
+  return findLinkEntityCallSites(source).filter((site) => site < range.start || site > range.end);
+}
+
+/**
+ * 在**内存中的源码副本**里，往别名目标解析函数里塞一次 `linkEntityId(...)` 调用。
+ *
+ * ⚠️ **只改内存副本，不碰磁盘上的 `src/`**：
+ *   在测试里就地改源文件会让 CI 跑完之后留下**脏工作树**
+ *   （后续提交会把这次变异一起带进去 ⇒ 事故）。
+ *
+ * ⚠️ **切片用原始源码**（不是剥过注释的副本）：
+ *   `stripCommentsAndStrings` **长度不变** ⇒ 下标在原文里同样成立
+ *   ⇒ 变异后的副本仍然是「原文件 + 一处改动」，而不是「原文件 + 注释被抹掉」。
+ */
+function injectAliasTargetLink(source: string): string {
+  const code = stripCommentsAndStrings(source);
+  const range = functionBodyRangeOf(code, 'resolveAliasTargetEntityId');
+  if (range === undefined) {
+    return source;
+  }
+  const body = source.slice(range.start, range.end + 1);
+  const mutatedBody = body.replace(
+    /\{/,
+    '{\n  linkEntityId({ linkedEntityIds: [], seen: new Set<string>() }, name);',
+  );
+  return source.slice(0, range.start) + mutatedBody + source.slice(range.end + 1);
+}
+
+/**
+ * 在**内存中的源码副本**里，把「要不要回报 `ALIAS_TARGET_NOT_LINKED`」的判定改成**恒真**。
+ *
+ * ⚠️ **只改内存副本，不碰磁盘上的 `src/`**（就地改源码会让 CI 留下脏工作树）。
+ * ⚠️ **恒真是最阴的一种错**：它不会让任何断言报红，除非有人专门去问
+ *   「这条判定到底看不看 `linkedEntityIds`」⇒ 所以要有机器检。
+ */
+function injectAlwaysTrueWarning(source: string): string {
+  const code = stripCommentsAndStrings(source);
+  const range = functionBodyRangeOf(code, 'syncEntityAliases');
+  if (range === undefined) {
+    return source;
+  }
+  const body = source.slice(range.start, range.end + 1);
+  const mutatedBody = body.replace(
+    /if\s*\(\s*!\s*linkedEntityIds\s*\.\s*includes\s*\([^)]*\)\s*\)/,
+    'if (true)',
+  );
+  return source.slice(0, range.start) + mutatedBody + source.slice(range.end + 1);
+}
+
+/**
+ * 「要不要回报 `ALIAS_TARGET_NOT_LINKED`」这条判定**是不是条件式**。
+ *
+ * ⚠️ **为什么要机器检这条**：判定写成恒真（`if (true)`）⇒ **每一次**写入都回报
+ *   「这个实体没跟本条记忆关联」⇒ 与事实相反 ⇒ 调用方被**持续误导**
+ *   （而所有「正向」断言仍然全绿 ⇒ 典型的真空）。
+ *   ⇒ 判定必须**真的**看 `linkedEntityIds`。
+ */
+function aliasTargetWarningIsConditional(source: string): boolean {
+  const code = stripCommentsAndStrings(source);
+  const body = functionBodyOf(code, 'syncEntityAliases');
+  if (body === undefined) {
+    return false;
+  }
+  return /linkedEntityIds\s*\.\s*includes\s*\(/.test(body);
+}
+
+/**
+ * `write()` 里 `resolveEntities(...)` 的**实参文本**。
+ *
+ * ⚠️ 这条守的是「**关联只由 `input.entities` 表达**」的**调用点**那一半：
+ *   `resolveEntities` 是**唯一**能往 `@linkedEntityIds` 里加东西的地方
+ *   ⇒ 它的实参**只能**是 `input.entities`，**不得**混进 `entityAliases[].name`。
+ */
+function resolveEntitiesArgs(source: string): string | undefined {
+  const code = stripCommentsAndStrings(source);
+  const body = functionBodyOf(code, 'write');
+  if (body === undefined) {
+    return undefined;
+  }
+  const at = body.indexOf('resolveEntities(');
+  if (at === -1) {
+    return undefined;
+  }
+  let depth = 0;
+  for (let index = at + 'resolveEntities'.length; index < body.length; index += 1) {
+    const char = body[index];
+    if (char === '(') {
+      depth += 1;
+    } else if (char === ')') {
+      depth -= 1;
+      if (depth === 0) {
+        return body.slice(at + 'resolveEntities('.length, index);
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * 在**内存中的源码副本**里，把 `entityAliases[].name` 混进 `resolveEntities` 的实参
+ * （= 模拟「别名目标也算关联」的旧口径）。
+ */
+function injectAliasNamesIntoEntities(source: string): string {
+  const code = stripCommentsAndStrings(source);
+  const body = functionBodyOf(code, 'write');
+  if (body === undefined) {
+    return source;
+  }
+  const at = code.indexOf(body);
+  const mutatedBody = body.replace(
+    /input\.entities \?\? \[\]/,
+    '[...(input.entities ?? []), ...(input.entityAliases ?? []).map((entry) => entry.name)]',
+  );
+  return source.slice(0, at) + mutatedBody + source.slice(at + body.length);
+}
 
 /** 取出捕获到的 `MemoryError`（失败时给出可读的原因）。 */
 function expectMemoryError(fn: () => unknown): MemoryError {
@@ -111,6 +411,42 @@ function linkedEntityIdsOf(db: TestDb, memoryId: string): string[] {
     .prepare('SELECT entity_id FROM memory_entities WHERE memory_id = ? ORDER BY entity_id')
     .all(memoryId) as Array<{ entity_id: string }>;
   return rows.map((row) => row.entity_id);
+}
+
+/**
+ * 取「别名冲突」那一类 warning（`WriteWarning` 是**可辨识联合** ⇒ 这里做**显式收窄**）。
+ *
+ * ⚠️ 不用 `as` 断言硬转：那会把「类型收窄」变成「相信类型」⇒ 字段名写错也照样绿。
+ */
+function aliasConflictOf(warning: WriteWarning | undefined): AliasConflictWarning | undefined {
+  return warning !== undefined && warning.code === 'ALIAS_CONFLICT' ? warning : undefined;
+}
+
+/**
+ * 直接插一条**带向量**的记忆（用于构造「两个候选」的场景）。
+ *
+ * ⚠️ **为什么不用 `write()` 造候选**：候选的 id 必须**写死**才能比较两次运行的结果
+ *   （`write()` 生成随机 UUID ⇒ 两次运行的 id 不同 ⇒ 比不了）。
+ */
+function insertCandidate(
+  db: TestDb,
+  id: string,
+  content: string,
+  tokens: string,
+  vector: number[] | null,
+): void {
+  db.prepare(
+    `INSERT INTO memories (id, kind, content, content_tokens, content_hash, embedding,
+                           stability, difficulty, created_at, last_access, access_count,
+                           deleted, deleted_at)
+     VALUES (@id, 'fact', @content, @tokens, @hash, @embedding, 1, 0.5, 0, 0, 0, 0, NULL)`,
+  ).run({
+    id,
+    content,
+    tokens,
+    hash: `hash-${id}`,
+    embedding: vector === null ? null : vectorToBlob(new Float32Array(vector)),
+  });
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -360,9 +696,9 @@ describe('P1-T07 · entityAliases 同步（§4.9 步骤 1c）', () => {
     // 性质：**调用方看得见**（warnings 是「调用方能看见的通道」）
     expect(result.warnings).toHaveLength(1);
     expect(result.warnings[0]?.code).toBe('ALIAS_CONFLICT');
-    expect(result.warnings[0]?.alias).toBe('老张');
-    expect(result.warnings[0]?.currentEntityId).toBe(zhangSanId);
-    expect(result.warnings[0]?.intendedEntityId).toBe(zhangSanfengId);
+    expect(aliasConflictOf(result.warnings[0])?.alias).toBe('老张');
+    expect(aliasConflictOf(result.warnings[0])?.currentEntityId).toBe(zhangSanId);
+    expect(aliasConflictOf(result.warnings[0])?.intendedEntityId).toBe(zhangSanfengId);
 
     // 性质：**既有映射没有被覆盖**（覆盖是 `setAlias` 的职责，两处不能统一）
     const row = db.prepare('SELECT entity_id FROM entity_aliases WHERE alias = ?').get('老张') as {
@@ -421,8 +757,8 @@ describe('P1-T07 · entityAliases 同步（§4.9 步骤 1c）', () => {
     // 性质：主名优先 ⇒ 冲突被报出来
     expect(result.warnings).toHaveLength(1);
     expect(result.warnings[0]?.code).toBe('ALIAS_CONFLICT');
-    expect(result.warnings[0]?.alias).toBe('张三');
-    expect(result.warnings[0]?.currentEntityId).toBe(zhangSanId);
+    expect(aliasConflictOf(result.warnings[0])?.alias).toBe('张三');
+    expect(aliasConflictOf(result.warnings[0])?.currentEntityId).toBe(zhangSanId);
     expect(logger.ofLevel('warn').length).toBeGreaterThan(0);
 
     // 性质：没有把主名写进别名表（那会让 §4.5 的解析顺序出现两个答案）
@@ -635,11 +971,6 @@ describe('P1-T07 · 新建事实的事件（§8.4 的 write 行）', () => {
 // ─────────────────────────────────────────────────────────────
 
 describe('P1-T07 · growStability 仍是全库唯一的 stability 写入点', () => {
-  /** 本测试文件所在目录（ESM 下没有 `__dirname`）。 */
-  const HERE = fileURLToPath(new URL('.', import.meta.url));
-  /** 仓库的 `src/` 目录。 */
-  const SRC_ROOT = resolve(HERE, '../../src');
-
   /** 递归列出目录下的 `.ts` 实现文件（排除测试与声明）。 */
   function listSourceFiles(root: string): string[] {
     const out: string[] = [];
@@ -717,5 +1048,457 @@ describe('P1-T07 · growStability 仍是全库唯一的 stability 写入点', ()
       .filter((line) => !/UPDATE\s+memories\s+SET\s+stability\s*=/i.test(line))
       .join('\n');
     expect(findStabilityWriteSites(withoutWrite)).toHaveLength(0);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+// 裁决 C / D / E / F / G（主理人 2026-10-31 签字）
+// ─────────────────────────────────────────────────────────────
+
+describe('P1-T07 · 裁决 C：别名目标实体「建，但不隐含关联」', () => {
+  it('★ 只给 entityAliases（entities 为空）⇒ 目标实体**被建出来** + 本条记忆**不**关联它 + 回报 ALIAS_TARGET_NOT_LINKED', () => {
+    const { db, store, logger } = createWriteContext();
+
+    // ⚠️ `entities` **故意为空**：这条断言守的是「只声明别名」时目标实体仍然要被建出来、
+    //   **但不得**与本条记忆建立关联（ADR-P1-T07-DEC 的 D-3/R2「建，但不隐含关联」）。
+    const result = write(store, {
+      content: '张三住在北京',
+      entityAliases: [{ name: '张三', aliases: ['老张'] }],
+    });
+
+    const zhangSanId = entityIdOf(db, '张三');
+    // 性质：实体被创建（库里只有这一个）——**显式点名的实体不许被静默丢弃**
+    expect(countRows(db, 'entities')).toBe(1);
+    // 性质：别名挂到了它身上
+    const aliasRow = db
+      .prepare('SELECT entity_id FROM entity_aliases WHERE alias = ?')
+      .get('老张') as {
+      entity_id: string;
+    };
+    expect(aliasRow.entity_id).toBe(zhangSanId);
+    // 性质：★ 本条记忆**不**关联它（关联只由 `input.entities` 表达）
+    expect(linkedEntityIdsOf(db, result.id)).toEqual([]);
+    // 性质：★ write 事件的 `payload.entityIds` **不含**它
+    //   ⚠️ 落点是**事件 payload**，不是 `WriteResult`——`WriteResult` 里**没有** `entityIds` 字段。
+    const event = readEvents(db, 'write')[0];
+    expect(event?.payload.entityIds).toEqual([]);
+    // 性质：★ 库里也**没有** `memory_entities` 关联行（不是「事件里没带、库里却建了」）
+    expect(countRows(db, 'memory_entities')).toBe(0);
+
+    // 性质：★ `warnings` 里出现 `ALIAS_TARGET_NOT_LINKED`
+    //   （**边界可以存在，但必须可观测**：别名建好了、本条记忆却不与它关联
+    //   ⇒ 图谱路查不到 ⇒ 静默达不到召回目的 ⇒ 必须回报给调用方）
+    const notLinked = result.warnings.filter((w) => w.code === 'ALIAS_TARGET_NOT_LINKED');
+    expect(notLinked).toHaveLength(1);
+    expect(result.warnings).toContainEqual({
+      code: 'ALIAS_TARGET_NOT_LINKED',
+      name: '张三',
+      entityId: zhangSanId,
+    });
+    // 性质：★ 磁盘日志里也有（§8.1：两个通道都要）
+    const warns = logger.ofLevel('warn');
+    expect(warns.length).toBeGreaterThan(0);
+    expect(warns.some((line) => line.fields.name === '张三')).toBe(true);
+
+    // ⚠️ **工具自检**：上面的「为空」断言不能是**空断言**——
+    //   ⇒ 同一个库里再写一条**带 `entities`** 的记忆 ⇒ 同一个查询必须能查得出关联行。
+    //   （否则「查不到」可能只是因为查询写错了，而不是因为真的没关联。）
+    const linked = write(store, { content: '张三喜欢喝奶茶', entities: ['张三'] });
+    expect(linkedEntityIdsOf(db, linked.id)).toEqual([zhangSanId]);
+  });
+
+  it('★ 静态守卫：`linkEntityId` 的**唯一**调用点在 `resolveEntities` 里（关联只由 `entities` 表达）', () => {
+    const source = readFileSync(join(SRC_ROOT, 'store', 'write.ts'), 'utf8');
+
+    // 性质：★ 全文件**恰好一处**调用点（`@linkedEntityIds` 只能由 `entities` 那条路径往里加）
+    expect(findLinkEntityCallSites(source)).toHaveLength(1);
+    // 性质：★ 别名路径（步骤 1c）**没有**第二处调用点
+    expect(linkEntityCallSitesOutsideEntities(source)).toEqual([]);
+    // 性质：★ `resolveEntities` 的实参**只有** `input.entities`（不得混进别名目标名）
+    expect(resolveEntitiesArgs(source)).toContain('input.entities');
+    expect(resolveEntitiesArgs(source) ?? '').not.toContain('entityAliases');
+
+    // ⚠️ **负控 ①**：往**被审对象本身**（`resolveAliasTargetEntityId` 的函数体）里
+    //   塞一次 `linkEntityId(...)` 调用 ⇒ 守卫必须立刻改判。
+    //   ⇒ 这一步只改**内存中的源码副本**，磁盘上的 `src/` 一个字都不动
+    //   （就地改源码会让 CI 留下脏工作树）。
+    const mutatedLink = injectAliasTargetLink(source);
+    // 变异确实落到被审对象上了（否则下面那条断言就是空断言）
+    expect(mutatedLink).not.toBe(source);
+    // 性质：★ 守卫在变异后**改判** ⇒ 闸门不是摆设
+    expect(findLinkEntityCallSites(mutatedLink)).toHaveLength(2);
+    expect(linkEntityCallSitesOutsideEntities(mutatedLink)).toHaveLength(1);
+
+    // ⚠️ **负控 ②**：把 `entityAliases[].name` 混进 `resolveEntities` 的实参
+    //   （= 「别名目标也算关联」的旧口径）⇒ 实参守卫必须立刻改判。
+    const mutatedArgs = injectAliasNamesIntoEntities(source);
+    expect(mutatedArgs).not.toBe(source);
+    expect(resolveEntitiesArgs(mutatedArgs) ?? '').toContain('entityAliases');
+  });
+
+  it('★ 静态守卫：「要不要回报 ALIAS_TARGET_NOT_LINKED」这条判定**必须**是条件式（不得恒真）', () => {
+    const source = readFileSync(join(SRC_ROOT, 'store', 'write.ts'), 'utf8');
+
+    // 性质：★ 判定确实看 `linkedEntityIds`（**不是**恒真）
+    expect(aliasTargetWarningIsConditional(source)).toBe(true);
+
+    // ⚠️ **负控**：把判定改成恒真（`if (true)`）⇒ 守卫必须立刻改判。
+    //   ⇒ 只改**内存中的源码副本**，磁盘上的 `src/` 一个字都不动。
+    //   ⚠️ 这一条是**关键**：恒真不会让任何「正向」断言变红
+    //   （每次写入都多报一条 warning 时，正向用例照样可能全绿）⇒ 必须有这条守卫。
+    const mutated = injectAlwaysTrueWarning(source);
+    // 变异确实落到被审对象上了（否则下面那条断言就是空断言）
+    expect(mutated).not.toBe(source);
+    // 性质：★ 守卫在变异后**改判** ⇒ 闸门不是摆设
+    expect(aliasTargetWarningIsConditional(mutated)).toBe(false);
+  });
+
+  it('★ 反向：`entities` 里显式点名 ⇒ 该实体**被关联** + 别名挂到它身上 + **没有新建第二个实体** + **没有** ALIAS_TARGET_NOT_LINKED', () => {
+    const { db, store } = createWriteContext();
+
+    // ⚠️ 这条是上一条的**反向用例**：守住「关联**只**由 `entities` 表达」这条边界。
+    //   同一个实体名同时出现在 `entities` 与 `entityAliases[].name` 里
+    //   ⇒ 它**因 `entities` 而被关联**（不是因别名路径）。
+    const result = write(store, {
+      content: '张三住在北京',
+      entities: ['张三'],
+      entityAliases: [{ name: '张三', aliases: ['老张'] }],
+    });
+
+    const zhangSanId = entityIdOf(db, '张三');
+    // 性质：★ 被关联（走 `input.entities` 那条路径）
+    expect(linkedEntityIdsOf(db, result.id)).toEqual([zhangSanId]);
+    // 性质：★ write 事件的 `payload.entityIds` 含它
+    const event = readEvents(db, 'write')[0];
+    expect(event?.payload.entityIds).toEqual([zhangSanId]);
+    // 性质：别名挂到了**同一个**实体上
+    const aliasRow = db
+      .prepare('SELECT entity_id FROM entity_aliases WHERE alias = ?')
+      .get('老张') as {
+      entity_id: string;
+    };
+    expect(aliasRow.entity_id).toBe(zhangSanId);
+    // 性质：★ **没有新建第二个实体**（别名路径与 `entities` 路径解析到同一个 id）
+    expect(countRows(db, 'entities')).toBe(1);
+    // 性质：关联行只有一条（不会因两条路径各写一条而重复）
+    expect(countRows(db, 'memory_entities')).toBe(1);
+    // 性质：★ **没有** `ALIAS_TARGET_NOT_LINKED`
+    //   （它**确实**被关联了 ⇒ 边界没发生 ⇒ 不该回报边界）
+    expect(result.warnings.filter((w) => w.code === 'ALIAS_TARGET_NOT_LINKED')).toHaveLength(0);
+    // 性质：一条 warning 都没有（别名既不冲突、边界也没发生）
+    expect(result.warnings).toHaveLength(0);
+  });
+
+  it('★ 一个 name 声明多个别名 ⇒ **只产生一条** ALIAS_TARGET_NOT_LINKED（不是每个别名一条）', () => {
+    const { db, store } = createWriteContext();
+
+    const result = write(store, {
+      content: '张三住在北京',
+      entityAliases: [{ name: '张三', aliases: ['老张', '小张'] }],
+    });
+
+    // 性质：★ **一条**（报的是「这个实体没跟这条记忆关联」，不是「这两个别名有问题」）
+    expect(result.warnings).toHaveLength(1);
+    expect(result.warnings[0]?.code).toBe('ALIAS_TARGET_NOT_LINKED');
+    // 性质：两个别名**都**挂上去了（少挂一个才是 bug）
+    const zhangSanId = entityIdOf(db, '张三');
+    const aliases = db
+      .prepare('SELECT alias, entity_id FROM entity_aliases ORDER BY alias')
+      .all() as Array<{ alias: string; entity_id: string }>;
+    expect(aliases).toEqual([
+      { alias: '小张', entity_id: zhangSanId },
+      { alias: '老张', entity_id: zhangSanId },
+    ]);
+  });
+
+  it('★ entityAliases 的 name 指向**别名** ⇒ 解析到同一个 id，不新建第二个实体', () => {
+    const { db, store } = createWriteContext();
+
+    write(store, {
+      content: '张三住在北京',
+      entities: ['张三'],
+      entityAliases: [{ name: '张三', aliases: ['老张'] }],
+    });
+    const entitiesBefore = countRows(db, 'entities');
+
+    // ⚠️ name = 「老张」是**别名** ⇒ a→b 归一必须解析到**同一个**实体（不新建）
+    const second = write(store, {
+      content: '张三喜欢喝奶茶',
+      entities: ['张三'],
+      entityAliases: [{ name: '老张', aliases: ['老张头'] }],
+    });
+
+    // 性质：「老张头」挂在**张三**这个实体上
+    const aliasRow = db
+      .prepare('SELECT entity_id FROM entity_aliases WHERE alias = ?')
+      .get('老张头') as {
+      entity_id: string;
+    };
+    expect(aliasRow.entity_id).toBe(entityIdOf(db, '张三'));
+    // 性质：**没有新建第二个实体**
+    expect(countRows(db, 'entities')).toBe(entitiesBefore);
+    // 性质：第二条记忆关联到那个实体（**因 `input.entities` 表达**，不是因别名路径）
+    expect(linkedEntityIdsOf(db, second.id)).toEqual([entityIdOf(db, '张三')]);
+  });
+});
+
+describe('P1-T07 · 裁决 D：候选排序是**全序**（四级 tie-break）', () => {
+  it('★ 四级排序：overlap 降 → cos 降 → bm25 升 → id 升', () => {
+    const base = { id: 'b', overlap: 2, cos: 0.95, bm25: -1.5 };
+
+    // 性质：实体重叠多的优先
+    expect(compareMergeCandidates({ ...base, overlap: 3 }, base)).toBeLessThan(0);
+    // 性质：重叠相同 ⇒ 余弦大的优先
+    expect(compareMergeCandidates({ ...base, cos: 0.99 }, base)).toBeLessThan(0);
+    // 性质：余弦也相同 ⇒ BM25 小的优先（BM25 越小越相关）
+    expect(compareMergeCandidates({ ...base, bm25: -2 }, base)).toBeLessThan(0);
+    // 性质：★ 前三级全同 ⇒ **id 小的优先**（这一级是「可复现」的唯一保证）
+    expect(compareMergeCandidates({ ...base, id: 'a' }, base)).toBeLessThan(0);
+    // 性质：四键全等 ⇒ 判为「同一个候选」
+    expect(compareMergeCandidates(base, { ...base })).toBe(0);
+    // 性质：没有向量可比（`-Infinity`）⇒ **排最后**，而不是当成 0
+    expect(
+      compareMergeCandidates({ ...base, cos: Number.NEGATIVE_INFINITY }, base),
+    ).toBeGreaterThan(0);
+  });
+
+  it('★ 全序性：id 不同的两个候选**必须**能定出先后（去掉 id 级就会红）', () => {
+    const candidates = [
+      { id: 'a', overlap: 2, cos: 0.95, bm25: -1.5 },
+      { id: 'b', overlap: 2, cos: 0.95, bm25: -1.5 },
+      { id: 'c', overlap: 2, cos: 0.95, bm25: -1.5 },
+    ];
+
+    for (const a of candidates) {
+      for (const b of candidates) {
+        if (a.id === b.id) {
+          continue;
+        }
+        const forward = compareMergeCandidates(a, b);
+        const backward = compareMergeCandidates(b, a);
+        // 性质：**不能判成相同**（否则「先命中谁」取决于遍历顺序 ⇒ 不可复现）
+        expect(forward).not.toBe(0);
+        // 性质：反对称
+        expect(Math.sign(forward)).toBe(-Math.sign(backward));
+      }
+    }
+
+    // 负控：★ **去掉 id 那一级**的话，两个只有 id 不同的候选就判成「相同」——
+    //   ⇒ 这就是「id 级不可省」的证明（也是这条断言会红的原因）。
+    const withoutIdLevel = (
+      x: (typeof candidates)[number],
+      y: (typeof candidates)[number],
+    ): number => {
+      if (x.overlap !== y.overlap) {
+        return y.overlap - x.overlap;
+      }
+      if (x.cos !== y.cos) {
+        return y.cos - x.cos;
+      }
+      if (x.bm25 !== y.bm25) {
+        return x.bm25 - y.bm25;
+      }
+      return 0;
+    };
+    expect(withoutIdLevel(candidates[0]!, candidates[1]!)).toBe(0);
+  });
+
+  it('★ 行为：两个同分候选（重叠数相同、余弦相同）⇒ 恒定选中同一条，连跑两次一致', () => {
+    /** 造一个「两个候选 + 一个新写入」的场景（候选的 id **写死** ⇒ 两次运行完全可比）。 */
+    const scenario = (): {
+      db: TestDb;
+      store: WriteStore;
+      params: ReturnType<typeof createTestStore>['params'];
+    } => {
+      const context = createWriteContext();
+      const { db, params } = context;
+      const vector = unitVector(params.EMBED_DIM, 0);
+
+      // 两个候选：正文不同（⇒ hash 不同），但**前 3 个 bigram 相同**、向量相同、关联同样的两个实体
+      insertCandidate(
+        db,
+        'mem-a',
+        '张三喜欢猫粮和狗粮',
+        '张三 三喜 喜欢 欢猫 猫粮 粮和 和狗 狗粮',
+        vector,
+      );
+      insertCandidate(
+        db,
+        'mem-b',
+        '张三喜欢鱼粮和鸟粮',
+        '张三 三喜 喜欢 欢鱼 鱼粮 粮和 和鸟 鸟粮',
+        vector,
+      );
+      db.prepare('INSERT INTO entities (id, name, type, created_at) VALUES (?, ?, ?, ?)').run(
+        'ent-zhang',
+        '张三',
+        'concept',
+        0,
+      );
+      db.prepare('INSERT INTO entities (id, name, type, created_at) VALUES (?, ?, ?, ?)').run(
+        'ent-li',
+        '李四',
+        'concept',
+        0,
+      );
+      for (const memoryId of ['mem-a', 'mem-b']) {
+        db.prepare('INSERT INTO memory_entities (memory_id, entity_id) VALUES (?, ?)').run(
+          memoryId,
+          'ent-zhang',
+        );
+        db.prepare('INSERT INTO memory_entities (memory_id, entity_id) VALUES (?, ?)').run(
+          memoryId,
+          'ent-li',
+        );
+      }
+      return context;
+    };
+
+    const first = scenario();
+    const firstResult = write(first.store, {
+      content: '张三喜欢喝茶',
+      entities: ['张三', '李四'],
+      embedding: unitVector(first.params.EMBED_DIM, 0),
+    });
+    // 性质：合并到了**某一条**候选上（不是新建）
+    expect(firstResult.merged).toBe(true);
+    expect(['mem-a', 'mem-b']).toContain(firstResult.id);
+    // 性质：库里仍然只有两条（两条候选 + 新的那条合并进了其中一条）
+    expect(countRows(first.db, 'memories')).toBe(2);
+
+    // 性质：★ **连跑两次结果一致**（同样的输入 ⇒ 合并同一条 ⇒ 可复现）
+    const second = scenario();
+    const secondResult = write(second.store, {
+      content: '张三喜欢喝茶',
+      entities: ['张三', '李四'],
+      embedding: unitVector(second.params.EMBED_DIM, 0),
+    });
+    expect(secondResult.id).toBe(firstResult.id);
+  });
+});
+
+describe('P1-T07 · 裁决 E：alias 等于主名（含它自己那个实体的主名）⇒ 冲突', () => {
+  it('★ alias 等于**它自己那个实体的主名** ⇒ 跳过 + warnings + 日志，别名表不写', () => {
+    const { db, store, logger } = createWriteContext();
+
+    write(store, { content: '张三住在北京', entities: ['张三'] });
+    const zhangSanId = entityIdOf(db, '张三');
+
+    const result = write(store, {
+      content: '张三喜欢喝奶茶',
+      entities: ['张三'],
+      entityAliases: [{ name: '张三', aliases: ['张三'] }],
+    });
+
+    // 性质：冲突被报出来（**不是**幂等成功）
+    expect(result.warnings).toHaveLength(1);
+    expect(result.warnings[0]?.code).toBe('ALIAS_CONFLICT');
+    expect(aliasConflictOf(result.warnings[0])?.alias).toBe('张三');
+    expect(aliasConflictOf(result.warnings[0])?.currentEntityId).toBe(zhangSanId);
+    expect(aliasConflictOf(result.warnings[0])?.intendedEntityId).toBe(zhangSanId);
+    // 性质：★ 别名表**没有**写入（主名不许同时当别名）
+    const row = db.prepare('SELECT entity_id FROM entity_aliases WHERE alias = ?').get('张三');
+    expect(row).toBeUndefined();
+    // 性质：记了磁盘日志
+    expect(logger.ofLevel('warn').length).toBeGreaterThan(0);
+  });
+});
+
+describe('P1-T07 · 裁决 F：退化情形（< 2 个 bigram）只有实体重叠能成立', () => {
+  it('★ 退化：余弦够高但实体重叠 < 2 ⇒ **不合并**（候选确实被找到了）', () => {
+    const { db, store, params } = createWriteContext();
+    const vector = unitVector(params.EMBED_DIM, 0);
+
+    write(store, { content: '说好的明天见', entities: ['张三'], embedding: vector, now: 0 });
+    const second = write(store, {
+      content: '好的',
+      entities: ['李四'],
+      embedding: vector,
+      now: MS_PER_DAY,
+    });
+
+    // 性质：★ 候选**确实被找到了**（否则「没合并」可能只是因为压根没候选 ⇒ 测不到退化条款）
+    const ftsRows = db
+      .prepare('SELECT rowid FROM mem_fts WHERE mem_fts MATCH ?')
+      .all('好的') as Array<{
+      rowid: number;
+    }>;
+    expect(ftsRows.length).toBeGreaterThan(0);
+
+    // 性质：**不合并**（退化时 cos 通道不单独成立）
+    expect(second.merged).toBe(false);
+    expect(countRows(db, 'memories')).toBe(2);
+    expect(readEvents(db, 'merge')).toHaveLength(0);
+  });
+
+  it('★ 退化：实体重叠 ≥ 2 ⇒ 合并（这时不需要 cos）', () => {
+    const { db, store, params } = createWriteContext();
+    const vector = unitVector(params.EMBED_DIM, 0);
+
+    write(store, {
+      content: '说好的明天见',
+      entities: ['张三', '李四'],
+      embedding: vector,
+      now: 0,
+    });
+    const second = write(store, {
+      content: '好的',
+      entities: ['张三', '李四'],
+      embedding: vector,
+      now: MS_PER_DAY,
+    });
+
+    // 性质：合并（实体重叠数达标 ⇒ 证据成立）
+    expect(second.merged).toBe(true);
+    expect(countRows(db, 'memories')).toBe(1);
+  });
+});
+
+describe('P1-T07 · 裁决 G：入参越界一律 INVALID_INPUT（details.reason 分类）', () => {
+  it('★ confidence 越界 ⇒ INVALID_INPUT，details.reason = confidence', () => {
+    const { db, store } = createWriteContext();
+
+    const error = expectMemoryError(() =>
+      write(store, { content: '一个事实', entities: ['张三'], confidence: 1.5 }),
+    );
+    expect(error.code).toBe('INVALID_INPUT');
+    expect(error.details.reason).toBe('confidence');
+    // 性质：库内**没有**这条记录（校验在写库之前）
+    expect(countRows(db, 'memories')).toBe(0);
+  });
+
+  it('★ kind 不在枚举内 ⇒ INVALID_INPUT，details.reason = kind', () => {
+    const { db, store } = createWriteContext();
+
+    const error = expectMemoryError(() =>
+      write(store, { content: '一个事实', entities: ['张三'], kind: 'bogus' as never }),
+    );
+    expect(error.code).toBe('INVALID_INPUT');
+    expect(error.details.reason).toBe('kind');
+    expect(countRows(db, 'memories')).toBe(0);
+  });
+
+  it('★ mediaRef 单独给（不给 mediaType）⇒ INVALID_INPUT，details.reason = media', () => {
+    const { db, store } = createWriteContext();
+
+    const error = expectMemoryError(() =>
+      write(store, { content: '一个事实', entities: ['张三'], mediaRef: 'photo.jpg' }),
+    );
+    expect(error.code).toBe('INVALID_INPUT');
+    expect(error.details.reason).toBe('media');
+    expect(countRows(db, 'memories')).toBe(0);
+  });
+
+  it('★ 负控：emotion 越界是**钳制**不是抛错（别和 confidence 写混）', () => {
+    const { db, store } = createWriteContext();
+
+    const result = write(store, { content: '一个事实', entities: ['张三'], emotion: 5 });
+
+    // 性质：写成功了（emotion 按 §4.3 钳制，不抛错）
+    expect(result.merged).toBe(false);
+    expect(countRows(db, 'memories')).toBe(1);
+    // 性质：emotion 被钳到 [0,1]
+    const event = readEvents(db, 'write')[0];
+    expect(event?.payload.emotion).toBe(1);
   });
 });

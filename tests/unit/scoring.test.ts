@@ -701,8 +701,20 @@ describe('archiveFilterThreshold / passesIntensityFilter（§4.6 步骤 2）', (
     expect(archiveFilterThreshold(P, false)).toBe(P.ARCHIVE_LINE);
   });
 
-  it('`includeArchived = true` ⇒ 阈值 0.0（归档记忆照常参与打分与排序）', () => {
-    expect(archiveFilterThreshold(P, true)).toBe(0);
+  it('★ `includeArchived = true` ⇒ **抛错**（归档模式不设阈值，而不是「阈值 0.0」）', () => {
+    // ⚠️ **为什么不能是 0.0**：阈值 0.0 **仍然是阈值** ⇒ `intensity === 0` 的行照样被挡掉，
+    //   而归档层的语义是「显式查询**全部**归档记忆」（§4.4）⇒ 0.0 会**静默**少召回一批。
+    //   ⇒ 正确形态：归档模式下**调用方根本不调用 `passesIntensityFilter`**。
+    let caught: unknown;
+    try {
+      archiveFilterThreshold(P, true);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(MemoryError);
+    expect((caught as MemoryError).code).toBe('INVALID_INPUT');
+    // 性质：它**抛错**，而不是返回一个数（尤其不是 `0.0`）
+    expect(() => archiveFilterThreshold(P, true)).toThrow();
   });
 
   it('精筛是**严格大于**（恰好等于归档线的记忆不进候选）', () => {

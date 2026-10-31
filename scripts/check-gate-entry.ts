@@ -16,7 +16,7 @@
  *      会再次被内建命令遮蔽（所以本模块逐段校验**写法**）。
  *
  * ⚠️ **分母必须是写死的期望值**（C31）：
- *   `EXPECTED_GATE_COMMANDS`（9 条门禁）是本模块里的**常量数组**，
+ *   `EXPECTED_GATE_COMMANDS`（10 条门禁）是本模块里的**常量数组**，
  *   **不是**「本次解析出来有几条」——后者会让「少了一条」看起来像「全绿」。
  *
  * ⚠️ 本模块既可被 `scripts/check-contract-ids.ts` 内联调用（⇒ 每跑一次
@@ -28,11 +28,15 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 /**
- * ★ **写死的期望值**：门禁必须串起的 **9 条子命令**（C31 的分母）。
+ * ★ **写死的期望值**：门禁必须串起的 **10 条子命令**（C31 的分母）。
  *
- * ⚠️ 这 9 条是「阶段 0 的全部验收门禁」：
- *   类型检查 → 代码风格 → 单元测试 → 6 条契约脚本。
+ * ⚠️ 这 10 条是「阶段 0 的全部验收门禁 + F-08 ③ 的静态守卫」：
+ *   类型检查 → 代码风格 → 单元测试 → 7 条契约脚本。
  *   改这个数组等于改「门禁是什么」，必须是一次**显式**的改动。
+ *
+ * ⚠️ **加一条门禁就必须同步改这个数组**（否则 `check:contract-ids` 内联调用本模块时
+ *   会以「多出 / 缺少」的形式把门禁链卡红）⇒ 这是 C31「分母写死」的必然代价，
+ *   不是本模块在阻碍变化。
  */
 export const EXPECTED_GATE_COMMANDS: readonly string[] = [
   'typecheck',
@@ -44,6 +48,7 @@ export const EXPECTED_GATE_COMMANDS: readonly string[] = [
   'check:anchor',
   'check:contract-ids',
   'check:doc-counts',
+  'check:clamp',
 ];
 
 /**

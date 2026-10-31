@@ -40,6 +40,8 @@
 import { closeSync, existsSync, mkdirSync, openSync, writeSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
+import { MS_PER_DAY } from './time.js';
+
 /** 日志级别（§8.1）。 */
 export type LogLevel = 'info' | 'warn' | 'error';
 
@@ -76,9 +78,6 @@ export type LogFields = Record<string, unknown>;
 /** 队列参数（§8.3）：最大缓冲 200 行或 1000ms，先到先触发 flush。 */
 export const LOG_QUEUE_MAX_LINES = 200;
 export const LOG_QUEUE_MAX_MS = 1000;
-
-/** 一天的毫秒数（用于日期换算）。 */
-const MS_PER_DAY = 86_400_000;
 
 /** 标量的写法。 */
 function formatScalar(value: unknown): string {

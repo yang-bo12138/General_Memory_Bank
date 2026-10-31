@@ -606,6 +606,16 @@ effectiveStability(m) = m.stability × m.pin_factor          // 单位：天，�
 intensity(m, now)     = min(1, exp( -Δt / (effectiveStability(m) × 86400000) ))
 ```
 
+★ **实现分层（v2.1 勘误 / ADR-P1-T07-DEC §10-A）——`86400000` 只有**一个**定义处**：  
+- **`src/util/time.ts`** = 时间常量的**唯一定义处**（导出 `MS_PER_DAY = 86400000`）；  
+- **`src/core/decay.ts`** = **re-export**（`export { MS_PER_DAY } from '…/util/time.js'`）⇒  
+  ⚠️ **别名不是第二份定义**：re-export 只是把同一个常量换个名字暴露出去，**不得**在 `decay.ts` 里再写一遍字面量；  
+- **任何模块都不得自己再写一遍 `86400000`**（§4.4 / §4.5 / §4.6 / §4.15 / §9.4 各处公式里的那个数，**一律引用它**）。  
+⇒ **为什么要分层而不是各自定义**：C36「同一件事不得有两套口径」——两份副本一旦漂移**不报错**，  
+  只表现为「记忆保鲜时长看起来不太对」/「归档判定提前或推后」，极难定位。  
+⇒ **判定方式**：静态扫描「除 `src/util/time.ts` 外没有第二处 `86400000` 字面量」+  
+  `decay.ts` 的 `MS_PER_DAY` 必须是 **re-export**（不是 `const MS_PER_DAY = 86400000`）。
+
 - **量纲说明（避免「半衰期」误称）**：  
   `effectiveStability` 是负指数衰减的**时间常数 τ**，不是半衰期。  
   `intensity = exp(-t/τ)` 在 `t = τ` 时衰减到 `1/e ≈ 36.8%`；  
@@ -1862,8 +1872,11 @@ restore(id: string, options?: { mergeInto?: string }): void
 > - **在启动对账 / 首次重训完成之前，不得对外提供 IVF 向量路**；
 > - **必须新增一条硬断言**：「库内所有 `embedding IS NOT NULL` 且 `deleted = 0` 的记忆，
 >   其 id 集合与 `vector_cell_members` 的 `memory_id` 集合**相等**」
->   （集合相等，不是条数相等——§9.3.2 ③ 的三条判据）⇒ 把阶段 1 的欠账变成阶段 2 的**可检断言**，
->   而不是靠自觉。
+>   （集合相等，不是条数相等——§9.3.2 ③ 的三条判据）
+>   ⚠️ **左侧是「全库」，不是「本次写入的批次」**（ADR-P1-T07-DEC D-12）——
+>   取全批次 ⇒ 断言退化成「本批写的东西都进桶了」⇒ **恰好放不过阶段 1 遗留的那笔欠账**
+>   ⇒ 口径必须写成 `SELECT id FROM memories WHERE embedding IS NOT NULL AND deleted = 0`（全库）
+>   ⇒ 把阶段 2 的**可检断言**做成真正的「全库对账」，而不是「本批次自洽」。
 >
 > ⚠️ 阶段 1 另有两处**同源**的阶段性豁免（一并写明，避免被当成漏实现）：
 > - §4.9 步骤 3a2 的**向量路候选**（两级路由 + 桶内检索）需要桶中心 ⇒ 阶段 1 **跳过**，
@@ -1937,20 +1950,39 @@ restore(id: string, options?: { mergeInto?: string }): void
         · **写路径步骤 1c（本节）** ⇒ **跳过 + `warnings` + 磁盘日志**，**不抛错**——
           因为**记忆本身已经写成功**（§11.2 末：别名冲突是「非致命但调用方必须知道的事」；
           抛错会让调用方重试 `write()` ⇒ 同一事实被写两遍）。
-      ⚠️ **v2.1 勘误（ADR-P1-T07-DEC D-3）：`entityAliases[].name` 的解析走与 `input.entities`
-        **同一套 a → b 归一**——
+      ⚠️ **v2.1 勘误（ADR-P1-T07-DEC D-3，★ 2026-10-31 主理人**改判**，结论反转过一次）：
+        `entityAliases[].name` 的解析走与 `input.entities` **同一套 a → b 归一**——
         ① `resolveEntity` 命中（主名或别名）⇒ 用该 id（**不新建**）；
         ② 均未命中 ⇒ **按步骤 1b UPSERT 新建一个实体**。
-        · **新建的那个实体要计入 `@linkedEntityIds`**（与 `input.entities` 同等对待）
-          ⇒ **它与本条记忆建立关联**。
-          依据：步骤 1b 写明「`@linkedEntityIds` = a 返回的 id 与 **b 新建的 id** 汇总」，
-          而 b 步产物天然是 `@linkedEntityIds` 的一员；
-          且「**新建即孤儿**」是不该有的状态（为这次写入而建的实体，却不与这次写入关联）。
-        · **命中既有实体的那一个**：**不自动**计入 `@linkedEntityIds`
-          ——调用方没把它写进 `input.entities` ⇒ 它与本条记忆的关联**未被声明**。
-          ⇒ **边界（明写）**：想让「这条记忆关于它」成立，**必须把实体名写进 `input.entities`**。
-        · **两条路都不静默丢弃**：b 步建实体 ⇒ 别名**有处可挂**；
-          若改成「不建」，这次声明的别名就**无处可挂** ⇒ 静默丢弃 ⇒ 违背本节「不要静默」的总原则。
+        · **建**：`entityAliases[].name` 是调用方**显式点名**的实体，
+          而写路径的既定语义就是「**写入路径负责建实体**」（步骤 1b 对 `input.entities` 里的未知名字也是建）
+          ⇒ **同一个调用方语义在两个字段上必须表现一致**。
+          ⇒ 不建 ⇒ 这次声明的别名**无处可挂**（`entity_aliases.entity_id` 无处指）⇒ **静默丢弃**。
+        · ⚠️ **不隐含关联**：**无论命中既有实体还是新建，都不进 `@linkedEntityIds`**
+          ⇒ 不与本条记忆建立 `memory_entities` 关联，也不出现在 write 事件的 `entityIds` 里。
+          理由：**`entities` 是「这条记忆跟 X 有关」的**唯一**表达机制**
+          ⇒ 若 `entityAliases` 也能顺带建立关联，就有**两处**能表达同一件事
+          ⇒ §14.3 边界原则 1（每个承诺都要能指到唯一代码路径）就破了。
+        · ⚠️ **代价（明写在这里，别让它变成静默）**：调用方若**只**声明 `entityAliases`、
+          却没把该实体名放进 `input.entities` ⇒ 别名映射建好了，但**本条记忆不与该实体关联**
+          ⇒ 图谱路查不到它 ⇒ **静默达不到召回目的**。
+          ⇒ **想让别名对召回生效，必须把实体名同时写进 `input.entities`。**
+        · ★ **这条边界已可观测（ADR-P1-T07-DEC D-3/R2，落地于 P1-T07）**：
+          「建但不隐含关联」是**有意**的边界，但它有代价 ⇒ **边界可以存在，但必须可观测**
+          ⇒ 写路径在「别名目标实体没跟本条记忆关联」时，回一条 **`ALIAS_TARGET_NOT_LINKED`** warning
+          （字段：`code` / `name` = 调用方在 `entityAliases[].name` 里写的那个名字 /
+          `entityId` = **已经建出来的**那个实体的 id），并按 §8.1 记一条磁盘日志。
+          ⚠️ **一个 `name` 一条**（不是每个别名一条）：报的是「**这个实体**没跟这条记忆关联」，
+          不是「这两个别名有问题」⇒ `{ name:'张三', aliases:['老张','小张'] }` ⇒ **1 条**，不是 2 条。
+          ⚠️ **判定按实体 id，不按名字**：调用方可能用**别名**点名同一个实体
+          （`entities: ['老张']` + `entityAliases: [{ name:'张三', … }]`）⇒ 那个实体**确实**被关联了
+          ⇒ **不该**报这条 warning。
+          ⚠️ **三处必须同步**（漏一处门禁就红）：`src/core/errors.ts` 的 `WARNING_ONLY_CASES`、
+          `scripts/check-contract-ids.ts` 的 `EXPECTED_WARNING_ONLY_CASES`、§11.2 的对照表那一行。
+        · **若别名目标实体与 `input.entities` 里的同名实体是同一个** ⇒ 那时它**因 `input.entities`
+          而被关联**（走 `entities` 那条路径）⇒ 这是对的；
+          **不要因此把别名路径的关联也打开**（别名路径**不**调「计入 `@linkedEntityIds`」那一步）。
+          ⇒ 这种情况下**不**回 `ALIAS_TARGET_NOT_LINKED`（它确实被关联了）。
    注：这确保「老张」和「张三」写入同一实体记录，召回图谱路才查得到这些记忆。
       （唯一例外是 c 的冲突情形——alias 已指向他人时本次不覆盖，此时靠 warnings 让调用方知道。）
 
@@ -2044,19 +2076,28 @@ restore(id: string, options?: { mergeInto?: string }): void
       -- 候选相关性骤降——此时应要求实体重叠数 ≥ 2 才允许合并（见步骤 c），不要放宽。
       -- ⚠️ v2.1 勘误（ADR-P1-T07-DEC D-6）：这里的「≥ 2」是 **DEDUP_ENTITY_MIN 的默认值**，
       --   判据本身应当用**参数** `DEDUP_ENTITY_MIN`（默认 2），与步骤 c 的实体判据同源。
-   ★ **退化态与非退化态的精确判定式**（v2.1 勘误 / ADR-P1-T07-DEC D-6）：
+   ★ **退化态与非退化态的精确判定式**（v2.1 勘误 / ADR-P1-T07-DEC D-6，★ 2026-10-31 与实现逐条对齐）：
      ```
-     退化态（候选不足 2 个 bigram）：
-         合并 ⟺ entityOverlap ≥ DEDUP_ENTITY_MIN（默认 2）
-         （cos 通道在退化态**整条不生效**——不是「两条判据任一成立」）
-     非退化态：
-         合并 ⟺ entityOverlap ≥ DEDUP_ENTITY_MIN
-                 OR (cos ≠ null AND cos ≥ DEDUP_COS_MIN)
+     记 @bigrams = tokenize(新文本) 的 bigram 列表（去掉空项），n = @bigrams.length
+
+     n = 0（空串 / 纯空白）⇒ **文本路整体不执行**：连候选都不取 ⇒ 直接判「不合并」
+        ⚠️ 这**不是**「退化态」：退化态是「有候选、但候选面不可信」；这里是「压根没有候选面」
+          ⇒ 两条是**不同的路**，不要合并成一个分支写。
+
+     n = 1（退化态，如「好的」）⇒ 合并 ⟺ entityOverlap ≥ DEDUP_ENTITY_MIN（默认 2）
+        ⇒ **cos 通道整条不生效**：「单靠余弦即可判合并」这条判据在退化态**恒为假**
+          （不是「cos 参与候选生成、但不足以单独成立合并」的弱化版 —— 两种实现不等价）
+        ⇒ 候选**照常取**（FTS 用单个 token 的 AND 退化查询），只是**合并资格**只看实体重叠
+
+     n ≥ 2（非退化态）⇒ 合并 ⟺ entityOverlap ≥ DEDUP_ENTITY_MIN
+                           OR (cos ≠ null AND cos ≥ DEDUP_COS_MIN)
      ```
      ⇒ **字面读法**：步骤 3a 的「**应要求实体重叠数 ≥ 2 才允许合并**」是**必要条件**，
        叠加步骤 c 的「满足任一即可」⇒ 退化态的判定**收敛为** `entityOverlap ≥ DEDUP_ENTITY_MIN`。
      ⇒ ⚠️ **不得**写成「退化态只要 cos 高就合并」：候选面已不可信 ⇒ 不能拿余弦去合并。
      ⇒ ⚠️ **也不得**写成「退化态放宽阈值」——放宽会让短文本的误合并率直接跳上去。
+     ⇒ ⚠️ **「cos 通道不生效」说的是「合并资格」，不是「排序」**：退化态下若多个候选同时达标，
+       tie-break 里的 `cos 降序` **照常执行**（D-4 的四级全序在退化态同样适用）。
 
    a2. 向量路候选（**只在本次有 @newVec 时执行**；没有就跳过，回到纯文本路的行为，不是降级报错）：
        ⚠️ **v1.0 的写法是全表扫**（`WHERE m.deleted = 0 AND m.embedding IS NOT NULL`，无 LIMIT），
@@ -2139,6 +2180,13 @@ restore(id: string, options?: { mergeInto?: string }): void
        （§12 对排序的要求：「排序有全序 tie-break」）⇒ 同样输入不可复现。
      ⇒ **不要**改成「取第一条达标的就合并」：那会让「先命中哪个候选」取决于 BM25 抖动，
        而合并是**不可逆**的正文改写（只能靠 `content_history` 兜底）。
+     ⇒ ⚠️ **「`id` 升序」这一级的守卫方式与其他三级不同**（ADR-P1-T07-DEC D-4 补充）：
+       它是**可复现性**的唯一保证，但**行为级断言覆盖不了它**——
+       要让两个候选的 `raw_bm25` 相等，它们必须有相同的 `content_tokens`
+       ⇒ 相同正文 ⇒ 相同 `content_hash` ⇒ **撞 `idx_mem_hash` 唯一索引** ⇒ **构造不出来**。
+       ⇒ 守卫放在**比较器级**：`compareMergeCandidates` 直接单测（四级全序 + `id` 升序那一格）
+       ＋ **全序性性质断言**（任意两个键 ⇒ 比较器返回非 0 且反对称）；
+       行为级只守「同分候选**恒定**选中同一条、连跑两次结果一致」。
 
    → **判定成立则进入原子合并**（UPDATE，与归档同事务）：
         ① 先把**现有正文**归档进 content_history（这是唯一的版本兜底，须与下面的 UPDATE 同事务）：
@@ -3912,10 +3960,18 @@ export interface WriteInput {
   entityAliases?: Array<{ name: string; aliases: string[] }>;
                                                // 显式声明「某个实体有哪些别名」：`name` 按 §4.9 步骤 1 解析出
                                                // entity_id 后，把这些 aliases 挂到它名下（§4.9 步骤 1c）。
-                                               // 不传 = 只做名称归一，不写别名表。别名与已有映射冲突时
-                                               // **不覆盖**，改为在返回值 `warnings` 里报 `ALIAS_CONFLICT`
-                                               // ——覆盖是 setAlias 的职责（§4.9.2），两处不能统一。
-  emotion?: number;                            // 0.0 ~ 1.0；越界值由 §4.3 钳制，不信任调用方
+                                               // ⚠️ **别名目标实体「建、但不隐含关联」**（ADR-P1-T07-DEC D-3/R2）：
+                                               //   目标实体**会被建出来**（或复用既有的），但**不会**因此与本条记忆
+                                               //   建立关联 ⇒ 想让别名对召回生效，**必须**同时把该实体名写进 `entities`。
+                                               //   ⇒ 这种情况下 `write()` 会回一条 **`ALIAS_TARGET_NOT_LINKED`** warning。
+                                               //   ⚠️ 别名与已有映射冲突时**不覆盖**，改为在返回值 `warnings` 里报
+                                               //   `ALIAS_CONFLICT` ——覆盖是 `setAlias` 的职责（§4.9.2），两处不能统一。
+  emotion?: number;                            // 0.0 ~ 1.0；**越界 ⇒ 钳制到 [0, 1]，不抛错**
+                                               //   （§4.3：`emotion = clamp(input.emotion ?? 0, 0, 1)`）
+                                               //   ⚠️ 与下面的 `confidence` **刻意不同**（ADR-P1-T07-DEC D-7，
+                                               //     主理人 2026-10-31 确认「不改实现，只在本文写明」）：
+                                               //     `emotion` **没有**库层 CHECK ⇒ 钳制是它的既定语义；
+                                               //     `confidence` **有**库层 CHECK ⇒ 越界只能抛错、不能钳制。
   mediaRef?: string;
   mediaType?: 'image' | 'audio' | 'video';     // 与 mediaRef 必须同时给或同时不给（§3 的 media_type 允许 NULL）
                                                //   ⚠️ 二者**只给一个** ⇒ **INVALID_INPUT**（`details.reason = 'media'`）；
@@ -3923,8 +3979,8 @@ export interface WriteInput {
                                                //   ⚠️ `details` 一律**平铺**（见 `confidence` 行的形状约定）
   source?: string;                             // 溯源元数据，仅存储与展示，不参与召回
   confidence?: number;                         // 0~1，缺省 0.7；通过 §4.3 影响 initialDifficulty
-                                               //   ⚠️ 越界（含非有限数）⇒ **抛 INVALID_INPUT**（**不是钳制**）——
-                                               //   与 `emotion` 的「越界由 §4.3 钳制」**刻意不同**（v2.1 勘误 / ADR-P1-T07-DEC D-7）：
+                                               //   ⚠️ 越界（含非有限数）⇒ **抛 INVALID_INPUT**（**不是钳制**，详见下）
+                                               //   ⚠️ 与 `emotion` 的「越界由 §4.3 钳制」**刻意不同**（v2.1 勘误 / ADR-P1-T07-DEC D-7）：
                                                //   ① confidence **有**库层 CHECK（§3：`CHECK (confidence >= 0.0 AND confidence <= 1.0)`）
                                                //      ⇒ 不在应用层拦就会撞 CHECK ⇒ 裸的 SQLite 错误码穿给调用方（§11.2 禁止）；
                                                //   ② emotion **没有**库层 CHECK ⇒ 钳制是它的既定语义（§4.3）。
@@ -4252,15 +4308,31 @@ export interface MemoryStats {
                               //   ⇒ **持续偏高 = 联想路在「边喂边漏」**，调用方据此发现漏记。
 }
 
-/** 非致命但调用方必须知道的事。目前唯一来源是 §4.9 步骤 1c 的别名冲突。
+/** 非致命但调用方必须知道的事。目前两个来源都是 §4.9 步骤 1c 的别名处理。
  *  这类情形库**不覆盖**既有映射（覆盖是 setAlias 的职责），但绝不能静默——
  *  调用方若不看这个字段，会一直以为自己提供的别名归一已经生效。 */
-export interface WriteWarning {
+export interface AliasConflictWarning {
   code: 'ALIAS_CONFLICT';   // alias 已指向另一个实体，本次映射未生效
   alias: string;            // 冲突的别名
   currentEntityId: string;  // 库里现在指向谁
   intendedEntityId: string; // 本次想指向谁（调用方若要改，请显式调 setAlias）
 }
+
+/** ★ `ALIAS_TARGET_NOT_LINKED`：别名目标实体**建好了**，但**没有**跟本条记忆建立关联。
+ *  ⚠️ 为什么需要它（ADR-P1-T07-DEC D-3/R2）：「建但不隐含关联」是**有意**的边界
+ *    （关联只由 `input.entities` 表达 ⇒ §14.3 边界原则 1），但它有代价：
+ *    只声明 `entityAliases`、不点名实体 ⇒ 别名建好了、本条记忆却不与该实体关联
+ *    ⇒ 图谱路查不到它 ⇒ **静默达不到召回目的**。
+ *  ⇒ **边界可以存在，但必须可观测** ⇒ 这里回一条 warning（并按 §8.1 记一条磁盘日志）。
+ *  ⚠️ 它**不是错误**：主体工作（写入这条记忆）已经做成 ⇒ 同样**不抛错**（§11.2 末）。 */
+export interface AliasTargetNotLinkedWarning {
+  code: 'ALIAS_TARGET_NOT_LINKED'; // 边界提示码（可辨识联合的判别键）
+  name: string;                     // 调用方在 entityAliases[].name 里写的那个实体名
+  entityId: string;                 // 该实体的 id（**已经建出来了**——只是没跟本条记忆关联）
+}
+
+/** `write()` 返回值里的 warning 集合（**可辨识联合** ⇒ 用 `code` 判别）。 */
+export type WriteWarning = AliasConflictWarning | AliasTargetNotLinkedWarning;
 
 /** `touch()` 的回执：本次「声明了但没写进去」的结构化归因。
  *  ★ 为什么需要它：共激活有两个**不抛错**的收敛点——
@@ -5211,8 +5283,15 @@ unassignBucket(memoryId: string): void
      COUNT 相同但**成员不同**（一条漏了、另一条多了）是完全可能的，
      而「条数对得上」会让人以为对账通过 ⇒ 漏召永久存在且无人发现。
    ⇒ 对账口径（两侧都取 id 集合）：
-     库侧：SELECT memory_id FROM memories
+     库侧：SELECT id FROM memories
             WHERE deleted = 0 AND embedding IS NOT NULL
+     ⚠️ **左侧（库侧）是「全库」扫描的结果，不是「本次写入的批次」**（ADR-P1-T07-DEC D-12）——
+       若左侧只取本批次，断言就退化成「本批写的东西都进桶了」，
+       **恰好放不过阶段 1 遗留的那笔欠账**（有向量、无桶归属的旧记忆）
+       ⇒ 阶段 2 什么都没写也会**假绿**。
+       ⇒ 左侧口径必须写成：`SELECT id FROM memories WHERE embedding IS NOT NULL AND deleted = 0`（**全库**）。
+       ⚠️ **列名是 `id`，不是 `memory_id`**：`memory_id` 是 `vector_cell_members` 的外键列名，
+       `memories` 表的主键叫 `id` ⇒ 抄成 `SELECT memory_id FROM memories` 会直接 SQL 报错。
      桶侧（★ **LEFT JOIN，不丢硬删孤儿**，否则真孤儿会被一并放过）：
        SELECT vcm.memory_id, m.id, m.deleted, m.embedding
          FROM vector_cell_members vcm
@@ -5308,6 +5387,14 @@ intensity ≤ ARCHIVE_LINE
 ⇒ 最远归档时刻 = `last_access + 180×5×ln(20)` 天 = **2696 天**，  
 与 §4.6 的 `@coarseCutoffPinned`（2696 天）**完全吻合**  
 ⇒ 这个公式与 §4.6 的粗筛推导同源，可直接引用。
+
+★ **归档跨度的唯一实现（v2.1 勘误 / ADR-P1-T07-DEC §10-A）**：  
+`ln(1 / ARCHIVE_LINE)` 这个数**至少在三处**被用到——① 本节的 `archive_at`；② §9.4.1 的**迁移回填**；  
+③ §4.6 步骤 2 的**粗筛窗口**（`coarseGateWindow`）⇒ **三处各写一遍 ⇒ 改公式要改三处，漏改一处不报错**。  
+⇒ **唯一定义处 = `src/core/decay.ts` 的 `archiveSpanFactor(archiveLine)`**（并由 `archiveSpanMs()` 给出毫秒形态）；  
+⚠️ **`src/core/scoring.ts` 的粗筛窗口必须调它**，**不得自己再写一遍 `Math.log(1 / ARCHIVE_LINE)`**——  
+  那就是**第三份副本**（C36：两份副本必然漂移，而漂移不报错；表现为「按迁移回填判未归档、按粗筛窗口却被挡住」）。  
+⇒ 与 `86400000` 的分层同源：**`src/util/time.ts` 定义常量 → `src/core/decay.ts` 提供唯一公式 → 其余模块一律调用**。
 
 ⇒ `countArchived()` = `SELECT COUNT(*) FROM archival_schedule WHERE archive_at <= @now`  
 　　走索引，**< 5ms**，且**结果与全表精筛逐位相同**（不是近似）。
@@ -5616,7 +5703,7 @@ Bigram 方案是为中文优化的，对拉丁文与数字有明确缺陷。以�
 | 参数不合法               | 抛 `INVALID_INPUT`                       | 全部写方法 + `recall` / `setParams`                                                                                                                  |
 | 唯一性冲突               | 抛 `CONFLICT`（带 `details.conflictingId`） | `restore` / `updateContent` / `setAlias`                                                                                                        |
 | 只读实例上的写操作           | 抛 `READONLY_VIOLATION`                  | 全部写方法                                                                                                                                           |
-| 主体工作做成了，但附属产出未生效    | **不抛错**，走 `write()` 的 `warnings`        | `write`（别名冲突 `ALIAS_CONFLICT`）                                                                                                                  |
+| 主体工作做成了，但附属产出未生效    | **不抛错**，走 `write()` 的 `warnings`        | `write`（别名冲突 `ALIAS_CONFLICT`；别名目标未关联 `ALIAS_TARGET_NOT_LINKED`）                                                                                                                  |
 
 **`ALIAS_CONFLICT` 刻意不是异常，而是 `write()` 返回值的 `warnings`**（§6 `WriteWarning`）：  
 异常意味着「本次调用什么都没做成」，而别名冲突时**记忆本身已经写成功**，只有附带的别名映射没落库。  
@@ -5625,6 +5712,16 @@ Bigram 方案是为中文优化的，对拉丁文与数字有明确缺陷。以�
 
 - 异常 = 主体工作没做成，调用方应重试或改参数；
 - warning = 主体工作做成了，但有一项附属产出未生效，调用方需据此调整后续行为（例如显式调 `setAlias`）。
+
+★ **`ALIAS_TARGET_NOT_LINKED` 同属这一类**（ADR-P1-T07-DEC D-3/R2；§4.9 步骤 1c）：  
+它是「**边界可以存在，但必须可观测**」的产物——「别名目标实体建了、但**不**与本条记忆关联」是**有意**的边界  
+（关联只由 `input.entities` 表达 ⇒ §14.3 边界原则 1：每个承诺都要能指到唯一代码路径），  
+但它的代价是「只声明别名、不点名实体」的调用方**静默达不到召回目的** ⇒ 必须让它**看得见**。  
+⇒ 它**不是错误**、**不抛错**：主体工作（写入这条记忆 + 挂上别名）**已经做成**，  
+只有「这条记忆与该实体的关联」没有建立 ⇒ 与 `ALIAS_CONFLICT` 同属「附属产出未生效」，同走 `warnings`。  
+⚠️ **三处必须同步**（漏一处门禁就红，`scripts/check-contract-ids.ts` 会逐名比对）：  
+`src/core/errors.ts` 的 `WARNING_ONLY_CASES`、`scripts/check-contract-ids.ts` 的 `EXPECTED_WARNING_ONLY_CASES`、  
+以及**本表最后一行**（`ALIAS_TARGET_NOT_LINKED` 必须写在反引号里，门禁才读得到）。
 
 ### 11.3 备份与恢复
 
