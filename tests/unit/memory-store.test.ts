@@ -405,6 +405,9 @@ describe('P1-T10 · 门面的边界（公开面 / 错误透出 / 只读）', () 
   it('★ 只读实例：写方法被拒绝（§7.1），且库里的数据一个字都没变', () => {
     const h = createHarness();
     const written = h.store.write({ content: '张三喜欢猫', entities: ['张三'], now: T0 });
+    // ⚠️ 先把「猫」这个实体与那条边建好：后面的 `mergeEntities` 需要**两个都存在**的实体，
+    //   否则它会在「存在性校验」那一步就抛 `NOT_FOUND` ⇒ 断言到的就不是只读拒绝这条路径了。
+    h.store.link('张三', '喜欢', '猫', written.id, T0);
 
     // 另开一个只读连接（§7.1：`fileMustExist: true`）。
     const readonly = new MemoryStore({ dbPath: h.dbPath, readonly: true });
@@ -417,26 +420,35 @@ describe('P1-T10 · 门面的边界（公开面 / 错误透出 / 只读）', () 
     const unpinError = captureMemoryError(() => readonly.unpin(written.id));
     expect(unpinError.code).toBe('READONLY_VIOLATION');
 
-    // ── ② 其余写方法：抛错，且**零写入** ──
-    // ⚠️ **TODO（等别线落地）**：这四个方法的实现里**没有** `readonly` 断言，
-    //   它们是写到 SQLite 时才撞上 `SQLITE_READONLY`。
-    //   ⇒ `translateSqliteError()` 一旦把 `SQLITE_READONLY` 映射成
-    //     `READONLY_VIOLATION`（§11.2 的五码之一），下面这四条就能收紧成
-    //     「`code === 'READONLY_VIOLATION'`」。
-    //   ⚠️ **本任务不改 `src/core/errors.ts`**（那是别线的文件域）⇒ 现在只断言
-    //     「抛了错」+「数据没变」这两条**与错误码无关**的性质。
-    expect(() => readonly.write({ content: '只读写入', now: T0 })).toThrow();
-    expect(() => readonly.touch([written.id], T0 + MS_PER_DAY)).toThrow();
-    expect(() => readonly.link('张三', '讨厌', '狗', written.id, T0)).toThrow();
-    expect(() => readonly.setAlias('老张', entityIdOf(h.reader, '张三'))).toThrow();
-    expect(() =>
+    // ── ② 其余写方法：抛 `READONLY_VIOLATION`，且**零写入** ──
+    // ⚠️ 这四个方法的实现里**没有** `readonly` 断言（它们是写到 SQLite 时才撞上
+    //   `SQLITE_READONLY`）⇒ 错误码由**唯一**的映射出处 `translateSqliteError()`
+    //   给出（§14.3 边界原则 1：每个承诺指到唯一代码路径）。
+    //   ⇒ 本条断言守的是「**门面透出的错误码是对的**」，而不是「某个方法自己判了 readonly」。
+    const writeError = captureMemoryError(() => readonly.write({ content: '只读写入', now: T0 }));
+    expect(writeError.code).toBe('READONLY_VIOLATION');
+
+    const touchError = captureMemoryError(() => readonly.touch([written.id], T0 + MS_PER_DAY));
+    expect(touchError.code).toBe('READONLY_VIOLATION');
+
+    const linkError = captureMemoryError(() => readonly.link('张三', '讨厌', '狗', written.id, T0));
+    expect(linkError.code).toBe('READONLY_VIOLATION');
+
+    const aliasError = captureMemoryError(() =>
+      readonly.setAlias('老张', entityIdOf(h.reader, '张三')),
+    );
+    expect(aliasError.code).toBe('READONLY_VIOLATION');
+
+    const mergeError = captureMemoryError(() =>
       readonly.mergeEntities(entityIdOf(h.reader, '张三'), entityIdOf(h.reader, '猫')),
-    ).toThrow();
+    );
+    expect(mergeError.code).toBe('READONLY_VIOLATION');
 
     // 零写入：记忆条数没变、`pin_factor` 没变、别名表没多行、边表没多行。
     expect(countRows(h.reader, 'memories')).toBe(1);
     expect(countRows(h.reader, 'entity_aliases')).toBe(0);
-    expect(countRows(h.reader, 'edges')).toBe(0);
+    // ⚠️ 边表**本来就有一条**（上面 `link` 建的）⇒ 只读实例没能再加第二条。
+    expect(countRows(h.reader, 'edges')).toBe(1);
     const row = h.reader
       .prepare('SELECT pin_factor FROM memories WHERE id = ?')
       .get(written.id) as {

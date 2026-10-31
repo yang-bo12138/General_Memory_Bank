@@ -177,6 +177,12 @@ export type {
   RecallRouteInfo,
   RecallSuppressed,
 } from './store/recall.js';
+// ⚠️ `extractEntityNames` 是**便利辅助函数**（ADR-2：实体抽取归调用方，库内不做 NER）：
+//   **它不在召回流水线里**，由调用方显式调用；调用它即承担 O(#实体 + #别名) 的行扫描成本
+//   （10 万级实体上就是几十~几百毫秒 ⇒ 绝不能放进每次 recall 都付的路径）。
+//   ⚠️ **完整免责说明在 `src/store/recall.ts` 里该函数的 JSDoc** —— 此处只做指针，
+//   **不改写、不缩写**那份说明（免责说明被抄成第二份 ⇒ 两份必然漂移）。
+export { extractEntityNames } from './store/recall.js';
 export type {
   GrowStabilityOutcome,
   TouchOptions,
