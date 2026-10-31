@@ -144,31 +144,16 @@
 | 1 | **阶段 1 不写桶归属**：有向量但无桶归属的记忆必然存在（阶段 1 没有细桶，桶行会被 FK 直接拒绝） | 阶段间交接 | P2-T03 的**集合相等硬断言**（左侧口径：**全库** `embedding IS NOT NULL AND deleted = 0`）+ 启动对账 + 首次重训 |
 | 2 | **静态断言只保证「阶段 1 不写桶」，不保证「阶段 2 写了桶」** | ⚠️ 静默失效点 | 必须靠 P2-T03 自己的集合相等断言兜底 |
 | 3 | `alias` 事件的 `aliasAdded` = **布尔**，源主名本体记在 `alias` 键（C36：同一件事不得有两套词） | 已裁决 | 已落地 |
-| 4 | `entityAliases[].name` 目标不存在 ⇒ **建但不隐含关联** ⇒ 只声明别名、不在 `entities` 点名的调用方**静默达不到召回目的** | ⚠️ 明写的代价 | ✅ **已闭环**：新增 warning `ALIAS_TARGET_NOT_LINKED`（一个 `name` 一条）⇒ 边界可观测；三处白名单同步中 |
+| 4 | `entityAliases[].name` 目标不存在 ⇒ **建但不隐含关联** ⇒ 只声明别名、不在 `entities` 点名的调用方**静默达不到召回目的** | ⚠️ 明写的代价 | ✅ **已闭环**：新增 warning `ALIAS_TARGET_NOT_LINKED`（一个 `name` 一条）⇒ 边界可观测；**四处**白名单/镜像同步中（`errors.ts` + `check-contract-ids.ts` + DESIGN §11.2 + 两处测试镜像） |
 | 5 | 库未校验 `stability > 0`（F-08 ④） | 独立问题 | 阶段 2 的参数/校验面 |
-| 6 | `intensity()` 两道钳制在正常输入下**行为等价** ⇒ 行为层无解 | 已知方法论边界 | ✅ **已闭环**：`scripts/check-clamp.ts` 静态扫描守卫（已挂进 `verify` 链）+ 行为层探针（负 τ + 1 天偏移，分辨力 0.63） |
+| 6 | `intensity()` 两道钳制在正常输入下**行为等价** ⇒ 行为层无解 | 已知方法论边界 | ✅ **已闭环**：`scripts/check-clamp.ts`（**数据流判据**，堵住「补无关同形态调用」的绕过）+ 行为层探针（负 τ + 1 天偏移，分辨力 0.63） |
 | 7 | `LIMIT 100` / `slice(0,20)` / `topN ∈ 1~8` **刻意硬编码**，不进参数表 | 设计决定 | 改它们是设计变更，走 ADR |
 | 8 | `stats()` **不在阶段 1 的 10 个方法内**且未实现 ⇒ 基线断言顺延 | 计划口径 | 已收敛进 `DEVELOPMENT-PLAN.md` |
 | 9 | **`extractEntityNames` 阶段 1 不实现**（ADR-P1-T07-DEC D-1）⇒ 设计稿 §4.6 只留口子 | 已裁决 | ✅ 已落地（删除函数 + 删除导出 + 导出面守卫） |
-| 10 | 门禁**曾经**看不见「新增 warning code 未登记白名单」 | ⚠️ **静默失效点** | ✅ 补守卫中（工程师-2） |_DAY` 定义下沉 + F-08 ③ 静态守卫（`scripts/check-clamp.ts`） | 工程师-3 | `decay.ts` `util/time.ts` `log.ts` `package.json` | 进行中 |
-| 4 | P1-T09 基线等价验收 | QA | `tests/baseline/ref-v1.ts` `v1-equivalence.test.ts`（新） | 进行中 |
-| 5 | ADR-P1-T07-DEC 的 D-3 改写 + `ALIAS_TARGET_NOT_LINKED` 三处同步 + `MS_PER_DAY` 分层裁决 | 架构师 | `docs/design/**` `scripts/check-contract-ids.ts` | 进行中 |
-| — | `extractEntityNames` 纳入导出面 | 工程师（线A） | `src/index.ts` | **已撤回**（ADR-P1-T07-DEC D-1：阶段 1 不实现；导出面已撤回，原文保留见 `docs/design/adr-p1-t07-decisions.md`） |
-
----
-
-## 七、已知边界与欠账（**必须随阶段 2 一起消化**）
-
-| # | 欠账 | 性质 | 归属 |
-|---|---|---|---|
-| 1 | **阶段 1 不写桶归属**：有向量但无桶归属的记忆必然存在（阶段 1 没有细桶，桶行会被 FK 直接拒绝） | 阶段间交接 | P2-T03 的**集合相等硬断言**（左侧口径：**全库** `embedding IS NOT NULL AND deleted = 0`）+ 启动对账 + 首次重训 |
-| 2 | **静态断言只保证「阶段 1 不写桶」，不保证「阶段 2 写了桶」** | ⚠️ 静默失效点 | 必须靠 P2-T03 自己的集合相等断言兜底 |
-| 3 | `alias` 事件的 `aliasAdded` = **布尔**，源主名本体记在 `alias` 键（C36：同一件事不得有两套词） | 已裁决 | 已落地 |
-| 4 | `entityAliases[].name` 目标不存在 ⇒ **建但不隐含关联** ⇒ 只声明别名、不在 `entities` 点名的调用方**静默达不到召回目的** | ⚠️ 明写的代价 | 文档已写明；若要加 `warnings` 需同步改 `EXPECTED_WARNING_ONLY_CASES` 白名单 |
-| 5 | 库未校验 `stability > 0`（F-08 ④） | 独立问题 | 阶段 2 的参数/校验面 |
-| 6 | `intensity()` 两道钳制在正常输入下**行为等价** ⇒ 行为层无解 | 已知方法论边界 | F-08 ③ 的**静态扫描**守卫（工程师-3 落地中） |
-| 7 | `LIMIT 100` / `slice(0,20)` / `topN ∈ 1~8` **刻意硬编码**，不进参数表 | 设计决定 | 改它们是设计变更，走 ADR |
-| 8 | `stats()` **不在阶段 1 的 10 个方法内**且未实现 ⇒ 基线断言顺延 | 计划口径 | 已收敛进 `DEVELOPMENT-PLAN.md` |
+| 10 | 门禁**曾经**看不见「新增 warning code 未登记白名单」 | ⚠️ **静默失效点** | ✅ **已闭环**：`scripts/check-contract-ids.ts` 补「源码实发 warning code ⊆ 白名单」守卫 ⇒ **已在实战中生效**（登记缺失 ⇒ verify EXIT=1） |
+| 11 | 门禁只认 `code: 'XXX'` **字面量** ⇒ 动态实参（`code: someVar`）判不了 | 类型层加固 | **阶段 2**：把 `MemoryError` 构造签名收紧成 `code: MemoryErrorCode`（破坏性变更 ⇒ 走 ADR）。当前阶段 1 的 warning code 全是字面量 ⇒ **无实际风险** |
+| 12 | `archiveFilterThreshold(params, true)` 在归档模式下返回 `0.0` | ⚠️ **静默失效点** | ✅ **已改**：改为抛 `INVALID_INPUT`（0.0 仍是阈值 ⇒ 会把 `intensity === 0` 的归档记忆挡掉 ⇒ 静默少召回） |
+| 13 | 归档模式下**粗筛窗口取 0** ⇒ 候选池放大 | 性能 | **阶段 2**（向量路范畴）；阶段 1 的 `topN ∈ 1~8` + `LIMIT 100` 已兜住上限 |
 
 ---
 
