@@ -10,6 +10,15 @@
  * ⚠️ **纯逻辑 + 一处批量查询**：除 `graphProximity` 的那一次 `SELECT` 外，本文件**不碰数据库**，
  *   其余全是纯函数 ⇒ 可单测、无副作用、**不写库**。
  *
+ * ★ **本文件也是「准入闸门的数值」的唯一权威**（§4.6 步骤 2 / §4.15.2）：
+ *   精筛阈值（`ARCHIVE_LINE`）、精筛判定（严格大于）、**粗筛两档窗口**都在这里。
+ *   ⚠️ **闸门与打分必须同源**：铁律①要求「准入闸门对三路**一视同仁**」，
+ *     而阶段 2 的向量路（`VectorBackend.search` 的 `filter`）要的**就是同一对下界**
+ *     （`VectorFilter.timeFloor` / `pinnedTimeFloor` ≡ SQL 的 `@coarseCutoff` /
+ *     `@coarseCutoffPinned`）。
+ *   ⇒ SQL 的**文本形状**留在 SQL 层（每条路的 SQL 形状不同），
+ *     但**闸门的数字**只有这一处 —— 两份数字必然漂移，而漂移**不报错**。
+ *
  * ⚠️ **C37 时钟注入**：本文件唯一读时间的地方是 `recency()`，它的签名含 `now?`，
  *   真实时钟只经 `resolveNow()`（唯一入口 `src/core/clock.ts`）。
  *   ⇒ 本文件**不得**出现 `Date.now()` / `new Date()`，
@@ -23,7 +32,7 @@
  */
 
 import { resolveNow } from './clock.js';
-import { MS_PER_DAY } from './decay.js';
+import { MS_PER_DAY, effectiveStability } from './decay.js';
 import { MemoryError } from './errors.js';
 import type { Params } from './params.js';
 
@@ -658,4 +667,106 @@ export function archiveFilterThreshold(params: Params, includeArchived: boolean)
  */
 export function passesIntensityFilter(intensityValue: number, threshold: number): boolean {
   return intensityValue > threshold;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 六、准入闸门：粗筛窗口（§4.6 步骤 2 的两档窗口）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * 粗筛窗口（§4.6 步骤 2 的**两档窗口**）。
+ *
+ * ⚠️ **字段名刻意与 SQL 的绑定名逐字相同**（`@coarseCutoff` / `@coarseCutoffPinned`）：
+ *   「名字即契约」—— SQL 层拿到的键名与 core 层算出的字段名是同一批词，
+ *   于是「把 `pinnedTimeFloor` 绑成普通窗口」这类**接错线**在读代码时就看得出来。
+ */
+export interface CoarseGateWindow {
+  /**
+   * 是否设粗筛（`false` ⇒ 显式查询归档层，粗筛窗口**整体取消**，§4.6 步骤 2）。
+   *
+   * ⚠️ **单独给出这个标志，而不是让调用方从数值反推**：
+   *   「取消粗筛」这件事一旦只能靠「下界是不是 0」来推断，
+   *   它就成了一个**隐式编码** ⇒ 换个实现（如下界取 `-1`）就会静默改变语义。
+   */
+  readonly enabled: boolean;
+  /**
+   * 普通记忆的 `last_access` 下界（毫秒）—— SQL 的 `@coarseCutoff`。
+   *
+   * ⚠️ `enabled === false` 时恒为 **0**（不是 `undefined`、不是 `null`）：
+   *   §4.6 步骤 2 的原话就是「令 `@coarseCutoff = 0`（不设 last_access 粗筛）」。
+   */
+  readonly coarseCutoff: number;
+  /**
+   * 被 pin 记忆的 `last_access` 下界（毫秒）—— SQL 的 `@coarseCutoffPinned`。
+   *
+   * ⚠️ `enabled === false` 时恒为 **0**（同上）。
+   */
+  readonly coarseCutoffPinned: number;
+}
+
+/**
+ * 粗筛窗口（§4.6 步骤 2 的两档窗口）—— **三路共用的唯一计算处**。
+ *
+ * ```
+ * coarseCutoff       = now - MAX_STABILITY × ln(1/ARCHIVE_LINE) × 86400000        (默认 ≈ 539 天)
+ * coarseCutoffPinned = now - MAX_STABILITY × MAX_PIN_FACTOR × ln(1/ARCHIVE_LINE) × 86400000  (默认 ≈ 2696 天)
+ * ```
+ *
+ * ★ **为什么必须三路共用这一个函数**（这是本函数存在的全部理由）：
+ *   §4.6 的**铁律①**是「准入闸门对三路**一视同仁**」，
+ *   而 §4.15.2 的 `VectorBackend.search(query, k, filter)` 契约明写
+ *   「`filter` 承载**准入闸门条件**（`deleted = 0` + 粗筛窗口）」——
+ *   ⇒ 阶段 2 的向量路要的**就是这两个数**（`VectorFilter.timeFloor` /
+ *     `pinnedTimeFloor`），它们与文本路/图谱路 SQL 里绑的 `@coarseCutoff` /
+ *     `@coarseCutoffPinned` **是同一对数**。
+ *   ⚠️ **若向量路另算一份**，最坏情况非常具体：
+ *     **向量路的窗口比文本路宽 ⇒ 一条早已淡忘的记忆从向量路溜进来**
+ *     ⇒ 正是铁律①要防的「用相似度废掉遗忘曲线」，而且它**不报错**，只是让遗忘曲线失效。
+ *
+ * ⚠️ **为什么用 `effectiveStability` 算 τ**（而不是直接写 `MAX_STABILITY × MAX_PIN_FACTOR`）：
+ *   τ 的定义只有一处（`src/core/decay.ts` 的 `effectiveStability` = `stability × pin_factor`）。
+ *   ⇒ 粗筛窗口用的 τ 与 `intensity` 用的 τ **必然同源**：
+ *     粗筛是「粗」的上界（τ 取最大值），精筛用每行自己的 τ ⇒ 粗筛**绝不会**
+ *     挡掉一条精筛本该放行的记忆（两个口径打架的表现是「明明没过期却召不回」）。
+ *
+ * ⚠️ **`includeArchived === true` ⇒ 粗筛整体取消**（两个下界都取 0）：
+ *   §4.6 步骤 2 原话：「`includeArchived = true`：令 `@coarseCutoff = 0`（不设 last_access 粗筛），
+ *   精筛阈值 `@archiveLine = 0.0`，即只过滤 `deleted = 0`」。
+ *   ⇒ 这是「**显式查询归档层**」的唯一代码路径（§4.4「归档仅显式查询可见」）。
+ *   ⚠️ **向量路必须服从同一个开关**（铁律①）：否则「显式查归档层」只对两路生效，
+ *     而归档层的记忆**根本进不了向量路** ⇒ 归档层在语义上就只被部分看见。
+ *
+ * @param params 生效参数（**必传**：窗口由 `MAX_STABILITY` / `MAX_PIN_FACTOR` / `ARCHIVE_LINE` 决定）
+ * @param now 注入时钟（C37）；缺省取真实时钟
+ * @param includeArchived 是否显式查询归档层（`true` ⇒ 粗筛整体取消）
+ * @returns 粗筛窗口（**形状恒定**，字段恒为三个）
+ */
+export function coarseGateWindow(
+  params: Params,
+  now: number,
+  includeArchived: boolean,
+): CoarseGateWindow {
+  if (includeArchived) {
+    // ⚠️ 用 0 而不是 null/undefined：绑定参数**恒有两个**（见下方「形状恒定」的说明）。
+    return { enabled: false, coarseCutoff: 0, coarseCutoffPinned: 0 };
+  }
+
+  // ⚠️ τ 的算法只有一处：`effectiveStability` = `stability × pin_factor`。
+  const plainTauDays = effectiveStability({
+    stability: params.MAX_STABILITY,
+    pin_factor: 1,
+    last_access: 0,
+  });
+  const pinnedTauDays = effectiveStability({
+    stability: params.MAX_STABILITY,
+    pin_factor: params.MAX_PIN_FACTOR,
+    last_access: 0,
+  });
+  const archiveSpanDays = Math.log(1 / params.ARCHIVE_LINE);
+
+  return {
+    enabled: true,
+    coarseCutoff: now - plainTauDays * archiveSpanDays * MS_PER_DAY,
+    coarseCutoffPinned: now - pinnedTauDays * archiveSpanDays * MS_PER_DAY,
+  };
 }
