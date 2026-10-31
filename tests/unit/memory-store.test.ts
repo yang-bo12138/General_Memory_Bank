@@ -32,9 +32,11 @@ import { describe, expect, it } from 'vitest';
 import { MS_PER_DAY } from '../../src/core/decay.js';
 import { MemoryError } from '../../src/core/errors.js';
 import { DEFAULT_PARAMS } from '../../src/core/params.js';
+import * as publicApi from '../../src/index.js';
 import { MemoryStore } from '../../src/store/MemoryStore.js';
 import { EventWriter } from '../../src/store/events.js';
 import { type PinStore, pin as pinImpl } from '../../src/store/pin.js';
+import * as recallModule from '../../src/store/recall.js';
 import { MemoryLogger } from '../../src/util/log.js';
 
 /** 一个固定的时间基准（所有时刻都相对它推算）。 */
@@ -335,6 +337,24 @@ describe('P1-T10 · 门面的边界（公开面 / 错误透出 / 只读）', () 
       'unpin',
       'write',
     ]);
+  });
+
+  it('★ 公开入口**不导**便利函数 `extractEntityNames`（阶段 1 的导出面不越出方法清单）', () => {
+    // ⚠️ **理由出处**：ADR-P1-T07-DEC **D-1**（两份 ADR 口径相反时取**更晚**的那份正式裁决）
+    //   + DESIGN-v2.md §4.6 步骤 1 正文：「⚠️ **阶段 1 不实现它**……**本节只留口子**」。
+    //   ⇒ 阶段 1 的导出面**只含 §12 阶段 1 方法清单内的东西**；便利函数不在其中。
+    const exported = Object.keys(publicApi);
+
+    // ⚠️ **负控先行**：导出面**确实**有东西（否则下面那条可能因为「模块空了」而恒真）。
+    expect(exported).toContain('MemoryStore');
+    expect(exported).toContain('DEFAULT_PIN_FACTOR');
+
+    // ⇒ 阶段 1 的公开入口**不导**它。
+    expect(exported).not.toContain('extractEntityNames');
+
+    // ⚠️ **「没进导出面」≠「这个函数不存在」**：它仍然从 `src/store/recall.ts` 独立导出
+    //   （阶段 2 的实体名入口会用上它）⇒ 本条守的是「**公开入口**的边界」，不是「删掉它」。
+    expect(typeof recallModule.extractEntityNames).toBe('function');
   });
 
   it('★ 底层抛出的 MemoryError 原样透出（code / details / message 逐字段与直接调实现相同）', () => {
