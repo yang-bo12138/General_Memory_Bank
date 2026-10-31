@@ -150,6 +150,61 @@ export function normalize(v: Float32Array): Float32Array {
 }
 
 /**
+ * 把**原始 double 数组**归一化成单位向量（`number[]` → `Float32Array`）。
+ *
+ * ⚠️⚠️ **为什么这是「两个入口」而不是「同一个函数」**（别把它们合并！）：
+ *   · `normalize(v: Float32Array)`：入参**已经是 float32**（从库里读出的向量、
+ *     已经是 `Float32Array` 的调用方）⇒ 它的模长是「**float32 值**的 double 平方和」；
+ *   · `normalizeNumbers(raw: number[])`：入参是**原始 double**（调用方给的 API 输入）
+ *     ⇒ 归一化**在 double 域里算**，**之后**才截断成 float32。
+ *   ⇒ **两者逐位不同**（实测 6 个分量**全部**不同：`0.1` 在 float32 里是 `0.10000000149011612`
+ *     ⇒ 用它算模长必然得到不同的 norm ⇒ 归一化后的分量**逐位不同**）。
+ *   ⇒ ⚠️ **写入路径必须走 `normalizeNumbers`**（§4.9 步骤 2 的口径：
+ *     「调用方给的 `number[]` 先按 double 归一化，再落库为 float32」）
+ *     —— 这是 **v1.0 的既有行为** ⇒ **P1-T09 的基线逐位一致**依赖它
+ *     ⇒ 换成「先截断成 float32 再归一化」会**逐位改变落库值** ⇒ **基线会红**。
+ *
+ * @param raw 原始向量（**double**）
+ * @returns 新的单位向量（`Float32Array`）
+ * @throws {MemoryError} code = `INVALID_INPUT`（`details.reason` = `'nan'` / `'zero'`）
+ */
+export function normalizeNumbers(raw: readonly number[]): Float32Array {
+  let sumSquares = 0;
+  for (const value of raw) {
+    if (!Number.isFinite(value)) {
+      throw MemoryError.invalidInput('向量含 NaN / Inf（拒绝而非降级）', {
+        reason: 'nan',
+      });
+    }
+    sumSquares += value * value;
+  }
+
+  const norm = Math.sqrt(sumSquares);
+  if (!Number.isFinite(norm)) {
+    // ⚠️ 有限但极大的分量相加会溢出成 `Infinity` ⇒ 归一化后全变 0（一个零向量）。
+    //   与真正的 NaN 一样不可用 ⇒ 同样按「非有限」拒绝。
+    throw MemoryError.invalidInput('向量的模长溢出为无穷（分量过大）', { reason: 'nan' });
+  }
+  if (!(norm > MIN_VECTOR_NORM)) {
+    throw MemoryError.invalidInput('向量的模长为 0（零向量没有方向）', { reason: 'zero' });
+  }
+
+  const normalized = new Float32Array(raw.length);
+  for (let index = 0; index < raw.length; index += 1) {
+    const value = raw[index];
+    if (value === undefined) {
+      throw MemoryError.invalidInput('向量的长度与维度不符', {
+        reason: 'dim',
+        expected: raw.length,
+        actual: index,
+      });
+    }
+    normalized[index] = value / norm;
+  }
+  return normalized;
+}
+
+/**
  * 校验一个向量是否可以作为**向量索引的输入**（写入口径，§4.9 步骤 2）。
  *
  * ⚠️ **三条校验一个都不能放宽**（计划稿明写）：

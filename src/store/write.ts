@@ -36,7 +36,7 @@ import type { Params } from '../core/params.js';
 import { escapeFts5, normalize, tokenize } from '../core/tokenize.js';
 import { LOG_ACTIONS } from '../util/log.js';
 import { assignBucket, unassignBucket } from '../vector/bucketAssign.js';
-import { MIN_VECTOR_NORM } from '../vector/dot.js';
+import { normalizeNumbers } from '../vector/dot.js';
 import { MEDIA_TYPES, MEMORY_KINDS, type MediaType, type MemoryKind } from './get.js';
 import {
   type MergeMemoryState,
@@ -324,41 +324,13 @@ function resolveVector(store: WriteStore, input: WriteInput): Float32Array | nul
     );
   }
 
-  let sumSquares = 0;
-  for (const value of raw) {
-    if (!Number.isFinite(value)) {
-      throw MemoryError.invalidInput('embedding 含 NaN / Inf（§4.9 步骤 2：拒绝而非降级）', {
-        reason: 'nan',
-      });
-    }
-    sumSquares += value * value;
-  }
-
-  const norm = Math.sqrt(sumSquares);
-  if (!Number.isFinite(norm)) {
-    // ⚠️ 有限但极大的分量相加会溢出成 `Infinity` ⇒ 归一化后全变 0（一个零向量）。
-    //   与真正的 NaN 一样不可用 ⇒ 同样按「非有限」拒绝。
-    throw MemoryError.invalidInput('embedding 的模长溢出为无穷（分量过大）', { reason: 'nan' });
-  }
-  if (!(norm > MIN_VECTOR_NORM)) {
-    throw MemoryError.invalidInput('embedding 的模长为 0（零向量没有方向）', { reason: 'zero' });
-  }
-
-  const normalized = new Float32Array(dim);
-  for (let index = 0; index < dim; index += 1) {
-    const value = raw[index];
-    if (value === undefined) {
-      // ⚠️ 理论上不可达（长度已校验）——但仍必须给一个**有类型**的错误，
-      //   而不是让 `undefined / norm` 变成 `NaN` 静默写进库里。
-      throw MemoryError.invalidInput('embedding 的长度与维度不符', {
-        reason: 'dim',
-        expected: dim,
-        actual: raw.length,
-      });
-    }
-    normalized[index] = value / norm;
-  }
-  return normalized;
+  // ⚠️ **归一化走向量层的唯一权威**（`src/vector/dot.ts` 的 `normalizeNumbers`）。
+  //   ⚠️⚠️ **必须用 `normalizeNumbers`（`number[]` 入口）而不是 `normalize`（`Float32Array` 入口）**：
+  //     本路径的入参是**原始 double** ⇒ 归一化必须在 **double 域**里算、**之后**才截断成 float32；
+  //     而 `normalize` 的入参已经是 float32 ⇒ 两者**逐位不同**（实测 6 个分量全部不同）。
+  //     ⇒ 换成 `normalize` 会**逐位改变落库值** ⇒ **P1-T09 的基线逐位一致会红**。
+  //   ⇒ 归一化的校验（NaN/Inf、模长溢出、零向量）与实现**只有一份**，在向量层。
+  return normalizeNumbers(raw);
 }
 
 /** 两个向量的余弦；长度不一致 / 缺向量 / 零向量 ⇒ `null`（§4.9 步骤 3b）。 */
