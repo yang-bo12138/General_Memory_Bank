@@ -360,6 +360,50 @@ describe('P2-T07 · 写入路径的去重候选收窄（§4.9 步骤 3a2）', ()
       expect(T0 - row.last_access).toBeGreaterThanOrEqual(180 * MS_PER_DAY);
     });
 
+    it('★ 一条**半年前**写入的近重复**仍然会被合并**（注入时钟 ⇒ 没有 @coarseCutoff）', () => {
+      const fixture = createFixture({
+        count: 40,
+        coarseCenters: 2,
+        fineCenters: 4,
+      });
+      const oldVector = pseudoUnitVector(555_555);
+
+      // ── 半年前写入的那一条（`now` 是**注入时钟**）──
+      const first = write(fixture.store, {
+        content: '甲乙丙丁戊己庚辛',
+        embedding: Array.from(oldVector),
+        now: T0 - 180 * MS_PER_DAY,
+      });
+      expect(first.merged).toBe(false);
+
+      // 性质：那条老记忆**确实是半年前**写的、且**半年前**才被访问过
+      //   ⚠️ **必须在合并之前取**（合并会把 `last_access` 推到本次的 `now`）。
+      const before = fixture.db
+        .prepare('SELECT created_at, last_access FROM memories WHERE id = ?')
+        .get(first.id) as { created_at: number; last_access: number };
+      expect(T0 - before.created_at).toBeGreaterThanOrEqual(180 * MS_PER_DAY);
+      expect(T0 - before.last_access).toBeGreaterThanOrEqual(180 * MS_PER_DAY);
+
+      // ── 现在写入的**同义改写**（两条正文没有任何共享 bigram ⇒ 文本路找不到）──
+      const second = write(fixture.store, {
+        content: '壬癸子丑寅卯辰巳',
+        embedding: Array.from(perturb(oldVector, 0.01)),
+        now: T0,
+      });
+
+      // 性质：**合并了**（⇒ 半年前那条**没有被时间窗挡掉**）
+      //   ⚠️ 这条断言对「加一个 @coarseCutoff 时间窗（30 天）」的变异有牙：
+      //   一旦加了窗口，这条（`last_access` 在半年前）就进不了候选 ⇒ 不会合并。
+      expect(second.merged).toBe(true);
+      expect(second.id).toBe(first.id);
+
+      // 性质：合并**没有**把它「变年轻」（`created_at` 仍是半年前）
+      const after = fixture.db
+        .prepare('SELECT created_at FROM memories WHERE id = ?')
+        .get(first.id) as { created_at: number };
+      expect(T0 - after.created_at).toBeGreaterThanOrEqual(180 * MS_PER_DAY);
+    });
+
     it('★ 候选 SQL 里**不含**任何时间窗条件（静态断言：没有 last_access 过滤）', () => {
       const fixture = getBigFixture();
       const query = pseudoUnitVector(999_999);
