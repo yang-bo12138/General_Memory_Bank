@@ -1084,7 +1084,11 @@
   ⑦ 记 `events(type='merge', payload={ targetId, intervalDays, boostApplied, contentText, contentLength, contentHash, prevContentLength, addedEntities, hasEmbedding, stabilityDelta })`。
 - **步骤 4：全新事实创建**：  
   `INSERT memories`（含 `embedding = @newVec`，为 null 时该列为 NULL）→ 批量插 `memory_entities` →  
-  记 `events(type='write', payload={ id, kind, contentText, contentLength, contentHash, entityIds, entityNames, emotion, confidence, hasEmbedding, initialStability, initialDifficulty })`。
+  记 `events(type='write', payload={ id, kind, contentText, contentLength, contentHash, entityIds, emotion, confidence, hasEmbedding, initialStability, initialDifficulty })`。
+  ⚠️ **payload 里没有 `entityNames`**（v2.1 勘误）：写事件的键集以 §8.4 的 `write` 行为准
+    （`id, kind, contentText, contentLength, contentHash, entityIds, emotion, confidence, hasEmbedding, initialStability, initialDifficulty`）
+    ——`entityNames` 只在 §4.9 步骤 4 的伪代码里出现过，**从来不是 payload 的键**
+    （别与 `RecallOptions.entityNames` 混：那是**入参**，不是**事件键**）。
 - **初始稳定度与难度（§4.3）**：
   - `initialStability = min(MAX_STABILITY, INITIAL_STABILITY × (1 + EMOTION_WEIGHT × emotion))`，  
     `emotion = clamp(input.emotion ?? 0, 0, 1)`。  
@@ -1122,9 +1126,36 @@
   事件 payload 的 `hasEmbedding` **恒带**，若库里没写向量而事件记 `hasEmbedding: true`
   ⇒ **重放器会重建出一条库里没有的向量** ⇒ §9.2 的「可完整重放」当场破。
 
+- ★ **六条设计稿口径的同步**（ADR-P1-T07-DEC D-2 ~ D-7；设计稿已按这六条勘误，代码按这六条实现）：
+  - **D-2「唯一合并写入点」**：§9.3.0.1 首句已改成「**在写入路径内**，§4.9 步骤 2 / 3c 的
+    **合并写入序列**是唯一能改变这六项的代码路径」⇒ **步骤 2 与 3c 都属于这条路径**
+    （步骤 2 碰 `embedding` 的唯一入口是 `merge.ts` 里的向量回填函数）。
+    ⚠️ 但 `touch()`（§4.2）也加固 ⇒ **「写入路径内」这个限定不可省**；
+    加固的唯一函数入口仍是 `growStability()` 本身（§4.2 / §4.15.5）。
+  - **D-3 别名目标实体**：`entityAliases[].name` 走与 `input.entities` **同一套 a → b 归一**；
+    未命中 ⇒ **按步骤 1b 新建**，且**新建的实体计入 `@linkedEntityIds`**（⇒ 与本条记忆建立关联）。
+    ⚠️ 命中既有实体但**不在** `input.entities` 里的 ⇒ **不自动计入**（关联未被声明）。
+  - **D-4 多候选 tie-break（必须是全序）**：
+    `entityOverlap 降序 → cos 降序（`cos` 为 `null` 的排最后）→ raw_bm25 升序 → id 升序`。
+    ⚠️ **最后一级 `id` 升序是必需的**：没有它就不是全序 ⇒ 同样输入不可复现（§12 的排序要求）。
+  - **D-5 alias 撞主名**：两条路径分别处理——`setAlias` ⇒ `CONFLICT`（带 `details.conflictingEntityId`）；
+    **写路径步骤 1c ⇒ 跳过 + `warnings` + 磁盘日志**（**不抛错**：记忆本身已写成功，抛错会让调用方重试 ⇒ 同一事实写两遍）。
+  - **D-6 退化态判定式**（精确）：
+    候选不足 2 个 bigram ⇒ `合并 ⟺ entityOverlap ≥ DEDUP_ENTITY_MIN（默认 2）`，**cos 通道整条不生效**；
+    非退化态 ⇒ `entityOverlap ≥ DEDUP_ENTITY_MIN OR (cos ≠ null AND cos ≥ DEDUP_COS_MIN)`。
+  - **D-7 入参前置校验**：`kind` / `mediaRef`+`mediaType` / `confidence` 越界 ⇒ **`INVALID_INPUT`**，
+    `details` 一律**平铺**：`reason` = `'kind'` / `'media'` / `'confidence'`（另带 `current` / `expected`）。
+    ⚠️ **不要写成嵌套的 `{ kind: { current, reason } }`**（与 §4.9 步骤 2 的向量校验同口径：
+    `details.reason` = `'dim'`/`'nan'`/`'zero'`）。
+    ⚠️ **`emotion` 越界是钳制、不是报错**（§4.3）——别把两者混起来。
+
 **验收标准**：
 
 - **硬断言**：
+  - **多候选 tie-break 是全序**：构造两个候选（`entityOverlap` / `cos` / `bm25` 全同）⇒ 合并的**必须是 `id` 较小的那条**（可复现）。
+  - **退化态只认实体重叠**：候选不足 2 个 bigram 时，**余弦再高也不合并**（除非 `entityOverlap ≥ DEDUP_ENTITY_MIN`）。
+  - **别名目标新建即关联**：`entityAliases[].name` 是新实体 ⇒ 该实体**出现在本条记忆的关联集合里**（`@linkedEntityIds`）。
+  - **`details` 平铺**：`kind` / `media` / `confidence` 三种越界 ⇒ `details.reason` 分别是 `'kind'` / `'media'` / `'confidence'`。
   - 写相同归一化文本 ⇒ 判为 `exact === true`、库内**只有一条**、返回的 `content` 是**库内版本**。
   - 写同义改写（共享实体 ≥ 2 或 cos ≥ 0.92）⇒ 判为 `exact === false` 的合并；库内**只有一条**；  
     旧正文进 `content_history`（`reason='merge'`）；事件为 `type='merge'` 且 payload 键集完整。
@@ -1286,6 +1317,12 @@
     `explain.routes.vector.ran`（整条向量路本次跑没跑）是两个层级。  
   - `explain: true` ⇒ **恰好一条** `recall` 事件；`diagnostics: true` ⇒ **零条** `recall` 事件但有 `explain` 块。
   - `recall` **不写 `memories`**（除 `reinforce: true` 的加固，见 P1-T06）。
+  - ★ **`reinforce: true` 不建共激活边**（§4.11.2 裁决 / ADR-P1-T07-DEC D-10）：
+    `recall({ reinforce: true })` **只加固稳定度**，**绝不写 `coacts`**——
+    否则每次 reinforce 都把本次 top-N 焊成一个团 ⇒ 触发 §0.2 明令禁止的「topN 自我强化」。
+    ⚠️ **这条目前只有注释、没有断言** ⇒ **必须补一条**：
+    调用 `recall({ reinforce: true })` 前后，`coacts` 表**行数必须不变**。
+    （否则将来有人让 reinforce 建边，今天测不出来。）
 - **软阈值**：
   - `recall` 默认**不记事件**（写放大）——这是设计决定，不是可调项。
   - `explain` 常开 = 最高频操作每次写一条事件 ⇒ 文档已标注代价，实现时在 API 注释里保留该警告。
@@ -1349,7 +1386,7 @@
     ⚠️ **基线条件只有这一套**：`VECTOR_ROUTER` 是三值选择器（'auto'/'ivf'/'flat'），
     只能说「设为 flat」、不能「关闭」；**`'auto'` 不构成基线条件**（它的实际走向随库规模变）。  
     ⚠️ **`ARCHIVAL_CACHE` 计入基线组**（关掉 = 走慢路但结果相同，不纳入则「逐位一致」在字面上不成立）。  
-  - ⚠️ **基线测试自身必须有负控**：参考实现里故意写错一个公式 ⇒ 基线测试必须变红并指向该差异（ADR-P1-R2 裁决 8）。  
+  - ⚠️ **基线测试自身必须有负控**：参考实现里故意写错一个公式 ⇒ 基线测试必须变红并指向该差异（ADR-P1-T07-DEC D-9）。  
     「验收工具本身必须被验收」——一个永远为真的基线断言等于没有基线。
 - **软阈值**：无。
 
@@ -1367,7 +1404,7 @@
 
 **目标**：把阶段 1 的 10 个公开方法**接到一个可调用的公共入口**上，让阶段 1 的成果真的能被外部用起来。
 
-> **为什么必须有这个任务**（ADR-P1-R2 裁决 6 / F-10）：  
+> **为什么必须有这个任务**（ADR-P1-T07-DEC D-11 / F-10）：  
 > DESIGN §12 把 10 个公开方法归给阶段 1，但 P1-T01~T09 的文件清单里**没有任何一项提到
 > `MemoryStore.ts` 或 `index.ts`** ⇒ 按原计划走完阶段 1，**公共入口一个方法都调不到**。  
 > §14.3 边界原则 1「每个承诺都要能指到**唯一**代码路径」：  
@@ -1631,7 +1668,7 @@
   - ★ **集合相等断言**（v2.1 新增 / ADR-P1-C 裁决 7 的交接项）：  
     「库内所有 `embedding IS NOT NULL` 且 `deleted = 0` 的记忆，其 id 集合
     与 `vector_cell_members` 的 `memory_id` 集合**相等**」。  
-    ⚠️ **左侧是「全库」扫描的结果，不是「本次写入的批次」**（ADR-P1-R2 裁决 7 补充）——
+    ⚠️ **左侧是「全库」扫描的结果，不是「本次写入的批次」**（ADR-P1-T07-DEC D-12）——
     若左侧只取本批次，断言就退化成「本批写的东西都进桶了」，
     **恰好放不过阶段 1 遗留的那笔欠账**（有向量、无桶归属的旧记忆）。
     ⇒ 左侧口径必须写成：`SELECT id FROM memories WHERE embedding IS NOT NULL AND deleted = 0`（全库）。  
