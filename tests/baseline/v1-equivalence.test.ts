@@ -23,6 +23,11 @@
  *
  * ⚠️ **断言用 `toEqual` 而不是 `toBeCloseTo`**：本基线要的是**逐位相同**，
  *   近似比较会把「权重差 1e-6」这种真漂移放过去。
+ *
+ * ⚠️ **三个「一天」不许合并**（C36 意义上的**刻意例外**，逐个理由见下方常量区）：
+ *   语料的 `CORPUS_DAY_MS`（**时间轴粒度**）/ 参考实现的 `REF_MS_PER_DAY`
+ *   （**v1.0 的历史事实**）/ 库的 `MS_PER_DAY`（**被审对象**）
+ *   ⇒ 三者之间由一条守卫**显式断言**：库漂移 ⇒ 基线立刻红 ⇒ **漂移可见，而不是被吸收**。
  */
 
 import { readFileSync } from 'node:fs';
@@ -41,6 +46,14 @@ import { type RecallResult, recall } from '../../src/store/recall.js';
 import { type TouchOutcome, touch } from '../../src/store/touch.js';
 import { type WriteResult, type WriteWarning, write } from '../../src/store/write.js';
 import { MemoryLogger } from '../../src/util/log.js';
+/**
+ * ⚠️ **这里的 `MS_PER_DAY` 只用于「守卫」，不用于推进语料时间轴。**
+ *
+ * 语料的时间推进用的是**它自己的一份**（`CORPUS_DAY_MS` / `CORPUS_HOUR_MS`，见下）
+ * ⇒ 基线的「时间轴」**不依赖被审对象**
+ * ⇒ 将来库里把 `MS_PER_DAY` 改错，基线会**立刻变红**（守卫），
+ *   而**不是**悄悄跟着换口径（那会让基线「静默地不再是基线」）。
+ */
 import { MS_PER_DAY } from '../../src/util/time.js';
 import {
   REF_FORMULAS,
@@ -67,20 +80,26 @@ import {
 const T0 = 1_700_000_000_000;
 
 /**
- * 一小时（毫秒）—— **这是语料自己的时间粒度，不是库的时间常量**。
+ * 语料的一「天」（毫秒）—— **语料自己的时间粒度**，**不是库的时间常量**。
  *
- * ⚠️ **为什么它可以留在测试文件里**（而 `MS_PER_DAY` 不行）：
- *   `MS_PER_DAY` 是**库的一个键**（§4.1 公式里的「天 → 毫秒」换算）⇒ 仓库里有
- *   **唯一定义处**（`src/util/time.ts`，C36 收敛后的结果）⇒ 测试文件里再写一份
- *   就是「同一个键两处两套定义」⇒ 将来库改了、基线不跟着改 ⇒ 基线**静默地**
- *   不再是基线。
- *   ⇒ 这里**从库 import**（`import { MS_PER_DAY } from '../../src/util/time.js'`）。
- *
- * ⚠️ 而 `HOUR`（一小时）**不是库的键**：它既不在 `src/util/time.ts` 里，
- *   也不在 §4.1 / §4.6 的任何公式里 ⇒ 它只是「本语料把召回放在写完 1 小时后」
- *   这个**排期选择** ⇒ 留在测试文件里没问题，但必须写明它是语料粒度。
+ * ⚠️ **为什么不用库的 `MS_PER_DAY`**（这是**三个不同的东西**，不许合并）：
+ *   · `CORPUS_DAY_MS`（这里）= **测试推进时间轴用的粒度**（真实毫秒）；
+ *   · `REF_MS_PER_DAY`（`ref-v1.ts`）= **v1.0 的历史事实**（一天 = 86 400 000 毫秒），
+ *     参考实现**必须**自带一份（它不能 import `src/**`，否则库改错它跟着错 ⇒ 循环论证）；
+ *   · `MS_PER_DAY`（`src/util/time.ts`）= **库当前**的常量（**被审对象**）。
+ *   ⇒ 语料用**自己的一份**，才能保证「库把 `MS_PER_DAY` 改错 ⇒ 基线红」
+ *     而不是「基线跟着一起变」⇒ **漂移可见，而不是漂移被吸收**。
  */
-const HOUR = 3_600_000;
+const CORPUS_DAY_MS = 86_400_000;
+
+/**
+ * 语料的一「小时」（毫秒）—— 同上，**语料自己的时间粒度**，不是库的键。
+ *
+ * ⚠️ 它既不在 `src/util/time.ts` 里，也不在 §4.1 / §4.6 的任何公式里
+ *   ⇒ 它只是「本语料把召回放在写完 1 小时后」这个**排期选择**
+ *   ⇒ 留在测试文件里没问题，但必须写明它是**语料粒度**。
+ */
+const CORPUS_HOUR_MS = 3_600_000;
 
 /**
  * 基线参数（**手写**，不用 `toBaselineParams()`）。
@@ -248,29 +267,35 @@ const CORPUS: CorpusStep[] = [
   },
   // ⚠️ **图谱路**：传 `entityNames` ⇒ 库只做「名字 → entity_id」的归一（库不抽取实体）。
   //   `['张三']` 正是 v1.0 会从「张三住哪里」里抽到的那一组 ⇒ 两侧图谱路输入等价。
-  { op: 'recall', context: '张三住哪里', topN: 5, entityNames: ['张三'], now: T0 + HOUR },
-  { op: 'recall', context: '周会', topN: 5, entityNames: ['周会'], now: T0 + HOUR + 1000 },
+  { op: 'recall', context: '张三住哪里', topN: 5, entityNames: ['张三'], now: T0 + CORPUS_HOUR_MS },
+  {
+    op: 'recall',
+    context: '周会',
+    topN: 5,
+    entityNames: ['周会'],
+    now: T0 + CORPUS_HOUR_MS + 1000,
+  },
   // ⚠️ **图谱路为空**（分支④：「咖啡」里没有「咖啡机」⇒ v1.0 也抽不到实体 ⇒ 两侧都空）。
-  { op: 'recall', context: '咖啡', topN: 3, now: T0 + HOUR + 2000 },
+  { op: 'recall', context: '咖啡', topN: 3, now: T0 + CORPUS_HOUR_MS + 2000 },
   {
     op: 'recall',
     context: 'PostgreSQL',
     topN: 5,
     entityNames: ['PostgreSQL'],
-    now: T0 + HOUR + 3000,
+    now: T0 + CORPUS_HOUR_MS + 3000,
   },
-  { op: 'recall', context: '猫', topN: 5, entityNames: ['猫'], now: T0 + HOUR + 4000 },
+  { op: 'recall', context: '猫', topN: 5, entityNames: ['猫'], now: T0 + CORPUS_HOUR_MS + 4000 },
   // ⚠️ **分支②**：传 `entityIds` ⇒ 完全跳过名称解析（等价于「调用方自己解析好了」）。
   {
     op: 'recall',
     context: '张三喜欢猫',
     topN: 5,
     entityIdsByName: ['张三'],
-    now: T0 + HOUR + 5000,
+    now: T0 + CORPUS_HOUR_MS + 5000,
   },
-  { op: 'touch', targets: [0, 1], now: T0 + 2 * MS_PER_DAY },
-  { op: 'touch', targets: [0], now: T0 + 2 * MS_PER_DAY + 1000 },
-  { op: 'touch', targets: [3, 4], now: T0 + 40 * MS_PER_DAY },
+  { op: 'touch', targets: [0, 1], now: T0 + 2 * CORPUS_DAY_MS },
+  { op: 'touch', targets: [0], now: T0 + 2 * CORPUS_DAY_MS + 1000 },
+  { op: 'touch', targets: [3, 4], now: T0 + 40 * CORPUS_DAY_MS },
   // ⚠️ **归档口径**（ADR-P1-T08-GAP 小口径③）：40 天后「咖啡机」那条的强度已降到归档线以下
   //   ⇒ 非归档模式被**强度精筛**挡掉（空集）、归档模式**跳过精筛**（命中）。
   //   ⇒ 这一对召回是「归档模式不做强度精筛」这条口径的**判别力**所在。
@@ -279,20 +304,20 @@ const CORPUS: CorpusStep[] = [
     context: '咖啡机',
     topN: 5,
     includeArchived: true,
-    now: T0 + 40 * MS_PER_DAY + HOUR,
+    now: T0 + 40 * CORPUS_DAY_MS + CORPUS_HOUR_MS,
   },
   {
     op: 'recall',
     context: '咖啡机',
     topN: 5,
     expectEmpty: true,
-    now: T0 + 40 * MS_PER_DAY + HOUR + 1000,
+    now: T0 + 40 * CORPUS_DAY_MS + CORPUS_HOUR_MS + 1000,
   },
-  { op: 'get', target: 0, now: T0 + 2 * MS_PER_DAY + HOUR },
-  { op: 'get', target: 1, now: T0 + 41 * MS_PER_DAY },
-  { op: 'get', target: 6, now: T0 + 41 * MS_PER_DAY },
-  { op: 'get', target: 13, now: T0 + 41 * MS_PER_DAY },
-  { op: 'get', target: -1, now: T0 + 41 * MS_PER_DAY },
+  { op: 'get', target: 0, now: T0 + 2 * CORPUS_DAY_MS + CORPUS_HOUR_MS },
+  { op: 'get', target: 1, now: T0 + 41 * CORPUS_DAY_MS },
+  { op: 'get', target: 6, now: T0 + 41 * CORPUS_DAY_MS },
+  { op: 'get', target: 13, now: T0 + 41 * CORPUS_DAY_MS },
+  { op: 'get', target: -1, now: T0 + 41 * CORPUS_DAY_MS },
   // ⚠️ **时钟回拨**：`now` 早于 `last_access` ⇒ `Δt` 被 `max(0, ·)` 钳到 0 ⇒
   //   强度恒为 1（§4.1 的第一重钳制；F-08 的正域不可观测 ⇒ 这里专门钉住它）。
   { op: 'get', target: 0, now: T0 },
@@ -495,8 +520,8 @@ function runRealCorpus(): RealRun {
       const first = writtenIds[0];
       const second = writtenIds[1];
       if (first !== undefined && second !== undefined) {
-        link(store, '张三', '喜欢', '猫', second, T0 + 19 * MS_PER_DAY);
-        link(store, '张三', '住在', '北京', first, T0 + 19 * MS_PER_DAY);
+        link(store, '张三', '喜欢', '猫', second, T0 + 19 * CORPUS_DAY_MS);
+        link(store, '张三', '住在', '北京', first, T0 + 19 * CORPUS_DAY_MS);
       }
       edgesSeeded = true;
     }
@@ -1301,12 +1326,15 @@ describe('P1-T09 · v1.0 基线等价（write / recall / touch / get）', () => 
     expect(offenders).toEqual([]);
   });
 
-  it('★ 「天 → 毫秒」只有一个来源：参考实现的常量必须与库相等', () => {
-    // ⚠️ **为什么两边都要有**：库侧是**唯一定义处**（`src/util/time.ts`，C36 收敛后的结果）；
-    //   参考实现侧**不能 import 它**（否则基线自证）⇒ 两侧各有一份常量。
-    //   ⇒ 那就**显式断言两者相等** ⇒ 将来 `MS_PER_DAY` 改了，这条断言立刻变红
-    //   （而不是「基线静默地不再是基线」）。
-    expect(REF_MS_PER_DAY).toBe(MS_PER_DAY);
+  it('★ 「天 → 毫秒」不许漂移：v1.0 的历史事实 vs 库当前值', () => {
+    // ⚠️ **两个断言的方向不一样，别搞混**：
+    //   ① `REF_MS_PER_DAY` 钉住的是**v1.0 的历史事实**（一天 = 86 400 000 毫秒）
+    //      —— 参考实现代表「v1.0 当时一天有多少毫秒」，它**不是**库的常量；
+    //   ② 库的 `MS_PER_DAY` 必须**仍等于**这个历史事实
+    //      ⇒ 库漂移了 ⇒ 基线**立刻红**（**漂移可见**），
+    //        而不是基线**跟着一起错**（⇒ 循环论证回来了，且**无声**）。
+    expect(REF_MS_PER_DAY).toBe(86_400_000);
+    expect(MS_PER_DAY).toBe(REF_MS_PER_DAY);
   });
 
   it('★ 语料本身有判别力：四条写入路径 + 冲突 + 同日守卫都出现了', () => {
