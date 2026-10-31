@@ -14,19 +14,6 @@
  * ⚠️ **决策一律委托给 `src/core/graph.ts`**：本文件只负责「按结论执行 SQL」，
  *   不再自己做判断 ⇒ 决策错了 `tests/unit/graph.test.ts` 变红，SQL 错了这里的端到端测变红，
  *   两者不会互相掩盖。
- *
- * ── 交付状态（截至 2026-10-31 07:45）────────────────────────────────────────
- * ⚠️ **本文件是 P1-T05「SQL 层」的在途稿**：
- *   · 已完成：`link` / `linkByIds` 的 §4.5 四步（解析 → 缺失实体处理 → 自环校验 → 边 UPSERT）
- *     与「步骤 2 与步骤 4 同事务」的编排；
- *   · **尚未接入**：`src/index.ts` 未导出本模块 ⇒ 运行时不可达；
- *   · **尚未验收**：缺端到端集成测试（重复三元组强化不产生重复边 / `createMissing=false` 零写入 /
- *     每次 link 记一条事件 / `setAlias` 撞既有别名走 DO UPDATE / `mergeEntities` 后记忆正文一行未动 /
- *     幂等返回）⇒ 这些是 P1-T05 收尾时的**必做项**，不是可选项；
- *   · 本次只修正了一处契约违例：原先自造了 `ENTITY_UPSERT_FAILED` / `EDGE_UPSERT_FAILED`
- *     两个**不属于封闭五码集合**的 `MemoryErrorCode` ⇒ 按 §11.2「语义不属于五个 code 的错误
- *     原样抛出但必须带 `code` 字段」改为 `invariantError()`。
- * ─────────────────────────────────────────────────────────────────────────
  */
 
 import { randomUUID } from 'node:crypto';
@@ -35,11 +22,12 @@ import type Database from 'better-sqlite3';
 
 import { resolveNow } from '../core/clock.js';
 import { resolveEntity } from '../core/entities.js';
-import { MemoryError, translateSqliteError } from '../core/errors.js';
+import { MemoryError } from '../core/errors.js';
 import type { LinkEventPayload } from '../core/events.types.js';
 import { isSelfLoop } from '../core/graph.js';
 import type { Params } from '../core/params.js';
 import type { EventWriter } from './events.js';
+import { runWriteTransaction } from './transaction.js';
 
 /** 图写入所需的上下文（库句柄 + 生效参数 + 事件写入器）。 */
 export interface GraphStore {
@@ -67,10 +55,19 @@ export interface LinkResult {
   /** **实际落库**的权重（`RETURNING weight` 取回，不在外面重算）。 */
   weightAfter: number;
   /**
-   * 本次自动新建的实体 id。
+   * 本次**自动新建**的实体**名称**列表（§4.5 步骤 2：`@autoCreatedEntities`）。
    *
-   * ⚠️ 走 `ON CONFLICT ... DO UPDATE` 分支拿到的**既有**实体 id **不算**进来——
-   *   它本来就在，不是本次创建的（§4.5 步骤 2）。
+   * ⚠️ **元素是实体名（`entities.name`），不是 entity_id**（§4.5 步骤 2 原文：
+   *   「`@autoCreatedEntities = [本次实际新建的实体名, ...]`」）。
+   *   ⇒ 用**名**而不是 id 的理由（不是偏好，是必需）：`link` 事件的 payload 里
+   *   **没有任何实体名**（只有 `subjectId` / `objectId`），
+   *   若这里记 id，重放器（§9.2「可完整重放」）就永远不知道
+   *   那个被自动建出来的实体**叫什么** ⇒ 图谱重建时建不出同名的实体。
+   *
+   * ⚠️ **只有「本次真的新建」的端点才进来**：
+   *   · 走 `ON CONFLICT(name) DO UPDATE` 分支拿到的**既有**实体**不算**
+   *     （它本来就在，不是本次创建的）；
+   *   · 解析得到既有实体（主名或别名命中）的端点也**不算**。
    */
   autoCreatedEntities: string[];
 }
@@ -107,28 +104,6 @@ const UPSERT_EDGE_SQL = `
     memory_id   = COALESCE(@memoryId, edges.memory_id)
   RETURNING weight
 `;
-
-/** 判断一个错误是否已是本库的错误类型（是则原样抛出，不再转译）。 */
-function isMemoryError(error: unknown): error is MemoryError {
-  return error instanceof MemoryError;
-}
-
-/**
- * 执行一段图写入；把 SQLite 原生错误转译成 §11.2 的语义错误。
- *
- * ⚠️ **已经是 `MemoryError` 的原样抛出**：转译器只看 `code`，
- *   把一个 `NOT_FOUND` 再转一次会变成 `CONFLICT` 或 `INVALID_INPUT` ⇒ 语义被覆盖。
- */
-function runGraphWrite<T>(db: Database.Database, body: () => T): T {
-  try {
-    return db.transaction(body)();
-  } catch (error) {
-    if (isMemoryError(error)) {
-      throw error;
-    }
-    throw translateSqliteError(error);
-  }
-}
 
 /**
  * §11.2：**语义不属于五个 code 的内部不变量违例 ⇒ 原样抛出，但必须带上 `code` 字段**。
@@ -180,26 +155,37 @@ export function link(
   const createMissing = options?.createMissing !== false;
   const db = store.db;
 
-  return runGraphWrite(db, () => {
+  return runWriteTransaction(db, () => {
     // ── 步骤 1：两端各解析一次，结果先落在「可能为 null」的变量里 ──
     // ⚠️ 不要写成 `subjectId = resolveEntity(...) ?? 步骤2建出的id`——
     //    步骤 1 就引用步骤 2 的产物，而步骤 2 此时还没执行。
     let subjectId = resolveEntity(db, subject);
     let objectId = resolveEntity(db, object);
 
+    // ⚠️ ★ **必须在建实体之前**记下「哪些端点原本解析不到」。
+    //   之前的实现是「先建实体、再回头 `resolveEntity` 查」——
+    //   建完之后实体**必然查得到** ⇒ 判定恒为「不是新建」
+    //   ⇒ `autoCreatedEntities` **恒为空** ⇒ 「这次 link 自动建了哪些实体」完全不留痕
+    //   （§8.4 硬规则 2：状态变了就必须有记录）。
+    //   ⇒ 现在改成：**先记 null，再建**；只有原本为 null 的端点才计入。
+    const subjectWasMissing = subjectId === null;
+    const objectWasMissing = objectId === null;
+
     // ── 步骤 2：缺失实体处理 ──
-    // ⚠️ **先判两端再建**：`createMissing === false` 时必须**零写入**，
-    //    禁止「建了一个端点、另一个端点缺失才抛错」的混合策略。
     if (subjectId === null || objectId === null) {
+      // ⚠️ **先判两端再建**：`createMissing === false` 时必须**零写入**，
+      //    禁止「建了一个端点、另一个端点缺失才抛错」的混合策略。
       if (!createMissing) {
-        const missing: string[] = [];
-        if (subjectId === null) missing.push(subject);
-        if (objectId === null) missing.push(object);
+        const missingNames: string[] = [];
+        if (subjectWasMissing) missingNames.push(subject);
+        if (objectWasMissing) missingNames.push(object);
         throw MemoryError.notFound(
-          `link 的端点实体不存在，且 createMissing = false（未产生任何写入）：${missing.join(', ')}`,
-          { missingIds: missing },
+          `link 的端点实体不存在，且 createMissing = false（未产生任何写入）：${missingNames.join(', ')}`,
+          // ⚠️ `link` 的端点是**名称**（不是 id）⇒ 这个差集装的是「缺失的端点名」。
+          { missingIds: missingNames },
         );
       }
+
       if (subjectId === null) {
         subjectId = upsertEntity(db, subject, at);
       }
@@ -208,17 +194,23 @@ export function link(
       }
     }
 
+    // ⚠️ **只把「原本解析不到」的端点记进来**：
+    //   · 原本就解析得到（主名或别名命中）的端点 ⇒ **不是**本次新建的；
+    //   · 走 `ON CONFLICT(name) DO UPDATE` 分支拿到的**既有**实体 ⇒ **不是**本次新建的。
     const autoCreatedEntities: string[] = [];
-    if (resolveEntity(db, subject) === null) {
-      autoCreatedEntities.push(subjectId);
+    if (subjectWasMissing) {
+      autoCreatedEntities.push(subject);
     }
-    if (resolveEntity(db, object) === null) {
-      autoCreatedEntities.push(objectId);
+    if (objectWasMissing && !autoCreatedEntities.includes(object)) {
+      // ⚠️ 两端同名时（`link('张三','关联','张三')`）第二个 INSERT 走
+      //   `ON CONFLICT(name) DO UPDATE` 分支拿回**同一个** id ⇒ 那个实体只建了一次
+      //   ⇒ 名字只应记一次。
+      autoCreatedEntities.push(object);
     }
 
     // ── 步骤 3：自环校验（id 已回填 ⇒ 按 id 判）──
     if (isSelfLoop(subjectId, objectId)) {
-      // ⚠️ 抛错会回滚步骤 2 已建的实体——前提是**同一事务**（本函数整体在 runGraphWrite 里）。
+      // ⚠️ 抛错会回滚步骤 2 已建的实体——前提是**同一事务**（本函数整体在 runWriteTransaction 里）。
       throw MemoryError.invalidInput('link 的两端解析到同一个实体（自环）', {
         subjectId,
         predicate,
@@ -277,7 +269,8 @@ export function link(
  * ⚠️ **实体存在性必须自己校验**（各 `SELECT 1 FROM entities WHERE id = ?`），
  *   **不能指望外键**：
  *   · FK 报的是未类型化的 `SQLITE_CONSTRAINT_FOREIGNKEY`，会原样穿给调用方；
- *   · `PRAGMA foreign_keys` 是**每连接**开关，漏开时会**静默写入悬空边**。
+ *   · `PRAGMA foreign_keys` 是**每连接**开关，漏开时**静默写入悬空边**
+ *     （之后扩散永远查不到邻居，且不报任何错）。
  *
  * @throws {MemoryError} `NOT_FOUND`（`details.missingIds = 差集`）
  * @throws {MemoryError} `INVALID_INPUT`（自环）
@@ -293,7 +286,7 @@ export function linkByIds(
   const at = resolveNow(now);
   const db = store.db;
 
-  return runGraphWrite(db, () => {
+  return runWriteTransaction(db, () => {
     const existsStatement = db.prepare('SELECT 1 AS ok FROM entities WHERE id = ?');
     const present = [subjectId, objectId].filter((id) => existsStatement.get(id) !== undefined);
     const missing = [subjectId, objectId].filter((id) => !present.includes(id));
