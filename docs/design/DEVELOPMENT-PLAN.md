@@ -1035,8 +1035,11 @@
   ⇒ **代价（明写）**：只声明别名、不在 `entities` 里点名该实体的调用方，
   会「别名建好了但这条记忆不进图谱路」⇒ **静默达不到召回目的**。
   ⇒ **缓解**：文档必须写明「关联只能由 `entities` 表达」；
-  ⚠️ 若将来要在写路径给「只声明别名未声明关联」加一条 `warnings`，
-  **必须同步改 `scripts/check-contract-ids.ts` 的 `EXPECTED_WARNING_ONLY_CASES` 白名单**（否则门禁变红）。
+  ⚠️ ★ **已落地**：`write()` 的 `warnings` 里回一条 `ALIAS_TARGET_NOT_LINKED`
+  （**一个 `name` 一条**）⇒ 边界可观测，不静默；
+  ⇒ 该 warning 码**必须**同时登记在 `src/core/errors.ts` 的 `WARNING_ONLY_CASES`、
+  `scripts/check-contract-ids.ts` 的 `EXPECTED_WARNING_ONLY_CASES`、与 DESIGN §11.2 的表格里
+  （**三处必须相等** ⇒ 少一处门禁就红）。
 - **步骤 2：归一化与完全重复检测**：  
   `@normText = normalize(input.content)`；`@newHash = sha1(@normText)`。  
   ⚠️ **落库用原文**（保留大小写与全角），只有 hash 用归一化形式。  
@@ -1133,8 +1136,18 @@
     ⚠️ 但 `touch()`（§4.2）也加固 ⇒ **「写入路径内」这个限定不可省**；
     加固的唯一函数入口仍是 `growStability()` 本身（§4.2 / §4.15.5）。
   - **D-3 别名目标实体**：`entityAliases[].name` 走与 `input.entities` **同一套 a → b 归一**；
-    未命中 ⇒ **按步骤 1b 新建**，且**新建的实体计入 `@linkedEntityIds`**（⇒ 与本条记忆建立关联）。
-    ⚠️ 命中既有实体但**不在** `input.entities` 里的 ⇒ **不自动计入**（关联未被声明）。
+    未命中 ⇒ **按步骤 1b 新建**（**建**，保证别名有处可挂、不被静默丢弃）。
+    ⚠️ ★ **R2 终裁（2026-10-31 主理人改判，结论反转过一次）**：
+    **无论命中既有实体还是新建，都**不**计入 `@linkedEntityIds`** ⇒
+    **不与本条记忆建立关联**，也**不出现在 write 事件的 `entityIds` 里**。
+    ⇒ **理由**：`entities` 是「这条记忆跟 X 有关」的**唯一**表达机制；
+    若 `entityAliases` 也能顺带建立关联 ⇒ 同一件事有**两处**能表达 ⇒ §14.3 边界原则 1 破了。
+    ⇒ **代价（明写）**：只声明 `entityAliases`、不点名实体的调用方 ⇒
+    别名映射建好了但**图谱路查不到它** ⇒ **静默达不到召回目的**
+    ⇒ **想让别名对召回生效，必须把实体名同时写进 `input.entities`**。
+    ⇒ **边界必须可观测**：这种「建了但没关联」的情形 ⇒ `write()` 的 `warnings` 里回一条
+    `ALIAS_TARGET_NOT_LINKED`（**一个 `name` 一条**，不是每个别名一条）
+    ⇒ 详见 §4.9 步骤 1c 与 ADR-P1-T07-DEC 的 D-3/R2。
   - **D-4 多候选 tie-break（必须是全序）**：
     `entityOverlap 降序 → cos 降序（`cos` 为 `null` 的排最后）→ raw_bm25 升序 → id 升序`。
     ⚠️ **最后一级 `id` 升序是必需的**：没有它就不是全序 ⇒ 同样输入不可复现（§12 的排序要求）。
@@ -1154,7 +1167,16 @@
 - **硬断言**：
   - **多候选 tie-break 是全序**：构造两个候选（`entityOverlap` / `cos` / `bm25` 全同）⇒ 合并的**必须是 `id` 较小的那条**（可复现）。
   - **退化态只认实体重叠**：候选不足 2 个 bigram 时，**余弦再高也不合并**（除非 `entityOverlap ≥ DEDUP_ENTITY_MIN`）。
-  - **别名目标新建即关联**：`entityAliases[].name` 是新实体 ⇒ 该实体**出现在本条记忆的关联集合里**（`@linkedEntityIds`）。
+  - ★ **别名目标「建但不隐含关联」**（D-3/R2 终裁，**与旧稿相反**）：
+    只声明 `entityAliases`（不声明 `entities`）⇒ 该实体**被建出来**、别名**挂上去**，
+    但它**不在** `@linkedEntityIds` 里 ⇒ **`memory_entities` 表里没有它那一行**
+    ⇒ **不与本条记忆建立关联**（行为级证据：不只看返回值）。
+  - ★ **边界可观测**：上述情形 ⇒ `write()` 的 `warnings` 里**恰好一条**
+    `ALIAS_TARGET_NOT_LINKED`（**一个 `name` 一条** ⇒ 多个别名不重复报）；
+    且该实体**确实存在于 `entities` 表**（建了，只是没关联）。
+  - ★ **反向不误报**：调用方用**别名**点名同一实体
+    （`entities: ['老张']` + `entityAliases: [{ name: '张三', … }]`）
+    ⇒ 该实体**已被 `entities` 关联** ⇒ **不报**这条 warning（判定按实体 id，不按名字）。
   - **`details` 平铺**：`kind` / `media` / `confidence` 三种越界 ⇒ `details.reason` 分别是 `'kind'` / `'media'` / `'confidence'`。
   - 写相同归一化文本 ⇒ 判为 `exact === true`、库内**只有一条**、返回的 `content` 是**库内版本**。
   - 写同义改写（共享实体 ≥ 2 或 cos ≥ 0.92）⇒ 判为 `exact === false` 的合并；库内**只有一条**；  

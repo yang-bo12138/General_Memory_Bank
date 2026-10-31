@@ -32,11 +32,7 @@
  */
 
 import { resolveNow } from './clock.js';
-import { MS_PER_DAY, effectiveStability } from './decay.js';
-// ⚠️ **单独一行 import**（不并进上面那行）：上面那行归工程师-3 的「`MS_PER_DAY` 定义下沉」，
-//   他要把它改成从 `./util/time.js` 取 ⇒ 并成一行会让两人改同一行、必然撞车。
-//   ⇒ 这里只从 `./decay.js` 取**归档跨度因子**（同一模块的另一个导出）。
-import { archiveSpanFactor } from './decay.js';
+import { MS_PER_DAY, archiveSpanFactor, effectiveStability } from './decay.js';
 import { MemoryError } from './errors.js';
 import type { Params } from './params.js';
 
@@ -758,6 +754,13 @@ export interface CoarseGateWindow {
  *   §4.6 步骤 2 原话：「`includeArchived = true`：令 `@coarseCutoff = 0`（不设 last_access 粗筛），
  *   精筛阈值 `@archiveLine = 0.0`，即只过滤 `deleted = 0`」。
  *   ⇒ 这是「**显式查询归档层**」的唯一代码路径（§4.4「归档仅显式查询可见」）。
+ *   ⚠️⚠️ **「精筛阈值 0.0」这句原话已被 ADR 判为自相矛盾，实际口径是「归档模式整体不判强度」**：
+ *     `passesIntensityFilter` 是**严格大于**（`>`），而 `intensity = min(1, exp(-Δt/τ))`
+ *     在 Δt 足够大时**下溢成恰好 0.0** ⇒ 若真按「阈值 0.0」判，这些行会被挡掉，
+ *     可它们**已经被 SQL 捞进来了** ⇒ 「显式查询归档层」名存实亡。
+ *     ⇒ 归档模式下**不调用** `passesIntensityFilter`（见 `src/store/recall.ts` 的 `filterAndSlice`），
+ *       判据只有一条「只过滤 `deleted = 0`」。
+ *     ⇒ 本函数只管**粗筛**（`last_access` 下界）；粗筛与精筛是两件事，别混。
  *   ⚠️ **向量路必须服从同一个开关**（铁律①）：否则「显式查归档层」只对两路生效，
  *     而归档层的记忆**根本进不了向量路** ⇒ 归档层在语义上就只被部分看见。
  *   ⚠️ **取消粗筛的做法是「不绑这两个参数」（并把 SQL 里的粗筛片段去掉）**，
@@ -789,10 +792,11 @@ export function coarseGateWindow(
     pin_factor: params.MAX_PIN_FACTOR,
     last_access: 0,
   });
-  // ⚠️ **跨度只从唯一权威取**（`decay.ts` 的 `archiveSpanFactor`）：
-  //   这里曾经自己写了一份 `Math.log(1 / params.ARCHIVE_LINE)` ⇒ **同一公式两份实现**（C36 漂移）：
-  //   改一处不改另一处 ⇒ 粗筛窗口与归档判定**差一截**，而**不报错**（两个数都像正常值）。
-  //   ⇒ 乘法顺序保持 `τ × 因子 × MS_PER_DAY` ⇒ 与收敛前的数值**逐位相同**。
+  // ⚠️ **归档跨度不自己算**（C36：同一件事不得有两套公式）：
+  //   `ln(1 / ARCHIVE_LINE)` 的唯一权威是 `decay.ts` 的 `archiveSpanFactor()`
+  //   （`archiveAt()` 与本函数是同一公式的正反两面）⇒ 这里直接调用，不重写一遍。
+  //   ⚠️ 历史上这个式子有三份副本（decay.ts / db/migrate.ts / 本文件）
+  //   ⇒ 改一处不改另一处 ⇒ 粗筛窗口与归档时刻差一截，**且不报错**。
   const archiveSpanDays = archiveSpanFactor(params.ARCHIVE_LINE);
 
   return {

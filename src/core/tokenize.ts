@@ -173,6 +173,16 @@ export interface MatchQuery {
  *   单个拉丁字母/数字走 LIKE 会**扫全表且区分度为零**（`LIKE '%a%'` 命中一切含 a 的正文）
  *   ⇒ 返回空候选、交给调用方补全关键词，比返回几万条噪声更有用。
  *
+ * ⚠️ **单 token 时 `matchSql` 里不会出现 `AND` 字面量**（这是 `Array.join` 的**语义**，
+ *   不是个人偏好）：分支 ③ 的实现是 `safeTokens.map(escapeFts5).join(' AND ')`
+ *   ⇒ 数组**只有 1 个元素**时 `join` 直接返回那一个元素、**不插分隔符**
+ *   ⇒ `buildMatchQuery("猫粮")`（`tokenize("猫粮")` 只有 1 个 bigram）
+ *     实测 `matchSql === '"猫粮"'`、**条件个数 == 1**。
+ *   ⇒ 因此断言要按「**走哪支 + 条件个数**」写，**不要**按「字符串里有没有 `AND` 字面量」写
+ *     （后者在 token 数为 1 时恒假 ⇒ 是一条恒不成立的假断言）。
+ *   权威：DESIGN-v2.md §10.2（`safeTokens.map(escapeFts5).join(' AND ')`，≤3 走 AND、>3 走 OR），
+ *   口径与 `docs/design/DEVELOPMENT-PLAN.md` P1-T03 的验收标准（「走哪支 + 条件个数」）一致。
+ *
  * ⚠️ **本函数内部会 tokenize 一次** ⇒ **不得**把「已切好的 token 串」喂进来
  *   （二次分词；详见文件头的说明）。
  *
