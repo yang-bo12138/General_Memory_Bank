@@ -6,8 +6,9 @@
  *   `graphProximity` / `recency`），与 §4.2 把 `growStability` 收成「唯一写入点」是同一条纪律：
  *   「五条路各写各的公式」必然漂移，而漂移**极难在实现期被发现**
  *   （两边的数都像正常值，测试也照样绿）。
- *   ⇒ 本文件**不实现任何打分公式**，只做：步骤 1 实体 → 步骤 2 三路候选 →
- *     步骤 2.5 去重 → 步骤 3 调打分 → 步骤 4 排序截断 + 事件。
+ *   ⇒ 本文件**不实现任何打分公式**，也**不另算粗筛窗口**
+ *     （两档窗口由 `scoring.ts` 的 `coarseGateWindow()` 独家提供 —— 「三路共用的唯一计算处」），
+ *     只做：步骤 1 实体 → 步骤 2 三路候选 → 步骤 2.5 去重 → 步骤 3 调打分 → 步骤 4 排序截断 + 事件。
  *
  * ⚠️ **流水线顺序不可换**（§4.6 首段）：
  *   路由（步骤 0，阶段 2 补）→ 三路候选（步骤 2）→ 融合打分（步骤 3）
@@ -50,17 +51,19 @@ import { createHash } from 'node:crypto';
 import type Database from 'better-sqlite3';
 
 import { resolveNow } from '../core/clock.js';
-import { MS_PER_DAY, intensity } from '../core/decay.js';
+import { intensity } from '../core/decay.js';
 import { resolveEntity } from '../core/entities.js';
 import { MemoryError } from '../core/errors.js';
 import type { RecallEventPayload } from '../core/events.types.js';
 import type { Params } from '../core/params.js';
 import {
   type Bm25Candidate,
+  type CoarseGateWindow,
   SCORE_WEIGHTS,
   type TextRouteMode,
   archiveFilterThreshold,
   assignGraphProximity,
+  coarseGateWindow,
   fuseScore,
   normalizeBm25,
   passesIntensityFilter,
@@ -500,47 +503,46 @@ function resolveContextEntityIds(
 // 四、步骤 2：三路候选
 // ═══════════════════════════════════════════════════════════════════════════
 
-/** 把 SQL 模板里的粗筛占位符换成真正的片段（或换成空串）。 */
-function buildSql(template: string, includeArchived: boolean): string {
-  return template.replace(COARSE_PLACEHOLDER, includeArchived ? '' : COARSE_WINDOW_SQL);
+/**
+ * 把 SQL 模板里的粗筛占位符换成真正的片段（或换成空串）。
+ *
+ * ⚠️ **判据取自 `coarseGateWindow(...).enabled`，而不是另写一份 `includeArchived`**：
+ *   「粗筛是否生效」这件事**只有一个出处**（`scoring.ts`）。
+ *   ⇒ 本文件不再自己判断一次 —— 否则阶段 2 的向量路（按 `enabled` 判）与
+ *     文本路 / 图谱路（按 `includeArchived` 判）一旦漂移，
+ *     **三路的闸门就不再是一视同仁**（铁律①），而且**不报错**（两个数都像正常值）。
+ */
+function buildSql(template: string, coarse: CoarseGateWindow): string {
+  return template.replace(COARSE_PLACEHOLDER, coarse.enabled ? COARSE_WINDOW_SQL : '');
 }
 
 /**
- * 粗筛窗口的两个时刻（§4.6 步骤 2 的推导）。
+ * 粗筛窗口的 SQL 绑定参数（§4.6 步骤 2 的两档窗口）。
  *
- * ```
- * @coarseCutoff       = now - MAX_STABILITY × ln(1/ARCHIVE_LINE) × 86400000        (默认 ≈ 539 天)
- * @coarseCutoffPinned = now - MAX_STABILITY × MAX_PIN_FACTOR × ln(1/ARCHIVE_LINE) × 86400000
- *                                                                                    (默认 ≈ 2696 天)
- * ```
- *
- * ⚠️ **`includeArchived === true` ⇒ 粗筛窗口整体取消**（§4.6 步骤 2）：
- *   「令 `@coarseCutoff = 0`（不设 last_access 粗筛）」——
- *   ⇒ 本实现直接把**粗筛片段从 SQL 里去掉**，而不是把阈值设成 0
+ * ⚠️ **窗口本身由 `scoring.ts` 的 `coarseGateWindow()` 独家计算**
+ *   （§4.6 步骤 2：「三路共用的唯一计算处」）——本文件**不重复实现**那个公式：
+ *   两份公式会漂移，而漂移**不报错**（两个数都像正常值），
+ *   只会让某一路的闸门悄悄变宽 ⇒ **用相似度废掉遗忘曲线**（铁律①要防的那件事）。
+ * ⚠️ **字段名与 SQL 的绑定名逐字相同**（`@coarseCutoff` / `@coarseCutoffPinned`）：
+ *   「名字即契约」⇒「把 pin 档绑成普通档」这类接错线在读代码时就看得出来。
+ * ⚠️ **`includeArchived === true` ⇒ 粗筛整体取消**（§4.6 步骤 2：
+ *   「令 `@coarseCutoff = 0`（不设 last_access 粗筛）」）——
+ *   本实现**把粗筛片段从 SQL 里去掉**，而不是把阈值设成 0
  *   （设成 0 仍会留下 `last_access >= 0` 这个下界，对负值时间戳仍是筛子）。
  *
- * @param params 生效参数
- * @param now 注入时钟
- * @param includeArchived 是否显式查询归档层
- * @returns 粗筛参数（`includeArchived` 时为 `null` ⇒ 不绑定）
+ * @param coarse `coarseGateWindow()` 的返回值
+ * @returns SQL 绑定参数（粗筛取消时为空 ⇒ 一个键都不绑）
  */
-function coarseCutoffs(
-  params: Params,
-  now: number,
-  includeArchived: boolean,
-): { coarseCutoff: number; coarseCutoffPinned: number } | null {
-  if (includeArchived) {
-    return null;
+function coarseBindingsOf(coarse: CoarseGateWindow): {
+  coarseCutoff?: number;
+  coarseCutoffPinned?: number;
+} {
+  if (!coarse.enabled) {
+    return {};
   }
-  // ⚠️ **两档窗口的推导**（§4.6 步骤 2）：
-  //   普通记忆：MAX_STABILITY × ln(1/ARCHIVE_LINE) 天（默认 180 × ln(20) ≈ 539 天）
-  //   被 pin  ：MAX_STABILITY × MAX_PIN_FACTOR × ln(1/ARCHIVE_LINE) 天（默认 ≈ 2696 天）
-  const archiveSpanDays = Math.log(1 / params.ARCHIVE_LINE);
-  const plainWindowDays = params.MAX_STABILITY * archiveSpanDays;
-  const pinnedWindowDays = params.MAX_STABILITY * params.MAX_PIN_FACTOR * archiveSpanDays;
   return {
-    coarseCutoff: now - plainWindowDays * MS_PER_DAY,
-    coarseCutoffPinned: now - pinnedWindowDays * MS_PER_DAY,
+    coarseCutoff: coarse.coarseCutoff,
+    coarseCutoffPinned: coarse.coarseCutoffPinned,
   };
 }
 
@@ -609,13 +611,13 @@ function collectTextCandidates(
   now: number,
 ): TextRouteResult {
   const { matchSql, fallbackLike } = buildMatchQuery(context);
-  const coarse = coarseCutoffs(params, now, includeArchived);
-  const coarseBindings = coarse === null ? {} : { ...coarse };
+  const coarse = coarseGateWindow(params, now, includeArchived);
+  const coarseBindings = coarseBindingsOf(coarse);
 
   // ── 分支 ①：FTS（`matchSql` 非空）──
   if (matchSql !== null && matchSql !== '') {
     const rows = db
-      .prepare(buildSql(TEXT_FTS_SQL, includeArchived))
+      .prepare(buildSql(TEXT_FTS_SQL, coarse))
       .all({ matchSql, ...coarseBindings }) as CandidateRow[];
     return { rows: filterAndSlice(rows, archiveLine, now), route: 'fts' };
   }
@@ -623,7 +625,7 @@ function collectTextCandidates(
   // ── 分支 ②：LIKE 单字兜底（`fallbackLike` 非空）──
   if (fallbackLike !== null && fallbackLike !== '') {
     const rows = db
-      .prepare(buildSql(TEXT_LIKE_SQL, includeArchived))
+      .prepare(buildSql(TEXT_LIKE_SQL, coarse))
       .all({ fallbackLike, ...coarseBindings }) as CandidateRow[];
     return { rows: filterAndSlice(rows, archiveLine, now), route: 'like' };
   }
@@ -657,10 +659,10 @@ function collectGraphCandidates(
   if (entityIds.length === 0) {
     return [];
   }
-  const coarse = coarseCutoffs(params, now, includeArchived);
-  const coarseBindings = coarse === null ? {} : { ...coarse };
+  const coarse = coarseGateWindow(params, now, includeArchived);
+  const coarseBindings = coarseBindingsOf(coarse);
   const rows = db
-    .prepare(buildSql(GRAPH_SQL, includeArchived))
+    .prepare(buildSql(GRAPH_SQL, coarse))
     .all({ entityIds: JSON.stringify(entityIds), ...coarseBindings }) as CandidateRow[];
   return filterAndSlice(rows, archiveLine, now);
 }
