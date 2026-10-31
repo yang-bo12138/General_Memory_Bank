@@ -102,6 +102,20 @@ export function blobToVector(blob: Buffer): Float32Array {
  *     **重训必须与「重分配归属」在同一个事务里**（归属的写入是 P2-T03 的
  *     `assignBucket` 的唯一职责 ⇒ 本模块**只管中心**，不碰归属）。
  *
+ * ⚠️ ★ **事务按上下文自适应**（P2-T05 的前置）：
+ *   ⚠️ **真实风险不是「事务不能嵌套」，而是「未被调用方事务包裹时会提前提交」**：
+ *     better-sqlite3 的事务**可以嵌套**（内层走 SAVEPOINT，不报错；提交 / 回滚语义正常——
+ *     外层回滚时内层的写入**一起回滚** ⇒ 事务对调用方是透明的），
+ *     所以「不能嵌套」从来不是这里的问题。
+ *     ⇒ 真正的失效形状是：**重训序列若没有被包在调用方的事务里** ⇒ 本函数会**自己提交**
+ *       （中心已落库）⇒ 而旧归属已被 FK CASCADE 清空 ⇒ 重分配还没做
+ *       ⇒ **向量路候选集为空，且不报错、不告警**（F8 的典型面孔）。
+ *   ⇒ 所以：**已在事务里** ⇒ 直接执行（不开嵌套事务，语义与外层一致）；
+ *     **不在事务里** ⇒ 自己开一个（保持对现有调用方的行为不变
+ *     ⇒ **不包事务的调用方不会失去原子性**）。
+ *   ⚠️ **不要**简单地把 `db.transaction(...)` 删掉 ⇒ 那会让不包事务的调用方
+ *     失去原子性 ⇒ 那是另一种静默失效。
+ *
  * @param db 库句柄
  * @param model 要落库的中心模型
  * @param now 更新时间戳（毫秒）
@@ -111,6 +125,72 @@ export function saveCentroidModel(
   model: IvfCentroidModel,
   now: number,
 ): void {
+  const write = (): void => {
+    pruneStaleCentroidCells(db, model);
+    upsertCentroidCells(db, model, now);
+  };
+
+  // ⚠️ **事务边界由「谁在事务里」决定，不由被调方猜**（同 `bucketAssign.ts` 的
+  //   `assertInWriteTransaction` 是同一套纪律）。
+  if (db.inTransaction) {
+    write();
+    return;
+  }
+  db.transaction(write)();
+}
+
+/**
+ * 把中心模型**写进**桶表（**只写不删**）—— `vector_coarse_cells` + `vector_fine_cells`。
+ *
+ * ⚠️ ★ **必须用 `ON CONFLICT DO UPDATE`，不能用 `INSERT OR REPLACE`**：
+ *   SQLite 的 `REPLACE` 冲突策略 = **DELETE + INSERT** ⇒ 而 `vector_cell_members`
+ *   的外键指向 `vector_fine_cells(fine_id)`（`ON DELETE CASCADE`）
+ *   ⇒ **`REPLACE` 会连带删掉桶归属行**（实测：1 行 ⇒ 0 行）
+ *   ⇒ 而粗桶也一样（`vector_fine_cells.coarse_id` → `vector_coarse_cells` 级联）
+ *   ⇒ **一次「重写同样的桶」就会静默清空全库桶归属**（F8 的另一副面孔）。
+ *   ⇒ `ON CONFLICT DO UPDATE` 是**纯 UPDATE** ⇒ 不触发级联 ⇒ 归属行保住。
+ *
+ * ⚠️ **只写不删**：陈旧行的清理是**另一件事**（`pruneStaleCentroidCells`）
+ *   ⇒ 因为「删陈旧行」会**级联删归属** ⇒ 重训序列必须**最后**才做那一步（§4.15.5 步骤 ③）。
+ *
+ * @param db 库句柄
+ * @param model 要落库的中心模型
+ * @param now 更新时间戳（毫秒）
+ */
+export function upsertCentroidCells(
+  db: Database.Database,
+  model: IvfCentroidModel,
+  now: number,
+): void {
+  const insertCoarse = db.prepare(
+    'INSERT INTO vector_coarse_cells (coarse_id, centroid, updated_at) VALUES (?, ?, ?) ' +
+      'ON CONFLICT(coarse_id) DO UPDATE SET centroid = excluded.centroid, updated_at = excluded.updated_at',
+  );
+  const insertFine = db.prepare(
+    'INSERT INTO vector_fine_cells (fine_id, coarse_id, centroid, updated_at) VALUES (?, ?, ?, ?) ' +
+      'ON CONFLICT(fine_id) DO UPDATE SET ' +
+      'coarse_id = excluded.coarse_id, centroid = excluded.centroid, updated_at = excluded.updated_at',
+  );
+  for (const cell of model.coarse) {
+    insertCoarse.run(cell.coarseId, vectorToBlob(cell.centroid), now);
+  }
+  for (const cell of model.fine) {
+    insertFine.run(cell.fineId, cell.coarseId, vectorToBlob(cell.centroid), now);
+  }
+}
+
+/**
+ * 删掉**不在模型里**的陈旧桶行（`vector_coarse_cells` + `vector_fine_cells`）。
+ *
+ * ⚠️ ★ **这一步会级联删掉桶归属行**（`ON DELETE CASCADE`）：
+ *   ⇒ 它**只能在**「归属已经全部迁到新桶之后」执行（§4.15.5 的步骤 ③）
+ *   ⇒ 先删 ⇒ **全库桶归属被清空**（向量路整体消失、**不报错**）。
+ *   ⇒ 粗桶先删还是细桶先删**都会**级联 ⇒ 但显式先删细桶 ⇒ 顺序不依赖级联行为。
+ *
+ * @param db 库句柄
+ * @param model 当前生效的中心模型（**不在它里面的**桶行即为陈旧）
+ */
+export function pruneStaleCentroidCells(db: Database.Database, model: IvfCentroidModel): void {
   const keepCoarse = new Set(model.coarse.map((cell) => cell.coarseId));
   const keepFine = new Set(model.fine.map((cell) => cell.fineId));
 
@@ -123,35 +203,19 @@ export function saveCentroidModel(
 
   const deleteCoarse = db.prepare('DELETE FROM vector_coarse_cells WHERE coarse_id = ?');
   const deleteFine = db.prepare('DELETE FROM vector_fine_cells WHERE fine_id = ?');
-  const insertCoarse = db.prepare(
-    'INSERT OR REPLACE INTO vector_coarse_cells (coarse_id, centroid, updated_at) VALUES (?, ?, ?)',
-  );
-  const insertFine = db.prepare(
-    'INSERT OR REPLACE INTO vector_fine_cells (fine_id, coarse_id, centroid, updated_at) ' +
-      'VALUES (?, ?, ?, ?)',
-  );
 
-  const write = db.transaction((): void => {
-    // ⚠️ **先删细桶再删粗桶**：细桶的外键指向粗桶（删粗桶会级联删细桶，
-    //   但显式先删细桶 ⇒ 顺序不依赖级联行为）。
-    for (const row of staleFine) {
-      if (!keepFine.has(row.fine_id)) {
-        deleteFine.run(row.fine_id);
-      }
+  // ⚠️ **先删细桶再删粗桶**：细桶的外键指向粗桶（删粗桶会级联删细桶，
+  //   但显式先删细桶 ⇒ 顺序不依赖级联行为）。
+  for (const row of staleFine) {
+    if (!keepFine.has(row.fine_id)) {
+      deleteFine.run(row.fine_id);
     }
-    for (const row of staleCoarse) {
-      if (!keepCoarse.has(row.coarse_id)) {
-        deleteCoarse.run(row.coarse_id);
-      }
+  }
+  for (const row of staleCoarse) {
+    if (!keepCoarse.has(row.coarse_id)) {
+      deleteCoarse.run(row.coarse_id);
     }
-    for (const cell of model.coarse) {
-      insertCoarse.run(cell.coarseId, vectorToBlob(cell.centroid), now);
-    }
-    for (const cell of model.fine) {
-      insertFine.run(cell.fineId, cell.coarseId, vectorToBlob(cell.centroid), now);
-    }
-  });
-  write();
+  }
 }
 
 /**

@@ -105,6 +105,7 @@ export {
   type RestoreEventPayload,
   type SweepEventPayload,
   type SweepItemEventPayload,
+  type SweepRebuildBucketsEventPayload,
   type SweepSummaryEventPayload,
   type TouchEventPayload,
   type UnpinEventPayload,
@@ -173,6 +174,13 @@ export {
 // ⚠️ 类型名**全部来自 `src/` 里已有的定义**（先 grep 再导），不自造别名。
 export { type MemoryConfig, MemoryStore } from './store/MemoryStore.js';
 export type { MergeEntitiesResult } from './store/entities.js';
+export type {
+  MaintainContext,
+  MemoryMaintainer,
+  RebuildBucketsOptions,
+  RebuildBucketsResult,
+  RebuildOnceOutcome,
+} from './store/maintain.js';
 export type {
   MediaType,
   MemoryKind,

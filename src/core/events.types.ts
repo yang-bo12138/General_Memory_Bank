@@ -296,6 +296,27 @@ export interface SweepSummaryEventPayload {
   members?: number;
 }
 
+/**
+ * `sweep` 事件的 **`action='rebuildBuckets'`** 字段集（§8.4 硬规则 4）。
+ *
+ * ⚠️ **为什么单列一个接口**（而不是复用 `SweepSummaryEventPayload`）：
+ *   §8.4 硬规则 4 明写「**payload 按 `action` 分组写清字段集**」
+ *   ——`action='rebuildBuckets'` 的字段集就是 `cells, members` 两个。
+ *   ⇒ 而 `SweepSummaryEventPayload` 把四个 action 的字段**并在一个接口里、且全部必填**
+ *   ⇒ 用它写 `rebuildBuckets` 就得**把 `purged` / `vacuumed` / `coactPairsActive` 一并填上**
+ *   ⇒ 那等于**伪造**本次重训「清理了 0 条、淘汰了 0 条共激活边」这些**根本没发生**的事实
+ *   ⇒ 消费方按 `type='sweep'` 推断「数据被销毁」时会被误导（硬规则 4 的前半段）。
+ *   ⇒ 本接口把「按 action 分组」这条规则落到**类型**上。
+ */
+export interface SweepRebuildBucketsEventPayload {
+  /** 维护动作（§8.4：四个维护动作共用同一个 `events.type`）。 */
+  action: 'rebuildBuckets';
+  /** 新一代的**细桶**数（持有成员的桶）。 */
+  cells: number;
+  /** 重分配后的**桶归属条数**。 */
+  members: number;
+}
+
 /** `sweep` 事件的**逐条**字段集（§8.4 的 sweep 行）。 */
 export interface SweepItemEventPayload {
   id: string;
@@ -304,7 +325,10 @@ export interface SweepItemEventPayload {
 }
 
 /** `sweep` 事件的 payload（逐条 / 汇总两套）。 */
-export type SweepEventPayload = SweepItemEventPayload | SweepSummaryEventPayload;
+export type SweepEventPayload =
+  | SweepItemEventPayload
+  | SweepSummaryEventPayload
+  | SweepRebuildBucketsEventPayload;
 
 /**
  * `config` 事件的 payload（§8.4 的 config 行）。

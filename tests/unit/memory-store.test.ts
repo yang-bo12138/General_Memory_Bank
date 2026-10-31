@@ -339,11 +339,11 @@ describe('P1-T10 · 门面的 10 个公开方法（§6）', () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 二、边界：公开面恰好 10 个方法 / 错误原样透出 / 只读拒绝
+// 二、边界：公开面恰好 11 个方法 / 错误原样透出 / 只读拒绝
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe('P1-T10 · 门面的边界（公开面 / 错误透出 / 只读）', () => {
-  it('★ 公开方法恰好是那 10 个（不多不少，也没有第 11 个）', () => {
+  it('★ 公开方法恰好是那 11 个（阶段 1 的 10 个 + 阶段 2 的 rebuildVectorBuckets）', () => {
     const methods = Object.getOwnPropertyNames(MemoryStore.prototype)
       .filter((name) => name !== 'constructor')
       .filter((name) => {
@@ -352,12 +352,15 @@ describe('P1-T10 · 门面的边界（公开面 / 错误透出 / 只读）', () 
       })
       .sort();
 
+    // ⚠️ **阶段 2 新增的是 `rebuildVectorBuckets`**（DEVELOPMENT-PLAN.md §3.1 的方法归位表：
+    //   阶段 2 = 1 个方法 = `rebuildVectorBuckets`）⇒ 公开面从 10 个长到 11 个。
     expect(methods).toEqual([
       'get',
       'link',
       'linkByIds',
       'mergeEntities',
       'pin',
+      'rebuildVectorBuckets',
       'recall',
       'setAlias',
       'touch',

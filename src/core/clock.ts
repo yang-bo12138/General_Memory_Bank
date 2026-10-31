@@ -50,6 +50,9 @@ export const CLOCK_EXEMPT_METHODS: Readonly<Record<string, string>> = {
   setParams: '不写任何时间派生字段（events.at 用真实时钟，不参与计算）',
   setAlias: '不写任何时间派生字段（events.at 用真实时钟，不参与计算）',
   mergeEntities: 'edges.last_active 取两条边中的较大者，不引入当前时刻',
+  rebuildVectorBuckets:
+    '桶中心的 updated_at 用真实时钟，且只用于观测（库级真相看 vector_fine_cells.updated_at）、' +
+    '不参与任何计算（同 setParams 的 events.at 口径）',
 };
 
 /** 时钟解析器：注入优先，缺省用真实时钟（§11.1「缺省 `Date.now()`」）。 */
