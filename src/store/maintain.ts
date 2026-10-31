@@ -1,5 +1,6 @@
 /**
- * 维护类操作 —— P2-T05（`rebuildVectorBuckets`；DESIGN-v2.md §4.15.5 / §6 / §9.3.2 ④）。
+ * 维护类操作 —— P2-T05（`rebuildVectorBuckets`；DESIGN-v2.md §4.15.5 / §6 / §9.3.2 ④）
+ * 与 P2-T06（启动对账 / 桶质量退化检测；§9.3.2 ③ / ④）。
  *
  * ⚠️ **本文件是 §6 公开方法 `rebuildVectorBuckets` 的落点**（DEVELOPMENT-PLAN.md §3.1
  *   的方法归位表：阶段 2 新增的**唯一**公开方法就是它）。
@@ -7,6 +8,9 @@
  * ⚠️ **重训的三步序列在 `src/vector/rebuild.ts`**（向量层）：
  *   本文件只做**存储层该做的事**——取参数、记事件、管 `inRetrain`、失效中心缓存。
  *   ⇒ 桶表名**不出现**在本文件里（§4.6 步骤 2c：流水线不得引用桶表名）。
+ *
+ * ⚠️ ★ **启动对账与桶质量在 `src/vector/reconcile.ts` / `src/vector/bucketQuality.ts`**
+ *   （向量层）⇒ 本文件只做**接线**（参数、`inRetrain`、事务包装）。
  *
  * ⚠️ ★ **并发口径**（§4.15.5 的 v2.1 裁决，与 ADR-5 一致）：
  *   · **库内没有定时器、没有后台线程** ⇒ 重训由**调用方显式调用**本文件暴露的方法触发；
@@ -20,6 +24,7 @@
  *   查询侧才可能观察到 `inRetrain = true`。
  *   ⇒ **推论：面板不得把「`inRetrain=false`」解读成「没在重训」**——
  *     它只说明「**本实例看不到**重训」；**库级真相看 `vector_fine_cells.updated_at`**。
+ *   ⇒ **对账也用这条**：重训进行中 ⇒ 对账结论不可信 ⇒ **整体跳过并报告**（§9.3.2 ③）。
  */
 
 import type Database from 'better-sqlite3';
@@ -29,6 +34,11 @@ import type { Params } from '../core/params.js';
 import { LOG_ACTIONS, type Logger } from '../util/log.js';
 import type { BucketAssignContext } from '../vector/bucketAssign.js';
 import { type BucketRebuildHooks, rebuildBuckets } from '../vector/rebuild.js';
+import {
+  type ReconcileOptions,
+  type ReconcileOutcome,
+  reconcileBuckets,
+} from '../vector/reconcile.js';
 import type { EventWriter } from './events.js';
 import { runWriteTransaction } from './transaction.js';
 
@@ -275,4 +285,86 @@ export class MemoryMaintainer {
 
     return { rebuilt: true, degraded, cells: result.cells, members: result.members };
   }
+
+  /**
+   * 启动对账 + 桶质量（**同一次扫描**）—— §9.3.2 ③ / ④。
+   *
+   * ⚠️ ★ **这一遍同时给出「对账结论」与「要不要重训」的判据**：
+   *   `outcome.quality.degraded` ⇒ **建议**调用方调 `rebuildVectorBuckets()`
+   *   ⇒ **库不自动重训**（重训是 1~3 分钟的阻塞操作，ADR-5）。
+   *   ⇒ 典型的启动序列：
+   *   ```ts
+   *   const outcome = maintainer.reconcileBuckets();
+   *   maintainer.rebuildVectorBucketsOnce(() => outcome.quality.degraded, { reason: 'startup' });
+   *   ```
+   *   ⇒ ⚠️ **注意**：第二次调 `reconcileBuckets()` 会**再扫一遍** ⇒
+   *     要省这一遍 ⇒ **把第一次的 `quality` 传进 `rebuildVectorBucketsOnce`**（如上）。
+   *
+   * ⚠️ ★ **重训进行中 ⇒ 整体跳过**（`outcome.report.skipReason = 'retrain-in-progress'`）：
+   *   此刻「中心已换、归属只迁了一半」⇒ 结论不可信；
+   *   而且修复会用**旧中心**把缺失的记忆挂到**旧代桶**上 ⇒ 重训的步骤 ③ 会**级联删掉**
+   *   ⇒ 那批记忆**永久没有归属**（静默、永久）⇒ 宁可跳过并报告。
+   *
+   * @param options 覆盖项（一般不用传 ⇒ 参数与 `inRetrain` 都由本类接线）
+   * @returns 对账报告 + 桶质量
+   */
+  reconcileBuckets(options?: Partial<ReconcileOptions>): ReconcileOutcome {
+    const context = this.#context;
+    const outcome = reconcileBuckets(
+      context.db,
+      // ⚠️ **事务语义只有一份实现**（`src/store/transaction.ts` 的 `runWriteTransaction`）
+      //   ⇒ 向量层不自己包事务（依赖方向单向：store → vector）。
+      <T>(body: () => T): T => runWriteTransaction(context.db, body),
+      {
+        // ⚠️ **中心模型取缓存里的那份**（= 当前代）⇒ 缺失的记忆归入**最近的当前代细桶**。
+        centroids: () => context.buckets.centroids(),
+        nprobeCoarse: context.params.ROUTER_NPROBE_COARSE,
+        maxBucketSize: context.params.ROUTER_BUCKET_MAX,
+        // ⚠️ ★ **重训进行中 ⇒ 跳过**（`inRetrain` 是本实例的真相，§4.15.5）。
+        isRetraining: () => this.#inRetrain,
+        ...options,
+      },
+    );
+
+    const report = outcome.report;
+    if (report.skipReason !== null) {
+      // ⚠️ **跳过必须留痕**（不静默）：否则调用方会把「没查」当成「查过了、没问题」。
+      context.logger.warn(LOG_ACTIONS.sweep, {
+        reason: 'reconcile-skipped',
+        detail: `启动对账被跳过：${report.skipReason}（结论不可信 ⇒ 不据此判断桶健康）`,
+      });
+      return outcome;
+    }
+
+    if (!report.consistent) {
+      // ⚠️ **对账不通过 ⇒ 记告警**（§9.3.2 ③：「若对账每次都发现差异 ⇒ 那是 bug，不是数据问题」）。
+      context.logger.warn(LOG_ACTIONS.sweep, {
+        reason: 'reconcile-inconsistent',
+        missing: report.missing,
+        dirty: report.dirty,
+        duplicates: report.duplicates,
+        softDeleted: report.softDeleted,
+      });
+    }
+
+    return outcome;
+  }
+}
+
+/**
+ * `verifyIntegrity` 的 `bucketCoverage`（§6：已有向量且已入桶的记忆占比）—— **纯读**。
+ *
+ * ⚠️ **「只算不修」**：它是**健康度**指标 ⇒ 必须在修复**之前**测
+ *   ⇒ 所以它走「**只检测**的对账」⇒ 修复后就恒为 1 ⇒ 没有信息量了。
+ *
+ * ⚠️ **不额外扫全表**：覆盖率来自对账那**同一次**桶侧扫描 ⇒ §9.3.2 ④ 的
+ *   「这一遍可与启动对账合并成同一次扫描」。
+ *
+ * @param db 库句柄
+ * @returns 覆盖率（`0`~`1`；库里没有向量时取 `1` = 没有欠账）
+ */
+export function computeBucketCoverage(db: Database.Database): number {
+  return reconcileBuckets(db, <T>(body: () => T): T => runWriteTransaction(db, body), {
+    detectOnly: true,
+  }).report.coverage;
 }
