@@ -5,16 +5,26 @@
  *   只测「通过」的话，一个「永远返回通过」的脚本也能全绿 ⇒ 闸门形同虚设。
  */
 
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { describe, expect, it } from 'vitest';
 
 import {
+  ANCHOR_PATH_BINDINGS,
+  EXPECTED_ANCHOR_PATH_COUNTS,
   EXPECTED_ANCHOR_ROWS,
   EXPECTED_HARD_RULE_COUNT,
+  checkAnchorPathBindings,
   compareAnchorRows,
   countHardRules,
   findAnchorTable,
   normalizeCell,
 } from '../../scripts/check-anchor.js';
+import {
+  ALLOWED_BUCKET_WRITE_FILES,
+  checkBucketWriteSites,
+} from '../../scripts/check-bucket-write.js';
 import {
   EXPECTED_MISSING_EXPRESSION_GROUPS,
   EXPECTED_READONLY_WRITE_METHODS,
@@ -43,6 +53,14 @@ import {
   parseSection8_4PayloadKeys,
   parseSweepActionGroups,
 } from '../../scripts/check-payload-keys.js';
+import {
+  containsAnchorKeyword,
+  normalizeAnchorLabel,
+  parseAnchorKeywords,
+  parseAnchorPathLabels,
+} from '../../scripts/lib/anchor-match.js';
+import { scanSourceTree } from '../../scripts/lib/bucket-write-scan.js';
+import { blankComments, extractFunctionBody } from '../../scripts/lib/code-span.js';
 import {
   extractBacktickSpans,
   extractPayloadKeys,
@@ -234,6 +252,193 @@ describe('P0-T06 · check-anchor（跨节锚定 5 行 × 3 列）', () => {
 
   it('写死的期望恰好五行', () => {
     expect(EXPECTED_ANCHOR_ROWS).toHaveLength(5);
+  });
+});
+
+describe('P2-T04 · check-bucket-write（§9.3.0 的 lint 规则）', () => {
+  /** 仓库根（本测试文件所在目录的上一级）。 */
+  const REPO_ROOT = fileURLToPath(new URL('../..', import.meta.url));
+
+  it('白名单是**写死的期望值**，且恰好一个文件', () => {
+    // ⚠️ C31：分母必须是外部写死的期望值 ⇒ 白名单不是「本次扫出来的」。
+    expect(ALLOWED_BUCKET_WRITE_FILES).toEqual(['vector/bucketAssign.ts']);
+  });
+
+  it('真实的仓库：桶归属的写入只出现在唯一写入点', () => {
+    const hits = scanSourceTree(resolve(REPO_ROOT, 'src'));
+    expect(checkBucketWriteSites(hits)).toEqual([]);
+  });
+
+  it('★ 反例：别处出现裸写 ⇒ 必须报红并点名那个文件', () => {
+    const hits = [
+      { file: 'vector/bucketAssign.ts', line: 169 },
+      { file: 'store/write.ts', line: 854 },
+    ];
+    const diffs = checkBucketWriteSites(hits);
+    expect(diffs.length).toBeGreaterThan(0);
+    expect(diffs.map((d) => d.reason).join(' ')).toContain('store/write.ts');
+  });
+
+  it('★ 反例：白名单写成空集 + 源码里一处裸写都没有 ⇒ **必须报红**（真空守卫）', () => {
+    // ⚠️ 「每一处都在白名单内」在这种情况下**恒真** ⇒ 闸门形同虚设
+    //   ⇒ 必须另有一条「命中数 > 0」的判据把它抓住（C31 的症状）。
+    const diffs = checkBucketWriteSites([]);
+    expect(diffs.length).toBeGreaterThan(0);
+    expect(diffs.map((d) => d.reason).join(' ')).toContain('真空守卫');
+  });
+
+  it('★ 反例：白名单里的文件一处写入都没扫到 ⇒ 必须报红（白名单陈旧）', () => {
+    const diffs = checkBucketWriteSites([{ file: 'store/write.ts', line: 1 }]);
+    expect(diffs.map((d) => d.reason).join(' ')).toContain('白名单');
+  });
+});
+
+describe('P2-T04 · check-anchor 的「动作关键词落在管辖路径上」', () => {
+  /** 仓库根。 */
+  const REPO_ROOT = fileURLToPath(new URL('../..', import.meta.url));
+
+  it('真实的设计稿 + 真实的源码：每条路径都命中（待补的除外）', () => {
+    const rows = findAnchorTable(markdown) ?? [];
+    const { outcomes, diffs } = checkAnchorPathBindings(rows, {
+      repoRoot: REPO_ROOT,
+      designDoc: markdown,
+    });
+    expect(diffs).toEqual([]);
+    expect(outcomes.length).toBe(27);
+  });
+
+  it('待补的路径**被记进结果**（不许静默跳过），且**不判红**', () => {
+    const rows = findAnchorTable(markdown) ?? [];
+    const { outcomes, diffs } = checkAnchorPathBindings(rows, {
+      repoRoot: REPO_ROOT,
+      designDoc: markdown,
+    });
+    const pending = outcomes.filter((outcome) => outcome.status === 'pending');
+    // ⚠️ **必须非空**：否则这条断言就是「待补机制根本没生效」的假绿。
+    expect(pending.length).toBeGreaterThan(0);
+    expect(diffs).toEqual([]);
+    for (const outcome of pending) {
+      expect(outcome.detail.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('★ 反例：删掉「桶归属同步」的一条管辖路径 ⇒ 必须报红（分母写死）', () => {
+    const rows = (findAnchorTable(markdown) ?? []).map((row) => [...row]);
+    const target = rows.find((row) => normalizeCell(row[0] ?? '') === '桶归属同步');
+    expect(target).toBeDefined();
+    if (target !== undefined) {
+      // ⚠️ 把四个路径删成三个 ⇒ 「实际命中几个」当分母的话 ⇒ 脚本自己看不出来
+      //   ⇒ 必须靠**写死的期望值**（4）抓住。
+      target[2] = '§4.9 步骤 2 / §4.9 步骤 3c ② / §4.9 步骤 4';
+    }
+    const { diffs } = checkAnchorPathBindings(rows, {
+      repoRoot: REPO_ROOT,
+      designDoc: markdown,
+    });
+    expect(diffs.length).toBeGreaterThan(0);
+    expect(diffs.map((d) => d.reason).join(' ')).toContain('管辖路径条数');
+  });
+
+  it('★ 反例：落点表少一条 ⇒ 必须报红（不是「少一个也照样绿」）', () => {
+    const rows = findAnchorTable(markdown) ?? [];
+    const original = ANCHOR_PATH_BINDINGS.findIndex((rule) => rule.rule === '桶归属同步');
+    const binding = ANCHOR_PATH_BINDINGS[original];
+    expect(binding).toBeDefined();
+    if (binding === undefined) {
+      return;
+    }
+    // ⚠️ **落点表少一条** ⇒ 若拿「实际命中几个」当分母 ⇒ 脚本自己看不出来
+    //   ⇒ 必须靠**写死的期望值**（4）抓住。
+    const shrunk = { ...binding, paths: binding.paths.slice(0, binding.paths.length - 1) };
+    const patched = ANCHOR_PATH_BINDINGS.map((rule, index) => (index === original ? shrunk : rule));
+    const { diffs } = checkAnchorPathBindings(rows, {
+      repoRoot: REPO_ROOT,
+      designDoc: markdown,
+      bindings: patched,
+    });
+    expect(diffs.length).toBeGreaterThan(0);
+    expect(diffs.map((d) => d.reason).join(' ')).toContain('落点条数');
+  });
+
+  it('★ 反例：落点指向一个没有关键词的文件 ⇒ 必须报红', () => {
+    const rows = findAnchorTable(markdown) ?? [];
+    const original = ANCHOR_PATH_BINDINGS.findIndex((rule) => rule.rule === '桶归属同步');
+    const patched = ANCHOR_PATH_BINDINGS.map((rule, index) =>
+      index === original
+        ? {
+            ...rule,
+            paths: rule.paths.map((path) =>
+              path.label === '§4.9 步骤 4'
+                ? { ...path, file: 'src/store/write.ts', symbol: 'write' }
+                : path,
+            ),
+          }
+        : rule,
+    );
+    // ⚠️ `write()` 函数体里**没有** `assignBucket`（它在 `createMemory` 里）
+    //   ⇒ 落点写错 ⇒ 必须被抓出来（这正是「错列比缺行更危险」的那一类）。
+    const { diffs } = checkAnchorPathBindings(rows, {
+      repoRoot: REPO_ROOT,
+      designDoc: markdown,
+      bindings: patched,
+    });
+    expect(diffs.length).toBeGreaterThan(0);
+    expect(diffs.map((d) => d.reason).join(' ')).toContain('§4.9 步骤 4');
+  });
+});
+
+describe('P2-T04 · 关键词与路径标签的口径', () => {
+  it('关键词从锚定表那一列解析（去反引号、拆分）', () => {
+    expect(
+      parseAnchorKeywords('`vector_cell_members` / `assignBucket` / `unassignBucket`'),
+    ).toEqual(['vector_cell_members', 'assignBucket', 'unassignBucket']);
+    expect(parseAnchorKeywords('吻合率 / 只漏不错')).toEqual(['吻合率', '只漏不错']);
+  });
+
+  it('路径标签规范化（去 markdown、去掉末尾的括号补充）', () => {
+    expect(normalizeAnchorLabel('§4.9.1 步骤 4（**四条 embedding 赋值路径一条都不能漏**）')).toBe(
+      '§4.9.1 步骤 4',
+    );
+    expect(normalizeAnchorLabel('§3 `cluster_snapshot_meta`')).toBe('§3 cluster_snapshot_meta');
+  });
+
+  it('路径标签逐条解析出写死的条数（4 / 6 / 6 / 7 / 4）', () => {
+    const rows = findAnchorTable(markdown) ?? [];
+    const counts = rows.map((row) => parseAnchorPathLabels(row[2] ?? '').length);
+    expect(counts).toEqual(EXPECTED_ANCHOR_PATH_COUNTS.map(([, count]) => count));
+  });
+
+  it('★ ASCII 关键词按**词边界**匹配（`mode` 不命中 `model`）', () => {
+    expect(containsAnchorKeyword('mode: flat_auto', 'mode')).toBe(true);
+    expect(containsAnchorKeyword('the model changed', 'mode')).toBe(false);
+    expect(containsAnchorKeyword("mode === 'absent'", 'absent')).toBe(true);
+  });
+
+  it('★ 中文短语**去标点**后匹配（「只漏、不错」≡「只漏不错」）', () => {
+    expect(containsAnchorKeyword('覆盖不足时只漏、不错', '只漏不错')).toBe(true);
+    expect(containsAnchorKeyword('覆盖不足时只漏、不错', '只漏没错')).toBe(false);
+  });
+
+  it('★ 注释涂白后下标不变（长度一致）⇒ 区间定位不会漂', () => {
+    const source = 'const a = 1; // assignBucket 的注释\nconst b = 2;\n';
+    const blanked = blankComments(source);
+    expect(blanked.length).toBe(source.length);
+    expect(blanked).not.toContain('assignBucket');
+  });
+
+  it('★ 函数体提取按花括号配对（SQL 模板里的括号不算）', () => {
+    const source = [
+      'function demo(): void {',
+      "  db.prepare('SELECT {x} FROM t').run();",
+      '  assignBucket();',
+      '}',
+      'function other(): void {',
+      '  unassignBucket();',
+      '}',
+    ].join('\n');
+    const body = extractFunctionBody(source, 'demo');
+    expect(body).toContain('assignBucket');
+    expect(body).not.toContain('unassignBucket');
   });
 });
 

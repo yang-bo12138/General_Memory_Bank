@@ -28,10 +28,10 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 /**
- * ★ **写死的期望值**：门禁必须串起的 **10 条子命令**（C31 的分母）。
+ * ★ **写死的期望值**：门禁必须串起的 **11 条子命令**（C31 的分母）。
  *
- * ⚠️ 这 10 条是「阶段 0 的全部验收门禁 + F-08 ③ 的静态守卫」：
- *   类型检查 → 代码风格 → 单元测试 → 7 条契约脚本。
+ * ⚠️ 这 11 条是「阶段 0 的全部验收门禁 + F-08 ③ 的静态守卫 + P2 的两个新门禁」：
+ *   类型检查 → 代码风格 → 单元测试 → 8 条契约脚本。
  *   改这个数组等于改「门禁是什么」，必须是一次**显式**的改动。
  *
  * ⚠️ **加一条门禁就必须同步改这个数组**（否则 `check:contract-ids` 内联调用本模块时
@@ -46,6 +46,7 @@ export const EXPECTED_GATE_COMMANDS: readonly string[] = [
   'check:payload-keys',
   'check:clock',
   'check:anchor',
+  'check:bucket-write',
   'check:contract-ids',
   'check:doc-counts',
   'check:clamp',
