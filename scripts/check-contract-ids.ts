@@ -13,6 +13,7 @@
  * 用法：`pnpm exec tsx scripts/check-contract-ids.ts`
  */
 
+import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -22,6 +23,7 @@ import {
   METHODS_THROWING_NOT_FOUND,
   METHODS_THROWING_READONLY_VIOLATION,
   MISSING_IDS_KEY,
+  MemoryErrorCode,
   NOT_FOUND_METHODS_WITH_MISSING_IDS,
   WARNING_ONLY_CASES,
 } from '../src/core/errors.js';
@@ -31,6 +33,7 @@ import {
   DEFAULT_PARAMS,
   VECTOR_OVERFETCH_FACTOR,
 } from '../src/core/params.js';
+import { stripComments } from './check-clock.js';
 import { checkGateEntry, compareNameSets, readPackageJson } from './check-gate-entry.js';
 import {
   extractBacktickSpans,
@@ -503,10 +506,214 @@ export function checkContracts(markdown: string): ContractDiff[] {
   return diffs;
 }
 
+// ─────────────────────────── 「源码实发 ⊆ 白名单」的守卫 ───────────────────────────
+
+/**
+ * ⚠️ **这条守卫补的是一个「三方比对看不见」的方向**（实测漏洞）：
+ *   既有门禁做的是**三方互相比对**（写死的期望 ↔ 代码里的常量 ↔ 设计稿的表格）。
+ *   ⇒ 它们保证「白名单与文档一致」，却**从不检查「源码里实际发出的 warning code 集合」**
+ *   ⇒ **新加一个 warning code 而忘了登记白名单 ⇒ 门禁全绿**。
+ *   实测：`src/store/write.ts` 已经有两个 warning code
+ *   （`ALIAS_CONFLICT` 与 `ALIAS_TARGET_NOT_LINKED`），而三处白名单都还只有前者
+ *   ⇒ `pnpm run verify` **EXIT=0**。
+ *
+ * ⇒ 这是 **C36「同一件事不得有两套词」**的经典漏洞：
+ *   warning code 这个「键」现在有**两处**来源（源码的判别字面量 + 白名单数组），
+ *   而门禁只让它们**各自与文档一致**，不保证它们**彼此一致**。
+ *
+ * ★ **本段的函数是纯函数、可注入**（`source` 与白名单都是入参）
+ *   ⇒ 负控可以直接喂**假源码文本**，**不必去改 `src/store/write.ts`**
+ *   ⇒ 守卫既可测，又不污染源码（这是它能不能被信任的关键）。
+ */
+
+/** 扫源码目录的根。 */
+const SRC_ROOT = 'src';
+
+/**
+ * 剥掉注释（复用 `check-clock.ts` 的实现——**它保留换行与字符位置**）。
+ *
+ * ⚠️ **必须剥注释**：源码注释里大量出现 warning code 的字面量举例
+ *   （「这里回一条 `ALIAS_TARGET_NOT_LINKED`」）
+ *   ⇒ 不剥注释会把**举例**当成「实发」⇒ 门禁误报。
+ */
+function codeOnly(source: string): string {
+  return stripComments(source);
+}
+
+/**
+ * 扫描源码里**实际发出**的 warning code。
+ *
+ * ⚠️ **判据是「`code: 'XXX'` 这个形状」**，不是「文件里出现过这个字符串」
+ *   ——后者会把注释里的举例、类型文档里的引用全部算进去。
+ *
+ * @param source 源码文本
+ * @returns 去重后的 code 列表（排序）
+ */
+export function findEmittedWarningCodes(source: string): string[] {
+  const codes = new Set<string>();
+  const text = codeOnly(source);
+  const pattern = /\bcode\s*:\s*'([A-Za-z_][A-Za-z0-9_]*)'/g;
+  let match = pattern.exec(text);
+  while (match !== null) {
+    codes.add(match[1] ?? '');
+    match = pattern.exec(text);
+  }
+  return [...codes].sort();
+}
+
+/**
+ * 找出「源码实发、但白名单没登记」的 warning code。
+ *
+ * ⚠️ **是「⊆」不是「=」**：白名单里可以有**暂时没有实发**的 code
+ *   （例如设计上允许、当前还没触发的情形）⇒ 那由既有的三方比对负责。
+ *
+ * @param source 源码文本
+ * @param whitelist 已登记的 code 名单（`WARNING_ONLY_CASES`）
+ * @returns 未登记的 code（排序）
+ */
+export function findUnregisteredWarningCodes(
+  source: string,
+  whitelist: readonly string[],
+): string[] {
+  return findEmittedWarningCodes(source).filter((code) => !whitelist.includes(code));
+}
+
+/**
+ * 守卫：源码实发的 warning code ⊆ 白名单。
+ *
+ * @param source 源码文本
+ * @param whitelist 已登记的 code 名单
+ * @returns 不一致清单（空 = 一致）
+ */
+export function checkWarningCodesRegistered(
+  source: string,
+  whitelist: readonly string[],
+): ContractDiff[] {
+  return findUnregisteredWarningCodes(source, whitelist).map((code) => ({
+    reason:
+      `源码里实发的 warning code「${code}」没有登记进白名单（src/core/errors.ts 的 WARNING_ONLY_CASES）` +
+      '——§11.2「不抛错，走 write() 的 warnings」那一行必须同步登记：' +
+      '否则调用方拿到一个**没人认识的 code**，而门禁此前看不见它（实测：登记缺失时 verify 仍 EXIT=0）',
+  }));
+}
+
+/**
+ * 扫描源码里 `new MemoryError(...)` 用到的**字面量** code。
+ *
+ * ⚠️ **只认两种字面量形状**：`MemoryErrorCode.X` 与 `'X'`。
+ *   动态实参（`new MemoryError(someVar, …)`）**判不了** ⇒ 跳过（不误报）。
+ *
+ * @param source 源码文本
+ * @param closedSet 封闭集合（`MemoryErrorCode` 的五个值）
+ * @returns 不在封闭集合里的 code（排序）
+ */
+export function findUnknownMemoryErrorCodes(
+  source: string,
+  closedSet: readonly string[],
+): string[] {
+  const text = codeOnly(source);
+  const found = new Set<string>();
+  const patterns = [
+    /new\s+MemoryError\s*\(\s*MemoryErrorCode\.([A-Za-z_][A-Za-z0-9_]*)/g,
+    /new\s+MemoryError\s*\(\s*'([A-Za-z_][A-Za-z0-9_]*)'/g,
+  ];
+  for (const pattern of patterns) {
+    let match = pattern.exec(text);
+    while (match !== null) {
+      const code = match[1] ?? '';
+      if (!closedSet.includes(code)) {
+        found.add(code);
+      }
+      match = pattern.exec(text);
+    }
+  }
+  return [...found].sort();
+}
+
+/**
+ * 守卫：`new MemoryError(...)` 的 code 必须落在 `MemoryErrorCode` 的**封闭集合**里。
+ *
+ * ⚠️ §11.2 的五个 code 是**封闭集合**：凭空造一个新错误码 =
+ *   给调用方一个它没学过、也没文档可查的 code
+ *   ⇒ 比「抛一个未类型化的错误」更难处置。
+ *
+ * @param sources 参与检查的源码（文件名 + 文本）
+ * @param closedSet 封闭集合
+ */
+export function checkMemoryErrorCodesClosed(
+  sources: ReadonlyArray<{ file: string; source: string }>,
+  closedSet: readonly string[],
+): ContractDiff[] {
+  const diffs: ContractDiff[] = [];
+  for (const { file, source } of sources) {
+    for (const code of findUnknownMemoryErrorCodes(source, closedSet)) {
+      diffs.push({
+        reason:
+          `${file} 里 new MemoryError(...) 用了封闭集合之外的 code「${code}」` +
+          `——§11.2 的五个 code 是封闭集合（${closedSet.join(' / ')}），` +
+          '不在集合内的语义必须用 invariantError(code, …) 那种「带 code 的原样抛出」',
+      });
+    }
+  }
+  return diffs;
+}
+
+/** 列出 `src/` 下的源文件（**排除**测试文件）。 */
+function listSourceFiles(root: string = SRC_ROOT): string[] {
+  const files: string[] = [];
+  for (const entry of readdirSync(root)) {
+    const full = resolve(root, entry);
+    if (statSync(full).isDirectory()) {
+      files.push(...listSourceFiles(full));
+      continue;
+    }
+    if (entry.endsWith('.ts') && !entry.endsWith('.test.ts')) {
+      files.push(full);
+    }
+  }
+  return files.sort();
+}
+
+/**
+ * 对一批源码跑**源码层**的两条守卫（warning code 登记 + 错误码封闭集合）。
+ *
+ * ⚠️ **与源码解耦（入参是「文件名 + 文本」）** ⇒ 负控可以直接喂假源码，
+ *   **不必去改 `src/store/write.ts`**（那是源码，不是测试的靶子）。
+ *
+ * @param sources 参与检查的源码
+ * @param warningWhitelist 已登记的 warning code（`WARNING_ONLY_CASES`）
+ * @param errorCodeClosedSet 错误码封闭集合（`MemoryErrorCode` 的五个值）
+ */
+export function checkSourceContracts(
+  sources: ReadonlyArray<{ file: string; source: string }>,
+  warningWhitelist: readonly string[],
+  errorCodeClosedSet: readonly string[],
+): ContractDiff[] {
+  const diffs: ContractDiff[] = [];
+  for (const { file, source } of sources) {
+    diffs.push(
+      ...checkWarningCodesRegistered(source, warningWhitelist).map((diff) => ({
+        reason: `${file}：${diff.reason}`,
+      })),
+    );
+  }
+  diffs.push(...checkMemoryErrorCodesClosed(sources, errorCodeClosedSet));
+  return diffs;
+}
+
 /** 主流程。 */
 function main(): void {
   const markdown = readDesignDoc();
   const diffs = checkContracts(markdown);
+
+  // ⚠️ **新增守卫①**：源码实发的 warning code ⊆ 白名单。
+  //   扫全 `src/`（不只 `write.ts`）：将来别的文件也开始产生 warnings 时同样被守住。
+  // ⚠️ **新增守卫②**：`new MemoryError(...)` 的 code 必须落在封闭集合里。
+  const sources = listSourceFiles().map((file) => ({
+    file,
+    source: readFileSync(file, 'utf8'),
+  }));
+  diffs.push(...checkSourceContracts(sources, WARNING_ONLY_CASES, Object.values(MemoryErrorCode)));
 
   process.stdout.write(
     '契约编号与引用数字一致性检查（C25 / C26 / §5 的 8 条 / §11.2 的错误语义）\n',
