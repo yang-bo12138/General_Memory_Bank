@@ -234,6 +234,13 @@ export class MemoryStore {
   /**
    * 召回 —— §6 的 `recall()`（§4.6 的三路召回与融合打分）。
    *
+   * ⚠️ **库不抽取实体**（ADR-2 / ADR-P1-T08-GAP 缺口①）：
+   *   「上下文 → 实体名」由**调用方**完成；调用方把名字放进 `RecallOptions.entityNames`
+   *   （或已解析好的 `entityIds`），库只做「名字 → `entity_id`」的归一。
+   *   ⇒ **两者都不传 ⇒ 图谱路为空**（本次召回退化为「文本路 + 向量路」），
+   *     而**不是**「库替你去库里找实体」。
+   *   ⇒ 两个都传 ⇒ 抛 `INVALID_INPUT`（互斥，§4.6 步骤 1）。
+   *
    * @param options 召回选项（`context` 必填）
    * @returns §6 的 `RecallResult`（`hits` / `explain?` / `suppressed` / `diffused`）
    */

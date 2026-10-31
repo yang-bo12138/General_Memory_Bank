@@ -152,6 +152,34 @@ describe('P1-T10 · 门面的 10 个公开方法（§6）', () => {
     expect(Array.isArray(result.diffused)).toBe(true);
   });
 
+  it('★ 门面透传 ADR-2 的实体契约：库**不抽取实体**（不传 ⇒ 图谱路为空；传 entityNames ⇒ 图谱路跑）', () => {
+    const h = createHarness();
+    h.store.write({ content: '张三喜欢猫', entities: ['张三'], now: T0 });
+
+    // ── ① 不传 entityNames / entityIds ⇒ **图谱路整体不执行** ──
+    // ⚠️ 依据：ADR-2 / ADR-P1-T08-GAP 缺口①「库不抽取实体」——
+    //   「上下文 → 实体名」由**调用方**完成 ⇒ 库**不会**替你去库里找实体。
+    //   ⇒ 本次召回退化为「文本路 + 向量路」（向量路本阶段整路缺席）。
+    const withoutEntities = h.store.recall({
+      context: '张三喜欢猫',
+      topN: 3,
+      explain: true,
+      now: T0,
+    });
+    expect(withoutEntities.explain?.routes.graph.ran).toBe(false);
+    expect(withoutEntities.explain?.routes.text.ran).toBe(true);
+
+    // ── ② 传 entityNames ⇒ 图谱路**真的跑了**（与 ① 构成一对）──
+    const withEntities = h.store.recall({
+      context: '张三喜欢猫',
+      entityNames: ['张三'],
+      topN: 3,
+      explain: true,
+      now: T0,
+    });
+    expect(withEntities.explain?.routes.graph.ran).toBe(true);
+  });
+
   it('③ touch()：真调一次，拿到逐条结果，且稳定度真的涨了', () => {
     const h = createHarness();
     const written = h.store.write({ content: '张三喜欢猫', entities: ['张三'], now: T0 });
