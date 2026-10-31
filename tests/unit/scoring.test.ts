@@ -717,6 +717,30 @@ describe('archiveFilterThreshold / passesIntensityFilter（§4.6 步骤 2）', (
     expect(() => archiveFilterThreshold(P, true)).toThrow();
   });
 
+  it('★ 反例：归档层里「强度下溢成恰好 0」的行**非常多** ⇒ 阈值 0 会**静默**丢掉它们', () => {
+    // ⚠️ **为什么归档层里这类行很多**（不是边缘 case）：
+    //   双精度 `exp(-x)` 在 `x ≳ 745` 时下溢为 **恰好 0**；
+    //   而 schema 只要求 `stability > 0` ⇒ **小 stability 的记忆几十小时就能下溢**
+    //   ⇒ 归档层（时间跨度以月/年计）里**非常多**。
+    //
+    // ⚠️ **症状**（这就是「阈值 0 是陷阱」的机理）：
+    //   这些行**已经被 SQL 粗筛捞进来了**（归档模式无时间窗 ⇒ 粗筛整体取消）
+    //   ⇒ 却在应用层被**精筛悄悄丢掉** ⇒「显式查询归档层」**名存实亡**，而且**不报错**。
+    //
+    // ⚠️ **为什么这条断言有意义**（它守的是「抛错」这个选择的**理由**）：
+    //   若将来有人把「抛错」改回「返回 0.0」，光靠上面那条「抛错」的断言只会红，
+    //   但**说不清危害**；这条把**危害本身**算出来 ⇒ 改回去的人能看见**会丢多少**。
+    const tauMs = 0.001 * MS_PER_DAY; // 极小的 stability ⇒ 几十小时即下溢
+    const elapsedMs = 500 * MS_PER_DAY;
+    const underflowed = Math.exp(-elapsedMs / tauMs); // ⇒ 恰好 0
+    expect(underflowed).toBe(0);
+
+    // ⇒ 若归档模式拿 0 当阈值照常比，这些行**过不去**（精筛是**严格大于**）：
+    expect(passesIntensityFilter(underflowed, 0)).toBe(false);
+    // ⇒ 而归档层的语义是「显式查询**全部**归档记忆」⇒ 这些行**本该被看到**。
+    // ⇒ 所以「归档模式不设阈值、且调用方整体不执行精筛」是唯一正确的形态。
+  });
+
   it('精筛是**严格大于**（恰好等于归档线的记忆不进候选）', () => {
     const threshold = archiveFilterThreshold(P, false);
     expect(passesIntensityFilter(threshold, threshold)).toBe(false);
