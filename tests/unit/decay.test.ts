@@ -160,6 +160,33 @@ describe('intensity（§4.1）', () => {
     expect(intensity(degenerate, 0)).toBe(1);
     expect(intensity(degenerate, days(1))).toBeLessThanOrEqual(1);
   });
+
+  it('★ 反例：漏掉 `min(1, ...)` ⇒ 负的 τ 会让 intensity > 1（钳制必须真的在起作用）', () => {
+    // ⚠️ 上一条用例是**真空负控**：删掉 `min(1, ...)` 它仍然通过
+    //   （因为 `max(0, Δt)` 已保证 Δt ≥ 0 ⇒ exp(-Δt/τ) ≤ 1 ⇒ min 永远夹不到东西）
+    //   ⇒ QA 复核 F-08 指出它「证明不了 min(1,…) 的存在」——**本条才是能抓住它的断言**。
+    //
+    // ⚠️ 为什么 `max(0, Δt)` 拦不住这一条：Δt 被钳到 0 了，但 **τ 为负**
+    //   ⇒ -Δt/τ = -0/负 = **NaN 或 +∞** ⇒ exp(∞) = ∞ ⇒ min(1, ∞) 才是 1。
+    //   没有 min(1,·) 时返回的就是 Infinity ⇒ 直接污染 §4.6 的 0.30 × intensity 与层级判定。
+    const negativeTau = memory({ stability: -1, pin_factor: 1, last_access: 0 });
+    const value = intensity(negativeTau, 0);
+
+    // 性质：无论输入多离谱，intensity 恒 ∈ (0, 1]
+    expect(Number.isFinite(value)).toBe(true);
+    expect(value).toBeGreaterThan(0);
+    expect(value).toBeLessThanOrEqual(1);
+
+    // ★ 负控：漏掉 `min(1, ...)` 的写法会返回 Infinity ⇒ 上面两条会失败
+    //   （Δt = max(0, 0 - 0) = 0；-0 / -1 = 0 ⇒ exp(0) = 1 本身不越界，
+    //     故这里改用「τ 为负且 Δt 为正」的情形：-Δt/τ = 正数 ⇒ exp 正数 > 1）
+    const negativeTauWithElapsed = memory({ stability: -1, pin_factor: 1, last_access: 0 });
+    const elapsedMs = days(1);
+    const withoutClamp = Math.exp(-elapsedMs / (negativeTauWithElapsed.stability * days(1)));
+    expect(withoutClamp).toBeGreaterThan(1);
+    // 而实现（带 min(1,·)）必须把它夹回 1
+    expect(intensity(negativeTauWithElapsed, elapsedMs)).toBe(1);
+  });
 });
 
 // ─────────────────────────────────────────────────────────────

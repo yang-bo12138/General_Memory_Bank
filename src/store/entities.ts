@@ -45,16 +45,18 @@ export interface MergeEntitiesResult {
   /**
    * 被合并实体的主名（已降级为目标的别名）。
    *
-   * ⚠️ **与事件 payload 的同名键不同义**（v2.1 勘误 / ADR-P1-C 冲突 1 与 F-3）：
+   * ⚠️ **本字段名与事件 payload 的 `aliasAdded` 不同义**（v2.1 勘误 / ADR-P1-C 冲突 1 与 F-3）：
    *   · 本字段（**函数返回值**）= **源主名的字符串**；
    *   · `events(type='alias', payload)` 里的 `aliasAdded` = **布尔**（是否动过别名映射），
    *     而源主名本体记在 payload 的 `alias` 键上。
-   *   ⇒ 裁决（ADR-P1-C 冲突 1）：选「布尔」这一边，理由是 C36
+   *   ⇒ 裁决（ADR-P1-C 冲突 1）：payload 那一侧选「布尔」，理由是 C36
    *     （同一件事不得有两套词）——`alias` 一键贯穿 `set` / `merge` 两个 action。
-   *   ⇒ **待办**：本字段名与 payload 同名不同义，建议改名为 `sourceName: string`；
-   *     改名会动调用方，故先在此显式声明差异，不静默留坑。
+   *   ⇒ **本字段已据此改名**为 `sourceName`（原名 `aliasAdded`）：
+   *     否则同一个键名在「返回值」与「事件 payload」两处表达两件事，
+   *     而返回值这一侧**只有源主名**、与「是否动过别名映射」无关 ⇒ 改名才能真正消歧。
+   *   ⚠️ 改名只影响本接口的字段名，**不改变任何行为**；调用点只有本文件与单元测试。
    */
-  aliasAdded: string;
+  sourceName: string;
 }
 
 /** `edges` 表在合并时需要的字段子集（与 `core/graph.ts` 的 `GraphEdgeInput` 对齐）。 */
@@ -167,7 +169,15 @@ export function mergeEntities(
         movedMemories: 0,
         mergedEdges: 0,
         droppedSelfLoops: 0,
-        aliasAdded: '',
+        // ⚠️ 幂等路径：源主名没被降级（它就是源实体自己的主名，未发生任何变化）
+        //   ⇒ 这里返回源实体的主名本身，而不是空串。
+        //   空串会与「合并后源主名被降级」的真实路径**语义相反**
+        //   ⇒ 调用方拿到空串会以为「源实体没有名字」。
+        sourceName: (
+          db.prepare('SELECT name FROM entities WHERE id = ?').get(sourceId) as {
+            name: string;
+          }
+        ).name,
       };
     }
 
@@ -299,7 +309,7 @@ export function mergeEntities(
       movedMemories,
       mergedEdges,
       droppedSelfLoops,
-      aliasAdded: sourceName,
+      sourceName,
     };
   });
 }
