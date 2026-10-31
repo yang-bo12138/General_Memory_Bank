@@ -31,6 +31,14 @@ import { createRng, fnv1a, sha1Hex } from './lib/harness.js';
 /** 语料的**默认规模**（P2-T08：100 万条）。 */
 export const DEFAULT_CORPUS_SIZE = 1_000_000;
 
+/**
+ * 指纹的**字段分隔符**（`\u0001`）。
+ *
+ * ⚠️ **为什么用控制字符**：它不会出现在任何字段里
+ *   ⇒ 字段拼接**无歧义**（否则 `ab`+`c` 与 `a`+`bc` 会撞出同一个指纹）。
+ */
+const FINGERPRINT_SEPARATOR = '\u0001';
+
 /** 语料的**默认种子**（**写死** ⇒ 复现的前提）。 */
 export const DEFAULT_CORPUS_SEED = 20260101;
 
@@ -207,8 +215,25 @@ export function corpusFingerprints(
   const fingerprints: string[] = [];
   let count = 0;
   for (const record of generateCorpus(options)) {
+    // ⚠️ **指纹必须覆盖整条记录**（不只正文）：
+    //   只把 `id + content + entities` 算进去 ⇒ **时间戳变了也看不出来**
+    //   ⇒ 「同种子 ⇒ 同语料」这条断言就只证明了一半。
+    //   ⇒ 这里把 `createdAt` / `lastAccess` / `accessCount` / `clusterIndex` 一并算进去。
+    // ⚠️ **分隔符用 `\u0001`**（控制字符）：它不会出现在任何字段里
+    //   ⇒ 字段拼接**无歧义**（否则 `ab` + `c` 与 `a` + `bc` 会撞出同一个指纹）。
     fingerprints.push(
-      sha1Hex([record.id, record.content, record.entities.join('|'), record.groupId].join('')),
+      sha1Hex(
+        [
+          record.id,
+          record.content,
+          record.entities.join('|'),
+          String(record.groupId),
+          String(record.clusterIndex),
+          String(record.createdAt),
+          String(record.lastAccess),
+          String(record.accessCount),
+        ].join(FINGERPRINT_SEPARATOR),
+      ),
     );
     count += 1;
     if (count >= limit) {

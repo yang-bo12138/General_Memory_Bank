@@ -27,7 +27,13 @@ import {
   generateCorpus,
   toCorpusRow,
 } from '../corpus.js';
-import { BENCH_NOW, encodeVector, openBenchDatabase, trainBenchBuckets } from './harness.js';
+import {
+  BENCH_NOW,
+  PeakRssSampler,
+  encodeVector,
+  openBenchDatabase,
+  trainBenchBuckets,
+} from './harness.js';
 
 /** 灌库的批大小（**一条事务一批** ⇒ 事务日志与回滚粒度都可控）。 */
 const INSERT_BATCH_SIZE = 500;
@@ -137,8 +143,10 @@ export interface PreparedBench {
   readonly loadMs: number;
   /** 训练耗时（毫秒）。 */
   readonly trainMs: number;
-  /** 训练期峰值 RSS（字节）。 */
+  /** 训练期峰值 RSS（字节）—— **进程高水位**（含灌库阶段的占用）。 */
   readonly trainPeakRssBytes: number;
+  /** 训练段**采样**到的峰值 RSS（字节）—— 只覆盖训练那一段。 */
+  readonly trainSampledPeakRssBytes: number;
   /** 训练**前**的 RSS（字节）—— 与峰值对比 ⇒ 训练自身的增量。 */
   readonly rssBeforeTrainBytes: number;
   /** 语料参数（**写进报告 ⇒ 规模与种子可核对**）。 */
@@ -235,7 +243,13 @@ function tryReuse(dbPath: string, corpus: CorpusOptions): PreparedBench | undefi
   if (!existsSync(manifestPath)) {
     return undefined;
   }
-  let manifest: { corpusSize?: number; loadMs?: number; trainMs?: number; peakRssBytes?: number };
+  let manifest: {
+    corpusSize?: number;
+    loadMs?: number;
+    trainMs?: number;
+    peakRssBytes?: number;
+    sampledPeakRssBytes?: number;
+  };
   try {
     manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as typeof manifest;
   } catch {
@@ -271,6 +285,7 @@ function tryReuse(dbPath: string, corpus: CorpusOptions): PreparedBench | undefi
       loadMs: manifest.loadMs ?? 0,
       trainMs: manifest.trainMs ?? 0,
       trainPeakRssBytes: manifest.peakRssBytes ?? 0,
+      trainSampledPeakRssBytes: manifest.sampledPeakRssBytes ?? 0,
       rssBeforeTrainBytes: 0,
       options: corpus,
     };
@@ -300,6 +315,7 @@ function writeManifest(dbPath: string, prepared: PreparedBench): void {
         loadMs: prepared.loadMs,
         trainMs: prepared.trainMs,
         peakRssBytes: prepared.trainPeakRssBytes,
+        sampledPeakRssBytes: prepared.trainSampledPeakRssBytes,
         rssBeforeTrainBytes: prepared.rssBeforeTrainBytes,
       },
       null,
@@ -356,6 +372,7 @@ function prepareWithDatabase(
       loadMs: load.elapsedMs,
       trainMs: 0,
       trainPeakRssBytes: 0,
+      trainSampledPeakRssBytes: 0,
       rssBeforeTrainBytes: 0,
       options: corpusOptions,
     };
@@ -364,6 +381,13 @@ function prepareWithDatabase(
   // ⚠️ **训练期的峰值内存**（§12 的 R-04：≥3.5GB 是资源规划的下限）：
   //   生产的重训序列一次性把全部向量读进内存 ⇒ 峰值 RSS 就是「训练期峰值内存」。
   const rssBeforeTrain = process.memoryUsage().rss;
+  // ⚠️ **两个峰值一起报**（互为兜底）：
+  //   · `PeakRssSampler`：**采样**到的峰值（训练是同步长任务 ⇒ 采样器可能一次都跑不到
+  //     ⇒ 这个值可能偏低 ⇒ 不能单独用）；
+  //   · `process.resourceUsage().maxRSS`：**内核维护的高水位**（永不丢失，但含灌库阶段）。
+  //   ⇒ 报告里写「进程高水位（含灌库）」+「采样峰值（仅训练段）」两个数。
+  const sampler = new PeakRssSampler();
+  sampler.start();
   const trainStart = process.hrtime.bigint();
   const trained = trainBenchBuckets(db, {
     coarseCenters: options.coarseCenters,
@@ -372,6 +396,8 @@ function prepareWithDatabase(
     now: BENCH_NOW,
   });
   const trainEnd = process.hrtime.bigint();
+  sampler.stop();
+  const trainSampledPeakRssBytes = sampler.peakBytes();
 
   return {
     db,
@@ -382,7 +408,8 @@ function prepareWithDatabase(
     loadMs: load.elapsedMs,
     trainMs: Number(trainEnd - trainStart) / 1_000_000,
     // ⚠️ **内核高水位**（不会因为采样器没跑到而丢失）。
-    trainPeakRssBytes: process.resourceUsage().maxRSS * 1024,
+    trainPeakRssBytes: Math.max(process.resourceUsage().maxRSS * 1024, trainSampledPeakRssBytes),
+    trainSampledPeakRssBytes,
     rssBeforeTrainBytes: rssBeforeTrain,
     options: corpusOptions,
   };

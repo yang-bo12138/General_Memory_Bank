@@ -290,6 +290,9 @@ function main(): void {
   const outPath = stringArg(args, 'out', `docs/baseline/agreement-${scale}.json`);
 
   const options: CorpusOptions = { ...DEFAULT_CORPUS_OPTIONS, size: scale, seed };
+  // ⚠️ **机器信息在开始时采集**（不是结束时）：
+  //   “运行开始时还有多少可用内存”才是“这个规模跑得动”的证据。
+  const machine = machineInfo();
   process.stdout.write(`吻合率测量：语料 ${scale} 条 / 查询 ${queryCount} 条 / 库 ${dbPath}\n`);
 
   // ⚠️ **走共享的库准备流程**（`bench/lib/db.ts`）⇒ 三个脚本的准备口径**同一份**
@@ -328,7 +331,7 @@ function main(): void {
     perQueryAgreement: result.perQuery,
     failures,
     benchNow: BENCH_NOW,
-    machine: machineInfo(),
+    machine,
     phases: phaseInfo(prepared),
   });
 

@@ -412,6 +412,8 @@ export interface PhaseInfo {
   readonly rssBeforeTrainBytes: number;
   /** 训练**后**的进程高水位 RSS（字节）—— **含灌库阶段的占用**。 */
   readonly peakRssBytes: number;
+  /** 训练段**采样**到的峰值 RSS（字节）—— 只覆盖训练那一段。 */
+  readonly sampledPeakRssBytes: number;
   /** 细桶数。 */
   readonly fineCells: number;
   /** 桶归属条数。 */
@@ -433,6 +435,7 @@ export function phaseInfo(prepared: {
   trainMs: number;
   rssBeforeTrainBytes: number;
   trainPeakRssBytes: number;
+  trainSampledPeakRssBytes: number;
   fineCells: number;
   members: number;
 }): PhaseInfo {
@@ -441,6 +444,7 @@ export function phaseInfo(prepared: {
     trainMs: prepared.trainMs,
     rssBeforeTrainBytes: prepared.rssBeforeTrainBytes,
     peakRssBytes: prepared.trainPeakRssBytes,
+    sampledPeakRssBytes: prepared.trainSampledPeakRssBytes,
     fineCells: prepared.fineCells,
     members: prepared.members,
   };

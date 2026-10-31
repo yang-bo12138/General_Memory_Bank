@@ -156,6 +156,9 @@ function main(): void {
   const outPath = stringArg(args, 'out', `docs/baseline/baseline-flat-${scale}.json`);
 
   const options: CorpusOptions = { ...DEFAULT_CORPUS_OPTIONS, size: scale, seed };
+  // ⚠️ **机器信息在开始时采集**（不是结束时）：
+  //   “运行开始时还有多少可用内存”才是“这个规模跑得动”的证据。
+  const machine = machineInfo();
   process.stdout.write(
     `前置测量（flat 路线的向量路耗时占比）：语料 ${scale} 条 / 查询 ${queryCount} 条\n`,
   );
@@ -190,7 +193,7 @@ function main(): void {
       '这是「改造前」的前置测量（证据，不是验收条件）；' +
       '「改造后」的分桶路线占比见 bench/perf.ts 的 vectorRouteShare。',
     benchNow: BENCH_NOW,
-    machine: machineInfo(),
+    machine,
     phases: phaseInfo(prepared),
   });
 

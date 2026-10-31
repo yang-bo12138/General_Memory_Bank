@@ -333,6 +333,9 @@ function main(): void {
   const outPath = stringArg(args, 'out', `docs/baseline/perf-${scale}.json`);
 
   const options: CorpusOptions = { ...DEFAULT_CORPUS_OPTIONS, size: scale, seed };
+  // ⚠️ **机器信息在开始时采集**（不是结束时）：
+  //   “运行开始时还有多少可用内存”才是“这个规模跑得动”的证据。
+  const machine = machineInfo();
   process.stdout.write(
     `P99 测量：语料 ${scale} 条 / 查询 ${queryCount} 条 / 写入 ${writeCount} 条 / 库 ${dbPath}\n`,
   );
@@ -369,7 +372,7 @@ function main(): void {
     vectorRouteLatency: result.vectorRouteLatency,
     failures,
     benchNow: BENCH_NOW,
-    machine: machineInfo(),
+    machine,
     phases: phaseInfo(prepared),
   });
 
