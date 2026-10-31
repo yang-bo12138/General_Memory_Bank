@@ -77,6 +77,22 @@ describe('P0-T05 · §11.1 的时钟注入表', () => {
     expect(resolveNow(undefined)).toBeGreaterThan(0);
   });
 
+  it('★ resolveNow：显式传 0 是合法值，不能被当成「没传」', () => {
+    // ⚠️ 这条断言守的是 `now ?? Date.now()` 而不是 `now || Date.now()`：
+    //   后者会把 0 当成「没传」⇒ 注入 epoch 0 时静默退回真实时钟 ⇒
+    //   decay / stability / link 的时间派生值全部偏移，且**不报错**。
+    //   ⇒ 0 是合法的 epoch 毫秒，必须原样返回。
+    expect(resolveNow(0)).toBe(0);
+  });
+
+  it('★ 负控：`||` 语义会把 0 当成「没传」⇒ 该实现必然违反上一条', () => {
+    // 负控：把 `resolveNow` 的实现换成 `now || Date.now()` 的语义，
+    // 断言必须失败 —— 证明上一条不是恒真的摆设。
+    const buggyNow = (now?: number): number => now || Date.now();
+    expect(buggyNow(0)).not.toBe(0);
+    expect(buggyNow(0)).toBeGreaterThan(0);
+  });
+
   it('resolveNowStrictly：显式传 0 是合法值，不能被当成「没传」', () => {
     expect(resolveNowStrictly(0, 999)).toBe(0);
     expect(resolveNowStrictly(undefined, 999)).toBe(999);

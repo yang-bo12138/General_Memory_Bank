@@ -9,7 +9,9 @@ import { describe, expect, it } from 'vitest';
 
 import {
   EXPECTED_ANCHOR_ROWS,
+  EXPECTED_HARD_RULE_COUNT,
   compareAnchorRows,
+  countHardRules,
   findAnchorTable,
   normalizeCell,
 } from '../../scripts/check-anchor.js';
@@ -42,6 +44,7 @@ import {
 import {
   extractBacktickSpans,
   extractPayloadKeys,
+  extractSection,
   parseAllTableRows,
   parseDefaultCell,
   readDesignDoc,
@@ -229,6 +232,46 @@ describe('P0-T06 · check-anchor（跨节锚定 5 行 × 3 列）', () => {
 
   it('写死的期望恰好五行', () => {
     expect(EXPECTED_ANCHOR_ROWS).toHaveLength(5);
+  });
+});
+
+describe('QA 复核 F-03 · §8.4 硬规则条数守卫', () => {
+  const section84 = extractSection(markdown, '### 8.4 事件类型与发射点对照表（枚举必须逐个落地）');
+
+  it('设计稿 §8.4 存在（抽不到就说明标题变了 ⇒ 必须报错而不是静默跳过）', () => {
+    expect(section84).toBeDefined();
+  });
+
+  it('★ §8.4 的硬规则恰好 6 条', () => {
+    expect(countHardRules(section84 ?? '')).toBe(EXPECTED_HARD_RULE_COUNT);
+    expect(EXPECTED_HARD_RULE_COUNT).toBe(6);
+  });
+
+  it('★ 负控：规则 4 的编号后带 ★ 也必须被数到（否则守卫对真实文档误报）', () => {
+    // ⚠️ 规则 4 的原文是 `4. ★ **只有 ...**` —— ★ 夹在编号与 ** 之间。
+    //   若正则要求编号后紧跟 **，规则 4 会被漏数 ⇒ 数出 5 ⇒ 守卫恒失败 = 没有守卫。
+    const withStar = [
+      '1. **第一**',
+      '2. **第二**',
+      '3. **第三**',
+      '4. ★ **第四**',
+      '5. **第五**',
+      '6. **第六**',
+    ].join('\n');
+    expect(countHardRules(withStar)).toBe(6);
+  });
+
+  it('★ 负控：删掉一条规则 ⇒ 必须数出 5（证明计数真的在数，不是恒等于 6）', () => {
+    const five = ['1. **第一**', '2. **第二**', '3. **第三**', '4. ★ **第四**', '5. **第五**'].join(
+      '\n',
+    );
+    expect(countHardRules(five)).toBe(5);
+    expect(countHardRules(five)).not.toBe(EXPECTED_HARD_RULE_COUNT);
+  });
+
+  it('★ 负控：把编号换成中文数字 ⇒ 不该被当成编号项（避免数进无关的编号列表）', () => {
+    const chinese = '（一）**第一**\n（二）**第二**';
+    expect(countHardRules(chinese)).toBe(0);
   });
 });
 

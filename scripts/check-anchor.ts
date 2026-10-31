@@ -65,6 +65,47 @@ export const EXPECTED_ANCHOR_ROWS: readonly string[][] = [
   ],
 ];
 
+/** §8.4 的标题。 */
+const SECTION_8_4_HEADING = '### 8.4 事件类型与发射点对照表（枚举必须逐个落地）';
+
+/**
+ * ★ §8.4 的硬规则**条数**（写死为常量）。
+ *
+ * ⚠️ **为什么必须由 CI 守**：§8.4 标题写「六条硬规则」，正文实际列了 6 条。
+ *   这两处一旦漂移（比如正文加到第 7 条、标题还写 6），全文所有引用
+ *   「§8.4 硬规则 N」的地方（`DEVELOPMENT-PLAN.md` 与 `src/` 的注释都靠它定位）
+ *   **全部指错** —— 而这**不会报任何错**，只会让实现者按错的口径写代码。
+ *
+ * ⚠️ 此前这条只被 `scripts/verify_errata_writeback.py` 断言，而那个脚本**不在 verify 链里**
+ *   ⇒ CI 根本不守（QA 复核 F-03）。现补进本脚本（本脚本**在** verify 链里）。
+ */
+export const EXPECTED_HARD_RULE_COUNT = 6;
+
+/**
+ * §8.4 里「六条硬规则」那一段的编号列表（形如 `1. `、`2. ` …）。
+ *
+ * ⚠️ **编号后必须允许 `★`**：规则 4 的原文是
+ *   `4. ★ **只有 \`action === 'purge'\` AND \`purged > 0\` 才代表……**`
+ *   —— `★` 夹在编号与 `**` 之间。若要求编号后紧跟 `**`，规则 4 会被漏数
+ *   ⇒ 数出 5 条 ⇒ **守卫对真实文档误报**（一个恒不等于期望值的守卫 = 没有守卫）。
+ */
+const HARD_RULE_NUMBERED_PATTERN = /^\s*(\d+)\.\s+(?:★\s*)?\*\*/gm;
+
+/**
+ * 数出 §8.4 硬规则列表的条数。
+ *
+ * ⚠️ **只数「以 `N. **` 开头的编号项」** —— §8.4 里还有别的编号列表（发射点表格的说明等），
+ *   不加限定就会把不相干的编号也算进来 ⇒ 恒大于 6 ⇒ 守卫变成摆设。
+ */
+export function countHardRules(section: string): number {
+  HARD_RULE_NUMBERED_PATTERN.lastIndex = 0;
+  let count = 0;
+  while (HARD_RULE_NUMBERED_PATTERN.exec(section) !== null) {
+    count += 1;
+  }
+  return count;
+}
+
 /** 规范化单元格（去掉 markdown 粗体标记、压缩空白）——只比内容，不比排版。 */
 export function normalizeCell(cell: string): string {
   return cell.replace(/\*\*/g, '').replace(/\s+/g, ' ').trim();
@@ -157,6 +198,26 @@ function main(): void {
   }
 
   process.stdout.write('\n✓ 跨节锚定清单：5 行 × 3 列，且与写死的期望一致\n');
+
+  // ── §8.4 硬规则条数（QA 复核 F-03：此前只有不在 verify 链里的脚本守着）──
+  const section84 = extractSection(markdown, SECTION_8_4_HEADING);
+  if (section84 === undefined) {
+    process.stderr.write('\n✗ 在设计稿里找不到 §8.4 这一节\n');
+    process.exitCode = 1;
+    return;
+  }
+
+  const hardRuleCount = countHardRules(section84);
+  if (hardRuleCount !== EXPECTED_HARD_RULE_COUNT) {
+    process.stderr.write(
+      `\n✗ §8.4 的硬规则条数不一致：正文数出 ${hardRuleCount} 条，期望 ${EXPECTED_HARD_RULE_COUNT} 条\n` +
+        '  ⇒ 全文所有「§8.4 硬规则 N」的引用都会指错（且不报错）\n',
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  process.stdout.write(`\n✓ §8.4 硬规则条数：${hardRuleCount} 条（与写死的期望一致）\n`);
 }
 
 const invokedDirectly =
