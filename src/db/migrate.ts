@@ -17,6 +17,7 @@
 
 import type Database from 'better-sqlite3';
 
+import { archiveSpanMs } from '../core/decay.js';
 import { MemoryError } from '../core/errors.js';
 import { DEFAULT_PARAMS } from '../core/params.js';
 import { EXPECTED_V2_TABLE_COUNT, V2_NEW_TABLES } from '../core/schema.js';
@@ -38,9 +39,19 @@ import { MIGRATION_V1_TO_V2_SQL } from './schema.sql.js';
  *
  * ⚠️ 从 `DEFAULT_PARAMS.ARCHIVE_LINE` **派生**（不在本文件写死 0.05）⇒ 改参数时这里跟着变。
  * ⚠️ 在 JS 里算而**不用 SQL 的 `ln()`**：避免依赖 SQLite 的 `SQLITE_ENABLE_MATH_FUNCTIONS` 编译开关。
+ *
+ * ★ **本函数不再自带公式**（C36：两份副本可能不一致）：
+ *   归档跨度的**唯一权威**是 `src/core/decay.ts` 的 `archiveSpanMs`
+ *   （它又只依赖 `archiveSpanFactor` 与 `MS_PER_DAY`）。
+ *   ⇒ 本文件**不再出现** `86_400_000` / `Math.log(1 / archiveLine)` 这两样东西。
+ *   ⚠️ 为什么必须收敛：迁移回填的 `archival_schedule.archive_at` 与运行时
+ *     `src/core/decay.ts` 的 `archiveAt` **必须逐位相同**——
+ *     否则同一条记忆在「迁移回填的归档表」与「运行时现算的归档时刻」上给出两个答案
+ *     ⇒ 归档判定随数据来源而变（**不报错**，只是有的库归档早、有的库归档晚）。
+ *   ⇒ 本函数保留原有签名与默认参数（对外 API 不变），只是**转发**给唯一权威。
  */
 export function archiveAtFactor(archiveLine: number = DEFAULT_PARAMS.ARCHIVE_LINE): number {
-  return Math.log(1 / archiveLine) * 86_400_000;
+  return archiveSpanMs(archiveLine);
 }
 
 /** 迁移的入参。 */

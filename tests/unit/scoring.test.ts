@@ -13,10 +13,18 @@
  *     「第 3 个候选的 normBm25 等于 0.4321」是快照——后者换一个输入就假红。
  */
 
+import { readFileSync } from 'node:fs';
+
 import Database from 'better-sqlite3';
 import { describe, expect, it } from 'vitest';
 
-import { MS_PER_DAY, archiveAt, intensity } from '../../src/core/decay.js';
+import {
+  MS_PER_DAY,
+  archiveAt,
+  archiveSpanFactor,
+  archiveSpanMs,
+  intensity,
+} from '../../src/core/decay.js';
 import { MemoryError } from '../../src/core/errors.js';
 import { DEFAULT_PARAMS, type Params } from '../../src/core/params.js';
 import {
@@ -44,6 +52,7 @@ import {
   passesIntensityFilter,
   recency,
 } from '../../src/core/scoring.js';
+import { archiveAtFactor } from '../../src/db/migrate.js';
 
 /** 生效参数（默认表）。 */
 const P: Params = DEFAULT_PARAMS;
@@ -785,6 +794,15 @@ describe('coarseGateWindow（§4.6 步骤 2 的两档窗口）', () => {
     expect(Math.abs(spanFromArchiveAt - spanFromWindow) / Math.abs(spanFromWindow)).toBeLessThan(
       1e-12,
     );
+
+    // ★ 扩展到**第三处**：`src/db/migrate.ts` 的 `archiveAtFactor`
+    //   （迁移回填 `archival_schedule.archive_at` 用它算常数项）。
+    //   ⇒ 三个口径（运行时归档时刻 / 迁移回填归档时刻 / 粗筛窗口）必须指向**同一个**归档跨度。
+    //   ⚠️ 这三处以前各写一遍 `ln(1/ARCHIVE_LINE)` ⇒ 漂移不会报错，只会「有的记忆早归档、有的晚归档」。
+    const spanFromMigrate = P.MAX_STABILITY * archiveAtFactor();
+    expect(Math.abs(spanFromMigrate - spanFromWindow) / Math.abs(spanFromWindow)).toBeLessThan(
+      1e-12,
+    );
   });
 
   it('★ 粗筛是「粗」的上界：它**不会**挡掉精筛本该放行的记忆（两个口径不打架）', () => {
@@ -831,5 +849,92 @@ describe('coarseGateWindow（§4.6 步骤 2 的两档窗口）', () => {
     const drifted = coarseGateWindow({ ...P, MAX_STABILITY: 90 }, now, false);
     const driftedHardcoded = now - 539 * MS_PER_DAY;
     expect(driftedHardcoded).not.toBeCloseTo(drifted.coarseCutoff, 0);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+// 归档跨度唯一实现（src/core/decay.ts 是唯一权威）
+// ─────────────────────────────────────────────────────────────
+
+describe('归档跨度唯一实现（src/core/decay.ts 是唯一权威）', () => {
+  const NOW = 1_700_000_000_000;
+
+  it('★ 三处逐位相同：decay 的唯一实现 / migrate 的 archiveAtFactor / scoring 的粗筛窗口', () => {
+    // ① 唯一权威（decay.ts）
+    const factor = archiveSpanFactor(P.ARCHIVE_LINE);
+    const spanMs = archiveSpanMs(P.ARCHIVE_LINE);
+
+    // ⚠️ 毫秒形态**就是**「因子 × MS_PER_DAY」，不是第二份公式
+    expect(spanMs).toBe(factor * MS_PER_DAY);
+
+    // ② migrate.ts：已改为**转发** decay.ts ⇒ 必须**逐位相同**（不是「接近」）
+    expect(archiveAtFactor()).toBe(spanMs);
+    expect(archiveAtFactor(P.ARCHIVE_LINE)).toBe(spanMs);
+
+    // ③ scoring.ts 的粗筛窗口（τ = MAX_STABILITY ⇒ 窗口跨度 ≡ τ × 归档跨度）
+    //    ⚠️ 这里断言的是**下界本身**（不是「now − 下界」）：
+    //       后者会把「毫秒级大数相减」的舍入误差混进来 ⇒ 不可能是逐位相同。
+    const window = coarseGateWindow(P, NOW, false);
+    expect(window.coarseCutoff).toBe(NOW - P.MAX_STABILITY * factor * MS_PER_DAY);
+    expect(window.coarseCutoffPinned).toBe(
+      NOW - P.MAX_STABILITY * P.MAX_PIN_FACTOR * factor * MS_PER_DAY,
+    );
+  });
+
+  it('★ 绝对值锚点：归档跨度 = ln(1/ARCHIVE_LINE) 天（权威实现被改成 ×2 ⇒ 这条必须变红）', () => {
+    // ⚠️ 期望值**独立重算**（不引用被测导出）⇒ 导出被篡改时这条立刻变红。
+    const expectedFactor = Math.log(1 / P.ARCHIVE_LINE);
+    const expectedSpanMs = expectedFactor * MS_PER_DAY;
+
+    expect(archiveSpanFactor(P.ARCHIVE_LINE)).toBe(expectedFactor);
+    expect(archiveSpanMs(P.ARCHIVE_LINE)).toBe(expectedSpanMs);
+
+    // decay.ts 的 `archiveAt`：τ = 1 天 ⇒ 跨度就是「一天衰减到归档线」的毫秒数
+    const oneDay = archiveAt({ stability: 1, pin_factor: 1, last_access: 0 }, P);
+    expect(oneDay).toBe(expectedSpanMs);
+    expect(oneDay / MS_PER_DAY).toBeCloseTo(Math.log(20), 12);
+
+    // migrate.ts 的 `archiveAtFactor`（迁移回填 `archival_schedule.archive_at` 用它）
+    expect(archiveAtFactor()).toBe(expectedSpanMs);
+    expect(archiveAtFactor() / MS_PER_DAY).toBeCloseTo(Math.log(20), 12);
+  });
+
+  it('★ 负控：把权威实现改成 ×2 ⇒ 依赖它的两处（migrate / scoring 粗筛）必须同时分家', () => {
+    // 模拟「decay.ts 的唯一实现被改成 ×2」这一**实际会发生**的漂移（C36）。
+    const authoritySpanMs = archiveSpanMs(P.ARCHIVE_LINE);
+    const tamperedFactor = archiveSpanFactor(P.ARCHIVE_LINE) * 2;
+    const tamperedSpanMs = tamperedFactor * MS_PER_DAY;
+
+    // ① 迁移侧（转发 decay.ts）：权威 ×2 ⇒ 迁移侧**跟着** ×2
+    //    ⇒ 「绝对值锚点」那条（`archiveAtFactor()` 对 `ln(1/L) × MS_PER_DAY`）会红。
+    expect(archiveAtFactor()).toBe(authoritySpanMs); // 现在：迁移侧 = 权威
+    expect(tamperedSpanMs).not.toBe(authoritySpanMs); // 篡改后：分家
+    expect(tamperedSpanMs / authoritySpanMs).toBeCloseTo(2, 12);
+
+    // ② 粗筛窗口侧：它用的是**自己那份**副本 ⇒ 权威 ×2 而窗口没变 ⇒ 两者分家
+    //    ⇒ 「三处逐位相同」那条断言会红。
+    const windowCutoff = coarseGateWindow(P, NOW, false).coarseCutoff;
+    expect(windowCutoff).not.toBe(NOW - P.MAX_STABILITY * tamperedFactor * MS_PER_DAY);
+    expect(windowCutoff).toBe(
+      NOW - P.MAX_STABILITY * archiveSpanFactor(P.ARCHIVE_LINE) * MS_PER_DAY,
+    );
+  });
+
+  it('★ 结构护栏：`src/db/migrate.ts` 不得再自带「天→毫秒」的字面量（副本漂移的结构性禁令）', () => {
+    // ⚠️ 为什么要读源码：上面的数值断言只能证明「**此刻**相等」，
+    //   证明不了「以后没人再抄一份」⇒ 这里把「不得出现副本」这条纪律**钉死**。
+    const source = readFileSync(new URL('../../src/db/migrate.ts', import.meta.url), 'utf8');
+
+    // ⚠️ 只查代码行：注释里允许引用设计稿原文（§9.4.1 的公式就写着 86400000）。
+    const codeLines = source
+      .split('\n')
+      .filter((line) => !line.trimStart().startsWith('*') && !line.trimStart().startsWith('//'));
+    const code = codeLines.join('\n');
+    const literalLines = codeLines.filter((line) => /86_400_000|86400000/.test(line));
+    expect(literalLines).toEqual([]);
+
+    // 且它必须**转发**唯一权威（而不是自己再算一遍）
+    expect(code).toContain('archiveSpanMs');
+    expect(code).not.toContain('Math.log(1 / archiveLine)');
   });
 });
