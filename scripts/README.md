@@ -8,7 +8,7 @@
 
 | 命令                                   | 是什么                                              | 是不是门禁 |
 | -------------------------------------- | --------------------------------------------------- | ---------- |
-| **`pnpm run verify`**                  | **门禁本体**：9 条子命令串成一条链                  | ✅ 是       |
+| **`pnpm run verify`**                  | **门禁本体**：10 条子命令串成一条链                 | ✅ 是       |
 | `pnpm run ci`                          | **别名**，内容恰好等于 `pnpm run verify`            | ✅ 是       |
 | `pnpm ci` / `npm ci`（**不带 `run`**） | **包管理器的内建命令**（clean install）             | ❌ **不是** |
 
@@ -20,10 +20,10 @@
 > ⇒ **规范入口是 `pnpm run verify`**（`verify` 不是任何包管理器的内建命令名 ⇒ 不会被遮蔽）。
 > ⇒ 这条纪律由 `scripts/check-gate-entry.ts` **机器可检**（见下表第 6 行）：
 > 它断言 `scripts.ci` 的内容**恰好**是 `pnpm run verify`，
-> 且 `scripts.verify` 串起的 9 条子命令**逐名**齐全、每一段都写成 `pnpm run <名>`。
+> 且 `scripts.verify` 串起的 10 条子命令**逐名**齐全、每一段都写成 `pnpm run <名>`。
 > 有人把 `ci` 改回一串别的命令、或从 `verify` 上摘掉某条门禁 ⇒ 门禁当场失败。
 
-## 五个门禁脚本
+## 门禁脚本
 
 | 脚本                      | 检查什么                                             | 依据                        |
 | ------------------------- | ---------------------------------------------------- | --------------------------- |
@@ -33,12 +33,13 @@
 | `scripts/check-anchor.ts` | 跨节锚定清单（**5 行 × 3 列**，路径写死为常量）       | §14.3.1 末                 |
 | `scripts/check-contract-ids.ts` | §5 的 8 条 ↔ §12 的引用 ↔ 代码的条数；C25 / C26；§11.2 的**六组**表达方式 ↔ 代码的契约表（逐名）；`missingIds` 锚点 | §5 / §11.2 / §12 / §14.3.1 C25·C26 |
 | `scripts/check-doc-counts.ts`   | 文档里**自称的参数计数** ↔ 代码键数：§5 分类声明四组之和 + v1.0 继承 == 60；每组声明总数 == 其子项之和；§8.1 的「N 项参数」== 60 | §5 分类声明 / §8.1 / 勘误 ②·③ |
+| `scripts/check-clamp.ts`  | **F-08 ③**：`intensity()` 的两道钳制 `Math.max(0, …)` 与 `Math.min(1, …)` **同时存在**（**按函数体范围定位**，不是全文件 grep；缺任一 ⇒ exit 1） | §4.1 的「两重防护」 |
 
 另有 `scripts/check-gate-entry.ts`：**门禁入口的可见性**（防「假绿闸门」）——
 它是 `check-contract-ids.ts` 的一部分（被内联调用），也可单独跑
 （`pnpm exec tsx scripts/check-gate-entry.ts`）。
 
-全部串在 **`pnpm run verify`** 里（typecheck → lint → test → 五个门禁），
+全部串在 **`pnpm run verify`** 里（typecheck → lint → test → 七个门禁），
 任一失败 ⇒ 退出码非 0。`pnpm run ci` 是它的别名。
 
 > ⚠️ GitHub Actions 的工作流在 `.github/workflows/ci.yml`：
