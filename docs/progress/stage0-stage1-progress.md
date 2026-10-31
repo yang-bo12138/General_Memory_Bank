@@ -1,165 +1,168 @@
 # 阶段 0 / 阶段 1 交付进度与遗留清单
 
-> 记录时点：2026-10-31 07:50（Asia/Shanghai）
-> 基线 commit：`33d3034`（`origin/main`）
-> 本文件是**交接文档**：任何接手者读完它，应当能直接开工，不需要回放对话。
+> **记录时点**：2026-10-31 11:40（Asia/Shanghai）
+> **基线 commit**：`651dac8`（`origin/main`）
+> **本文件是交接文档**：任何接手者读完它，应当能直接开工，不需要回放对话。
+>
+> ⚠️ **本文件每轮刷新**：阶段 1 的收官工作并行推进中（6 条开发线同时在跑），
+> 下面的「⏳ 进行中」一节会随合并推进而变。**最新状态以文件末尾的「本轮更新日志」为准。**
 
 ---
 
 ## 一、一句话状态
 
-**阶段 0 全完成**（6 个任务 + 收尾修复 + 设计稿回写）；**阶段 1 完成 3 / 9、部分 2 / 9**；
-**阶段 2~5 共 28 个任务尚未开始**。门禁全绿：`pnpm run verify` 退出码 0，14 个测试文件 / 263 条测试。
+**阶段 0 全完成**（6 个任务 + 收尾修复 + 设计稿回写，且经 QA **四轮独立复核**）；
+**阶段 1 的 9 个既有任务全部落地，代码与门禁齐备**；
+**阶段 1 收官的 4 项并行补齐工作在进行中**（门面导出面 / 基线等价验收 / recall 契约返工 / 静态守卫）。
+门禁全绿：`pnpm run verify` 退出码 0，**24 个测试文件 / 527 条测试**。
 
 ---
 
 ## 二、任务完成度总表
 
-图例：✅ 完成 · 🟡 部分完成（见备注） · ❌ 未开始
+图例：✅ 完成 · 🟡 进行中 · ❌ 未开始
+
+### 阶段 0（骨架与不变量）
 
 | 阶段 | 任务 | 状态 | 落点 commit | 备注 |
 |---|---|---|---|---|
 | 0 | P0-T01 工程基线与脚手架 | ✅ | `32fa697` | |
-| 0 | P0-T02 参数表与跨参数校验 | ✅ | `3e8086c` | 60 项 / 8 条 |
+| 0 | P0-T02 参数表与跨参数校验 | ✅ | `3e8086c` | 60 项 / 8 条跨参数校验 |
 | 0 | P0-T03 五个机制开关与基线不变量 | ✅ | `8b234b2` | |
 | 0 | P0-T04 事件流扩展（扩 payload 键） | ✅ | `963b2e0` | 不新增 `type` |
-| 0 | P0-T05 错误类型体系与时钟注入 | ✅ | `698094d` | |
+| 0 | P0-T05 错误类型体系与时钟注入 | ✅ | `698094d` | 封闭五码 |
 | 0 | P0-T06 CI 契约断言脚本骨架 | ✅ | `811258f` | 5 条契约脚本 |
-| 0 | P0-T07 收尾（门禁可见性 + 脚本补强） | ✅ | `e174fb4` `4e5cfb3` `07e7924` | 门禁入口守卫 + CI 工作流 |
-| 0 | A6 §8.4 硬规则编号更正 | ✅ | `55654a7` | |
-| 0 | A7 FK 违规归一化 NOT_FOUND | ✅ | `370c2c4` | 不扩码 |
-| 0 | 提交前检查单（共享工作树纪律） | ✅ | `e98ebb0` | |
-| 0 | **设计稿回写**（同步 + 5 条勘误） | ✅ | `828e6a4` `25447a6` | |
-| 1 | P1-T01 Schema 建库脚本与连接初始化 | ✅ | `acbab21` | 17 张表 / PRAGMA A/B / FTS5 三触发器 |
-| 1 | P1-T02 v1 → v2 迁移 | ✅ | 内容在 `1fbb574` | ⚠️ 归属被并入他人 commit，见 §六 |
-| 1 | P1-T03 中文 Bigram 分词与 FTS5 查询构造 | ❌ | — | **下一棒的建议起点** |
-| 1 | P1-T04 纯函数算法模块 | ✅ | `6d05109` | 衰减/强度/层级/边权/归档时刻 + `resolveEntity` |
-| 1 | P1-T05 图谱维护 | 🟡 | `1ac013c` `33d3034` | 纯决策层 ✅；SQL 层为**在途稿**（未接入、未验收） |
-| 1 | P1-T06 growStability 与 touch | 🟡 | `1fbb574` | 纯计算 ✅；`touch` 的 SQL 层与事件写入 ❌ |
-| 1 | P1-T07 write 写入路径（去重与合并） | ❌ | — | |
-| 1 | P1-T08 recall：三路召回与融合打分 | ❌ | — | |
-| 1 | P1-T09 get() 与阶段 1 基线不变量验收 | ❌ | — | |
-| 2 | P2-T01 ~ P2-T08（8 个任务） | ❌ | — | 向量分桶与路由 |
-| 3 | P3-T01 ~ P3-T06（6 个任务） | ❌ | — | 神经元交互 |
-| 4 | P4-T01 ~ P4-T08（8 个任务） | ❌ | — | 生命周期、事件重放与可观测性 |
-| 5 | P5-T01 ~ P5-T06（6 个任务） | ❌ | — | 只读查看器与服务集成 |
+| 0 | P0-T07 收尾（门禁可见性 + 脚本补强） | ✅ | `e174fb4` `4e5cfb3` `07e7924` `7c98987` | 门禁入口守卫 + CI 工作流 + QA F-01~F-03 修复 |
 
-**合计：43 个任务 → ✅ 13 · 🟡 2 · ❌ 28。**
+### 阶段 1（存储与基础运算）
+
+| 阶段 | 任务 | 状态 | 落点 | 关键文件 |
+|---|---|---|---|---|
+| 1 | P1-T01 Schema 建库脚本与连接初始化 | ✅ | `32fa697` 起 | `src/core/schema.ts`、`src/db/schema.sql.ts`、`src/db/connection.ts` |
+| 1 | P1-T02 v1 → v2 迁移（纯增量） | ✅ | 同上 | `src/db/migrate.ts`（阶段 A/B 两步，可重入） |
+| 1 | P1-T03 文本路：中文 Bigram 分词与 FTS5 查询构造 | ✅ | `acaaf24` | `src/core/tokenize.ts`（6 个纯函数，零依赖） |
+| 1 | P1-T04 纯函数算法模块（衰减 / 强度 / 层级 / 边权） | ✅ | `a1cf013` 前 | `src/core/decay.ts`、`stability.ts`、`graph.ts`、`entities.ts` |
+| 1 | P1-T05 图谱维护：link / linkByIds / setAlias / mergeEntities | ✅ | `6c42af3` `e1b1eef` `67ef84e` | `src/store/link.ts`、`src/store/entities.ts` |
+| 1 | P1-T06 growStability 与 touch（唯一 stability 写入点） | ✅ | `d3a19e1` | `src/core/stability.ts`、`src/store/touch.ts` |
+| 1 | P1-T07 write 写入路径（去重与合并） | ✅ | `6989fdb` `0d626d2` `7f78d45` | `src/store/write.ts`（977 行）、`src/store/merge.ts`（359 行） |
+| 1 | P1-T08 recall：三路召回与融合打分 | 🟡 | `5f42889` `0d3bb1e` `dcc35bb` | `src/store/recall.ts`、`src/core/scoring.ts`（661 行）—— 契约返工进行中 |
+| 1 | P1-T09 get() 与阶段 1 基线不变量验收 | 🟡 | `e58384f` `ea875f2` | `src/store/get.ts` 已完成；**基线等价测试在建** |
+| 1 | **P1-T10 门面 `MemoryStore` + 导出面收口** | 🟡 | — | **本轮新增任务**（ADR-P1-R2 裁决 6 / F-10）—— 在建 |
+| 1 | P1-T07 收尾项：六条口径签字落地 | 🟡 | — | ADR-P1-R2 裁决 ①②③—— 在建 |
+
+### 阶段 2 ~ 5（28 个任务）
+
+❌ **未开始**（阶段 2 向量分桶与路由 / 阶段 3 神经元交互 / 阶段 4 召回质量回归 / 阶段 5 前台与导出）。
 
 ---
 
-## 三、已交付的代码资产
+## 三、门禁与工程现状
 
-### 核心库（`src/`）
-```
-src/core/clock.ts        时钟注入（C37 的落点）
-src/core/decay.ts        衰减/强度/层级/边权/归档时刻 5 个纯函数 + resolveEntity
-src/core/entities.ts     实体解析
-src/core/errors.ts       MemoryError（封闭五码）+ translateSqliteError()
-src/core/events.types.ts 事件类型与 payload 契约
-src/core/flags.ts        五个机制开关
-src/core/graph.ts        图谱的 6 个纯决策（自环/强化/合并/别名冲突/缺失差集）
-src/core/params.ts       60 项参数的默认值与校验
-src/core/schema.ts       建库脚本装载
-src/core/stability.ts    growStability 的纯计算 + 唯一写入点静态闸门
-src/core/version.ts      版本
-src/db/connection.ts     连接初始化（PRAGMA A/B、foreign_keys 显式开启）
-src/db/migrate.ts        v1 → v2 迁移（阶段 A / 阶段 B）
-src/db/schema.sql.ts     schema/001 + schema/002 的装载
-src/store/events.ts      appendEvent（memory_id 必传实参）
-src/store/params.ts      参数读写
-src/store/link.ts        ★ 在途稿：link / linkByIds 的 §4.5 四步（未接入）
-src/util/log.ts          日志（setTimeout 是 §8.3 的 flush 计时器，非机制级定时器）
-```
-
-### 建库脚本
-```
-schema/001_schema_v2.sql          17 张表 + FTS5 三触发器
-schema/002_migration_v1_to_v2.sql  阶段 A（ALTER + 建表 + config 事件）+ 阶段 B（分批回填）
-```
-
-### 门禁脚本（`scripts/`，9 条串成一条链）
-| 脚本 | 守什么 |
+| 项 | 状态 |
 |---|---|
-| `check-gate-entry.ts` | 门禁入口的**形状**（`ci` 恰为 `verify` 的别名、链恰好 9 段、名字逐名齐全） |
-| `check-params.ts` | §5 参数表 ↔ `DEFAULT_PARAMS` 逐键逐值 |
-| `check-doc-counts.ts` | §5 分类声明与 §8.1 的参数计数 ↔ 代码（60 项） |
-| `check-payload-keys.ts` | §8.4 的 payload 键集 ↔ 代码 |
-| `check-clock.ts` | C37 时钟注入契约（白名单为**字面量**） |
-| `check-anchor.ts` | 跨节锚定清单（5 行 × 3 列） |
-| `check-contract-ids.ts` | C25 / C26 / §5 的 8 条 / §11.2 的错误语义 |
-| `capture-golden.ts` + `tests/baseline/` | 黄金基线捕获与比对 |
-| `lib/design-doc.ts` | 上述脚本共用的设计稿解析器 |
+| **真实门禁入口** | **`pnpm run verify`**（`pnpm run ci` 是它的别名）。⛔ **`pnpm ci` / `npm ci` 是包管理器内建命令（clean install），会遮蔽同名 script ⇒ 假绿** |
+| 门禁链 | `typecheck` → `lint`(biome) → `test`(vitest) → `check:params` → `check:payload-keys` → `check:clock` → `check:anchor` → `check:contract-ids` → `check:doc-counts` |
+| 测试规模 | **24 个测试文件 / 527 条测试**，全通过，无 `Errors` 行 |
+| 源码规模 | `src/` 29 个源文件 / 9070 行（不含测试） |
+| 测试规模 | `tests/` 31 个文件 / 10506 行 |
+| 契约脚本 | 6 条（`check:params` / `check:payload-keys` / `check:clock` / `check:anchor` / `check:contract-ids` / `check:doc-counts`）+ `check-gate-entry.ts` |
+| CI | `.github/workflows/ci.yml`：Node 22 + pnpm 12.16.1，`pnpm install --frozen-lockfile` + `pnpm run verify` + build 两个 job |
+| 构建 | `pnpm build` 通过（tsup：CJS + ESM + d.ts） |
+| 运行时 | better-sqlite3 v13（Node-API v10 ⇒ **必须 Node ≥ 22**）；vitest 4.1.12（`pool: 'forks'` 是硬性要求，原生模块在 threads 池会段错误） |
 
 ---
 
-## 四、验收证据（基线 `33d3034` 实测）
+## 四、阶段 0 独立复核结论（QA 四轮）
 
-| 项 | 实测 |
+报告：`docs/quality/stage0-recheck.md`（1021+ 行）· `docs/quality/stage0-verification.md`
+
+- **第一轮（基线 `a1cf013`）**：判定 **PASS_WITH_FINDINGS**，运行时 **NoOne**（源码无 Bug）。
+  **33 组破坏性负控**（改真实设计稿 / 源码，不是喂假值）全部按预期报红。
+- **第二轮（`7c98987`）**：QA 的 F-01 ~ F-03 已修，且**修复本身经负控实测是真守卫**。
+- **第三 / 四轮**：QA **推翻了自己第二轮的错误证据**（第二轮那份 `min(1,…)` 负控是真空的），
+  把 F-08 拆成 ①②③④ 并给出**最小探针 2**（`τ<0 且 Δt<0`）——这是本库负控方法论的一次重要修正。
+
+**P0 期间确认修好的三个同族缺陷**：
+① CRLF 抽取失配 · ② npm script 名拼文件名 · ③ 守卫只断言「文件存在」而不验行为。
+
+---
+
+## 五、阶段 1 的关键设计裁决（ADR）
+
+| 文件 | 内容 |
 |---|---|
-| `pnpm run verify` | **退出码 0** |
-| vitest 收集数 | **14** == 仓库 `*.test.ts` 清单数 **14** ✅ |
-| 测试数 | **263 passed / 0 failed**，无 `Errors N errors` 行 |
-| `pnpm typecheck` | 零错误 |
-| `pnpm lint` | 零错误（biome，41 个文件） |
-| `pnpm build` | 通过（tsup：CJS + ESM + d.ts） |
-| Node 版本 | **≥ 22**（`better-sqlite3@13` 是 Node-API v10，Node 20 段错误） |
-| CI 工作流 | `.github/workflows/ci.yml`，verify + build 两个 job，跑 `pnpm run verify` |
+| `docs/design/adr-p1-conflicts.md` | P1-T05/T06 暴露的 **7 条冲突 + 6 条额外发现（F-1~F-6）** 的逐条裁决 |
+| `docs/design/adr-p1-round2.md` | **第二轮 10 条裁决**（别名隐含关联 / `confidence` 与 `emotion` 的不对称 / `link` 校验次序 …） |
+| `docs/design/adr-p1-t08-gaps.md` | P1-T08 的两处设计稿缺口 + 三条小口径（`entityNames` 入口、归档模式、`Hit.from*`） |
 
-⚠️ **采信判据是语义判据，不是写死的数字**：收集数 == 仓库 `*.test.ts` 清单数 + 全部 passed +
-无 `Errors N errors` 行 + 退出码 0。写死「263」或任何具体条数就是 C31 警告的同一个坑
-（用实际条数当分母，条数一漂移就假绿或假红）。
+**最要紧的三条**（都写进了 `DEVELOPMENT-PLAN.md`，不只是 ADR）：
+
+1. **§9.3.0.1「唯一合并写入点」**：不是「步骤 3c」，而是「**步骤 2 / 3c 的合并写入序列**」
+   ⇒ 步骤 2 的向量回填也在同一条路径上（全库仅一处 `UPDATE memories SET embedding`）。
+2. **归档模式**：`includeArchived=true` 时**强度精筛整体不执行**（不是「阈值改成 0.0」）
+   ⇒ 原文的 0.0 阈值会把「intensity 因 exp 下溢成恰好 0.0」的行挡掉 ⇒「显式查询归档层」名存实亡。
+3. **库内不得做实体抽取**：`RecallOptions.entityNames` 显式入口 + 与 `entityIds` **互斥**
+   ⇒ 两者都不传 ⇒ 图谱路为空（ADR-2 明写并接受的代价）。
 
 ---
 
-## 五、遗留问题清单（按优先级）
+## 六、⏳ 进行中（阶段 1 收官，6 条线并行）
 
-### P0 —— 阻塞后续阶段，必须先做
-| # | 问题 | 位置 | 说明 |
+| # | 事项 | 负责人 | 文件域 | 状态 |
+|---|---|---|---|---|
+| 1 | P1-T07 六条口径落地（C~G） | 工程师-4 | `write.ts` `merge.ts` `entities.ts` | 进行中 |
+| 2 | recall 契约返工（4 项） | 工程师-5 | `recall.ts` `scoring.ts` | 进行中 |
+| 3 | P1-T10 门面 + 导出面 | 工程师（线A） | `MemoryStore.ts`（新） `index.ts` | 进行中 |
+| 4 | `SQLITE_READONLY` 映射 + reinforce 守卫 + F-01 残余 | 工程师-2 | `errors.ts` `transaction.ts` `touch.ts` `params.ts` `check-doc-counts.ts` | 进行中 |
+| 5 | 归档跨度常数收敛 + F-08 ③ 静态守卫 | 工程师-3 | `decay.ts` `migrate.ts` `check-clamp.ts`（新） `package.json` | 进行中 |
+| 6 | P1-T09 基线等价验收 | QA | `tests/baseline/ref-v1.ts` `v1-equivalence.test.ts`（新） | 进行中 |
+| — | ADR-P1-R2 裁决的文档回写 | 架构师 | `docs/design/**` | 进行中 |
+
+---
+
+## 七、已知边界与欠账（**必须随阶段 2 一起消化**）
+
+| # | 欠账 | 性质 | 归属 |
 |---|---|---|---|
-| 1 | **P1-T05 的 SQL 层未接入、未验收** | `src/store/link.ts` | 文件已提交但 `src/index.ts` 未导出；缺 6 条端到端集成测试（重复三元组强化不产生重复边 / `createMissing=false` 零写入 / 每次 link 记一条事件 / `setAlias` 撞既有别名走 DO UPDATE / `mergeEntities` 后记忆正文一行未动 / 幂等返回） |
-| 2 | **P1-T06 的 `touch` 只做了纯计算** | `src/core/stability.ts` | 缺 SQL 写入路径、缺 R-EDGE-TOUCH（先计数再 UPDATE、`memory_id IS NULL` 的边永不强化）、缺事件的 `boostApplied` / `edgesReinforced` / `reason` 三值 |
-| 3 | **`hasTrainedBuckets` 未接入** | `src/core/flags.ts` | 「低于门槛」分支目前不看桶是否真的建过；这是 QA 确认的阶段 2 待补项 A1 |
-| 4 | **P1-T03 未开工** | — | 中文 Bigram 分词与 FTS5 查询构造；`recall` 依赖它 |
-
-### P1 —— 设计/工程一致性，需在阶段 2 之前解决
-| # | 问题 | 说明 |
-|---|---|---|
-| 5 | **P1-T02 的提交归属错位** | 其内容落在 engineer-2 的 `1fbb574` 里（共享工作树的暂存区被全量暂存吞掉）。**未重写历史**（07:30 前改历史风险大于收益），归属在本文件与提交信息中留档 |
-| 6 | **共享工作树的暂存区会串** | 已两次发生（阶段 0 的 `git stash` 抽走补丁、阶段 1 的全量暂存吞掉他人改动）。缓解措施已写进 `scripts/README.md` 的「提交前检查单」，但**两人以上并行时建议改用独立 `git worktree`** |
-| 7 | **`page_size` 只在建库时生效** | 实测：`new Database()` 已按 4096 建好文件，`journal_mode=WAL` 写库头后固化 ⇒ 对已存在的库再设 8192 无效。实现已改为「文件原本不存在时把 `page_size` 作为第一条 PRAGMA」 |
+| 1 | **阶段 1 不写桶归属**：有向量但无桶归属的记忆必然存在（阶段 1 没有细桶，桶行会被 FK 直接拒绝） | 阶段间交接 | P2-T03 的**集合相等硬断言**（左侧口径：**全库** `embedding IS NOT NULL AND deleted = 0`）+ 启动对账 + 首次重训 |
+| 2 | **静态断言只保证「阶段 1 不写桶」，不保证「阶段 2 写了桶」** | ⚠️ 静默失效点 | 必须靠 P2-T03 自己的集合相等断言兜底 |
+| 3 | `alias` 事件的 `aliasAdded` = **布尔**，源主名本体记在 `alias` 键（C36：同一件事不得有两套词） | 已裁决 | 已落地 |
+| 4 | `entityAliases[].name` 目标不存在 ⇒ **建但不隐含关联** ⇒ 只声明别名、不在 `entities` 点名的调用方**静默达不到召回目的** | ⚠️ 明写的代价 | 文档已写明；若要加 `warnings` 需同步改 `EXPECTED_WARNING_ONLY_CASES` 白名单 |
+| 5 | 库未校验 `stability > 0`（F-08 ④） | 独立问题 | 阶段 2 的参数/校验面 |
+| 6 | `intensity()` 两道钳制在正常输入下**行为等价** ⇒ 行为层无解 | 已知方法论边界 | F-08 ③ 的**静态扫描**守卫（工程师-3 落地中） |
+| 7 | `LIMIT 100` / `slice(0,20)` / `topN ∈ 1~8` **刻意硬编码**，不进参数表 | 设计决定 | 改它们是设计变更，走 ADR |
+| 8 | `stats()` **不在阶段 1 的 10 个方法内**且未实现 ⇒ 基线断言顺延 | 计划口径 | 已收敛进 `DEVELOPMENT-PLAN.md` |
 
 ---
 
-## 六、本轮沉淀的方法论（写下来是为了不再重犯）
+## 八、环境与并行纪律（本轮踩过的坑，务必读）
 
-1. **门禁入口必须用不被遮蔽的名字。** `pnpm ci` / `npm ci` 是包管理器的**内建 clean-install**，
-   会遮蔽同名 script ⇒ 退出码 0 却一条检查都没跑 ⇒ 正是 C31 警告的「一个从不失败的闸门，
-   看起来在把关」。真实门禁名是 `verify`（`ci` 降为其别名）。
-2. **验收工具本身必须被验收。** 本轮出现过三个同族缺陷：① 抽取正则在 CRLF 文件上匹配不到
-   ⇒ 抽出 0 个块 ⇒「脚本跑通了但什么都没验」；② `GATE_CHECKS` 用 npm script 名拼文件名
-   ⇒ 5 条门禁永远判 ❌；③ 守卫脚本只断言「文件存在」而非「被 verify 链调用到」。
-   ⇒ 每条负控都要能说出「它到底是因为什么而失败」。
-3. **判据再严，只要取串那一步替回写者修正了缺陷，严判据也白搭。**
-4. **断言要写「性质」，不要写「当次的具体形状 / 数字」。**
-5. **工作树绿 ≠ 提交绿。** 每次提交后用 `git show HEAD:<关键文件> | grep '<关键符号>'` 确认实现确实在提交里。
-6. **成员结论为准，委托方不得凭印象断言。** 本轮主理人有两次判断被实测证伪
-   （§8.4 实为 6 条硬规则；桌面原件是 LF 而非 CRLF；某个锚点串三个基线文件里都不存在）。
+1. **`pnpm ci` / `npm ci` 是包管理器内建命令（clean install）**，会遮蔽同名 script ⇒ **永远用 `pnpm run verify`**。
+2. **不要在主工作树 `D:/Git/repo` 跑 `pnpm install` / `pnpm ci`**：
+   它会重写 `node_modules/.bin` 的 shim，把**同时在跑的其他人的门禁打断**
+   （本轮实测：`vitest` 启动路径被冲成 `p0\..\vitest\vitest.mjs` ⇒ 报「系统找不到指定的路径」⇒ 一次**假失败**）。
+   ⇒ **每条线一个 worktree，门禁只在自己的 worktree 跑**；主工作树只用于合并与合并态验证。
+3. **worktree 隔离**：`git worktree add <路径> -b <分支> origin/main` + `pnpm install --frozen-lockfile`（pnpm store 命中，**实测 6.4s**）。
+4. **主工作树里的 `git status` 不能作为「谁在改什么」的判据** —— 提交归属一律以 `git log` / `git show --name-only` 为准
+   （本轮出现过架构师把别人的提交记到自己名下的情况）。
 
 ---
 
-## 七、下一步的建议起点（可直接开工）
+## 九、接手者的开工顺序（阶段 1 收官 → 阶段 2）
 
-**第一件事（建议）**：P1-T03（中文 Bigram 分词与 FTS5 查询构造）——
-它是 `recall`（P1-T08）与只读查看器（P5）的前置，且**不依赖任何未完成的模块**，零冲突风险。
+1. 等 §六 的 6 条线合并到 `main`，跑一次**合并态** `pnpm run verify`（退出码 0 + 测试计数），
+   并把计数写回本文件「本轮更新日志」。
+2. 按 `DEVELOPMENT-PLAN.md` 的 **P2-T01** 开工：向量分桶与路由。
+   ⚠️ P2-T03 的两条硬断言（集合相等 + 先对账后开路）是阶段 1 欠账的**唯一清偿口**，不要漏。
+3. 设计权威永远是 `docs/design/DESIGN-v2.md`；`DEVELOPMENT-PLAN.md` 是任务分解；
+   ADR 文件是裁决记录。**三处冲突时以 DESIGN-v2 为准，并补 ADR。**
 
-**并行第二件事**：P1-T05 的收尾 —— 把 `src/store/link.ts` 接入 `src/index.ts`，
-并补齐 6 条端到端集成测试；顺带把 `src/store/entities.ts` / `src/store/touch.ts` 建起来。
+---
 
-**第三件事**：P1-T07（write 写入路径：去重与合并）⇒ P1-T08（recall）⇒ P1-T09（get() 与基线验收）。
+## 本轮更新日志
 
-**开工前必读**：
-- `docs/design/DESIGN-v2.md`（v2 设计稿，5799 行，**已回写定稿**）
-- `docs/design/DEVELOPMENT-PLAN.md`（阶段与任务清单，4029 行）
-- `docs/design/DESIGN-v2-errata.md`（回写补丁，1871 行）
-- `scripts/README.md` 的「提交前检查单」（共享工作树纪律）
+- **11:40** —— 合并 `e1b1eef`（link 自校验补 `deleted = 0`）、`f2d1b1d`+`32fdb38`（粗筛窗口上提 scoring）、
+  `0d626d2`+`dcc35bb`+`7f78d45`（步骤 3a 候选口径断言 + recall 复用 scoring 唯一实现）；
+  架构师两轮 ADR（`fed2796` `20bfc4f` `8e7ba39`）；本人落 `651dac8`（计划稿收口）；
+  **门禁：24 文件 / 527 测试，退出码 0**。
+</content>
