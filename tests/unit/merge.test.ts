@@ -902,3 +902,131 @@ describe('P1-T07 · 判据②：向量回填与 write 在同一事务内', () =>
     expect(code).toHaveLength(sample.length);
   });
 });
+
+// ─────────────────────────────────────────────────────────────
+// §4.9 步骤 3a：候选查询的口径（前 3 个 bigram + `bm25 ASC LIMIT 3`）
+// ─────────────────────────────────────────────────────────────
+
+/** 候选查询 SQL 的审计结论。 */
+interface CandidateSqlVerdict {
+  /** 是否走 FTS 全文检索（`MATCH @dedupSql`），而不是 `LIKE` 扫描。 */
+  usesMatch: boolean;
+  /** 是否显式 `ORDER BY bm25(mem_fts) ASC`（BM25 升序 = 最相关的在前）。 */
+  bm25Asc: boolean;
+  /** 是否 `LIMIT 3`（候选面固定为 3，§4.9 的「代价段」）。 */
+  limitThree: boolean;
+}
+
+/** 审计一段候选查询 SQL 是否符合 §4.9 步骤 3a 的口径。 */
+function auditCandidateSql(sql: string): CandidateSqlVerdict {
+  return {
+    usesMatch: /MATCH\s+@dedupSql/i.test(sql),
+    bm25Asc: /ORDER\s+BY\s+bm25\(\s*mem_fts\s*\)\s+ASC/i.test(sql),
+    limitThree: /LIMIT\s+3\b/i.test(sql),
+  };
+}
+
+/**
+ * 从 `write.ts` 里抠出 `FIND_CANDIDATES_SQL` 的模板字面量内容。
+ *
+ * ⚠️ **必须抠出字面量再判**：直接对整份源码做正则，会被**注释里的话**满足
+ *   （例如「不要写 `ORDER BY bm25(mem_fts) ASC`」这句话本身就是那个形状）
+ *   ⇒ 断言会永远绿，却什么都没守住。
+ */
+function extractCandidateSql(source: string): string {
+  const match = /const\s+FIND_CANDIDATES_SQL\s*=\s*`([\s\S]*?)`;/.exec(source);
+  return match?.[1] ?? '';
+}
+
+describe('P1-T07 · 步骤 3a 的候选查询口径', () => {
+  /** 本测试文件所在目录（ESM 下没有 `__dirname`）。 */
+  const HERE = fileURLToPath(new URL('.', import.meta.url));
+  /** 仓库的 `src/` 目录。 */
+  const SRC_ROOT = resolve(HERE, '../../src');
+
+  it('★ 候选只取**前 3 个 bigram**：后段 bigram 相同的两条**不合并**', () => {
+    const { db, store } = createWriteContext();
+
+    // 第一条：bigram = 我爱 / 爱北 / 北京 / 京天 / 天安 / 安门
+    const first = write(store, {
+      content: '我爱北京天安门',
+      entities: ['张三', '李四'],
+      now: 0,
+    });
+    // 第二条：bigram = 我们 / 们去 / 去看 / 看北 / 北京 / 京天 / 天安 / 安门
+    //   ⇒ 它与第一条**共享后段**（北京/京天/天安/安门），
+    //     但**前 3 个 bigram 一条都不在第一条里** ⇒ 不是候选 ⇒ 不该合并。
+    const second = write(store, {
+      content: '我们去看北京天安门',
+      entities: ['张三', '李四'],
+      now: MS_PER_DAY,
+    });
+
+    // 性质：**没有合并**（否则说明查询用的是后段 bigram 或全量 bigram）
+    expect(second.merged).toBe(false);
+    expect(second.id).not.toBe(first.id);
+    expect(countRows(db, 'memories')).toBe(2);
+  });
+
+  it('★ 前 3 个 bigram **全中** ⇒ 成为候选 ⇒ 合并（窗口不是更宽的）', () => {
+    const { db, store } = createWriteContext();
+
+    // 第一条：bigram = 我爱 / 爱北 / 北京 / 京天 / 天安 / 安门
+    const first = write(store, {
+      content: '我爱北京天安门',
+      entities: ['张三', '李四'],
+      now: 0,
+    });
+    // 第二条：bigram = 我爱 / 爱北 / 北京 / 京上 / 上海 / 海故 / 故宫
+    //   ⇒ **前 3 个全在第一条里** ⇒ 第一条是候选 ⇒ 合并。
+    //   ⇒ 这条断言同时钉住了「窗口 ≤ 3」：若查询要求第 4 个及以后的 bigram，
+    //     第一条就不该是候选 ⇒ 不会合并 ⇒ 本条会红。
+    const second = write(store, {
+      content: '我爱北京上海故宫',
+      entities: ['张三', '李四'],
+      now: MS_PER_DAY,
+    });
+
+    // 性质：合并（实体重叠数 ≥ `DEDUP_ENTITY_MIN` ⇒ 证据成立）
+    expect(second.merged).toBe(true);
+    expect(second.exact).toBe(false);
+    expect(second.id).toBe(first.id);
+    expect(countRows(db, 'memories')).toBe(1);
+  });
+
+  it('★ 静态：候选 SQL 写死 `MATCH` + `bm25 ASC` + `LIMIT 3`，且**不复用** buildMatchQuery', () => {
+    const source = readFileSync(join(SRC_ROOT, 'store', 'write.ts'), 'utf8');
+
+    const verdict = auditCandidateSql(extractCandidateSql(source));
+    // 性质：走 FTS 全文检索
+    expect(verdict.usesMatch).toBe(true);
+    // 性质：显式按 BM25 升序（**不是**隐式的 rowid 顺序）
+    expect(verdict.bm25Asc).toBe(true);
+    // 性质：候选面固定为 3
+    expect(verdict.limitThree).toBe(true);
+
+    // 性质：**不复用** `buildMatchQuery`
+    //   （它内部会再 tokenize 一次 ⇒ 把已切好的 bigram 串当输入是「二次分词」
+    //     ⇒ 去重条件变成不可预测的东西，且不报错）
+    expect(codeOnly(source)).not.toContain('buildMatchQuery');
+  });
+
+  it('★ 负控：把 LIMIT / bm25 排序 / buildMatchQuery 改掉 ⇒ 检查必须报出来', () => {
+    const source = readFileSync(join(SRC_ROOT, 'store', 'write.ts'), 'utf8');
+    const sql = extractCandidateSql(source);
+
+    // ① 候选面放大到 50 ⇒ 必须被抓
+    //   ⚠️ **改的是抠出来的 SQL，不是整份源码**：源码里 `ORDER BY bm25(mem_fts) ASC`
+    //     这个形状**先出现在注释里**（`String.replace` 只换第一处）⇒ 改注释等于没改。
+    expect(auditCandidateSql(sql.replace('LIMIT 3', 'LIMIT 50')).limitThree).toBe(false);
+
+    // ② 排序改成 rowid（等价于没有 BM25 排序）⇒ 必须被抓
+    expect(
+      auditCandidateSql(sql.replace('ORDER BY bm25(mem_fts) ASC', 'ORDER BY m.rowid')).bm25Asc,
+    ).toBe(false);
+
+    // ③ 复用 `buildMatchQuery` ⇒ 必须被抓
+    const reused = `${source}\nconst q = buildMatchQuery(tokens);\n`;
+    expect(codeOnly(reused)).toContain('buildMatchQuery');
+  });
+});

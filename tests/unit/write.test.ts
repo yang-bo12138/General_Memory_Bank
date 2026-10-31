@@ -18,7 +18,7 @@ import { MemoryError } from '../../src/core/errors.js';
 import { EVENT_PAYLOAD_VARIANTS } from '../../src/core/events.types.js';
 import { blobToVector } from '../../src/store/merge.js';
 import { type WriteStore, write } from '../../src/store/write.js';
-import { MemoryLogger } from '../../src/util/log.js';
+import { LOG_ACTIONS, MemoryLogger } from '../../src/util/log.js';
 import { countRows, createTestStore, readEvents } from '../fixtures/graph-store.js';
 
 /** 测试用的库句柄类型（内存 SQLite）。 */
@@ -374,6 +374,35 @@ describe('P1-T07 · entityAliases 同步（§4.9 步骤 1c）', () => {
     const warns = logger.ofLevel('warn');
     expect(warns.length).toBeGreaterThan(0);
     expect(warns[0]?.fields.alias).toBe('老张');
+    // 性质：日志里带上了「**本来想挂到谁**」（`want`）——
+    //   只有 alias 名字的话，运维看到「老张」不知道该改哪一条 ⇒ 日志等于没用。
+    expect(warns[0]?.fields.want).toBe(zhangSanfengId);
+    // 性质：日志的 action 是写入（§8.1 的动作词）
+    expect(warns[0]?.action).toBe(LOG_ACTIONS.write);
+  });
+
+  it('★ 没有别名冲突 ⇒ **一条 warn 都不记**（日志通道不能被噪声淹没）', () => {
+    const { db, store, logger } = createWriteContext();
+
+    write(store, { content: '张三住在北京', entities: ['张三'] });
+    write(store, { content: '李四住在北京', entities: ['李四'] });
+
+    // 「老张」是**新**别名（库里还没有）⇒ 无冲突 ⇒ 不该报冲突、也不该记日志
+    const result = write(store, {
+      content: '张三丰喜欢喝奶茶',
+      entities: ['张三丰'],
+      entityAliases: [{ name: '张三丰', aliases: ['老张'] }],
+    });
+
+    // 性质：没有告警
+    expect(result.warnings).toHaveLength(0);
+    // 性质：**一条 warn 都没有**（否则排障时日志里全是无关噪声）
+    expect(logger.ofLevel('warn')).toHaveLength(0);
+    // 性质：新别名真的挂上了（挂对了目标实体）
+    const row = db.prepare('SELECT entity_id FROM entity_aliases WHERE alias = ?').get('老张') as {
+      entity_id: string;
+    };
+    expect(row.entity_id).toBe(entityIdOf(db, '张三丰'));
   });
 
   it('★ alias 撞**主名** ⇒ 同样走「跳过 + warnings + 日志」，不静默', () => {
