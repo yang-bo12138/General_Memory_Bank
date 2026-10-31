@@ -694,12 +694,16 @@ export interface CoarseGateWindow {
    *
    * ⚠️ `enabled === false` 时恒为 **0**（不是 `undefined`、不是 `null`）：
    *   §4.6 步骤 2 的原话就是「令 `@coarseCutoff = 0`（不设 last_access 粗筛）」。
+   *   ⚠️ **但 0 是「占位值」而不是「可以照绑的下界」**：
+   *   `m.last_access >= 0` 对**负值时间戳**仍然是个筛子 ⇒ 真正「不设粗筛」的做法是
+   *   **把粗筛片段从 SQL 里去掉**，而不是把阈值绑成 0。
+   *   ⇒ 调用方**必须按 `enabled` 决定要不要绑定**（`enabled === false` ⇒ 一个键都不绑）。
    */
   readonly coarseCutoff: number;
   /**
    * 被 pin 记忆的 `last_access` 下界（毫秒）—— SQL 的 `@coarseCutoffPinned`。
    *
-   * ⚠️ `enabled === false` 时恒为 **0**（同上）。
+   * ⚠️ `enabled === false` 时恒为 **0**（同上：**占位值**，不得照绑）。
    */
   readonly coarseCutoffPinned: number;
 }
@@ -735,6 +739,8 @@ export interface CoarseGateWindow {
  *   ⇒ 这是「**显式查询归档层**」的唯一代码路径（§4.4「归档仅显式查询可见」）。
  *   ⚠️ **向量路必须服从同一个开关**（铁律①）：否则「显式查归档层」只对两路生效，
  *     而归档层的记忆**根本进不了向量路** ⇒ 归档层在语义上就只被部分看见。
+ *   ⚠️ **取消粗筛的做法是「不绑这两个参数」（并把 SQL 里的粗筛片段去掉）**，
+ *     **不是**「把它们绑成 0」—— 后者对负值时间戳仍然是个筛子（详见字段注释）。
  *
  * @param params 生效参数（**必传**：窗口由 `MAX_STABILITY` / `MAX_PIN_FACTOR` / `ARCHIVE_LINE` 决定）
  * @param now 注入时钟（C37）；缺省取真实时钟
