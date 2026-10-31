@@ -162,17 +162,26 @@ export function link(
     let subjectId = resolveEntity(db, subject);
     let objectId = resolveEntity(db, object);
 
-    // ⚠️ ★ **步骤 0：memoryId 的存在性自校验**（§11.2 的自校验清单明写
-    //   「`link` ⇒ `memoryId`（记忆）」）。
+    // ⚠️ ★ **步骤 1 尾部：memoryId 的存在性自校验**（§11.2 的自校验清单明写
+    //   「`link` ⇒ `memoryId`（记忆）」；§4.5 步骤 4 给了这一句的**逐字 SQL**：
+    //   「传了 @memoryId 时必须先 `SELECT 1 FROM memories WHERE id = @x AND deleted = 0`」）。
     //   不自校验的后果：传一个不存在的 memoryId ⇒ 撞 `edges.memory_id` 的外键
     //   ⇒ 在 `PRAGMA foreign_keys = ON`（§9.1，每连接都开）下抛
     //   `SQLITE_CONSTRAINT_FOREIGNKEY` ⇒ 被转译成 `NOT_FOUND`，
     //   **但 `details` 里没有 `missingIds`** ⇒ 违反 §11.2 的自校验清单。
+    //   ⚠️ **必须带 `AND deleted = 0`**（§4.5 步骤 4 的逐字要求，不是可选项）：
+    //   外键只管「这行在不在」，**不管「这行是不是已被软删」**
+    //   ⇒ 漏掉这个条件 ⇒ 一条**已被遗忘**的记忆仍能当「边的证据」
+    //   ⇒ 用户已经忘了它，它却还在给图谱供能（静默地与遗忘的意图相反）。
+    //   这与 `touch` 把软删 id 当缺失（§4.2 的 `AND deleted = 0`）是同一条语义：
+    //   **软删的记忆不是有效记忆**（§4.6 的准入闸门一律 `deleted = 0`）。
     //   ⚠️ 自校验必须在**事务内**做（否则并发删除会漏判）。
     if (memoryId !== undefined && memoryId !== null) {
-      const memoryExists = db.prepare('SELECT 1 AS ok FROM memories WHERE id = ?').get(memoryId);
+      const memoryExists = db
+        .prepare('SELECT 1 AS ok FROM memories WHERE id = ? AND deleted = 0')
+        .get(memoryId);
       if (memoryExists === undefined) {
-        throw MemoryError.notFound(`link 的 memoryId 不存在：${memoryId}`, {
+        throw MemoryError.notFound(`link 的 memoryId 不存在（含软删）：${memoryId}`, {
           missingIds: [memoryId],
         });
       }
@@ -319,13 +328,18 @@ export function linkByIds(
     }
 
     // ⚠️ ★ **memoryId 的存在性自校验**（§11.2 的自校验清单明写
-    //   「`linkByIds` ⇒ `subjectId`/`objectId` 与 `memoryId`」）。
+    //   「`linkByIds` ⇒ `subjectId`/`objectId` 与 `memoryId`」；
+    //   §4.5 步骤 4 给了逐字 SQL：`SELECT 1 FROM memories WHERE id = @x AND deleted = 0`）。
     //   与 `link` 同理：不自校验 ⇒ 撞 `edges.memory_id` 的外键 ⇒ 转译成 `NOT_FOUND`
     //   但 `details` 里没有 `missingIds` ⇒ 违反 §11.2 的自校验清单。
+    //   ⚠️ **同样必须带 `AND deleted = 0`**：软删的记忆不是有效记忆，
+    //   不能继续当边的证据（否则「忘了它」之后图谱强度仍在涨）。
     if (memoryId !== undefined && memoryId !== null) {
-      const memoryExists = db.prepare('SELECT 1 AS ok FROM memories WHERE id = ?').get(memoryId);
+      const memoryExists = db
+        .prepare('SELECT 1 AS ok FROM memories WHERE id = ? AND deleted = 0')
+        .get(memoryId);
       if (memoryExists === undefined) {
-        throw MemoryError.notFound(`linkByIds 的 memoryId 不存在：${memoryId}`, {
+        throw MemoryError.notFound(`linkByIds 的 memoryId 不存在（含软删）：${memoryId}`, {
           missingIds: [memoryId],
         });
       }

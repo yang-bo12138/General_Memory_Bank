@@ -225,6 +225,22 @@ describe('P1-T05 · mergeEntities（§4.9.2）', () => {
     expect(events[0]?.memory_id).toBeNull();
   });
 
+  it('★ mergeEntities 的返回值用 sourceName 装源主名（ADR-P1-C F-3：不与布尔 aliasAdded 共名）', () => {
+    const { db, store } = createTestStore();
+    insertEntity(db, 'e-src', '张三');
+    insertEntity(db, 'e-tgt', '李四');
+
+    const result = mergeEntities(store, 'e-src', 'e-tgt');
+
+    // 性质：返回值里的 `sourceName` = 被降级的那条主名（与 payload 的 `alias` 键同源）
+    expect(result.sourceName).toBe('张三');
+    // ⚠️ **负控**：返回值的键名**不得**叫 `aliasAdded`——
+    //   那个键名在事件 payload 里是**布尔**（ADR-P1-C 冲突 1 的裁决），
+    //   同名不同义会让读代码的人以为「这里也是布尔」⇒ 断言它**不存在**。
+    expect(Object.keys(result)).not.toContain('aliasAdded');
+    expect(Object.keys(result)).toContain('sourceName');
+  });
+
   it('★ mergedEdges 只数「因三元组冲突而被折叠掉」的边（不含仅改指的边）', () => {
     const { db, store } = createTestStore();
     insertEntity(db, 'e-src', '张三');
@@ -266,6 +282,12 @@ describe('P1-T05 · mergeEntities（§4.9.2）', () => {
 
     expect(result.sourceId).toBe('e-1');
     expect(result.targetId).toBe('e-1');
+    // 性质：幂等路径**也**返回源主名本体（不是空串）
+    //   —— 空串会让调用方以为「源实体没有名字」，与真实路径的语义**相反**。
+    expect(result.sourceName).toBe('张三');
+    // ⚠️ 反例（负控）：若幂等路径记空串 ⇒ 上面一行失败
+    //   ⇒ 这条断言守得住「幂等路径偷懒返回空串」的实现。
+    expect(result.sourceName).not.toBe('');
     expect(countRows(db, 'entities')).toBe(before.entities);
     expect(countRows(db, 'edges')).toBe(before.edges);
     expect(countRows(db, 'events')).toBe(before.events);

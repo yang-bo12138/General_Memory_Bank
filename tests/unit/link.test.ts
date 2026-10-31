@@ -297,18 +297,46 @@ describe('P1-T05 · link（§4.5 的四步）', () => {
     expect(events[0]?.memory_id).toBeNull();
   });
 
-  it('★ 证据记忆不存在 ⇒ 外键错误已被**转译**成 NOT_FOUND（不穿裸 SQLite 错误码）', () => {
+  it('★ 软删的记忆不能当边的证据（§4.5 步骤 4：自校验必须带 AND deleted = 0）', () => {
     const { db, store } = createTestStore();
+    insertMemory(db, 'm-deleted', { deleted: true });
 
-    const error = expectMemoryError(() => link(store, '张三', '关联', '李四', 'm-missing'));
-
-    // ⚠️ §11.2：「客户端只应看到本类，裸的 SQLite 错误码不得穿到调用方」。
-    //   `edges.memory_id` 有外键 ⇒ 不存在的记忆 id 会撞 FK；
-    //   `runWriteTransaction` 把它转成 `NOT_FOUND`（语义 =「被引用的行不存在」）。
+    // 性质：软删的记忆**不是**有效记忆 ⇒ 不能被引用为证据
+    //   ⇒ NOT_FOUND（且是**规范化**的 code，不是裸的 SQLite 错误码）。
+    const error = expectMemoryError(() => link(store, '张三', '关联', '李四', 'm-deleted'));
     expect(error.code).toBe('NOT_FOUND');
     expect(error.code).not.toBe('SQLITE_CONSTRAINT_FOREIGNKEY');
-    // 性质：撞 FK 的那一次**零写入**
+    expect(error.details.missingIds).toEqual(['m-deleted']);
+    // ★ 零写入：端点实体也不能被留下
     expect(countRows(db, 'entities')).toBe(0);
     expect(countRows(db, 'edges')).toBe(0);
+
+    // ⚠️ **反例（负控）**：若自校验**漏了 `AND deleted = 0`** ⇒ 这条 link 会**成功**
+    //   （外键只管「行在不在」，**不管「行是不是被软删了」**）
+    //   ⇒ 上面的 `NOT_FOUND` / `missingIds` / 零写入三条断言全部失败
+    //   ⇒ 这条断言守得住「漏掉 deleted = 0」的实现。
+    // 参照组（正控）：同一条**活着**的记忆当证据 ⇒ 成功
+    //   （证明这条规则不是「memoryId 一律不许用」）。
+    insertMemory(db, 'm-alive');
+    const ok = link(store, '王五', '关联', '赵六', 'm-alive');
+    expect(readEdge(db, ok.subjectId, ok.predicate, ok.objectId)?.memory_id).toBe('m-alive');
+  });
+
+  it('★ linkByIds 对软删的 memoryId ⇒ NOT_FOUND（自校验同样带 AND deleted = 0）', () => {
+    const { db, store } = createTestStore();
+    insertEntity(db, 'e-existing', '张三');
+    insertEntity(db, 'e-other', '李四');
+    insertMemory(db, 'm-deleted', { deleted: true });
+
+    const error = expectMemoryError(() =>
+      linkByIds(store, 'e-existing', '关联', 'e-other', 'm-deleted'),
+    );
+    expect(error.code).toBe('NOT_FOUND');
+    expect(error.details.missingIds).toEqual(['m-deleted']);
+    expect(countRows(db, 'edges')).toBe(0);
+    expect(countRows(db, 'events')).toBe(0);
+
+    // ⚠️ **反例（负控）**：漏了 `AND deleted = 0` ⇒ 外键放行（软删的行**仍在表里**）
+    //   ⇒ link 成功 ⇒ 上面两条断言失败。
   });
 });
