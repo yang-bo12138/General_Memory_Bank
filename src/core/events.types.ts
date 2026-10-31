@@ -116,17 +116,57 @@ export interface ManualFixEventPayload {
   hasEmbedding: boolean;
 }
 
-/** `alias` 事件（§8.4 的 alias 行）。 */
+/**
+ * `alias` 事件（§8.4 的 alias 行 + 表后的「alias 行的字段类型约定」）。
+ *
+ * ⚠️ **`aliasAdded` 是布尔，不是被降级的主名**（v2.1 勘误）：
+ *   设计稿 §4.9.2 步骤 5 原稿写的是 `aliasAdded: sourceName`（字符串），
+ *   与本文件原先的 `aliasAdded?: boolean` **直接冲突**——同一个键名两处两套语义。
+ *   ⇒ **裁决：`aliasAdded` = 布尔**（本次是否新增/改写了一条「别名 → 实体」映射），
+ *     **被降级的源实体主名本体记在 `alias` 键上**。
+ *   ⇒ 为什么不反过来（让 `aliasAdded` 装名字）：那样 `alias` 与 `aliasAdded` 会在
+ *     `action='set'` / `action='merge'` 两个子变体下**各表示一件事**
+ *     （`set` 时 `alias` 是被设置的别名、`merge` 时 `aliasAdded` 是被降级的主名）
+ *     ⇒ 一个事件类型两套词，违反 §14.3.1 的 C36。
+ *   ⇒ 现在的口径：`alias` 在**两个 action 下都是「本次涉及的别名名」**，语义统一。
+ *   ⚠️ **信息一条不丢**：合并会删掉源实体行（§4.9.2 步骤 4）⇒ 它的主名在库里
+ *     只剩「别名表」与「事件」两处；`alias` 键保住了名字，`aliasAdded` 键说明了「确实动过别名映射」。
+ */
 export interface AliasEventPayload {
   action: 'set' | 'merge';
+  /**
+   * 本次涉及的**别名名**。
+   *
+   * · `action='set'` ⇒ 被设置的别名（§4.9.2 步骤 4）；
+   * · `action='merge'` ⇒ **被降级为别名的源实体主名**（§4.9.2 步骤 5）。
+   */
   alias?: string;
+  /** `setAlias` 的目标实体 id。 */
   entityId?: string;
+  /** `setAlias` 覆盖前的映射目标实体 id（无覆盖则不出现）。 */
   prevEntityId?: string;
+  /** `mergeEntities` 的源实体 id（合并后该实体行被删）。 */
   sourceId?: string;
+  /** `mergeEntities` 的目标实体 id。 */
   targetId?: string;
+  /** 迁移的记忆关联条数（**全部**迁走的行，含目标本来就有的那些）。 */
   movedMemories?: number;
+  /**
+   * **因三元组冲突而被折叠掉的边数**（§4.9.2 步骤 2）。
+   *
+   * ⚠️ **只数冲突那一支**：仅改指（无冲突）的边**不计入**——它们是「搬迁」，不是「合并」。
+   * ⇒ 可对账恒等式：`合并前的边数 − 合并后的边数 == mergedEdges + droppedSelfLoops`。
+   */
   mergedEdges?: number;
+  /** 合并后被清掉的自环条数（§4.9.2 步骤 2b）。 */
   droppedSelfLoops?: number;
+  /**
+   * 本次是否新增/改写了一条「别名 → 实体」映射。
+   *
+   * ⚠️ **布尔**（不是被降级的主名——主名在 `alias` 键上）。
+   * `action='merge'` 恒为 `true`（源主名必然被降级为目标的别名）；
+   * `action='set'` **不带**此键。
+   */
   aliasAdded?: boolean;
 }
 

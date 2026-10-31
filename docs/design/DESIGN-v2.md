@@ -982,6 +982,19 @@ linkByIds(subjectId: string, predicate: string, objectId: string, memoryId?: str
      —— 事件只在步骤 3 记一次，不要在这里另记：两处各记一次会让一次 link 产生两条 link 事件。
    - options.createMissing === false：抛 MemoryError.NOT_FOUND，不产生任何写入（整条 link 失败，事务回滚）。
    - 明确禁止「一边自动建、一边抛错」的混合策略——两个 API 对同一输入必须给出相同结论。
+   —— ⚠️ ★ **`details` 里的键名按「装的是 id 还是名字」分开**（v2.1 勘误）：
+     · **端点缺失**（上一条分支）⇒ 端点的入参是**名称** ⇒ 记 **`details.missingEntityNames`**
+       （装缺失的端点**名**），**不要塞进 `details.missingIds`**——
+       `missingIds` 这个键名的语义是「缺失的**行 id**差集」（`src/core/errors.ts` 的
+       `MISSING_IDS_KEY`；§11.2 的 FK 兜底句「FK 违规 ⇒ NOT_FOUND（带 `details.missingIds`）」
+       也是这个意思，因为本库所有 FK 列都是 **id 引用**）
+       ⇒ 让它装名字，等于同一个键名在 `touch` / `linkByIds`（装 id）与 `link`（装名字）
+       下表达两件事 ⇒ 与 §14.3.1 的 C36「同一件事不得有两套词」同源。
+     · **`memoryId` 缺失** ⇒ 那是**记忆 id** ⇒ 记 **`details.missingIds`**（与 `touch` /
+       `linkByIds` 同族）。⚠️ **`link` 必须自己校验 `memoryId`**（§11.2 的自校验清单明写
+       「`link` ⇒ `memoryId`（记忆）」）：`edges.memory_id` 有 FK，不校验会撞
+       `SQLITE_CONSTRAINT_FOREIGNKEY`（未类型化，会原样穿给调用方，见 §11.2 的归一化收口）。
+     ⇒ 一句话：**键名必须与内容同族**——「装 id 的叫 `missingIds`，装实体名的叫 `missingEntityNames`」。
 
    **回填 @subjectId / @objectId**（步骤 1 只解析，步骤 2 才定稿）：
      @subjectId = @subjectIdRaw ?? （为 subject 新建/复用到的实体 id）
@@ -1750,6 +1763,38 @@ restore(id: string, options?: { mergeInto?: string }): void
 
 ### 4.9 写入去重与合并
 
+> ★ **阶段 1（P1）的桶归属阶段性豁免**（v2.1 勘误；**这是临时口径，阶段 2 落地后必须撤销**）：
+>
+> 本节有**四条 embedding 赋值路径**（步骤 2 补写 / 步骤 3c ② 合并写回 / 步骤 4 新建 /
+> §4.9.1 步骤 4 改写），每一条都要求「同事务内同步 `vector_cell_members`」（§9.3.0 / §9.3.2 ①）。
+> ⚠️ **但阶段 1 还没有分桶**：两级 k-means 训练、细桶中心、`assignBucket` / `unassignBucket`
+> 全部属于**阶段 2**（DEVELOPMENT-PLAN.md 的 P2-T03 及其桶训练任务）。
+> ⇒ **阶段 1 的 `write()` 照写 `memories.embedding`，但不写 `vector_cell_members`**：
+> - **写不了**：`vector_cell_members.fine_id` 有 FK 指向 `vector_fine_cells`（§3），
+>   而阶段 1 库里**一条细桶都没有** ⇒ 任何桶行都会被外键直接拒绝（FK 在每连接都开，§9.1）；
+> - **也不该写一个「空壳 `assignBucket`」**：没有细桶可分配的空函数 = **死函数 = 假绿**
+>   （§14.3 边界原则 1：每个承诺都要能指到唯一代码路径——指不到的，要么补实现，要么删承诺）。
+>
+> ⇒ ★ **欠账不会变成「永久漏召」**，阶段 2 有**两条自动修复路径**（都已在设计稿里）：
+> ① §9.3.2 ③ 的**启动对账**：「库侧有、桶侧无 ⇒ 补（归入最近的细桶）」；
+> ② §4.15.5 重建步骤 ② 的**全量重分配**：「按新中心重新分配**每条**记忆的桶归属」。
+> ⇒ ★ **阶段 2 落地时必须满足两条硬约束**（缺一条，那才是设计稿点名的「静默、永久、不报错」窗口）：
+> - **在启动对账 / 首次重训完成之前，不得对外提供 IVF 向量路**；
+> - **必须新增一条硬断言**：「库内所有 `embedding IS NOT NULL` 且 `deleted = 0` 的记忆，
+>   其 id 集合与 `vector_cell_members` 的 `memory_id` 集合**相等**」
+>   （集合相等，不是条数相等——§9.3.2 ③ 的三条判据）⇒ 把阶段 1 的欠账变成阶段 2 的**可检断言**，
+>   而不是靠自觉。
+>
+> ⚠️ 阶段 1 另有两处**同源**的阶段性豁免（一并写明，避免被当成漏实现）：
+> - §4.9 步骤 3a2 的**向量路候选**（两级路由 + 桶内检索）需要桶中心 ⇒ 阶段 1 **跳过**，
+>   近似去重退回纯文本路（步骤 3a）。代价是**少一条去重证据**，不是「去重失效」；
+> - §4.9 步骤 3c ② 的 `unassignBucket` 在阶段 1 **不存在** ⇒ 阶段 1 库里根本没有桶行可删 ⇒ 无矛盾。
+>
+> ⇒ ⚠️ **阶段 1 的 `stats().vectorBackend.embeddedRatio` 只表示「有向量的记忆数」**，
+> **不代表「已进入向量路」**（阶段 1 根本没有向量路）⇒ 不要把它读成「向量覆盖率」。
+> ★ 而 §0.2.2 的「密度门槛与向量覆盖率耦合」讨论的是**阶段 2 之后**的口径，
+> 阶段 1 的 `embeddedRatio` 偏高**不构成** §0.2.1 的任何结论。
+
 ```
 写入处理（包含实体同步与完整事件记录）：
 
@@ -1849,6 +1894,8 @@ restore(id: string, options?: { mergeInto?: string }): void
        -- ★ 同事务内更新 `vector_cell_members` —— 调 assignBucket(...)（§9.3.0）
        --   ⚠️ 漏了这一步 ⇒ 有向量但不在任何桶里 ⇒ 向量路永远召不回，
        --   而 `embeddedRatio` 却在涨 ⇒ **静默、永久**。
+       --   ⚠️ **阶段 1（P1）暂缓这一步**（见本节开头的「阶段性豁免」）：
+       --     阶段 1 没有细桶 ⇒ 桶行写不进去；欠账由阶段 2 的启动对账 / 首次重训补齐。
        -- 带 `embedding IS NULL` 是必须的：已有向量时不得覆盖。同一段正文在不同模型下算出的向量
        --   不可比（维度可能恰好相同，库无法检测），一旦允许覆盖，同一张表里就会混着两代向量，
        --   余弦值失去意义且**没有任何报错**。换模型 = 全库重算，那是 §11.3 快照导出后重建的事。
@@ -1980,6 +2027,8 @@ restore(id: string, options?: { mergeInto?: string }): void
            embedding = @newVec    -- 本次传了就写新的；**没传就置 NULL**
            -- ★ ★ **改了 embedding 就必须同步更新桶归属**（§9.3.0）：同事务内调用
            --   `assignBucket(id, @newVec)`（**从旧细桶移出 + 插入新细桶**，同事务）。
+           --   ⚠️ **阶段 1（P1）暂缓这两步**（见本节开头的「阶段性豁免」）：
+           --     阶段 1 没有细桶 ⇒ 桶行写不进去；且阶段 1 没有桶行可 unassign。
            --   ⚠️ **漏了这一步的后果不是「召不回」，是「排在错位置」**：
            --      它的向量已与旧桶心不匹配，却仍被扫到并参与排序 ⇒ **召回质量静默劣化**。
            --   ⚠️ **没传向量（置 NULL）⇒ 必须 `unassignBucket(id)`**：
@@ -2029,14 +2078,20 @@ restore(id: string, options?: { mergeInto?: string }): void
        -- ★ 同事务内更新 `vector_cell_members` —— 调 assignBucket(...)（§9.3.0）
        --   ⚠️ 漏了这一步 ⇒ 有向量但不在任何桶里 ⇒ 向量路永远召不回，
        --   而 `embeddedRatio` 却在涨 ⇒ **静默、永久**。
-   events(type='write', memory_id=<新 id>,
-     payload={ id, kind, contentText, contentLength, contentHash,
-       entityIds: @linkedEntityIds, entityNames: [...], emotion, confidence,
-       hasEmbedding: (@newVec !== null),   -- 恒带该键：事后能判断「这条为什么没进向量路」
-       initialStability, initialDifficulty })
-   （同样遵守 §8.2：正文只放 contentText，且该键是唯一可被遗忘流程脱敏的字段）
-   返回 { id, merged: false, exact: false, content: input.content,
-            warnings: @warnings }。    -- @warnings 见步骤 1c，无冲突时为 []
+       --   ⚠️ **阶段 1（P1）暂缓这一步**（见本节开头的「阶段性豁免」）：
+       --     阶段 1 没有细桶 ⇒ 桶行写不进去；欠账由阶段 2 的启动对账 / 首次重训补齐。
+  events(type='write', memory_id=<新 id>,
+    payload={ id, kind, contentText, contentLength, contentHash,
+      entityIds: @linkedEntityIds, emotion, confidence,
+      hasEmbedding: (@newVec !== null),   -- 恒带该键：事后能判断「这条为什么没进向量路」
+      initialStability, initialDifficulty })
+  （同样遵守 §8.2：正文只放 contentText，且该键是唯一可被遗忘流程脱敏的字段）
+  ⚠️ **payload 里没有 `entityNames`**（勘误）：本键只在 §4.9 步骤 4 的伪代码里出现过，
+    而 §8.4 的 write 行与 `EVENT_PAYLOAD_KEYS.write` **都没有它**
+    ⇒ 两处不一致 ⇒ 以 §8.4（事件 payload 契约的唯一权威）为准，删去该键。
+    实体名可由 `entityIds` 查 `entities` 表得到 ⇒ 信息不丢，且少一份冗余快照。
+  返回 { id, merged: false, exact: false, content: input.content,
+           warnings: @warnings }。    -- @warnings 见步骤 1c，无冲突时为 []
 ```
 
 > **为什么无条件采纳新文本**（替代「保留更长版本」的长度启发式）：
@@ -2181,6 +2236,20 @@ mergeEntities(sourceId: string, targetId: string): void
    INSERT OR IGNORE INTO memory_entities(memory_id, entity_id)
      SELECT memory_id, @targetId FROM memory_entities WHERE entity_id = @sourceId;
    DELETE FROM memory_entities WHERE entity_id = @sourceId;
+   —— ⚠️ ★ **不需要对 `memory_id` 做存在性预校验**（v2.1 勘误，把两处疑问一次说清）：
+     ① **`memory_entities` 表确实有外键**（§3：`memory_id REFERENCES memories(id) ON DELETE CASCADE`、
+        `entity_id REFERENCES entities(id) ON DELETE CASCADE`）——「这张表没有外键」是**误传**。
+     ② **但本步骤不可能违反那个外键**：它是把**既有的行**逐字拷贝——
+        `memory_id` 一律取自 `memory_entities` 已有行 ⇒ **不引入任何新的记忆引用**
+        ⇒ 拷贝出来的 `memory_id` 必然指向一条存在的 `memories` 行（外键要么本来就成立，要么是历史脏行）。
+     ③ **`entity_id` 那一侧也不会违反**：写入的 `@targetId` 由**步骤 0 的存在性校验**保证存在。
+     ⇒ 所以「预校验 `memory_id` 是否存在」是**为一个不可能发生的错误加一次全表扫描**：
+        它挡不住任何真实故障，只是让合并变慢。
+     ⚠️ **真正要防的是 `PRAGMA foreign_keys` 漏开**（§9.1 的**每连接**开关，R-08）——
+        但本步骤**不依赖 CASCADE**：它自己把源实体的行显式搬走、再显式删掉
+        ⇒ 漏开 FK 也不会留下「指向已删实体的孤儿关联行」。
+     ⚠️ 结论：**现在不加预校验**。若将来 `memory_entities` 的外键语义发生变化
+        （例如加上 `ON DELETE RESTRICT` 之类的新约束），**届时**再补预校验并同步本处与 §11.2 的自校验清单。
 2) 迁移边（可能与既有边撞 UNIQUE(subject_id, predicate, object_id)，必须逐条判冲突）：
    对 source 参与的每条边 e：
      若已存在同三元组且已指向 target 的边 e2：
@@ -2199,6 +2268,16 @@ mergeEntities(sourceId: string, targetId: string): void
             -- 等于凭空造出一条「目标指向自己」的假关系。
    —— 为什么取和：取大等于凭空砍掉一半关系强度。两条各 0.8 的边合并后应得 1.6，
       若取大只剩 0.8，可能直接跌破 ACTIVATION_MIN 让扩散永久失效（沉默的功能消失）。
+   —— ★ **`mergedEdges` 的口径（v2.1 勘误）**：**本次因三元组冲突而被折叠掉的边数**
+     （即上面「`DELETE FROM edges WHERE id = e.id`」那一支的执行次数）。
+     ⚠️ **只改指、无冲突的边不计入**——它们是「搬迁」，不是「合并」。
+     ⇒ 由此得到一条**可对账的恒等式**（合并前后各数一次 `edges` 的行数即可核）：
+          合并前的边数 − 合并后的边数 == mergedEdges + droppedSelfLoops
+        （每次冲突合并净删一条边；每次自环清理净删一条边；这两者之外边数不变）
+     ⇒ 口径一旦漂移（例如改成「迁移的边总数」），这条恒等式立刻不成立 ⇒ 可被对账当场抓住。
+     ⚠️ 命名上的刻意对照：`movedMemories` 是「**迁移**」的记忆关联条数（全部迁走的行），
+        `mergedEdges` 是「**合并**」掉的边数（只数冲突那一支）—— 两者刻意不同义，
+        不要拿「迁移了几条边」去填 `mergedEdges`。
 2b) 清理合并产生的自环（原 A→B 迁移后变成 A→A）：
    DELETE FROM edges WHERE subject_id = @targetId AND object_id = @targetId;   -- 计数入 droppedSelfLoops
    -- 只删**本次目标实体**身上的自环。不要写成 `WHERE subject_id = object_id`——
@@ -2212,7 +2291,22 @@ mergeEntities(sourceId: string, targetId: string): void
    —— 无需同步任何 JSON 冗余列（`entities.aliases` 已从 §3 删除，权威唯一来源是 entity_aliases）。
 4) DELETE FROM entities WHERE id = @sourceId;   -- 此时已无任何引用，各外键不会级联误删数据
 5) events(type='alias', payload={ action: 'merge', sourceId, targetId,
-     movedMemories, mergedEdges, droppedSelfLoops, aliasAdded: sourceName })
+     movedMemories, mergedEdges, droppedSelfLoops,
+     aliasAdded: true,        -- ★ **布尔**：本次是否新增/改写了一条「别名 → 实体」映射
+     alias: sourceName })     -- ★ 被降级为别名的**源实体主名**本体
+   -- ⚠️ ★ **v2.1 勘误：`aliasAdded` 是布尔，不是被降级的主名**。
+   --   原稿写的是 `aliasAdded: sourceName`（与 §8.4 的键集表无关，但与
+   --   `src/core/events.types.ts` 的 `AliasEventPayload.aliasAdded?: boolean` 直接冲突：
+   --   **同一个键名在两处表达两件事**（一个字符串、一个布尔）⇒ 重放器读到哪种含义取决于实现）。
+   --   ⇒ **裁决：`aliasAdded` = 布尔**（是否新增/改写了别名映射）；
+   --     **被降级的主名本体记在 `alias` 键上**。
+   --   ⇒ 为什么这样不丢信息：合并后源实体行被删（步骤 4）⇒ **它的主名在库里只剩别名表与事件两处**；
+   --     `alias` 键保住了名字，`aliasAdded` 键说明了「确实动过别名映射」⇒ 两条信息一条不丢。
+   --   ⇒ 为什么不用 `aliasAdded` 装名字（另一种写法）：那样同一个事件类型里
+   --     `alias` 与 `aliasAdded` 会**在两个 action 下各表示一件事**（`set` 时 `alias` 是被设置的别名、
+   --     `merge` 时 `aliasAdded` 是被降级的主名）⇒ 一个事件类型两套词，违反 C36 的同源纪律。
+   --     现在的口径是：`alias` 在**两个 action 下都是「本次涉及的别名名」**，语义统一。
+   --   （类型与口径的完整约定见 §8.4 表后的「alias 行的字段类型约定」。）
 ```
 
 > **为什么放在 §4.9 而不是单开一节**：这两个操作改的是「后续写入与召回如何解析实体」，  
@@ -4592,6 +4686,22 @@ export class MemoryStore {
 | `forget`     | §4.8（软删步骤／硬删步骤 ③）                                                                     | = id                      | `id, hard`；`hard: true` 时另有 `auditContentRetained`（软删**不带**此键——该字段只在硬删时才有意义，见 §4.8）                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | 否                                       |
 | `sweep`      | §4.10 步骤 1（每条清理）+ 步骤 4（整次汇总）                                                          | = id（逐条）；**汇总事件填无**       | 逐条：`id, reason('purge_deleted'), deletedAt`；**汇总（★ 全库唯一权威口径，§4.10 步骤 4 与 §4.12.4 ② 都以它为准）**：`action('purge'\|'rebuildArchive'\|'rebuildBuckets'\|'recluster'), purged, archivedCount, vacuumed, coactPairsActive, coactPairsPurged, clusterCount, largestClusterRatio, largestClusterRatioBeforeSplit, blocksAfterSplit` —— ★ `action` 用**同一个 events.type** 区分四个维护动作（**不新增 events.type**，符合 ADR-15 —— SQLite 的 CHECK 无法 ALTER，新增 type 要重建 events 表 + 重建全部索引与触发器）。`memory_id` 一律填 null（这些动作不针对单条记忆）。（`vacuumed` = 实际是否执行了 VACUUM，**不是入参回显**——`purged = 0` 时会跳过） | 否                                       |
 | `config`     | `MemoryStore` 构造或 `setParams()` 时                                                     | 无                         | 两者都必带 `SCHEMA_VERSION, params`（**变更后的完整生效参数**）；`setParams()` 另有 `changed: Array<{ key, from, to }>`，构造时**不带** `changed`（没有变更）                                                                                                                                                                                                                                                                                                                                                                                                                                  | 否                                       |
+
+> ★ **`alias` 行的字段类型约定**（v2.1 勘误补齐；**上表只列键名，类型在此补齐**——
+> ⚠️ **不要把类型标注写进上表第 4 列**：`scripts/check-payload-keys.ts` 从那一列解析键集，
+> `aliasAdded?(boolean)` 这类写法会被解析器判成「不是键」⇒ 门禁会误报「代码有而 §8.4 没有」）：
+>
+> - `action`：`'set'` / `'merge'`；
+> - `alias`（**字符串**）：`action='set'` ⇒ 被设置的别名名；`action='merge'` ⇒ **被降级为别名的源实体主名**；
+> - `aliasAdded`（**布尔**）：本次是否新增/改写了一条「别名 → 实体」映射。
+>   `action='merge'` 恒为 `true`（源主名必然被降级为目标的别名）；`action='set'` **不带**此键；
+> - `entityId` / `prevEntityId` / `sourceId` / `targetId`（**字符串**）：实体 id；
+> - `movedMemories`（**整数**）：迁移的记忆关联条数（**全部**迁走的行，含目标本来就有的那些）；
+> - `mergedEdges`（**整数**）：**因三元组冲突而被折叠掉的边数**（只数冲突那一支，不数仅改指的边）；
+> - `droppedSelfLoops`（**整数**）：合并后被清掉的自环条数。
+>
+> ⚠️ 三个计数的**口径互不相同**（§4.9.2 步骤 1 / 2 / 2b），
+> 抄写时不要用「迁移了几条」去填 `mergedEdges`（它数的是「合并掉了几条」）。
 
 **六条硬规则**（编号 1~6 即全文引用的唯一口径——`DEVELOPMENT-PLAN.md` 与 `src/` 里的「§8.4 硬规则 N」都指这里）：
 
