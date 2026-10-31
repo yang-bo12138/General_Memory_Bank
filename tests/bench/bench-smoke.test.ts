@@ -185,6 +185,9 @@ describe('P2-T08 · bench 的小规模冒烟（守门用；重测靠 bench/*.ts 
       expect(result.bucketCandidatesOutsideUniverse).toBe(0);
       // ⚠️ **「同义改写真的接近」**（关键口径 #2 的实测值）。
       expect(result.synonymCosineMean).toBeGreaterThan(0.5);
+      // ⚠️ ★ **桶内精确性**（C30 的「有没有算错」那半 ⇒ **硬断言**）：
+      //   分桶的 top-K 必须与「对同一个桶集合做全量精确扫描」的 top-K **逐位相同**。
+      expect(result.bucketInternalMismatches).toEqual([]);
     } finally {
       db.db.close();
     }

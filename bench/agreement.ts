@@ -114,6 +114,14 @@ export interface AgreementResult {
   readonly synonymCosineMin: number;
   /** ★ **同上，最大值**。 */
   readonly synonymCosineMax: number;
+  /**
+   * ★ **桶内精确性**（C30 的「有没有算错」那半）。
+   *
+   * ⚠️ **这是硬断言**（不是软阈值）：分桶的 top-K 必须与
+   *   「对同一个桶集合做全量精确扫描」的 top-K **逐位相同**（id / 顺序 / 分数）。
+   *   ⇒ 不一致的描述在这里（**空数组 = 逐位相同**）。
+   */
+  readonly bucketInternalMismatches: readonly string[];
 }
 
 /**
@@ -155,12 +163,19 @@ export function measureAgreement(
   let extraTotal = 0;
   let bucketCandidateTotal = 0;
   let bucketCandidatesOutsideUniverse = 0;
+  const internalMismatches: string[] = [];
 
   for (const query of queries) {
     const start = process.hrtime.bigint();
     const bucketHits = backend.search(query.embedding, TOP_N);
     const end = process.hrtime.bigint();
     latencies.push(Number(end - start) / 1_000_000);
+
+    // ⚠️ ★ **桶内精确性**（C30 的硬断言那半）：
+    //   分桶的 top-K 与「对同一个桶集合做全量精确扫描」的 top-K 逐位比较。
+    for (const mismatch of bucketInternalMismatches(db, backend, query.embedding, TOP_N)) {
+      internalMismatches.push(`查询 ${query.id}：${mismatch}`);
+    }
 
     // ⚠️ ★ **先量「同义改写真的接近」**（关键口径 #2 的实测证据）。
     synonymCosines.push(querySynonymCosine(query));
@@ -226,6 +241,7 @@ export function measureAgreement(
         : synonymCosines.reduce((total, value) => total + value, 0) / synonymCosines.length,
     synonymCosineMin: synonymCosines.length === 0 ? 0 : Math.min(...synonymCosines),
     synonymCosineMax: synonymCosines.length === 0 ? 0 : Math.max(...synonymCosines),
+    bucketInternalMismatches: internalMismatches,
   };
 }
 
@@ -241,6 +257,77 @@ export function measureAgreement(
  * @param result 测量结果
  * @returns 违规清单（**空数组 = 全部通过**）
  */
+/**
+ * ★ ★ **桶内精确性的硬断言**（C30 的「有没有算错」那半）。
+ *
+ * ⚠️ **为什么要单独一条**：C30 把问题分为两个区：
+ *   · **「有没有算错」** ⇒ **硬断言**：桶内是**精确点积**，
+ *     不得产生**近似误差** ⇒ 断言：
+ *     **分桶的 top-K 与「对同一个桶集合做全量精确扫描」的 top-K 逐位相同**；
+ *   · **「漏了多少」** ⇒ **软断言**：探针边界效应 ⇒ 合瑶率 ≥ 0.98。
+ * ⇒ 两条合起来才是完整的「只漏不错」。
+ *
+ * ⚠️ **口径为什么是「同一个桶集合」**：
+ *   分桶路径只扫命中桶的成员 ⇒ 它的候选集合就是「命中桶的全部成员」
+ *   ⇒ 把同一个集合交给**全量精确扫描**（bench/lib/flat.ts 的 `restrict` 参数）
+ *   ⇒ 两边应该**逐位相同**（id、顺序、分数）。
+ *
+ * @param db 库句柄
+ * @param backend 生产的分桶后端
+ * @param query 查询向量
+ * @param k 取前 K 条
+ * @returns 不一致清单（**空数组 = 逐位相同**）
+ */
+export function bucketInternalMismatches(
+  db: Database.Database,
+  backend: IvfVectorBackend,
+  query: Float32Array,
+  k: number,
+): string[] {
+  const fineIds = backend.route(
+    query,
+    DEFAULT_PARAMS.ROUTER_NPROBE_COARSE,
+    DEFAULT_PARAMS.ROUTER_NPROBE_FINE,
+  );
+  const members = new Set<string>();
+  const statement = db.prepare('SELECT memory_id FROM vector_cell_members WHERE fine_id = ?');
+  for (const fineId of fineIds) {
+    for (const row of statement.all(fineId) as Array<{ memory_id: string }>) {
+      members.add(row.memory_id);
+    }
+  }
+
+  // ⚠️ **参考**：对同一个桶集合做**全量精确扫描**（流式、同一个口径）。
+  const expected = flatTopK(db, query, k, undefined, members);
+  const actual = backend.search(query, k);
+
+  const mismatches: string[] = [];
+  if (expected.length !== actual.length) {
+    mismatches.push(
+      `桶内 top-K 条数不同：全量扫描 ${expected.length} 条 vs 分桶 ${actual.length} 条`,
+    );
+  }
+  const limit = Math.min(expected.length, actual.length);
+  for (let index = 0; index < limit; index += 1) {
+    const left = expected[index];
+    const right = actual[index];
+    if (left === undefined || right === undefined) {
+      break;
+    }
+    if (left.id !== right.id) {
+      mismatches.push(`桶内第 ${index + 1} 名 id 不同：全量扫描 ${left.id} vs 分桶 ${right.id}`);
+      break;
+    }
+    if (left.score !== right.score) {
+      mismatches.push(
+        `桶内第 ${index + 1} 名分数不同：全量扫描 ${left.score} vs 分桶 ${right.score}（${left.id}）`,
+      );
+      break;
+    }
+  }
+  return mismatches;
+}
+
 export function checkAgreement(result: AgreementResult): string[] {
   const failures: string[] = [];
 
@@ -269,7 +356,15 @@ export function checkAgreement(result: AgreementResult): string[] {
     failures.push('查询数为 0 ⇒ 吻合率是真空通过（必须至少有查询）');
   }
 
-  // ④ ★ **「同义改写真的接近」**（**测量有效性的前提** ⇒ 不满足则结论无效）。
+  // ④ ★ **桶内精确性**（C30 的「有没有算错」那半 ⇒ **硬断言**）。
+  if (result.bucketInternalMismatches.length > 0) {
+    failures.push(
+      '「算错」被破：桶内 top-K 与「对同一个桶集合做全量精确扫描」不逐位相同' +
+        `（${result.bucketInternalMismatches.length} 处，首处：${result.bucketInternalMismatches[0] ?? ''}）`,
+    );
+  }
+
+  // ⑤ ★ **「同义改写真的接近」**（**测量有效性的前提** ⇒ 不满足则结论无效）。
   if (result.synonymCosineMean < SYNONYM_COSINE_MIN) {
     failures.push(
       `同义改写余弦均值 ${result.synonymCosineMean.toFixed(6)} < ${SYNONYM_COSINE_MIN}` +
@@ -327,6 +422,7 @@ function main(): void {
     synonymCosineMean: result.synonymCosineMean,
     synonymCosineMin: result.synonymCosineMin,
     synonymCosineMax: result.synonymCosineMax,
+    bucketInternalMismatches: result.bucketInternalMismatches,
     queryLatencyMs: latency,
     perQueryAgreement: result.perQuery,
     failures,
