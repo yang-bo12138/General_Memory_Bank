@@ -566,6 +566,15 @@ function computeEntityOverlap(
  *   ⇒ 候选**只来自文本路**。这是**阶段边界，不是缺陷**。
  *   ⇒ 但「候选自身带向量时的余弦」仍按 §4.9 步骤 3b 计算（候选的向量就在库里）。
  *
+ * ⚠️ **阶段 1 不入桶**（ADR《P1 冲突裁决》冲突 7 的裁决）：
+ *   §4.9 步骤 3a2 的**向量路候选**（两级路由 + 桶内检索）需要**桶中心**，
+ *   而桶中心由阶段 2 的两级 k-means 训练产出（§4.15.3）⇒ 阶段 1 **跳过向量路候选**，
+ *   近似去重**退回纯文本路**（步骤 3a）。
+ *   ⇒ 代价是**少一条去重证据**（候选少了一半），**不是「去重失效」**
+ *     —— 实体重叠与余弦这两条证据仍在（§4.9 步骤 3b 的两条判据照常生效）。
+ *   ⇒ 阶段 2（P2-T03 + 桶训练）必须补齐，并在「启动对账 / 首次重训」完成前
+ *     **不得对外提供 IVF 向量路**（否则就是 §9.3.2 ① 点名的「静默、永久、不报错」窗口）。
+ *
  * @returns 判定成立时返回被合并的旧记忆；不成立返回 `undefined`
  */
 function findMergeCandidate(
@@ -679,6 +688,15 @@ function handleExactRepeat(
   linkEntities(db, m.id, addedEntities);
 
   // ── 向量补写（仅当库内 `embedding IS NULL`；已有向量不得覆盖）──
+  // ⚠️ **阶段 1 不入桶**（ADR《P1 冲突裁决》冲突 7 的裁决）：
+  //   §4.9 步骤 2 要求「同事务内更新 `vector_cell_members` —— 调 `assignBucket(...)`」，
+  //   但 `assignBucket` / `vector_cell_members` 属于**阶段 2**（P2-T03 + 桶训练）
+  //   ⇒ 阶段 1 **只写 `memories.embedding`、不写桶**。
+  //   ⇒ ⚠️ **不得为此造一个空的 `assignBucket`**：空壳函数 = 死函数 = 假绿，
+  //     还会让「四条路径都调了 `assignBucket`」这类静态断言**假通过**。
+  //   ⇒ 阶段 2 必须补桶（启动对账 / 首次重训），并新增硬断言：
+  //     「`embedding IS NOT NULL` 且 `deleted = 0` 的记忆 id 集合 == `vector_cell_members.memory_id` 集合」
+  //     （**集合相等**，不是条数相等——§9.3.2 ③ 的三条判据）。
   const embeddingAdded = backfillEmbeddingIfMissing(db, m.id, ctx.vector) ? 1 : 0;
 
   // ── 边强化（§4.5 规则 R-EDGE-TOUCH）：**先取计数再 UPDATE** ──
@@ -785,6 +803,10 @@ function createMemory(store: WriteStore, input: WriteInput, ctx: CreateContext):
     baseDifficulty + CONFIDENCE_PENALTY * (1 - confidence),
   );
 
+  // ⚠️ **阶段 1 不入桶**（ADR《P1 冲突裁决》冲突 7 的裁决）：
+  //   §4.9 步骤 4 要求「同事务内更新 `vector_cell_members` —— 调 `assignBucket(newId, @newVec)`」，
+  //   但桶归属是**阶段 2** 的活 ⇒ 阶段 1 **只写 `memories.embedding`、不写桶**。
+  //   ⇒ 阶段 2 必须补桶（启动对账 / 首次重训）；同源豁免的完整说明见 `handleExactRepeat` 里那一段。
   try {
     db.prepare(INSERT_MEMORY_SQL).run({
       id,

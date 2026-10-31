@@ -494,3 +494,93 @@ describe('P1-T07 · 唯一合并写入点（§9.3.0.1）', () => {
     expect(sequence?.seq).toBe(1);
   });
 });
+
+// ─────────────────────────────────────────────────────────────
+// 阶段 1 的桶归属豁免（ADR《P1 冲突裁决》冲突 7 的裁决）
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * P1-T07 · 阶段 1 **不入桶**。
+ *
+ * ⚠️ **为什么要有这条断言**：ADR《P1 冲突裁决》冲突 7 的裁决是
+ *   「阶段 1 照写 `memories.embedding`、**不写** `vector_cell_members`」，
+ *   并明确「**不得**实现空壳 `assignBucket`」——空壳函数 = 死函数 = 假绿，
+ *   还会让「四条路径都调了 `assignBucket`」这类静态断言**假通过**。
+ *   ⇒ 阶段 1 的代码里**不许出现**桶表与桶分配调用；
+ *   ⇒ 这笔欠账由**阶段 2**（P2-T03 + 桶训练）清偿（启动对账 / 首次重训），
+ *     并由阶段 2 的硬断言兜住：「`embedding IS NOT NULL` 且 `deleted = 0` 的记忆 id 集合
+ *     == `vector_cell_members.memory_id` 集合」（**集合相等**，不是条数相等）。
+ */
+describe('P1-T07 · 阶段 1 不入桶（ADR 冲突 7 的裁决）', () => {
+  /** 本测试文件所在目录（ESM 下没有 `__dirname`）。 */
+  const HERE = fileURLToPath(new URL('.', import.meta.url));
+  /** 仓库的 `src/store/` 目录。 */
+  const STORE_ROOT = resolve(HERE, '../../src/store');
+
+  /**
+   * 剥掉注释行，只留可执行行。
+   *
+   * ⚠️ **必须剥注释**：源码的说明文字里大量出现 `assignBucket` / `vector_cell_members`
+   *   这些词（它们是「阶段 2 才写」的**说明**）⇒ 不剥注释的话扫描器会把说明文字
+   *   当成实现 ⇒ 既误报、又测不出真问题。
+   */
+  function stripCommentLines(source: string): string {
+    return source
+      .split('\n')
+      .filter((rawLine) => {
+        const trimmed = rawLine.trim();
+        return !(
+          trimmed.startsWith('//') ||
+          trimmed.startsWith('*') ||
+          trimmed.startsWith('/*') ||
+          trimmed.endsWith('*/')
+        );
+      })
+      .join('\n');
+  }
+
+  it('★ 阶段 1：向量**写进库了**，但桶表**一条不写**（欠账显式留给阶段 2）', () => {
+    const { db, store, params } = createWriteContext();
+
+    write(store, {
+      content: '李四喜欢猫粮',
+      entities: ['李四', '猫粮'],
+      embedding: unitVector(params.EMBED_DIM, 0),
+      now: 0,
+    });
+
+    // 性质：向量**真的落库了**（阶段 1 照写 `embedding`，不是「不写向量」）
+    const withVector = db
+      .prepare('SELECT COUNT(*) AS n FROM memories WHERE embedding IS NOT NULL AND deleted = 0')
+      .get() as { n: number };
+    expect(withVector.n).toBe(1);
+
+    // 性质：桶表**一条都没有**（阶段 1 不入桶 ⇒ 欠账留给阶段 2 的启动对账 / 首次重训）
+    expect(countRows(db, 'vector_cell_members')).toBe(0);
+  });
+
+  it('★ 静态：write.ts / merge.ts 的**代码**里没有桶表、也没有桶分配调用', () => {
+    for (const name of ['write.ts', 'merge.ts']) {
+      const source = readFileSync(join(STORE_ROOT, name), 'utf8');
+      const code = stripCommentLines(source);
+
+      // 性质：代码里不碰桶表
+      expect(code).not.toContain('vector_cell_members');
+      // 性质：代码里没有「分配桶 / 回收桶」的调用（空壳 `assignBucket` 也算违规）
+      expect(code).not.toMatch(/\bassignBucket\b/);
+      expect(code).not.toMatch(/\bunassignBucket\b/);
+    }
+  });
+
+  it('★ 负控：注入一个 assignBucket 调用 ⇒ 检查必须报出来（闸门不是摆设）', () => {
+    const source = readFileSync(join(STORE_ROOT, 'write.ts'), 'utf8');
+
+    // ① 注入 ⇒ 剥完注释仍能扫到 ⇒ 闸门会判红
+    const injected = `${source}\nexport function rogue(): void {\n  assignBucket('id', vector);\n}\n`;
+    expect(stripCommentLines(injected)).toMatch(/\bassignBucket\b/);
+
+    // ② 对照：**原文**（含注释）里确实有这些词 ⇒ 说明「剥注释」这一步是有效的
+    //   ⇒ 上面两条断言不是因为「源码里根本没有这个词」才通过的。
+    expect(source).toContain('assignBucket');
+  });
+});

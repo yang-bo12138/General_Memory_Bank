@@ -229,6 +229,11 @@ export function linkEntities(
  *   §4.9 步骤 2 的回填是那条路径上的一个例外分支（它只补空值、不覆盖），
  *   把它放在同一个文件里，静态扫描「`SET embedding` 只出现在 `store/merge.ts`」才成立。
  *
+ * ⚠️ **阶段 1 不入桶**（ADR《P1 冲突裁决》冲突 7 的裁决）：
+ *   §4.9 步骤 2 要求回填向量时同步桶归属（`assignBucket`），
+ *   而桶归属是**阶段 2**（P2-T03 + 桶训练）的活 ⇒ 阶段 1 **只补 `memories.embedding`、不写桶**。
+ *   ⇒ 阶段 2 必须补桶（启动对账 / 首次重训）。
+ *
  * @param db 库句柄
  * @param memoryId 目标记忆 id
  * @param vector 本次写入使用的向量（`null` = 本次没有向量 ⇒ 不补写）
@@ -302,6 +307,15 @@ export function mergeMemory(
   // ── ② 正文无条件采纳新文本（★ 全库唯一的 `UPDATE memories SET content`）──
   // ⚠️ **不重算 hash**：用步骤 2 算出的 `@newHash`（理由见 `MergeInput.contentHash`）。
   // ⚠️ **同时改 `content_tokens`** ⇒ 触发器 `mem_au` 才会同步 FTS 索引（步骤 ⑥）。
+  // ⚠️ **阶段 1 不入桶**（ADR《P1 冲突裁决》冲突 7 的裁决）：
+  //   §4.9 步骤 3c ② 要求「改了 embedding 就必须同步桶归属：同事务内调 `assignBucket(id, @newVec)`」，
+  //   而 `assignBucket` / `unassignBucket` 属于**阶段 2**（P2-T03 + 桶训练）
+  //   ⇒ 阶段 1 **只写 `memories.embedding`、不写桶**；
+  //   ⇒ `unassignBucket` 在阶段 1 **不存在**，而阶段 1 库里**一条桶行都没有**
+  //     ⇒ 无「桶归属被删除」这件事 ⇒ 无矛盾、无需补偿。
+  //   ⇒ 阶段 2 必须补桶（启动对账 / 首次重训），并新增硬断言：
+  //     「`embedding IS NOT NULL` 且 `deleted = 0` 的记忆 id 集合 == `vector_cell_members.memory_id` 集合」
+  //     （**集合相等**，不是条数相等——§9.3.2 ③ 的三条判据）。
   db.prepare(
     `UPDATE memories
         SET content       = @content,
