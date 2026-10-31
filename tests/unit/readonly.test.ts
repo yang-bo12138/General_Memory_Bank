@@ -28,6 +28,8 @@ import { EventWriter } from '../../src/store/events.js';
 import { touch } from '../../src/store/touch.js';
 import { write } from '../../src/store/write.js';
 import { MemoryLogger } from '../../src/util/log.js';
+import type { BucketAssignContext } from '../../src/vector/bucketAssign.js';
+import { createUntrainedBucketContext } from '../fixtures/bucket-store.js';
 import { insertMemory } from '../fixtures/graph-store.js';
 
 /** 临时目录（每次用例一个，跑完清掉 ⇒ 不污染仓库）。 */
@@ -75,6 +77,7 @@ function storeOf(db: Database.Database): {
   params: typeof DEFAULT_PARAMS;
   events: EventWriter;
   logger: MemoryLogger;
+  buckets: BucketAssignContext;
 } {
   return {
     db,
@@ -82,6 +85,9 @@ function storeOf(db: Database.Database): {
     events: new EventWriter(db, { readonly: false, logger: new MemoryLogger(), now: () => 0 }),
     // ⚠️ `write()` 的 `WriteStore` 还要一个日志器（§8.1：别名冲突要同时记一条磁盘日志）。
     logger: new MemoryLogger(),
+    // ⚠️ `buckets` 是桶归属上下文（§9.3.0 的唯一写入点）：只读实例上根本写不进去
+    //   ⇒ 给「尚未训练」的即可（断言的是 READONLY_VOLATION，不是桶归属）。
+    buckets: createUntrainedBucketContext(db),
   };
 }
 

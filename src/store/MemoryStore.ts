@@ -35,6 +35,7 @@ import { SCHEMA_VERSION } from '../core/version.js';
 import { openDatabase, readUserVersion } from '../db/connection.js';
 import { assertV2TablesComplete, ensureSchema } from '../db/migrate.js';
 import { FileLogger, type Logger } from '../util/log.js';
+import { CentroidCache } from '../vector/centroids.js';
 import {
   type MergeEntitiesResult,
   mergeEntities as mergeEntitiesImpl,
@@ -53,7 +54,6 @@ import { pin as pinImpl, unpin as unpinImpl } from './pin.js';
 import { type RecallOptions, type RecallResult, recall as recallImpl } from './recall.js';
 import { type TouchOptions, type TouchOutcome, touch as touchImpl } from './touch.js';
 import { type WriteInput, type WriteResult, type WriteStore, write as writeImpl } from './write.js';
-
 /**
  * 门面的构造配置 —— DESIGN-v2.md §6 的 `MemoryConfig`。
  */
@@ -179,6 +179,16 @@ export class MemoryStore {
   readonly #writeContext: WriteStore;
 
   /**
+   * 桶中心缓存（§4.15.3：「桶中心常驻内存 ⇒ 加载时一次性读入并缓存」）。
+   *
+   * ⚠️ **重训之后必须 `reload()`**（§4.15.5）：
+   *   否则路由会继续用**旧中心**（而库里的中心已换）⇒ 探针命中错桶 ⇒ 召回静默变差。
+   *   ⇒ **T05 的重训路径**必须能拿到这个缓存并让它失效
+   *   （当前阶段还没有重训入口 ⇒ 本字段先备好）。
+   */
+  readonly #centroids: CentroidCache;
+
+  /**
    * 构造一个门面实例。
    *
    * ⚠️ **构造期做的四件事**（都不是业务逻辑，是「把依赖接上」）：
@@ -217,6 +227,10 @@ export class MemoryStore {
 
     this.#context = { db, params, events };
     this.#readContext = { db, params };
+    // ⚠️ **桶中心缓存**（§4.15.3）：写入路径的桶归属要靠它算「最近的细桶」
+    //   ⇒ 中心模型**只从库里读**（`CentroidCache` ⇒ 走真实的加载路径）
+    //   ⇒ 库里没有桶 ⇒ `assignBucket` 返回「没入桶」而**不抛错**（库仍可写）。
+    this.#centroids = new CentroidCache(db);
     // ⚠️ `embedder` 是**可选属性**：`exactOptionalPropertyTypes` 下显式写 `embedder: undefined`
     //   与「不传」是**两件事** ⇒ 用条件展开，避免把「没有 embedder」写成「embedder 是 undefined」。
     this.#writeContext = {
@@ -224,6 +238,15 @@ export class MemoryStore {
       params,
       events,
       logger,
+      // ⚠️ **桶归属上下文**（§9.3.0 的唯一写入点）：
+      //   写入路径改 `embedding` 时**同事务**同步桶归属（§9.3.2 ①）。
+      //   ⚠️ **探针数用参数表的 `ROUTER_NPROBE_COARSE`**（§5）——它必须与**训练时**用的探针数一致，
+      //     否则一条记忆会在下次写入时被**重新归桶**（无谓的桶 churn，§4.15.3）。
+      buckets: {
+        db,
+        centroids: () => this.#centroids.model(),
+        nprobeCoarse: params.ROUTER_NPROBE_COARSE,
+      },
       ...(config.embedder === undefined ? {} : { embedder: config.embedder }),
     };
   }

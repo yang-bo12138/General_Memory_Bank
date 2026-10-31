@@ -34,7 +34,8 @@ import { MemoryError } from '../core/errors.js';
 import type { TouchEventPayload, WriteEventPayload } from '../core/events.types.js';
 import type { Params } from '../core/params.js';
 import { escapeFts5, normalize, tokenize } from '../core/tokenize.js';
-import { LOG_ACTIONS, type Logger } from '../util/log.js';
+import { LOG_ACTIONS } from '../util/log.js';
+import { assignBucket, unassignBucket } from '../vector/bucketAssign.js';
 import { MIN_VECTOR_NORM } from '../vector/dot.js';
 import { MEDIA_TYPES, MEMORY_KINDS, type MediaType, type MemoryKind } from './get.js';
 import {
@@ -185,10 +186,14 @@ export interface WriteResult {
   warnings: WriteWarning[];
 }
 
-/** 写入所需的上下文（库句柄 + 生效参数 + 事件写入器 + 日志器 + 可选 embedder）。 */
+/**
+ * 写入所需的上下文（库句柄 + 生效参数 + 事件写入器 + 日志器 + 桶归属上下文 + 可选 embedder）。
+ *
+ * ⚠️ **日志器与桶归属上下文都继承自 `MergeStore`**：
+ *   · 日志器（§8.1：别名冲突要**同时**记一条磁盘日志）；
+ *   · 桶归属上下文（§9.3.0 的唯一写入点——写入路径改 `embedding` 时同事务同步桶归属）。
+ */
 export interface WriteStore extends MergeStore {
-  /** 日志器（§8.1：别名冲突要**同时**记一条磁盘日志）。 */
-  logger: Logger;
   /**
    * 可选的**同步**向量函数（§6 的 `MemoryConfig.embedder`）。
    *
@@ -705,18 +710,20 @@ export function compareMergeCandidates(a: MergeCandidateKey, b: MergeCandidateKe
  *   ⇒ 对 2 字 token 恰好幂等、对其它长度会切出意外 token
  *   ⇒ **去重条件变成不可预测的东西**（且不报错）。
  *
- * ⚠️ **向量路候选本阶段不做**（§4.9 步骤 3a2 的两级分桶属于阶段 2 的 `VectorBackend`）：
+ * ⚠️ **向量路候选本阶段不做**（§4.9 步骤 3a2 的两级路由 + 桶内检索属于**阶段 2 的向量路**，
+ *   由 T05 / T06 接通）：
  *   ⇒ 候选**只来自文本路**。这是**阶段边界，不是缺陷**。
  *   ⇒ 但「候选自身带向量时的余弦」仍按 §4.9 步骤 3b 计算（候选的向量就在库里）。
  *
- * ⚠️ **阶段 1 不入桶**（ADR《P1 冲突裁决》冲突 7 的裁决）：
- *   §4.9 步骤 3a2 的**向量路候选**（两级路由 + 桶内检索）需要**桶中心**，
- *   而桶中心由阶段 2 的两级 k-means 训练产出（§4.15.3）⇒ 阶段 1 **跳过向量路候选**，
- *   近似去重**退回纯文本路**（步骤 3a）。
+ * ⚠️ **但「桶归属」已经接了**（P2-T03-b）：
+ *   写入路径改 `memories.embedding` 时**同事务**同步桶归属（§9.3.0 / §9.3.2 ①）
+ *   ⇒ 「有向量 ⇒ 有桶归属」这条不变式**从现在起成立**
+ *   ⇒ 而「按桶找候选」（步骤 3a2 的向量路）**仍然缺席**
+ *     ⇒ 近似去重**暂时**退回纯文本路（步骤 3a）。
  *   ⇒ 代价是**少一条去重证据**（候选少了一半），**不是「去重失效」**
  *     —— 实体重叠与余弦这两条证据仍在（§4.9 步骤 3b 的两条判据照常生效）。
- *   ⇒ 阶段 2（P2-T03 + 桶训练）必须补齐，并在「启动对账 / 首次重训」完成前
- *     **不得对外提供 IVF 向量路**（否则就是 §9.3.2 ① 点名的「静默、永久、不报错」窗口）。
+ *   ⇒ ⚠️ 在「启动对账 / 首次重训」完成前**不得对外提供 IVF 向量路**
+ *     （否则就是 §9.3.2 ① 点名的「静默、永久、不报错」窗口）。
  *
  * @returns 判定成立时返回被合并的旧记忆；不成立返回 `undefined`
  */
@@ -842,16 +849,26 @@ function handleExactRepeat(
   linkEntities(db, m.id, addedEntities);
 
   // ── 向量补写（仅当库内 `embedding IS NULL`；已有向量不得覆盖）──
-  // ⚠️ **阶段 1 不入桶**（ADR《P1 冲突裁决》冲突 7 的裁决）：
-  //   §4.9 步骤 2 要求「同事务内更新 `vector_cell_members` —— 调 `assignBucket(...)`」，
-  //   但 `assignBucket` / `vector_cell_members` 属于**阶段 2**（P2-T03 + 桶训练）
-  //   ⇒ 阶段 1 **只写 `memories.embedding`、不写桶**。
-  //   ⇒ ⚠️ **不得为此造一个空的 `assignBucket`**：空壳函数 = 死函数 = 假绿，
-  //     还会让「四条路径都调了 `assignBucket`」这类静态断言**假通过**。
-  //   ⇒ 阶段 2 必须补桶（启动对账 / 首次重训），并新增硬断言：
-  //     「`embedding IS NOT NULL` 且 `deleted = 0` 的记忆 id 集合 == `vector_cell_members.memory_id` 集合」
-  //     （**集合相等**，不是条数相等——§9.3.2 ③ 的三条判据）。
   const embeddingAdded = backfillEmbeddingIfMissing(db, m.id, ctx.vector) ? 1 : 0;
+
+  // ── 桶归属同步（§4.9 步骤 2 / §9.3.0 / §9.3.2 ①）──
+  // ⚠️ **「补了向量就必须入桶」**：补写成功后这条记忆**现在有向量了**
+  //   ⇒ 必须有桶归属，否则它**永远不进任何桶** ⇒ 向量路永远召不回它，
+  //     而 `embeddedRatio` 却在涨 ⇒ **静默、永久、不报错**（§9.3.2 ① 点名的失效点）。
+  // ⚠️ **只在「真的补写了」时同步**：
+  //   · 已有向量 ⇒ 本次**没改**向量 ⇒ 桶归属不该动（改它等于无谓的桶 churn）；
+  //   · 没传向量 ⇒ 本次**没动**向量（库里那份原样保留）⇒ 桶归属也不该动。
+  if (embeddingAdded === 1 && ctx.vector !== null) {
+    const assignment = assignBucket(store.buckets, m.id, ctx.vector);
+    if (!assignment.assigned) {
+      // ⚠️ **中心模型尚未训练 ⇒ 没有可归属的桶**（`assignBucket` 不抛错，否则整个库不可写）。
+      //   ⇒ 记进日志让它可观测（静默吞掉就是上面说的那个静默失效点）。
+      store.logger.warn(LOG_ACTIONS.write, {
+        reason: 'bucket-not-trained',
+        memoryId: m.id,
+      });
+    }
+  }
 
   // ── 边强化（§4.5 规则 R-EDGE-TOUCH）：**先取计数再 UPDATE** ──
   // ⚠️ 顺序写死：事件里记的 `edgesReinforced` 必须等于**实际**被强化的条数；
@@ -957,10 +974,6 @@ function createMemory(store: WriteStore, input: WriteInput, ctx: CreateContext):
     baseDifficulty + CONFIDENCE_PENALTY * (1 - confidence),
   );
 
-  // ⚠️ **阶段 1 不入桶**（ADR《P1 冲突裁决》冲突 7 的裁决）：
-  //   §4.9 步骤 4 要求「同事务内更新 `vector_cell_members` —— 调 `assignBucket(newId, @newVec)`」，
-  //   但桶归属是**阶段 2** 的活 ⇒ 阶段 1 **只写 `memories.embedding`、不写桶**。
-  //   ⇒ 阶段 2 必须补桶（启动对账 / 首次重训）；同源豁免的完整说明见 `handleExactRepeat` 里那一段。
   try {
     db.prepare(INSERT_MEMORY_SQL).run({
       id,
@@ -986,6 +999,30 @@ function createMemory(store: WriteStore, input: WriteInput, ctx: CreateContext):
       );
     }
     throw error;
+  }
+
+  // ── 桶归属同步（§4.9 步骤 4 / §9.3.0 / §9.3.2 ①）──
+  // ⚠️ **必须在上面那条 INSERT 之后**：桶归属行的外键指向 `memories(id)`
+  //   ⇒ 记忆行还没落库时插桶行会被外键挡下（`NOT_FOUND`）。
+  // ⚠️ **与 INSERT 同事务**（本函数整体在调用方的 `runWriteTransaction` 里）
+  //   ⇒ 失败即整体回滚 ⇒ 不会出现「记忆在、桶不在」的孤儿。
+  if (ctx.vector === null) {
+    // ⚠️ **「没传向量 ⇒ 桶里不该有它」**（§4.15.3 第三条）：
+    //   无向量的记忆占着桶的成员名额 ⇒ 桶计数偏大
+    //   ⇒ `p95BucketSize` / `maxBucketSize` / 兜底切分判定量**全部偏**。
+    //   ⇒ 新记忆本无归属，这里仍走 `unassignBucket` 是为了守住
+    //     「**桶归属状态 == 向量状态**」这条不变式（不靠「这个状态不可达」当理由，§14.3 C28）。
+    unassignBucket(store.buckets, id);
+  } else {
+    const assignment = assignBucket(store.buckets, id, ctx.vector);
+    if (!assignment.assigned) {
+      // ⚠️ **中心模型尚未训练 ⇒ 没有可归属的桶**（`assignBucket` 不抛错，否则整个库不可写）。
+      //   ⇒ 记进日志让它可观测（静默吞掉就是 §9.3.2 ① 点名的静默失效点）。
+      store.logger.warn(LOG_ACTIONS.write, {
+        reason: 'bucket-not-trained',
+        memoryId: id,
+      });
+    }
   }
 
   // ── 关联实体 ──
@@ -1018,6 +1055,22 @@ function createMemory(store: WriteStore, input: WriteInput, ctx: CreateContext):
 }
 
 // ─────────────────────────── 门面 ───────────────────────────
+
+/**
+ * ⚠️ **TODO（P2-T03-b · 阶段 4 接手）：§4.9.1 步骤 4 的 `updateContent` 路径。**
+ *
+ * ⚠️ **本轮刻意不建 `src/store/updateContent.ts`**（阶段 4 才建）：
+ *   §4.9.1 步骤 4「显式改正文」是一条**独立的 embedding 赋值路径**
+ *   ⇒ 它建起来时**必须**同事务调用 `assignBucket` / `unassignBucket`（§9.3.0）
+ *   ⇒ 若先建一个「只改正文、不管桶」的空壳 ⇒ 那就是「阶段 1 不入桶」的翻版
+ *   ⇒ 而「四条路径都调了 `assignBucket`」这类静态断言会**假通过**。
+ *   ⇒ 所以：**要么一次做对，要么先别建**（同 P1-T07 对空壳 `assignBucket` 的处理）。
+ *
+ * ⚠️ **建的时候别忘了**：
+ *   ① 它落在**写事务内**（`runWriteTransaction`）⇒ 桶归属与正文同事务（§9.3.2 ①）；
+ *   ② 改了 `embedding` ⇒ 同步桶归属（§4.9.1 步骤 4）；
+ *   ③ 置 `NULL` ⇒ `unassignBucket`（§4.15.3 第三条）。
+ */
 
 /**
  * `write(input)` —— §4.9 的完整四步写入流程。

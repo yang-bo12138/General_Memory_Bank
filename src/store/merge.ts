@@ -31,10 +31,12 @@ import { resolveNow } from '../core/clock.js';
 import type { MergeEventPayload3c } from '../core/events.types.js';
 import type { Params } from '../core/params.js';
 import { tokenize } from '../core/tokenize.js';
+import { LOG_ACTIONS, type Logger } from '../util/log.js';
+import { type BucketAssignContext, assignBucket, unassignBucket } from '../vector/bucketAssign.js';
 import type { EventWriter } from './events.js';
 import { growStability } from './touch.js';
 
-/** 合并写入所需的上下文（库句柄 + 生效参数 + 事件写入器）。 */
+/** 合并写入所需的上下文（库句柄 + 生效参数 + 事件写入器 + 桶归属上下文 + 日志器）。 */
 export interface MergeStore {
   /** 库句柄。 */
   db: Database.Database;
@@ -42,6 +44,24 @@ export interface MergeStore {
   params: Params;
   /** 事件写入器（合并要记一条 `merge` 事件，§8.4）。 */
   events: EventWriter;
+  /**
+   * 桶归属写入上下文（§9.3.0 的**唯一写入点**）。
+   *
+   * ⚠️ **必须由调用方备好**：合并路径会改 `memories.embedding`
+   *   ⇒ 必须同事务同步桶归属（§4.9 步骤 3c ② / §9.3.2 ①）
+   *   ⇒ 而桶归属的写入**只允许**经 `assignBucket` / `unassignBucket`
+   *   （§9.3.0：注释提醒会漏读，单一函数让「漏」变成编译不过）。
+   */
+  buckets: BucketAssignContext;
+  /**
+   * 日志器（§8.1）。
+   *
+   * ⚠️ **合并路径要靠它把「没入桶」变成可观测**：
+   *   中心模型尚未训练时 `assignBucket` 返回 `assigned: false` 而不抛错
+   *   （抛错会让整个库不可写）⇒ 若调用方把它**默默咽下去**
+   *   ⇒ 就是 §9.3.2 ① 点名的静默失效点（库里有向量、桶侧无归属）。
+   */
+  logger: Logger;
 }
 
 /** 参与合并的旧记忆的字段子集（`memories` 行的相关列）。 */
@@ -208,10 +228,11 @@ export function linkEntities(
  *   §4.9 步骤 2 的回填是那条路径上的一个例外分支（它只补空值、不覆盖），
  *   把它放在同一个文件里，静态扫描「`SET embedding` 只出现在 `store/merge.ts`」才成立。
  *
- * ⚠️ **阶段 1 不入桶**（ADR《P1 冲突裁决》冲突 7 的裁决）：
- *   §4.9 步骤 2 要求回填向量时同步桶归属（`assignBucket`），
- *   而桶归属是**阶段 2**（P2-T03 + 桶训练）的活 ⇒ 阶段 1 **只补 `memories.embedding`、不写桶**。
- *   ⇒ 阶段 2 必须补桶（启动对账 / 首次重训）。
+ * ⚠️ **本函数只写 `memories.embedding`，不写桶**：
+ *   桶归属的写入**只允许**经 `assignBucket` / `unassignBucket`（§9.3.0）
+ *   ⇒ 回填成功之后**由调用方**（`src/store/write.ts` 的 §4.9 步骤 2 路径）
+ *     在**同一事务**里调 `assignBucket` ⇒ 「补了向量就必须入桶」。
+ *   ⇒ 本函数**不得**自己写桶表（那会开出第二个写入点 ⇒ §9.3.0 的铁律失效）。
  *
  * @param db 库句柄
  * @param memoryId 目标记忆 id
@@ -241,6 +262,9 @@ export function backfillEmbeddingIfMissing(
  *   ① 旧正文归档进 `content_history`（`reason='merge'`）——**唯一的版本兜底**，
  *      必须与下面的 UPDATE **同事务**（否则「归档成功但正文没换」⇒ 兜底失效且无从恢复）；
  *   ② 正文**无条件采纳新文本** + 重切 `content_tokens` + `content_hash = @newHash`；
+ *   ②' **桶归属同步**（P2-T03-b 补上）：`embedding` 变了 ⇒ 同事务同步桶归属
+ *      （`assignBucket` / `unassignBucket`，§9.3.0）——**在 ② 之后**，
+ *      因为它必须以「向量已落库」为前提（外键指向 `memories`）；
  *   ③ `growStability` 加固（`useSpacing=false`）；
  *   ④ `last_access` / `access_count` 已由 ③ 一并更新，此处不再重复赋值；
  *   ⑤ 补充新实体到 `memory_entities`（与步骤 2 同一套算法）；
@@ -286,15 +310,11 @@ export function mergeMemory(
   // ── ② 正文无条件采纳新文本（★ 全库唯一的 `UPDATE memories SET content`）──
   // ⚠️ **不重算 hash**：用步骤 2 算出的 `@newHash`（理由见 `MergeInput.contentHash`）。
   // ⚠️ **同时改 `content_tokens`** ⇒ 触发器 `mem_au` 才会同步 FTS 索引（步骤 ⑥）。
-  // ⚠️ **阶段 1 不入桶**（ADR《P1 冲突裁决》冲突 7 的裁决）：
-  //   §4.9 步骤 3c ② 要求「改了 embedding 就必须同步桶归属：同事务内调 `assignBucket(id, @newVec)`」，
-  //   而 `assignBucket` / `unassignBucket` 属于**阶段 2**（P2-T03 + 桶训练）
-  //   ⇒ 阶段 1 **只写 `memories.embedding`、不写桶**；
-  //   ⇒ `unassignBucket` 在阶段 1 **不存在**，而阶段 1 库里**一条桶行都没有**
-  //     ⇒ 无「桶归属被删除」这件事 ⇒ 无矛盾、无需补偿。
-  //   ⇒ 阶段 2 必须补桶（启动对账 / 首次重训），并新增硬断言：
-  //     「`embedding IS NOT NULL` 且 `deleted = 0` 的记忆 id 集合 == `vector_cell_members.memory_id` 集合」
-  //     （**集合相等**，不是条数相等——§9.3.2 ③ 的三条判据）。
+  // ⚠️ **阶段 2 已入桶**（P2-T03-b）：桶归属与 `memories` 同事务写（§9.3.2 ①）。
+  //   「改了 embedding 就必须同步更新桶归属」（§4.9 步骤 3c ②）——
+  //   漏了这一步的后果**不是「召不回」，是「排在错位置」**：
+  //   它的向量已与旧桶心不匹配，却仍被扫到并参与排序 ⇒ **召回质量静默劣化**。
+  //   ⇒ 桶归属的写入**只允许**经 `assignBucket` / `unassignBucket`（§9.3.0）。
   db.prepare(
     `UPDATE memories
         SET content       = @content,
@@ -309,6 +329,29 @@ export function mergeMemory(
     embedding: input.vector === null ? null : vectorToBlob(input.vector),
     id: m.id,
   });
+
+  // ── ②' 桶归属同步（§4.9 步骤 3c ② / §9.3.0 / §9.3.2 ①）──
+  // ⚠️ **与上面那条 UPDATE 同事务**（本函数整体在调用方的 `runWriteTransaction` 里）
+  //   ⇒ 失败即整体回滚 ⇒ 不会出现「向量换了、桶还挂着旧归属」的错位。
+  if (input.vector === null) {
+    // ⚠️ **「没传向量（置 NULL）⇒ 必须 `unassignBucket(id)`」**（§4.15.3 第三条）：
+    //   桶里留一条没有向量的行 ⇒ 桶计数偏大
+    //   ⇒ `p95BucketSize` / `maxBucketSize` / 兜底切分判定量**全部偏**。
+    //   ⇒ 这一行不能省，**也不能「保留旧向量」**。
+    unassignBucket(store.buckets, m.id);
+  } else {
+    const assignment = assignBucket(store.buckets, m.id, input.vector);
+    if (!assignment.assigned) {
+      // ⚠️ **中心模型尚未训练 ⇒ 没有可归属的桶**（`assignBucket` 不抛错，否则整个库不可写）。
+      //   ⇒ 把它**记进日志**让它可观测：静默吞掉就是 §9.3.2 ① 点名的那个静默失效点
+      //     （库里有向量、桶侧无归属 ⇒ 向量路永远召不回它，而 `embeddedRatio` 却在涨）。
+      //   ⇒ 启动对账（§9.3.2 ③）会清偿这笔欠账。
+      store.logger.warn(LOG_ACTIONS.merge, {
+        reason: 'bucket-not-trained',
+        memoryId: m.id,
+      });
+    }
+  }
 
   // ── ③ 稳定度加固（统一走 §4.2 的 `growStability`：守卫与上限都在里面）──
   // ⚠️ `useSpacing=false`：合并不是「间隔重复」，不该拿间隔加成。

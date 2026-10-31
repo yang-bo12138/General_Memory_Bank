@@ -25,6 +25,7 @@ import {
   write,
 } from '../../src/store/write.js';
 import { LOG_ACTIONS, MemoryLogger } from '../../src/util/log.js';
+import { createUntrainedBucketContext } from '../fixtures/bucket-store.js';
 import { countRows, createTestStore, readEvents } from '../fixtures/graph-store.js';
 
 /** 测试用的库句柄类型（内存 SQLite）。 */
@@ -347,7 +348,15 @@ function createWriteContext(): {
   const { db, store, params } = createTestStore();
   const logger = new MemoryLogger();
   // ⚠️ `logger` 是 `WriteStore` 的必需成员（§8.1：别名冲突要**同时**记一条磁盘日志）。
-  return { db, store: { ...store, logger }, params, logger };
+  // ⚠️ `buckets` 是桶归属上下文（§9.3.0 的唯一写入点）：这里给「**尚未训练**」的
+  //   ⇒ 写入路径不会落桶归属（对应「分桶尚未训练 ⇒ 向量路整体缺席」）。
+  //   ⇒ 四条路径的「真的入桶」断言在 `tests/unit/bucketSync.test.ts`（那里用**已训练**的上下文）。
+  return {
+    db,
+    store: { ...store, logger, buckets: createUntrainedBucketContext(db) },
+    params,
+    logger,
+  };
 }
 
 /** 造一个单位向量（第 `index` 个分量为 1）。 */
