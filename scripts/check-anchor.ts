@@ -227,8 +227,11 @@ export const EXPECTED_ANCHOR_PATH_COUNTS: readonly (readonly [string, number])[]
  * ⚠️ **落点的选择理由**（逐条）：
  *   · 「桶归属同步」⇒ 三条**写路径**的实现代码（P2-T03-b 已挂接），
  *     第四条（§4.9.1 的 `updateContent`）**属阶段 4** ⇒ `pending`；
- *   · 「探针覆盖」⇒ 它的动作是**可测的性质**（吻合率 / 只漏不错）⇒ 落在**设计稿小节**，
- *     而 §4.9 步骤 3a2 的向量路候选**尚未接通**（T05/T06）⇒ `pending`；
+ *   · 「探针覆盖」⇒ 它的动作是**可测的性质**（吻合率 / 只漏不错）⇒ 落在**设计稿小节**；
+ *     而 §4.9 步骤 3a2 的向量路候选**在 P2-T07 之后已接通**（两级分桶收窄）
+ *     ⇒ 落点是**实现代码**（`src/store/dedupCandidates.ts` 的 `collectVectorCandidates`）
+ *     —— ⚠️ 它的必需关键词是 `scanBucketCandidates`（**标识符**）而不是「吻合率 / 只漏不错」
+ *       （**中文短语**：涂白注释后不可能在代码里命中 ⇒ 落点会恒红 ⇒ 门禁变成摆设）；
  *   · 「reinforce 边界」⇒ 多数是**设计稿小节**；§0.2.2（「共激活建立率」）
  *     与 §0.2.3（「调用方应当怎么做」）是**面向人的散文**，正文里没有字面的动作关键词
  *     ⇒ 它们的落点分别是**它们描述的那段代码**：
@@ -293,10 +296,19 @@ export const ANCHOR_PATH_BINDINGS: readonly AnchorRuleBinding[] = [
       { label: '§4.6 步骤 2c', kind: 'doc', heading: '### 4.6 三路召回与融合打分' },
       {
         label: '§4.9 步骤 3a2',
-        kind: 'pending',
-        pendingReason:
-          '§4.9 步骤 3a2 的写入路径向量路候选尚未接通（阶段 2 的 T05/T06）' +
-          '⇒ 「只漏不错」这条性质在代码里还没有可观测的落点',
+        kind: 'code',
+        file: 'src/store/dedupCandidates.ts',
+        symbol: 'collectVectorCandidates',
+        // ⚠️ **P2-T07 之后这条路径不再是「待补」**：写入路径的向量路候选已接通
+        //   （两级分桶收窄 ⇒ 候选 ≤ 2000 ⇒ 不做全表扫）。
+        // ⚠️ **为什么必需关键词是 `scanBucketCandidates`**（而不是规则里的
+        //   「吻合率 / 只漏不错」）：那两个是**中文短语**（描述的是**性质**），
+        //   而 `code` 落点要先涂白注释与字符串 ⇒ **中文短语在代码里不可能命中**
+        //   ⇒ 落点会恒红 ⇒ 门禁变成摆设。
+        //   ⇒ 改用**这条路径在代码里必须出现的那个动作**：向量路候选**必须**经
+        //     `scanBucketCandidates()`（桶内扫描）产出 ⇒ 落点即可机器判定
+        //     「写入路径的向量路真的走了分桶收窄」。
+        requiredKeywords: ['scanBucketCandidates'],
       },
       { label: 'ADR-16', kind: 'doc', heading: '## 13. 设计决策记录（ADR 摘要）' },
       { label: 'ADR-17', kind: 'doc', heading: '## 13. 设计决策记录（ADR 摘要）' },

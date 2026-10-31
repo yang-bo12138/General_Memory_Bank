@@ -288,6 +288,217 @@ export function assignFineBucket(
   return fineHits[0]?.id ?? null;
 }
 
+/**
+ * 两级路由（**纯函数**）—— 算出查询向量落在哪些**细桶**里。
+ *
+ * ⚠️ **这是 `IvfVectorBackend.route()` 的唯一实现**（它转调本函数）⇒
+ *   召回路径与写入路径**共用同一套路由规则**（C36：同一件事不得有两套词）
+ *   ⇒ 两者**只差探针数**（召回 20/50，写入 8/20 —— §4.9 步骤 3a2）。
+ *
+ * ⚠️ **粗桶是细桶的父级，不参与乘法**（§4.6 步骤 0）：
+ *   ① 粗层：与**全部**粗中心算点积 ⇒ 取最近 `nprobeCoarse` 个**粗桶**；
+ *   ② 细层：**只在这 `nprobeCoarse` 个粗桶下的细中心**里算点积
+ *      ⇒ 取最近 `nprobeFine` 个**细桶**。
+ *   ⇒ 命中的是 **`nprobeFine` 个细桶**（不是 `nprobeCoarse × nprobeFine` 个）。
+ *
+ * ⚠️ **分桶尚未训练 ⇒ 返回空数组**（不是抛错、也不是静默回落 flat）：
+ *   §4.15.3：「模型为空 ⇒ 向量路整体缺席」。
+ *
+ * @param model 中心模型
+ * @param query 查询向量（**已 L2 归一化**）
+ * @param nprobeCoarse 粗层探针数
+ * @param nprobeFine 细层探针数
+ * @returns 命中的细桶 id 列表（**按中心距离升序** = 点积降序）
+ */
+export function routeFineBuckets(
+  model: IvfCentroidModel,
+  query: Float32Array,
+  nprobeCoarse: number,
+  nprobeFine: number,
+): string[] {
+  if (model.coarse.length === 0 || model.fine.length === 0) {
+    // ⚠️ **分桶尚未训练 ⇒ 向量路整体缺席**（不是「阻塞」，也不是静默回落 flat）。
+    return [];
+  }
+
+  const coarseHits = nearestByDot(
+    model.coarse.map((cell) => ({ id: cell.coarseId, centroid: cell.centroid })),
+    query,
+    nprobeCoarse,
+  );
+  const coarseIds = new Set(coarseHits.map((hit) => hit.id));
+  const fineCandidates = model.fine
+    .filter((cell) => coarseIds.has(cell.coarseId))
+    .map((cell) => ({ id: cell.fineId, centroid: cell.centroid }));
+  const fineHits = nearestByDot(fineCandidates, query, nprobeFine);
+  return fineHits.map((hit) => hit.id);
+}
+
+// ─────────────────── 写入路径的分桶候选扫描（§4.9 步骤 3a2） ───────────────────
+
+/**
+ * 桶内候选行（`memories` 的相关列）—— 写入路径向量路的**扫描产物**。
+ *
+ * ⚠️ **形状与 `VectorCandidateRow` 不同**（那是召回路径的形状）：
+ *   这里要带**正文四件套**（`content` / `content_tokens` / `stability` / `difficulty`），
+ *   因为命中后的候选要**直接进 §4.9 步骤 3c 的合并序列**（`mergeMemory` 要这些字段）。
+ *   ⇒ 向量本体**不留在行里**（余弦在扫描时就算掉了 ⇒ 不必把 2000 份 3KB 的向量
+ *     全留在内存里 ⇒ 峰值内存只与「最终入选的候选数」成正比）。
+ */
+export interface BucketCandidateRow {
+  /** 记忆 id。 */
+  id: string;
+  /** 库内当前正文。 */
+  content: string;
+  /** 库内当前分词快照。 */
+  content_tokens: string;
+  /** 当前稳定度（天）。 */
+  stability: number;
+  /** 上次访问时刻（毫秒）。 */
+  last_access: number;
+  /** 累计访问次数。 */
+  access_count: number;
+  /** 难度 `0~1`。 */
+  difficulty: number;
+  /**
+   * 该记忆的向量（**原始 BLOB**；行内一定是 `embedding IS NOT NULL` 的行）。
+   *
+   * ⚠️ **刻意保留 BLOB 而不是解成 `Float32Array`**：
+   *   命中桶里可能有上千行 ⇒ 一次性全解 ⇒ **峰值内存 = 扫描量 × 3KB**（2500 行 ⇒ 7.5MB）
+   *   ⇒ 而 better-sqlite3 反正已经把 BLOB 全读出来了（那部分内存躲不掉）
+   *   ⇒ 解码**挪到用的时候逐条做** ⇒ 峰值只多一条向量（3KB）。
+   */
+  embedding: Buffer;
+}
+
+/** 桶内候选扫描的结果（§4.9 步骤 3a2 ②）。 */
+export interface BucketCandidateScan {
+  /** 命中的细桶 id（**按中心距离升序** = 点积降序）。 */
+  fineIds: string[];
+  /**
+   * **被扫描的候选行数**（= 命中桶里 `deleted = 0` 且有向量的行数）。
+   *
+   * ⚠️ **这才是「候选扫描量」**（不是「返回的候选数」）：
+   *   §4.9 步骤 3a2 的「候选 ≤ 2000」指的是**扫描量**
+   *   （= `ROUTER_NPROBE_WRITE_FINE` × 每桶成员数 ≈ 20 × 100 = 2000），
+   *   而返回给去重判定的候选还要再过一道 `cos ≥ DEDUP_COS_MIN` 与 `VECTOR_TOPK`。
+   */
+  scanned: number;
+  /** 候选行（**按 `fineIds` 的命中顺序**，桶内按 `memory_id` 升序）。 */
+  rows: BucketCandidateRow[];
+}
+
+/**
+ * 构造「命中桶内取候选」的 SQL（§4.9 步骤 3a2 ② 的参考 SQL）。
+ *
+ * ⚠️ **刻意与设计稿的参考 SQL 逐字同形**（多取了几列正文相关字段）：
+ *   ```sql
+ *   SELECT m.id, m.embedding
+ *     FROM vector_cell_members vcm JOIN memories m ON vcm.memory_id = m.id
+ *    WHERE vcm.fine_id IN (@writeHitCells) AND m.deleted = 0 AND m.embedding IS NOT NULL;
+ *   ```
+ *   ⇒ **JOIN 的方向是「桶 → 记忆」**（桶侧走 `fine_id` 索引、记忆侧走 `id` 索引）
+ *     ⇒ 执行计划里**两个表都是 `SEARCH`**（不是 `SCAN`）
+ *     ⇒ 这条「不做全表扫」的性质**可被 `EXPLAIN QUERY PLAN` 观测**
+ *     （P2-T07 的硬断言之一）。
+ *
+ * ⚠️ **刻意不加时间窗**（`@coarseCutoff`）：
+ *   重复项完全可能是半年前写的那条 ⇒ 加了窗口就等于「只和最近用过的记忆去重」
+ *   ⇒ **这正是老库越用越脏的成因**（§4.9 步骤 3a2 的原文）。
+ *   ⇒ **不加时间窗 ≠ 不加空间窗**：分桶收窄的是**空间**（几何邻近），
+ *     不影响「半年前写的那条」是否进候选。
+ *
+ * ⚠️ **导出这个构造器**（而不是把 SQL 藏成模块常量）：
+ *   测试要用**同一份 SQL** 跑 `EXPLAIN QUERY PLAN`
+ *   ⇒ 断言的是**生产代码真正执行的那条语句**，不是测试自己抄的一份。
+ *
+ * @param fineIds 命中的细桶 id（**必须非空**——`IN ()` 是语法错误）
+ * @returns 可直接 `prepare()` 的 SQL（占位符与 `fineIds` 一一对应）
+ * @throws {MemoryError} `INVALID_INPUT`（`fineIds` 为空）
+ */
+export function buildBucketCandidateSql(fineIds: readonly string[]): string {
+  if (fineIds.length === 0) {
+    throw MemoryError.invalidInput('桶候选 SQL 需要至少一个细桶 id（空列表会生成非法的 IN ()）', {
+      reason: 'empty-buckets',
+      expected: '>= 1 个细桶 id',
+      actual: '0',
+    });
+  }
+  const placeholders = fineIds.map(() => '?').join(', ');
+  return `SELECT m.id AS id, m.content AS content, m.content_tokens AS content_tokens,
+            m.stability AS stability, m.last_access AS last_access, m.access_count AS access_count,
+            m.difficulty AS difficulty, m.embedding AS embedding
+       FROM vector_cell_members vcm
+       JOIN memories m ON m.id = vcm.memory_id
+      WHERE vcm.fine_id IN (${placeholders})
+        AND m.deleted = 0
+        AND m.embedding IS NOT NULL`;
+}
+
+/**
+ * 扫命中桶取候选（§4.9 步骤 3a2 ②）—— **写入路径的向量路候选的唯一扫描点**。
+ *
+ * ⚠️ **为什么放在向量层**（§4.6 步骤 2c 的硬边界）：
+ *   「流水线**不得**直接引用 `vector_cell_members` 的表名」
+ *   ⇒ 桶表名只出现在向量层内部（本模块 + `bucketAssign.ts`）
+ *   ⇒ 存储层只调本函数 ⇒ 换后端实现时存储层不必重写。
+ *
+ * ⚠️ **为什么「桶侧扫描」在这里而不是在 `bucketAssign.ts`**：
+ *   `bucketAssign.ts` 的 `scanBucketSide()` 是**全表**扫桶侧（对账与 P95 用，
+ *   它必须看到**每一行**才能分出「真孤儿 / 软删 / 无向量」三分支）
+ *   ⇒ 而本函数要的是「**只扫命中桶**」⇒ 两者是**不同的口径**，
+ *     共用同一个函数只会把「全扫」与「收窄」混成一件 ⇒ **刻意不复用**。
+ *   ⇒ 复用的是**路由规则**（`routeFineBuckets()`）与**桶归属表**本身。
+ *
+ * ⚠️ **不加时间窗**（见 `buildBucketCandidateSql()` 的说明）。
+ *
+ * ⚠️ **分桶尚未训练 ⇒ 扫描量为 0**（不是抛错、也不是静默回落 flat）：
+ *   §4.15.3：「模型为空 ⇒ 向量路整体缺席」⇒ 写入路径退回纯文本路（**不是降级报错**）。
+ *
+ * @param db 库句柄
+ * @param model 中心模型
+ * @param query 查询向量（**已 L2 归一化**）
+ * @param nprobeCoarse 粗层探针数（写入路径用 `ROUTER_NPROBE_WRITE_COARSE`）
+ * @param nprobeFine 细层探针数（写入路径用 `ROUTER_NPROBE_WRITE_FINE`）
+ * @returns 命中桶 + 扫描量 + 候选行
+ */
+export function scanBucketCandidates(
+  db: Database.Database,
+  model: IvfCentroidModel,
+  query: Float32Array,
+  nprobeCoarse: number,
+  nprobeFine: number,
+): BucketCandidateScan {
+  const fineIds = routeFineBuckets(model, query, nprobeCoarse, nprobeFine);
+  if (fineIds.length === 0) {
+    return { fineIds: [], scanned: 0, rows: [] };
+  }
+
+  const raw = db.prepare(buildBucketCandidateSql(fineIds)).all(...fineIds) as Array<{
+    id: string;
+    content: string;
+    content_tokens: string;
+    stability: number;
+    last_access: number;
+    access_count: number;
+    difficulty: number;
+    embedding: Buffer;
+  }>;
+
+  const rows: BucketCandidateRow[] = raw.map((row) => ({
+    id: row.id,
+    content: row.content,
+    content_tokens: row.content_tokens,
+    stability: row.stability,
+    last_access: row.last_access,
+    access_count: row.access_count,
+    difficulty: row.difficulty,
+    embedding: row.embedding,
+  }));
+
+  return { fineIds, scanned: rows.length, rows };
+}
+
 /** IVF 后端的构造选项。 */
 export interface IvfVectorBackendOptions {
   /** 库句柄（读桶成员与候选行）。 */
@@ -384,23 +595,9 @@ export class IvfVectorBackend implements VectorBackend {
   route(query: Float32Array, nprobeCoarse: number, nprobeFine: number): string[] {
     const config = this.assertInitialized();
     assertValidEmbedding(query, config.dimensions);
-    const model = this.centroidsProvider();
-    if (model.coarse.length === 0 || model.fine.length === 0) {
-      // ⚠️ **分桶尚未训练 ⇒ 向量路整体缺席**（不是「阻塞」，也不是静默回落 flat）。
-      return [];
-    }
-
-    const coarseHits = nearestByDot(
-      model.coarse.map((cell) => ({ id: cell.coarseId, centroid: cell.centroid })),
-      query,
-      nprobeCoarse,
-    );
-    const coarseIds = new Set(coarseHits.map((hit) => hit.id));
-    const fineCandidates = model.fine
-      .filter((cell) => coarseIds.has(cell.coarseId))
-      .map((cell) => ({ id: cell.fineId, centroid: cell.centroid }));
-    const fineHits = nearestByDot(fineCandidates, query, nprobeFine);
-    return fineHits.map((hit) => hit.id);
+    // ⚠️ **转调 `routeFineBuckets()`**（唯一实现）⇒ 召回路径与写入路径共用同一套路由规则
+    //   （C36：同一件事不得有两套词）⇒ 两者只差探针数。
+    return routeFineBuckets(this.centroidsProvider(), query, nprobeCoarse, nprobeFine);
   }
 
   /**

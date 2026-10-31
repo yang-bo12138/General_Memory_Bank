@@ -32,17 +32,16 @@ import { resolveNow } from '../core/clock.js';
 import { resolveEntity } from '../core/entities.js';
 import { MemoryError } from '../core/errors.js';
 import type { TouchEventPayload, WriteEventPayload } from '../core/events.types.js';
-import type { Params } from '../core/params.js';
-import { escapeFts5, normalize, tokenize } from '../core/tokenize.js';
+import { normalize, tokenize } from '../core/tokenize.js';
 import { LOG_ACTIONS } from '../util/log.js';
 import { assignBucket, unassignBucket } from '../vector/bucketAssign.js';
 import { normalizeNumbers } from '../vector/dot.js';
+import { collectDedupCandidates } from './dedupCandidates.js';
 import { MEDIA_TYPES, MEMORY_KINDS, type MediaType, type MemoryKind } from './get.js';
 import {
   type MergeMemoryState,
   type MergeStore,
   backfillEmbeddingIfMissing,
-  blobToVector,
   computeAddedEntities,
   linkEntities,
   mergeMemory,
@@ -225,32 +224,7 @@ const UPSERT_ENTITY_SQL = `
 `;
 
 /**
- * 相似候选的检索（§4.9 步骤 3a）。
- *
- * ⚠️ **`ORDER BY bm25(mem_fts) ASC` 必须显式写出**：不写的话 SQLite 按 rowid 顺序返回
- *   ⇒ 取到的是**最早写入的 3 条**而不是**最相似的 3 条** ⇒ 去重判据整个失灵。
- *
- * ⚠️ **只取前 3 条**：候选面越大，误合并的风险越高（§4.9 的代价段）。
- */
-const FIND_CANDIDATES_SQL = `
-  SELECT m.id             AS id,
-         m.content        AS content,
-         m.content_tokens AS content_tokens,
-         m.stability      AS stability,
-         m.last_access    AS last_access,
-         m.access_count   AS access_count,
-         m.difficulty     AS difficulty,
-         m.embedding      AS embedding,
-         bm25(mem_fts)    AS raw_bm25
-    FROM mem_fts
-    JOIN memories m ON mem_fts.rowid = m.rowid
-   WHERE mem_fts MATCH @dedupSql
-     AND m.deleted = 0
-   ORDER BY bm25(mem_fts) ASC
-   LIMIT 3
-`;
-
-/**
+ * 新建记忆的 INSERT（§4.9 步骤 4）。/**
  * 新建记忆的 INSERT（§4.9 步骤 4）。
  *
  * ⚠️ **`embedding` 在向量为 `null` 时显式写 `NULL`**（不是省略该列）：
@@ -340,38 +314,7 @@ function resolveVector(store: WriteStore, input: WriteInput): Float32Array | nul
   return normalizeNumbers(raw);
 }
 
-/** 两个向量的余弦；长度不一致 / 缺向量 / 零向量 ⇒ `null`（§4.9 步骤 3b）。 */
-function cosineOf(a: Float32Array | null, b: Float32Array | null): number | null {
-  if (a === null || b === null) {
-    return null;
-  }
-  if (a.length !== b.length || a.length === 0) {
-    // ⚠️ 维度不同 ⇒ **不可比**（§4.9 步骤 2 的「换模型 = 全库重算」那条边界）
-    //   ⇒ 返回 `null`，**不要**当成 0（当成 0 会让「不相似的证据」看起来像「没证据」）。
-    return null;
-  }
-  let dot = 0;
-  let normA = 0;
-  let normB = 0;
-  for (let index = 0; index < a.length; index += 1) {
-    const left = a[index];
-    const right = b[index];
-    if (left === undefined || right === undefined) {
-      // ⚠️ 理论上不可达（上面已校验两者等长）——但**不许**用 `?? 0` 静默补零：
-      //   补零会算出一个「看起来正常」的余弦，而库里没有第二处能发现它。
-      return null;
-    }
-    dot += left * right;
-    normA += left * left;
-    normB += right * right;
-  }
-  if (normA <= 0 || normB <= 0) {
-    return null;
-  }
-  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
-}
-
-// ─────────────────────────── 步骤 1：实体别名归一与 UPSERT ───────────────────────────
+// ─────────────────────────── 步骤 1：实体别名归一与 UPSERT ───────────────────────────// ─────────────────────────── 步骤 1：实体别名归一与 UPSERT ───────────────────────────
 
 /** 步骤 1a / 1b 的结果。 */
 interface ResolvedEntities {
@@ -592,17 +535,14 @@ function syncEntityAliases(
 
 // ─────────────────────────── 步骤 2 / 3：读取与判定 ───────────────────────────
 
-/** `memories` 行的相关列（步骤 2 / 3 用）。 */
-interface MemoryStateRow {
-  id: string;
-  content: string;
-  content_tokens: string;
-  stability: number;
-  last_access: number;
-  access_count: number;
-  difficulty: number;
-  embedding: Buffer | null;
-}
+/**
+ * `memories` 行的相关列（步骤 2 / 3 用）。
+ *
+ * ⚠️ **直接复用 `MergeMemoryState`**（`src/store/merge.ts`）——
+ *   两者是**同一形状**（同一张表的同一组列）⇒ 同一件事不得有两套词（C36）
+ *   ⇒ 一旦分家，「候选要交给合并序列」时就会缺字段。
+ */
+type MemoryStateRow = MergeMemoryState;
 
 /** 按 hash 找未删记忆（完全重复检测）。 */
 function findByHash(db: Database.Database, hash: string): MemoryStateRow | undefined {
@@ -684,82 +624,76 @@ export function compareMergeCandidates(a: MergeCandidateKey, b: MergeCandidateKe
 /**
  * 步骤 3a / 3b / 3c 的前半：找候选并判定是否该合并。
  *
+ * ⚠️ **候选的收集在 `src/store/dedupCandidates.ts`**（§4.9 步骤 3a 文本路 + 步骤 3a2 向量路）：
+ *   本函数只做**判定**（3b 的两个证据 + 3c 的准入条件）
+ *   ⇒ 三件事各有各的地盘（§14.3 边界原则 1）。
+ *
  * ⚠️ **`@dedupSql` 必须显式构造，绝不复用 `buildMatchQuery`**：
  *   `buildMatchQuery` 内部会**再 tokenize 一次** ⇒ 把已切好的 bigram 串传进去是「二次分词」
  *   ⇒ 对 2 字 token 恰好幂等、对其它长度会切出意外 token
  *   ⇒ **去重条件变成不可预测的东西**（且不报错）。
+ *   ⇒ 构造器是 `dedupCandidates.ts` 的 `buildDedupMatchSql()`。
  *
- * ⚠️ **向量路候选本阶段不做**（§4.9 步骤 3a2 的两级路由 + 桶内检索属于**阶段 2 的向量路**，
- *   由 T05 / T06 接通）：
- *   ⇒ 候选**只来自文本路**。这是**阶段边界，不是缺陷**。
- *   ⇒ 但「候选自身带向量时的余弦」仍按 §4.9 步骤 3b 计算（候选的向量就在库里）。
+ * ⚠️ **两条路都接上了**（P2-T07）：文本路靠 bigram、向量路靠**两级分桶**
+ *   ⇒ **同义改写（没有共享 bigram）也能被找到**（§4.9 步骤 3a2 的原文：
+ *     「她不吃猫粮」vs「她对猫粮过敏」⇒ FTS 一条都找不到）。
+ *   ⇒ 代价（明写）：向量路是**近似**的 ⇒ 真近重复的命中率 ≈ **40%**、漏检 ≈ 60%
+ *     ⇒ 由**宿主调度层**（分片 flat 全量扫描）补齐（§4.9 步骤 3a2 的「两层架构」）。
  *
- * ⚠️ **但「桶归属」已经接了**（P2-T03-b）：
- *   写入路径改 `memories.embedding` 时**同事务**同步桶归属（§9.3.0 / §9.3.2 ①）
- *   ⇒ 「有向量 ⇒ 有桶归属」这条不变式**从现在起成立**
- *   ⇒ 而「按桶找候选」（步骤 3a2 的向量路）**仍然缺席**
- *     ⇒ 近似去重**暂时**退回纯文本路（步骤 3a）。
- *   ⇒ 代价是**少一条去重证据**（候选少了一半），**不是「去重失效」**
- *     —— 实体重叠与余弦这两条证据仍在（§4.9 步骤 3b 的两条判据照常生效）。
- *   ⇒ ⚠️ 在「启动对账 / 首次重训」完成前**不得对外提供 IVF 向量路**
- *     （否则就是 §9.3.2 ① 点名的「静默、永久、不报错」窗口）。
+ * ⚠️ **向量路候选的余弦在收集时就算好了**（`dedupCandidates.ts`）：
+ *   ⇒ 两条路**共用同一个 `cosineOf`** ⇒ 两条路的 `cos` 可比（C36）。
+ *
+ * ⚠️ **退化态的判定是全局的**（§4.9 步骤 3a 的裁决 D-6）：
+ *   新文本切出的 bigram 数 < 2 ⇒ **cos 通道整条不生效**（合并资格只看实体重叠）
+ *   ⇒ ⚠️ 注意区分：**n = 0**（压根没有候选面 ⇒ 文本路整体不执行）
+ *     与 **n = 1**（退化态 ⇒ 有候选但候选面不可信）。
+ *   ⇒ 阈值用**参数** `DEDUP_ENTITY_MIN`（默认 2）而不是写死 2：
+ *     设计稿的字面「≥ 2」只是这个参数的**默认值**，判据本身应当与步骤 c 的实体判据同源。
+ *
+ * ⚠️ **候选自身带向量时的余弦**按 §4.9 步骤 3b 计算（候选的向量就在库里）。
+ *
+ * ⚠️ **「桶归属」与候选收集的关系**（P2-T03-b / P2-T07）：
+ *   桶归属写入（`assignBucket`）与 `memories` 写入**同事务**（§9.3.2 ①）
+ *   ⇒ 桶归属的**唯一写入点**仍是 `src/vector/bucketAssign.ts`
+ *   ⇒ 本模块**只读**桶侧（连读也在向量层：`src/vector/ivf.ts` 的 `scanBucketCandidates()`）。
  *
  * @returns 判定成立时返回被合并的旧记忆；不成立返回 `undefined`
  */
 function findMergeCandidate(
-  db: Database.Database,
-  params: Params,
+  store: WriteStore,
   content: string,
   linkedEntityIds: readonly string[],
   vector: Float32Array | null,
 ): MergeMemoryState | undefined {
-  const tokens = tokenize(content).split(' ').filter(Boolean);
-  if (tokens.length === 0) {
-    // ⚠️ 没有 token ⇒ 构造不出查询串 ⇒ 文本路整体不执行（§4.6 步骤 2a 的同一口径）。
-    return undefined;
-  }
+  const db = store.db;
+  const params = store.params;
 
-  const dedupSql = tokens.slice(0, 3).map(escapeFts5).join(' AND ');
-  // ⚠️ **候选不足 2 个 bigram 时**（如「好的」）`AND` 退化为单条件、候选相关性骤降
-  //   ⇒ 此时**要求实体重叠数达标**才允许合并（§4.9 步骤 3a 的退化条款），**不要放宽**。
-  // ⚠️ **裁决 F 的精确口径**：退化时合并判定**收敛为** `entityOverlap ≥ DEDUP_ENTITY_MIN`，
-  //   **cos 通道不单独成立**（非退化时仍是「entityOverlap ≥ N **或** cos ≥ DEDUP_COS_MIN」）。
-  //   口径出处：ADR-P1-R2 裁决 ①（待架构师最终措辞确认）。
-  //   ⚠️ **架构师已出终稿**（ADR-P1-T07-DEC 的 D-6，三分支）：
-  //     `n=0`（0 个 bigram）⇒ **文本路整体不执行**（无候选 ⇒ 不合并，**不是**退化态）——
-  //     上面 `tokens.length === 0` 时直接 `return undefined` 就是这一支；
-  //     `n=1`（退化态）⇒ **只认实体重叠**，cos 通道（**合并资格**）整条不生效；
-  //     `n≥2` ⇒ 「实体重叠达标 **或** cos 达标」。
-  //   ⚠️ 补充一句容易写反的地方：退化态**不是**「两条判据里有一条成立就合并」，
-  //   而是「**只认实体重叠**」——候选面已不可信 ⇒ 不能拿余弦去合并。
-  //   ⚠️ 「cos 通道不生效」说的是**合并资格**，**不是排序**：
-  //   退化态下 cos 仍然参与 tie-break 的第二级（见 `compareMergeCandidates`）。
-  //   ⚠️ 阈值用**参数** `DEDUP_ENTITY_MIN`（默认 2）而不是写死 2：
-  //   设计稿的字面「≥ 2」只是这个参数的**默认值**，判据本身应当与步骤 c 的实体判据同源。
-  const textRouteDegenerate = tokens.length < 2;
-
-  const rows = db.prepare(FIND_CANDIDATES_SQL).all({ dedupSql }) as Array<
-    MemoryStateRow & { raw_bm25: number }
-  >;
+  const { candidates, textRouteDegenerate } = collectDedupCandidates(
+    { db, params, buckets: store.buckets },
+    { content, vector },
+  );
 
   let best: { state: MergeMemoryState; key: MergeCandidateKey } | undefined;
-  for (const row of rows) {
-    const overlap = computeEntityOverlap(db, row.id, linkedEntityIds);
-    const cos = cosineOf(vector, row.embedding === null ? null : blobToVector(row.embedding));
+  for (const candidate of candidates) {
+    const overlap = computeEntityOverlap(db, candidate.id, linkedEntityIds);
+    const cos = candidate.cos;
     const entityOk = overlap >= params.DEDUP_ENTITY_MIN;
     const cosOk = cos !== null && cos >= params.DEDUP_COS_MIN && !textRouteDegenerate;
     if (!entityOk && !cosOk) {
       continue;
     }
     const key: MergeCandidateKey = {
-      id: row.id,
+      id: candidate.id,
       overlap,
       // ⚠️ 没有向量可比 ⇒ 记 `-Infinity` ⇒ **排在最后**（而不是当成 0）。
       cos: cos ?? Number.NEGATIVE_INFINITY,
-      bm25: row.raw_bm25,
+      // ⚠️ **向量路候选没有 BM25** ⇒ 记 `+Infinity` ⇒ 同分时排在文本路候选之后
+      //   （`+Infinity` 是**有限值** ⇒ `compareMergeCandidates` 的「先判是否相等再算差值」
+      //     不会算出 `NaN` ⇒ 排序不会静默失效）。
+      bm25: candidate.rawBm25 ?? Number.POSITIVE_INFINITY,
     };
     if (best === undefined || compareMergeCandidates(key, best.key) < 0) {
-      best = { state: row, key };
+      best = { state: candidate, key };
     }
   }
   return best?.state;
@@ -1110,13 +1044,7 @@ export function write(store: WriteStore, input: WriteInput): WriteResult {
     }
 
     // ── 步骤 3a / 3b：相似检测 ──
-    const candidate = findMergeCandidate(
-      db,
-      store.params,
-      input.content,
-      resolved.linkedEntityIds,
-      vector,
-    );
+    const candidate = findMergeCandidate(store, input.content, resolved.linkedEntityIds, vector);
     if (candidate !== undefined) {
       // ── 步骤 3c：原子合并序列（★ 全库唯一 ⇒ 在 `src/store/merge.ts`）──
       const outcome = mergeMemory(store, candidate, {
