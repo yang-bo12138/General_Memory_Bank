@@ -8,8 +8,9 @@
  *      ⇒ bench 侧改成**流式扫**（`statement.iterate()`）⇒ 峰值内存 ≈ 一行向量。
  *   ② **口径必须一致**：流式版**复用生产的 `dot()` / `clampCos()` / `passesTimeWindow()`
  *      / `compareHits()`** ⇒ 分数与排序**逐位相同**。
- *   ⇒ **等价性由断言保证**：`assertFlatStreamMatchesBackend()` 在小规模上
- *      把流式版与**生产的 `FlatVectorBackend`** 逐条比对（id 顺序 + 分数逐位相同）。
+ *   ⇒ **等价性由断言保证**：`flatStreamMismatches()` 在小规模上
+ *      把流式版与**生产的 `FlatVectorBackend`** 逐条比对（id 顺序 + 分数逐位相同）
+ *      ⇒ 它在冒烟门禁里（`tests/bench/bench-smoke.test.ts`）。
  *
  * ⚠️ **C29 的分母纪律**：flat 的**候选全集** = 「未删 且 有向量」的行
  *   （**不是** flat 的 top-N）⇒ 分桶 ⊆ flat 的断言用**这个全集**当分母。

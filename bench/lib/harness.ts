@@ -35,7 +35,7 @@ import type Database from 'better-sqlite3';
 import { openDatabase } from '../../src/db/connection.js';
 import { ensureSchema } from '../../src/db/migrate.js';
 import { runWriteTransaction } from '../../src/store/transaction.js';
-import { blobToVector, vectorToBlob } from '../../src/vector/centroids.js';
+import { vectorToBlob } from '../../src/vector/centroids.js';
 import { rebuildBuckets } from '../../src/vector/rebuild.js';
 
 // ═══════════════════════════════ 时钟（唯一的计时入口） ═══════════════════════════════
@@ -343,16 +343,6 @@ export function trainBenchBuckets(
  */
 export function encodeVector(vector: Float32Array): Buffer {
   return vectorToBlob(vector);
-}
-
-/**
- * 把库里的 BLOB 解回向量（**生产口径**）。
- *
- * @param blob BLOB
- * @returns 向量（Float32）
- */
-export function decodeVector(blob: Buffer): Float32Array {
-  return blobToVector(blob);
 }
 
 // ═══════════════════════════════ 落盘（结果与报告） ═══════════════════════════════
