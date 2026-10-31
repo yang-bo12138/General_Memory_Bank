@@ -1,10 +1,10 @@
 # 阶段 0 / 阶段 1 交付进度与遗留清单
 
-> **记录时点**：2026-10-31 11:40（Asia/Shanghai）
-> **基线 commit**：`651dac8`（`origin/main`）
+> **记录时点**：2026-10-31 12:05（Asia/Shanghai）
+> **基线 commit**：`66826ff`（`origin/main`）
 > **本文件是交接文档**：任何接手者读完它，应当能直接开工，不需要回放对话。
 >
-> ⚠️ **本文件每轮刷新**：阶段 1 的收官工作并行推进中（6 条开发线同时在跑），
+> ⚠️ **本文件每轮刷新**：阶段 1 的收官工作并行推进中（多条开发线同时在跑），
 > 下面的「⏳ 进行中」一节会随合并推进而变。**最新状态以文件末尾的「本轮更新日志」为准。**
 
 ---
@@ -12,9 +12,9 @@
 ## 一、一句话状态
 
 **阶段 0 全完成**（6 个任务 + 收尾修复 + 设计稿回写，且经 QA **四轮独立复核**）；
-**阶段 1 的 9 个既有任务全部落地，代码与门禁齐备**；
-**阶段 1 收官的 4 项并行补齐工作在进行中**（门面导出面 / 基线等价验收 / recall 契约返工 / 静态守卫）。
-门禁全绿：`pnpm run verify` 退出码 0，**24 个测试文件 / 527 条测试**。
+**阶段 1 的 9 个既有任务全部落地**，新增 **P1-T10（门面 + 导出面）已交付并合并**；
+**阶段 1 收官的其余 5 项并行补齐工作在进行中**（基线等价验收 / recall 打分层收尾 / 六条口径落地 / 静态守卫 / ADR 回写）。
+门禁全绿：`pnpm run verify` 退出码 0，**28 个测试文件 / 569 条测试**。
 
 ---
 
@@ -45,10 +45,10 @@
 | 1 | P1-T05 图谱维护：link / linkByIds / setAlias / mergeEntities | ✅ | `6c42af3` `e1b1eef` `67ef84e` | `src/store/link.ts`、`src/store/entities.ts` |
 | 1 | P1-T06 growStability 与 touch（唯一 stability 写入点） | ✅ | `d3a19e1` | `src/core/stability.ts`、`src/store/touch.ts` |
 | 1 | P1-T07 write 写入路径（去重与合并） | ✅ | `6989fdb` `0d626d2` `7f78d45` | `src/store/write.ts`（977 行）、`src/store/merge.ts`（359 行） |
-| 1 | P1-T08 recall：三路召回与融合打分 | 🟡 | `5f42889` `0d3bb1e` `dcc35bb` | `src/store/recall.ts`、`src/core/scoring.ts`（661 行）—— 契约返工进行中 |
+| 1 | P1-T08 recall：三路召回与融合打分 | ✅ 代码已合并 | `5f42889` `0d3bb1e` `dcc35bb` `74a7402` | `src/store/recall.ts`、`src/core/scoring.ts`—— 打分层收尾（归档分支删除）在跑 |
 | 1 | P1-T09 get() 与阶段 1 基线不变量验收 | 🟡 | `e58384f` `ea875f2` | `src/store/get.ts` 已完成；**基线等价测试在建** |
-| 1 | **P1-T10 门面 `MemoryStore` + 导出面收口** | 🟡 | — | **本轮新增任务**（ADR-P1-R2 裁决 6 / F-10）—— 在建 |
-| 1 | P1-T07 收尾项：六条口径签字落地 | 🟡 | — | ADR-P1-R2 裁决 ①②③—— 在建 |
+| 1 | **P1-T10 门面 `MemoryStore` + 导出面收口** | ✅ **已合并** | `dd5ea79` | 新建 `src/store/MemoryStore.ts`（364 行）+ `src/index.ts` 导出面 + 461 行测试 |
+| 1 | P1-T07 收尾项：六条口径签字落地 | 🟡 | `0169767` `5f65bbc` | C 口径三版收敛后已终裁，在改 |
 
 ### 阶段 2 ~ 5（28 个任务）
 
@@ -62,7 +62,7 @@
 |---|---|
 | **真实门禁入口** | **`pnpm run verify`**（`pnpm run ci` 是它的别名）。⛔ **`pnpm ci` / `npm ci` 是包管理器内建命令（clean install），会遮蔽同名 script ⇒ 假绿** |
 | 门禁链 | `typecheck` → `lint`(biome) → `test`(vitest) → `check:params` → `check:payload-keys` → `check:clock` → `check:anchor` → `check:contract-ids` → `check:doc-counts` |
-| 测试规模 | **24 个测试文件 / 527 条测试**，全通过，无 `Errors` 行 |
+| 测试规模 | **28 个测试文件 / 569 条测试**，全通过，无 `Errors` 行 |
 | 源码规模 | `src/` 29 个源文件 / 9070 行（不含测试） |
 | 测试规模 | `tests/` 31 个文件 / 10506 行 |
 | 契约脚本 | 6 条（`check:params` / `check:payload-keys` / `check:clock` / `check:anchor` / `check:contract-ids` / `check:doc-counts`）+ `check-gate-entry.ts` |
@@ -106,17 +106,16 @@
 
 ---
 
-## 六、⏳ 进行中（阶段 1 收官，6 条线并行）
+## 六、⏳ 进行中（阶段 1 收官，5 条线并行）
 
 | # | 事项 | 负责人 | 文件域 | 状态 |
 |---|---|---|---|---|
-| 1 | P1-T07 六条口径落地（C~G） | 工程师-4 | `write.ts` `merge.ts` `entities.ts` | 进行中 |
-| 2 | recall 契约返工（4 项） | 工程师-5 | `recall.ts` `scoring.ts` | 进行中 |
-| 3 | P1-T10 门面 + 导出面 | 工程师（线A） | `MemoryStore.ts`（新） `index.ts` | 进行中 |
-| 4 | `SQLITE_READONLY` 映射 + reinforce 守卫 + F-01 残余 | 工程师-2 | `errors.ts` `transaction.ts` `touch.ts` `params.ts` `check-doc-counts.ts` | 进行中 |
-| 5 | 归档跨度常数收敛 + F-08 ③ 静态守卫 | 工程师-3 | `decay.ts` `migrate.ts` `check-clamp.ts`（新） `package.json` | 进行中 |
-| 6 | P1-T09 基线等价验收 | QA | `tests/baseline/ref-v1.ts` `v1-equivalence.test.ts`（新） | 进行中 |
-| — | ADR-P1-R2 裁决的文档回写 | 架构师 | `docs/design/**` | 进行中 |
+| 1 | P1-T07 六条口径落地（C 终裁 + 新增 warning `ALIAS_TARGET_NOT_LINKED`） | 工程师-4 | `write.ts` `merge.ts` `entities.ts` | 进行中 |
+| 2 | recall 打分层收尾（删 `archiveFilterThreshold` 的归档分支 + 归档跨度 import） | 工程师-5 | `scoring.ts` | 进行中 |
+| 3 | `MS_PER_DAY` 定义下沉 + F-08 ③ 静态守卫（`scripts/check-clamp.ts`） | 工程师-3 | `decay.ts` `util/time.ts` `log.ts` `package.json` | 进行中 |
+| 4 | P1-T09 基线等价验收 | QA | `tests/baseline/ref-v1.ts` `v1-equivalence.test.ts`（新） | 进行中 |
+| 5 | ADR-P1-T07-DEC 的 D-3 改写 + `ALIAS_TARGET_NOT_LINKED` 三处同步 + `MS_PER_DAY` 分层裁决 | 架构师 | `docs/design/**` `scripts/check-contract-ids.ts` | 进行中 |
+| — | `extractEntityNames` 纳入导出面 | 工程师（线A） | `src/index.ts` | 进行中 |
 
 ---
 
@@ -163,6 +162,14 @@
 
 - **11:40** —— 合并 `e1b1eef`（link 自校验补 `deleted = 0`）、`f2d1b1d`+`32fdb38`（粗筛窗口上提 scoring）、
   `0d626d2`+`dcc35bb`+`7f78d45`（步骤 3a 候选口径断言 + recall 复用 scoring 唯一实现）；
-  架构师两轮 ADR（`fed2796` `20bfc4f` `8e7ba39`）；本人落 `651dac8`（计划稿收口）；
-  **门禁：24 文件 / 527 测试，退出码 0**。
+  架构师两轮 ADR（`fed2796` `20bfc4f` `8e7ba39`）；本人落 `651dac8`（计划稿收口）。
+- **12:05** —— 合并 `74a7402`（recall 契约：entityNames 入口 + 归档模式不判强度 + from* 标记）、
+  `77eacc0`（归档跨度收敛到 decay.ts 唯一实现）、`dd5ea79`（**P1-T10 门面 + 导出面**）、
+  `9b82e54`（只读错误码映射 + reinforce 守卫 + F-01 残余「计划稿副本纳入门禁」）；
+  计划稿与 ADR 收口 `651dac8`/`2d85753`/交付文档刷新 `205e6a1`。
+  **门禁：28 文件 / 569 测试，退出码 0**。
+- **C 口径三版收敛（值得单独记）**：① 我签的「同等待遇都关联」⇒ 否（关联有两处表达，违 §14.3）；
+  ② 架构师 D-3 的「新建关联、既有不关联」⇒ 否（**历史依赖**：同输入不同结果 = 静默漂移）；
+  ③ **终裁：命中与新建都不关联**，但写路径返回一条 **warning `ALIAS_TARGET_NOT_LINKED`**
+  ⇒ **边界可以存在，但必须可观测。**
 </content>
