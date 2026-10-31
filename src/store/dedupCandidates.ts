@@ -315,7 +315,8 @@ export function collectVectorCandidates(
   //   ⇒ 峰值内存只与「最终入选的候选数」成正比，而不是与「扫描量」成正比。
   const scored: Array<{ row: BucketCandidateRow; cos: number }> = [];
   for (const row of scan.rows) {
-    const cos = cosineOf(vector, row.embedding);
+    // ⚠️ **逐条解码**（不一次性全解）⇒ 峰值内存只与「一条向量」成正比。
+    const cos = cosineOf(vector, blobToVector(row.embedding));
     if (cos === null) {
       // ⚠️ **维度对不上 ⇒ 没有证据**（不是「不相似的证据」）。
       continue;
@@ -346,7 +347,9 @@ export function collectVectorCandidates(
     last_access: row.last_access,
     access_count: row.access_count,
     difficulty: row.difficulty,
-    embedding: null,
+    // ⚠️ **保留真实的 embedding BLOB**（不是 `null`）：
+    //   候选一旦被选中就要**原样**交给 §4.9 步骤 3c 的合并序列 ⇒ 形状必须是真的。
+    embedding: row.embedding,
     cos,
     rawBm25: null,
     sources: ['vector'] as const,

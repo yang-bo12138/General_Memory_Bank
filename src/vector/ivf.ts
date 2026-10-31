@@ -360,8 +360,15 @@ export interface BucketCandidateRow {
   access_count: number;
   /** 难度 `0~1`。 */
   difficulty: number;
-  /** 该记忆的向量（**已从 BLOB 解码**；行内一定是 `embedding IS NOT NULL` 的行）。 */
-  embedding: Float32Array;
+  /**
+   * 该记忆的向量（**原始 BLOB**；行内一定是 `embedding IS NOT NULL` 的行）。
+   *
+   * ⚠️ **刻意保留 BLOB 而不是解成 `Float32Array`**：
+   *   命中桶里可能有上千行 ⇒ 一次性全解 ⇒ **峰值内存 = 扫描量 × 3KB**（2500 行 ⇒ 7.5MB）
+   *   ⇒ 而 better-sqlite3 反正已经把 BLOB 全读出来了（那部分内存躲不掉）
+   *   ⇒ 解码**挪到用的时候逐条做** ⇒ 峰值只多一条向量（3KB）。
+   */
+  embedding: Buffer;
 }
 
 /** 桶内候选扫描的结果（§4.9 步骤 3a2 ②）。 */
@@ -486,7 +493,7 @@ export function scanBucketCandidates(
     last_access: row.last_access,
     access_count: row.access_count,
     difficulty: row.difficulty,
-    embedding: blobToVector(row.embedding),
+    embedding: row.embedding,
   }));
 
   return { fineIds, scanned: rows.length, rows };
