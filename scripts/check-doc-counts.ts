@@ -79,6 +79,22 @@ const PLAN_DOC_PATH = 'docs/design/DEVELOPMENT-PLAN.md';
 /** 计划稿里「§5 末的分类声明」那一段的标记（副本之一）。 */
 const PLAN_COMPOSITION_MARKER = '项的构成';
 
+/**
+ * 计划稿那份计数声明的**来源标注**（架构师定的措辞，与计划稿里的那句话**逐字一致**）。
+ *
+ * ⚠️ **为什么门禁也要带这一句**：
+ *   「文档里写的」与「门禁报出来的」**必须是同一句话** ⇒ 否则两处各说各话，
+ *   看到报红的人不知道**该改哪一处**（计划稿的副本？还是 §5？还是代码？）。
+ *   ⇒ 这一句同时回答了「**谁才是唯一副本**」：
+ *   **§5 的表格体才是唯一副本**（`check-params.ts` 已守住它 ↔ `DEFAULT_PARAMS`），
+ *   计划稿这份是**抄来的计数声明** ⇒ 修的时候改源头，不要只改抄本。
+ *
+ * ⚠️ **措辞必须与 `docs/design/DEVELOPMENT-PLAN.md`「60 项的构成」那一段的标注一致**
+ *   （那一段归主理人）⇒ 两处逐字相同 ⇒ 不会各说各话。
+ */
+const PLAN_COMPOSITION_SOURCE_NOTE =
+  '本段抄自 DESIGN-v2.md §5 末的分类声明；§5 表格体才是唯一副本。';
+
 /** 计划稿里「参数生效阶段的分布统计」那一段的标记（另一条轴的副本）。 */
 const PLAN_STAGE_DISTRIBUTION_MARKER = '参数生效阶段的分布统计';
 
@@ -349,7 +365,8 @@ export function checkPlanDocCounts(
       reason:
         `DEVELOPMENT-PLAN.md「${PLAN_COMPOSITION_MARKER}」那一段的分类构成之和 = ${planSum}` +
         ` ≠ §5 的参数总数 ${expectedKeyCount}` +
-        `（期望 ${expectedKeyCount}，实际 ${planSum}；§5 见 DESIGN-v2.md §5，计划稿见「${PLAN_COMPOSITION_MARKER}」那一段）`,
+        `（期望 ${expectedKeyCount}，实际 ${planSum}；§5 见 DESIGN-v2.md §5，计划稿见「${PLAN_COMPOSITION_MARKER}」那一段）` +
+        ` ${PLAN_COMPOSITION_SOURCE_NOTE}`,
     });
   }
 
@@ -358,7 +375,8 @@ export function checkPlanDocCounts(
     diffs.push({
       reason:
         `DEVELOPMENT-PLAN.md 自称的合计 ${plan.statedTotal} ≠ §5 的参数总数 ${expectedKeyCount}` +
-        `（期望 ${expectedKeyCount}，实际 ${plan.statedTotal}）`,
+        `（期望 ${expectedKeyCount}，实际 ${plan.statedTotal}）` +
+        ` ${PLAN_COMPOSITION_SOURCE_NOTE}`,
     });
   }
 
@@ -373,7 +391,8 @@ export function checkPlanDocCounts(
         reason:
           `DEVELOPMENT-PLAN.md 的「${name}」构成 [${planSubs.join(' + ')}] = ${planGroupSum}` +
           ` ≠ §5 的 [${designSubs.join(' + ')}] = ${designGroupSum}` +
-          `（期望 ${designGroupSum}，实际 ${planGroupSum}）`,
+          `（期望 ${designGroupSum}，实际 ${planGroupSum}）` +
+          ` ${PLAN_COMPOSITION_SOURCE_NOTE}`,
       });
     }
   }
@@ -383,11 +402,15 @@ export function checkPlanDocCounts(
     diffs.push({
       reason:
         `DEVELOPMENT-PLAN.md 的 v1.0 继承 ${plan.inherited} 项 ≠ §5 的 ${designInherited} 项` +
-        `（期望 ${designInherited}，实际 ${plan.inherited}）`,
+        `（期望 ${designInherited}，实际 ${plan.inherited}）` +
+        ` ${PLAN_COMPOSITION_SOURCE_NOTE}`,
     });
   }
 
   // ⑤ 阶段分布之和 == 参数总数（另一条轴，只看总和）
+  //    ⚠️ **这一条刻意不带来源标注**：`PLAN_COMPOSITION_SOURCE_NOTE` 说的是
+  //    「**本段**抄自 §5 末的分类声明」⇒ 它只适用于「项的构成」那一段；
+  //    而「参数生效阶段的分布统计」是**另一条轴**的另一份声明 ⇒ 加同一句会变成**假话**。
   const stageSum = plan.stageCounts.reduce((a, b) => a + b, 0);
   if (stageSum !== expectedKeyCount) {
     diffs.push({
