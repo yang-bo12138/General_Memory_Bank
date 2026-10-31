@@ -274,6 +274,9 @@ export interface Hit extends MemoryView {
 /**
  * ⚠️ **弃用别名**：§6 的公开契约叫 **`Hit`**（C36：同一件事不得有两套词），
  *   `RecallHit` 是本实现早期的命名 ⇒ 保留为别名，避免下游 import 断裂。
+ *   ⚠️ **不要删**：删了会打断已经 import 它的调用方。
+ *   ⚠️ **公共入口（`src/index.ts`）上两者都在，但 `Hit` 才是规范名**：
+ *   新代码一律写 `Hit`；`RecallHit` 只是为了让旧代码继续编译。
  */
 export type RecallHit = Hit;
 

@@ -167,7 +167,15 @@ export type {
 } from './store/get.js';
 export type { LinkOptions, LinkResult } from './store/link.js';
 export { DEFAULT_PIN_FACTOR } from './store/pin.js';
+/**
+ * ★ `Hit` 是 DESIGN-v2.md §6 的**规范名**；`RecallHit` 是它的**弃用别名**
+ *   （**保留是为了不打断已有调用方，不要删**；**新代码一律用 `Hit`**）。
+ *
+ * ⚠️ **C36（同一件事不得有两套词/两份实现）**：两个都导出，但**规范名必须在公共入口上** ——
+ *   否则「弃用的那套」反而成了公共入口上唯一的名字，等于同一件事有两套词**且弃用的那套赢了**。
+ */
 export type {
+  Hit,
   RecallBreakdown,
   RecallDiffused,
   RecallExplain,
