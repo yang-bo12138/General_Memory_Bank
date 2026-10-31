@@ -285,7 +285,12 @@ describe('get 的 MemoryView（§6 / §4.1 末）', () => {
       for (const field of MEMORY_VIEW_FIELDS) {
         expect(view).toHaveProperty(field);
       }
-      // ② 派生字段 `effectiveStability` 也在（§4.1 末点名要的：= stability × pin_factor）
+      // ② 派生字段 `effectiveStability` **单独**断言（**不在 §6 的 19 个之列**）：
+      //    §4.1 末点名要的派生值（= stability × pin_factor），§6 未列 ⇒
+      //    「§6 的 19 个」是**下界**（⊇），多这一个派生字段**不违反**该约束。
+      //    ⚠️ 之所以要**单独**写一条 expect（而不是把它塞进上面的 19 个清单）：
+      //    将来设计稿若把它补进 §6，这条断言会**从「多一个」变成「正好 19+1」**，
+      //    一眼能看出变化；否则它会无声地变成一条没人注意的额外字段。
       expect(view).toHaveProperty('effectiveStability');
 
       // ③ 字段的**类型**也要对（少一个字段 / 类型错位都属于「读不出来」）
