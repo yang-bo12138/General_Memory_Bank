@@ -870,6 +870,18 @@
   - 步骤 3：迁别名 + **把被合并实体的主名降级为别名**（否则旧名字此后召回不到）。
   - 步骤 4：`DELETE FROM entities WHERE id = @sourceId`。
   - 步骤 5：记 `events(type='alias', payload={ action:'merge', sourceId, targetId, movedMemories, mergedEdges, droppedSelfLoops, aliasAdded })`。
+    ⚠️ **`aliasAdded` 是布尔**（本次是否动过别名映射），**被降级的源主名本体记在 `alias` 键上**
+    （v2.1 勘误 / ADR-P1-C 冲突 1）——设计稿 §4.9.2 步骤 5 原稿写的是 `aliasAdded: sourceName`（字符串），
+    与 `src/core/events.types.ts` 的 `aliasAdded?: boolean` **直接冲突** ⇒ 同一个键名两处两套语义。
+    ⇒ 选「布尔」的理由是 §14.3.1 的 **C36**（同一件事不得有两套词）：
+    `alias` 一键贯穿 `set`/`merge` 两个 action，读事件的人不必先看 `action` 才知道读哪个键。
+    ⇒ **信息不丢**：合并会删掉源实体行 ⇒ 源主名在库里只剩「别名表」与「事件」两处。
+  - ⚠️ **`mergedEdges` 只数「因三元组冲突而被折叠掉」的边**（`DELETE FROM edges WHERE id = e.id` 那一支），
+    **仅改指、无冲突的边不计入**（ADR-P1-C 冲突 3）。
+    ⇒ 命名上的刻意对照：`movedMemories` = **迁移**的记忆关联条数（全部迁走的行），
+    `mergedEdges` = **合并**（折叠）掉的边数 ⇒ 两个键不同义。
+    ⇒ ★ **可对账恒等式**：`合并前的边数 − 合并后的边数 == mergedEdges + droppedSelfLoops`
+    （每次冲突合并净删一条边；每次自环清理净删一条边；这两者之外边数不变）。
 
 **验收标准**：
 
@@ -1063,6 +1075,28 @@
 - ⚠️ **并发兜底**：`INSERT memories` 时必须捕获 `SQLITE_CONSTRAINT_UNIQUE` 转成  
   `MemoryError.CONFLICT`（带 `details.conflictingId`）——与 §4.8.1 的 restore 撞唯一索引同源同处理。  
   **绝不能把裸的 SQLite 错误码抛给调用方**。
+  ⚠️ **`runWriteTransaction` 的通用转译器给不出 `conflictingId`**（它只知道「有唯一约束冲突」，
+  不知道冲突的是谁）⇒ **本任务必须自己 catch `SQLITE_CONSTRAINT_UNIQUE` 并带上 `conflictingId`**，
+  不能指望事务包装器。
+- ⚠️ **阶段 1（P1）的桶归属阶段性豁免**（v2.1 新增 / ADR-P1-C 裁决 7）：  
+  §4.9 的三条 embedding 赋值路径（步骤 2 的老库回填、步骤 3c ② 的合并写回、步骤 4 的新建）
+  在设计稿里都要求「同事务内调 `assignBucket(...)` 同步桶归属」——
+  但 `assignBucket` / `unassignBucket` 属于**阶段 2**（P2-T03 + 桶训练）。  
+  ⇒ **本任务照写 `memories.embedding`，但不写 `vector_cell_members`**。  
+  ⚠️ **不要实现空壳 `assignBucket`**：阶段 1 库里**一条细桶都没有**
+  ⇒ 任何桶行都会被 `vector_cell_members.fine_id` 的外键**直接拒绝**
+  ⇒ 空壳函数 = **死函数 = 假绿**（比「不写」更危险：
+  它会让「四条路径都调了 `assignBucket`」这条静态断言**假通过**）。  
+  ⚠️ **也不要自己写 `INSERT INTO vector_cell_members`**（P2-T03 的 lint 规则本来就要禁它）。  
+  ⇒ 欠账由阶段 2 的**启动对账**（§9.3.2 ③）与**首次重训的全量重分配**（§4.15.5 重建步骤 ②）
+  自动清偿 ⇒ 交接项已写成 **P2-T03 的两条硬断言**（集合相等 + 先对账后开路）。  
+  ⚠️ **另有两处同源豁免**（一并写明，避免被当成漏实现）：  
+  · §4.9 步骤 3a2 的**向量路候选**（两级路由 + 桶内检索）需要桶中心 ⇒ 阶段 1 **跳过**，
+    近似去重退回纯文本路（步骤 3a）——代价是**少一条去重证据**，不是「去重失效」；  
+  · §4.9 步骤 3c ② 的 `unassignBucket` 在阶段 1 **不存在** ⇒ 阶段 1 根本没有桶行可删 ⇒ 无矛盾。
+  ⚠️ **选这个方案的理由**（为什么不是「暂不写向量」）：
+  事件 payload 的 `hasEmbedding` **恒带**，若库里没写向量而事件记 `hasEmbedding: true`
+  ⇒ **重放器会重建出一条库里没有的向量** ⇒ §9.2 的「可完整重放」当场破。
 
 **验收标准**：
 
@@ -1489,6 +1523,24 @@
     `UPDATE vector_cell_members`（配套 lint 规则，§9.3.0 明写）。
   - 合并时未传向量 ⇒ 该条的桶归属被删除（`unassignBucket` 被调用），桶计数相应 -1。
   - `updateContent` 改正文后桶归属**同步更新**（阶段 4 补齐后加断言）。
+  - ★ **集合相等断言**（v2.1 新增 / ADR-P1-C 裁决 7 的交接项）：  
+    「库内所有 `embedding IS NOT NULL` 且 `deleted = 0` 的记忆，其 id 集合
+    与 `vector_cell_members` 的 `memory_id` 集合**相等**」。  
+    ⚠️ **必须是集合相等，不是条数相等**（§9.3.2 ③ 的三条判据：
+    双向 EXCEPT + COUNT==COUNT(DISTINCT) + 唯一索引）——
+    只比条数会漏掉「A 多一条、B 少一条」这种**总数相同但内容不同**的情况。  
+    ⇒ **这条断言的由来**：阶段 1（P1-T07）的 `write` **照写 `memories.embedding` 但不写桶**
+    （阶段 1 库里一条细桶都没有 ⇒ 桶行会被 FK 直接拒绝 ⇒ 物理上写不进去）
+    ⇒ 阶段 1 结束时必然存在「有向量但无桶归属」的记忆。
+    ⇒ 阶段 2 的**启动对账**（§9.3.2 ③）与**首次重训的全量重分配**（§4.15.5 重建步骤 ②）
+    会自动清偿这笔欠账 —— 但「会自动清偿」是**承诺**，不是**事实**
+    ⇒ 必须用这条断言把它变成**可检**的。
+  - ★ **在启动对账 / 首次重训完成前，不得对外提供 IVF 向量路**（v2.1 新增 / ADR-P1-C 裁决 7）。  
+    ⚠️ 理由：设计稿 §9.3.2 ① 点名的「静默失效点」——
+    「补了向量却不入桶 ⇒ 这条记忆**永远不进任何桶** ⇒ 向量路永远召不回它，
+    而 `embeddedRatio` 却在涨 ⇒ **静默、永久、不报错**」。
+    ⇒ 唯一的关窗动作就是「**先对账、后开路**」。
+    ⚠️ 阶段 1 的 `recall` 整路缺席向量路（不是「向量分全 0」那种降级）⇒ 阶段 1 无此风险。
 - **软阈值**：无。
 
 **常见坑**：

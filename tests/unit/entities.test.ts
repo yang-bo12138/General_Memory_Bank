@@ -219,7 +219,38 @@ describe('P1-T05 · mergeEntities（§4.9.2）', () => {
     expect(events[0]?.payload.mergedEdges).toBe(1);
     // 性质：被降级的主名本体被记下来（名字不能随源实体的删除一起消失）
     expect(events[0]?.payload.alias).toBe('张三');
+    // ⚠️ v2.1 勘误（ADR-P1-C 冲突 1）：`aliasAdded` 是**布尔**（是否动过别名映射），
+    //   源主名本体在 `alias` 键上 ⇒ 一个事件类型不出现两套词（C36）。
+    expect(events[0]?.payload.aliasAdded).toBe(true);
     expect(events[0]?.memory_id).toBeNull();
+  });
+
+  it('★ mergedEdges 只数「因三元组冲突而被折叠掉」的边（不含仅改指的边）', () => {
+    const { db, store } = createTestStore();
+    insertEntity(db, 'e-src', '张三');
+    insertEntity(db, 'e-tgt', '李四');
+    insertEntity(db, 'e-x', '王五');
+    insertEntity(db, 'e-y', '赵六');
+    // 源实体有 **2 条**边：其中 1 条与目标撞三元组（会被折叠），1 条不撞（仅改指）
+    insertEdge(db, 'edge-src-conflict', 'e-src', 'p', 'e-x', 0.8);
+    insertEdge(db, 'edge-src-keep', 'e-src', 'q', 'e-y', 0.6);
+    insertEdge(db, 'edge-tgt-conflict', 'e-tgt', 'p', 'e-x', 0.8);
+
+    const edgesBefore = countRows(db, 'edges');
+    mergeEntities(store, 'e-src', 'e-tgt');
+    const edgesAfter = countRows(db, 'edges');
+
+    const payload = readEvents(db, 'alias')[0]?.payload;
+    // ★ 关键：口径是「冲突折叠数」= 1；若是「迁移边总数」会是 2 ⇒ 这条断言能区分两种口径
+    expect(payload?.mergedEdges).toBe(1);
+    // ★ 可对账恒等式（ADR-P1-C 冲突 3 的决定性判据）：
+    //   合并前的边数 − 合并后的边数 == mergedEdges + droppedSelfLoops
+    //   （每次冲突合并净删一条边；每次自环清理净删一条边；这两者之外边数不变）
+    // ⚠️ payload 的静态类型是 `Record<string, unknown>` ⇒ 取出后要显式收窄成 number，
+    //   否则 `?? 0` 会被推成 `{}`（TS2365：Operator '+' cannot be applied to types '{}' and '{}'）。
+    const mergedCount = (payload?.mergedEdges as number | undefined) ?? 0;
+    const droppedCount = (payload?.droppedSelfLoops as number | undefined) ?? 0;
+    expect(edgesBefore - edgesAfter).toBe(mergedCount + droppedCount);
   });
 
   it('★ mergeEntities(x, x) ⇒ 幂等返回（不写库、不记事件）', () => {

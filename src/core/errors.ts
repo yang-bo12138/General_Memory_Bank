@@ -192,12 +192,34 @@ export const WARNING_ONLY_CASES: readonly string[] = ['ALIAS_CONFLICT'];
 export const MISSING_IDS_KEY = 'missingIds';
 
 /**
+ * `details` 里装「缺失的**实体名**」的键名（v2.1 勘误）。
+ *
+ * ⚠️ **为什么要另起一个键，而不是复用 `missingIds`**：
+ *   `missingIds` 的语义是「**行 id** 差集」——§11.2 的 FK 兜底句明写
+ *   「本库所有 FK 列都是 **id 引用** ⇒ FK 违规 ⇒ `NOT_FOUND`（带 `details.missingIds`）」。
+ *   而 `link` 的端点入参是**实体名**（不是 id）⇒ 把名字塞进 `missingIds`
+ *   会让**同一个键在 `touch`/`linkByIds`（装 id）与 `link`（装名字）下表达两件事**
+ *   ⇒ 违反 §14.3.1 的 C36（同一件事不得有两套词）。
+ *   ⇒ 裁决（ADR-P1-C 冲突 2）：`link` 的端点缺失 ⇒ `details.missingEntityNames`；
+ *     `memoryId` 缺失 ⇒ `details.missingIds`（它本来就是记忆 id）。
+ *
+ * ⚠️ **命名取 `missingEntityNames` 而非 `missingNames`**：与仓库既有词汇一致
+ *   （`entityNames` 是 write 事件 payload 的键；`autoCreatedEntities` 是 §4.5 步骤 2 的键）
+ *   ⇒ 明确表示「是实体名、不是记忆名」。
+ */
+export const MISSING_ENTITY_NAMES_KEY = 'missingEntityNames';
+
+/**
  * §11.2 的 `NOT_FOUND` 分组中，`details` **必须**带 `missingIds`（差集）的方法。
  *
  * ⚠️ 这不是「哪些方法会抛 `NOT_FOUND`」的完整名单（那份是 `METHODS_THROWING_NOT_FOUND`），
  *   而是「抛了 `NOT_FOUND` 之后、`details` 里必须额外说明**缺了哪些 id**」的子集。
+ *
+ * ⚠️ `link` 在此名单内（v2.1 勘误）：它的 `memoryId` 缺失路径带 `details.missingIds`。
+ *   ⚠️ **它的端点实体缺失路径带的是 `missingEntityNames`**（不是 `missingIds`）
+ *   —— 见 `MISSING_ENTITY_NAMES_KEY` 的说明。
  */
-export const NOT_FOUND_METHODS_WITH_MISSING_IDS: readonly string[] = ['touch', 'linkByIds'];
+export const NOT_FOUND_METHODS_WITH_MISSING_IDS: readonly string[] = ['touch', 'linkByIds', 'link'];
 
 /** 一个方法在「目标不存在」时的表达方式。 */
 export type MissingExpression = 'throw_not_found' | 'return_null' | 'not_applicable';

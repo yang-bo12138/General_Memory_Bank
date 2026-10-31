@@ -162,6 +162,22 @@ export function link(
     let subjectId = resolveEntity(db, subject);
     let objectId = resolveEntity(db, object);
 
+    // ⚠️ ★ **步骤 0：memoryId 的存在性自校验**（§11.2 的自校验清单明写
+    //   「`link` ⇒ `memoryId`（记忆）」）。
+    //   不自校验的后果：传一个不存在的 memoryId ⇒ 撞 `edges.memory_id` 的外键
+    //   ⇒ 在 `PRAGMA foreign_keys = ON`（§9.1，每连接都开）下抛
+    //   `SQLITE_CONSTRAINT_FOREIGNKEY` ⇒ 被转译成 `NOT_FOUND`，
+    //   **但 `details` 里没有 `missingIds`** ⇒ 违反 §11.2 的自校验清单。
+    //   ⚠️ 自校验必须在**事务内**做（否则并发删除会漏判）。
+    if (memoryId !== undefined && memoryId !== null) {
+      const memoryExists = db.prepare('SELECT 1 AS ok FROM memories WHERE id = ?').get(memoryId);
+      if (memoryExists === undefined) {
+        throw MemoryError.notFound(`link 的 memoryId 不存在：${memoryId}`, {
+          missingIds: [memoryId],
+        });
+      }
+    }
+
     // ⚠️ ★ **必须在建实体之前**记下「哪些端点原本解析不到」。
     //   之前的实现是「先建实体、再回头 `resolveEntity` 查」——
     //   建完之后实体**必然查得到** ⇒ 判定恒为「不是新建」
@@ -181,8 +197,12 @@ export function link(
         if (objectWasMissing) missingNames.push(object);
         throw MemoryError.notFound(
           `link 的端点实体不存在，且 createMissing = false（未产生任何写入）：${missingNames.join(', ')}`,
-          // ⚠️ `link` 的端点是**名称**（不是 id）⇒ 这个差集装的是「缺失的端点名」。
-          { missingIds: missingNames },
+          // ⚠️ v2.1 勘误（ADR-P1-C 冲突 2）：这个差集装的是「缺失的**端点实体名**」
+          //   （`link` 的入参是名字，不是 id）⇒ 用 `missingEntityNames`，
+          //   **不再用 `missingIds`** —— 后者的语义是「行 id 差集」
+          //   （§11.2 的 FK 兜底句把它绑在 id 上），装名字会让同一个键表达两件事
+          //   ⇒ 违反 §14.3.1 的 C36。
+          { missingEntityNames: missingNames },
         );
       }
 
@@ -296,6 +316,19 @@ export function linkByIds(
         `linkByIds 的实体不存在（已自行校验，未依赖外键）：${missing.join(', ')}`,
         { missingIds: missing },
       );
+    }
+
+    // ⚠️ ★ **memoryId 的存在性自校验**（§11.2 的自校验清单明写
+    //   「`linkByIds` ⇒ `subjectId`/`objectId` 与 `memoryId`」）。
+    //   与 `link` 同理：不自校验 ⇒ 撞 `edges.memory_id` 的外键 ⇒ 转译成 `NOT_FOUND`
+    //   但 `details` 里没有 `missingIds` ⇒ 违反 §11.2 的自校验清单。
+    if (memoryId !== undefined && memoryId !== null) {
+      const memoryExists = db.prepare('SELECT 1 AS ok FROM memories WHERE id = ?').get(memoryId);
+      if (memoryExists === undefined) {
+        throw MemoryError.notFound(`linkByIds 的 memoryId 不存在：${memoryId}`, {
+          missingIds: [memoryId],
+        });
+      }
     }
 
     if (isSelfLoop(subjectId, objectId)) {
