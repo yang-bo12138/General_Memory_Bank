@@ -24,8 +24,10 @@
  *   （「按上下文匹配库里已知实体名」的便利查询）**刻意没有**进导出面——
  *     阶段 1 **不实现**它（它不在 §12 阶段 1 的方法清单里 ⇒ 实现它会把阶段 1 的范围
  *     扩到清单之外；§4.6 步骤 1 只**留了口子**）。
- *   ⇒ 它仍然**从 `src/store/recall.ts` 独立导出**（阶段 2 的向量路/实体名入口会用上它），
- *     只是**公开入口不导它** ⇒ 「没进导出面」与「这个函数不存在」是**两件事**。
+ *   ⇒ **阶段 1 连实现都没有**：它已从 `src/store/recall.ts` **整体删除**
+ *     （**不是**「实现了但不导」——是**根本不存在**）。
+ *     ⇒ 若阶段 2 要它，须作为**独立于召回流水线**的辅助 API **新写**，
+ *       由调用方**显式调用**（成本 O(#实体 + #别名) 的行扫描，必须写在脸上）。
  *   ⇒ 推论：**任何**便利函数在它所属阶段落地前都**不进导出面**
  *     （阶段 0 的不变量设施与阶段 1 的门面是仅有的两批）。
  *
@@ -178,7 +180,15 @@ export type {
 } from './store/get.js';
 export type { LinkOptions, LinkResult } from './store/link.js';
 export { DEFAULT_PIN_FACTOR } from './store/pin.js';
+/**
+ * ★ `Hit` 是 DESIGN-v2.md §6 的**规范名**；`RecallHit` 是它的**弃用别名**
+ *   （**保留是为了不打断已有调用方，不要删**；**新代码一律用 `Hit`**）。
+ *
+ * ⚠️ **C36（同一件事不得有两套词/两份实现）**：两个都导出，但**规范名必须在公共入口上** ——
+ *   否则「弃用的那套」反而成了公共入口上唯一的名字，等于同一件事有两套词**且弃用的那套赢了**。
+ */
 export type {
+  Hit,
   RecallBreakdown,
   RecallDiffused,
   RecallExplain,
@@ -188,9 +198,10 @@ export type {
   RecallRouteInfo,
   RecallSuppressed,
 } from './store/recall.js';
-// ⚠️ `extractEntityNames` **刻意不在导出面**（ADR-P1-T07-DEC D-1 / DESIGN §4.6 步骤 1）：
-//   阶段 1 **不实现**它（它不在 §12 阶段 1 的方法清单里）⇒ 它**仍从
-//   `src/store/recall.ts` 独立导出**（阶段 2 会用），只是**公开入口不导它**。
+// ⚠️ `extractEntityNames` **阶段 1 既不实现、也不进导出面**
+//   （ADR-P1-T07-DEC D-1 / DESIGN §4.6 步骤 1）：
+//   它已从 `src/store/recall.ts` **整体删除** ——
+//   ⇒ 在这里「没进导出面」与「这个函数不存在」**是同一件事**（别再写「仍从 recall.ts 导出」）。
 export type {
   GrowStabilityOutcome,
   TouchOptions,

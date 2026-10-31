@@ -28,6 +28,10 @@ import {
   passesIntensityFilter,
 } from '../../src/core/scoring.js';
 import { tokenize } from '../../src/core/tokenize.js';
+// ⚠️ **从「公共入口」 import 规范名 `Hit`**（不是从 `src/store/recall.js` import）：
+//   ⇒ 「公共入口没导出 §6 的规范名」这件事在 **`tsc --noEmit` 阶段就会炸**（编译期守卫）。
+//   ⚠️ `import type` 在 `verbatimModuleSyntax` 下**整条被擦除** ⇒ 运行时零成本、零副作用。
+import type { Hit } from '../../src/index.js';
 import { recall } from '../../src/store/recall.js';
 import { countRows, createTestStore, readEvents } from '../fixtures/graph-store.js';
 
@@ -196,6 +200,33 @@ function sqlBlocks(source: string): Array<{ name: string; sql: string }> {
     matched = pattern.exec(source);
   }
   return blocks;
+}
+
+/**
+ * 取出源码里**全部** `export type { … }` 块里列出的名字（供「公共导出面」守卫用）。
+ *
+ * ⚠️ **为什么先剥注释**：导出块里可以挂 JSDoc（我给 `Hit` / `RecallHit` 挂了说明），
+ *   不剥的话注释文字会被当成「被导出的名字」⇒ 守卫变成「恒真」的摆设。
+ * ⚠️ **只认 `export type { … }`**：`Hit` 是**类型**，值导出（`export { … }`）不算数。
+ *
+ * @param source 源码全文
+ * @returns 全部被导出的类型名
+ */
+function exportedTypeNames(source: string): string[] {
+  const withoutComments = source.replace(/\/\*[\s\S]*?\*\//g, '');
+  const names: string[] = [];
+  const pattern = /export\s+type\s*\{([\s\S]*?)\}\s*from/g;
+  let matched = pattern.exec(withoutComments);
+  while (matched !== null) {
+    for (const raw of (matched[1] ?? '').split(',')) {
+      const name = raw.trim();
+      if (name !== '') {
+        names.push(name);
+      }
+    }
+    matched = pattern.exec(withoutComments);
+  }
+  return names;
 }
 
 /**
@@ -1258,6 +1289,51 @@ describe('P1-T08 · 流水线的静态纪律（ADR-16 / C37）', () => {
   it('★ 真实时钟只能经 `src/core/clock.ts`（C37）⇒ 本文件不出现直接读时钟的写法', () => {
     expect(source).not.toContain('Date.now(');
     expect(source).not.toContain('new Date(');
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 九之二、公共导出面（C36：规范名不得缺席）
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('P1-T08 · 公共导出面（C36：§6 的规范名必须在公共入口上）', () => {
+  it('★ 公共入口上 **`Hit`（§6 规范名）在**，`RecallHit` 作为**弃用别名**也仍在', () => {
+    // ── ① 编译期守卫 ────────────────────────────────────────────────
+    //   `Hit` 是从**公共入口**（`src/index.ts`）import 的（见文件头的 `import type`）——
+    //   ⇒ 「公共入口没导出规范名」这件事在 **`tsc --noEmit` 阶段就会炸**。
+    //   这里再把它当 `recall()` 返回值的元素类型**用一次** ⇒ `noUnusedLocals` 会盯着它。
+    const { db, store } = createTestStore();
+    seedMemory(db, { id: 'm1', content: '张三住在北京' });
+    const result = recall(store, { context: '张三住哪里', topN: 8, now: NOW });
+    const hits: Hit[] = result.hits;
+    expect(hits.length).toBeGreaterThan(0);
+
+    // ── ② 源码级守卫（把「导出名单」钉死）────────────────────────────
+    const indexSource = readFileSync(
+      fileURLToPath(new URL('../../src/index.ts', import.meta.url)),
+      'utf8',
+    );
+    const names = exportedTypeNames(indexSource);
+
+    // ⚠️ 负控：`Hit` 不在公共入口上 ⇒ 公共面上「弃用的那套」`RecallHit` 反而成了唯一的名字
+    //   ⇒ C36「同一件事有两套词，而且弃用的那套赢了」⇒ 变红。
+    expect(names).toContain('Hit');
+
+    // ⚠️ 负控：有人把 `RecallHit` 当成「多余的别名」删掉 ⇒ 打断已有调用方 ⇒ 变红。
+    //   ⚠️ **不要**断言 `RecallHit` **不存在** —— 它保留是刻意的（弃用别名，不是待删项）。
+    expect(names).toContain('RecallHit');
+  });
+
+  it('★ `Hit` 的基类 `MemoryView` **也在**公共入口上（拿到 `Hit` 就能标注它的基类部分）', () => {
+    const indexSource = readFileSync(
+      fileURLToPath(new URL('../../src/index.ts', import.meta.url)),
+      'utf8',
+    );
+    const names = exportedTypeNames(indexSource);
+
+    // ⚠️ 负控：`Hit extends MemoryView` ⇒ 公共入口上若没有 `MemoryView`，
+    //   调用方拿到 `Hit` 却无法标注/构造它的基类部分 ⇒ 变红。
+    expect(names).toContain('MemoryView');
   });
 });
 
