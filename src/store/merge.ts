@@ -21,8 +21,10 @@
  *   `addedEntities` 与实际入库的行对不上，**且不报错**）。
  *   ⇒ 抽成本文件的两个导出函数，`src/store/write.ts` 直接复用（单向依赖，无循环导入）。
  *
- * ⚠️ **依赖方向是单向的**：`write.ts` → `merge.ts` → `touch.ts` / `core/*`。
+ * ⚠️ **依赖方向是单向的**：`write.ts` → `merge.ts` → `touch.ts` / `vector/*` / `core/*`。
  *   `merge.ts` **不 import `write.ts`** ⇒ 没有循环导入。
+ *   ⚠️ **`vector/bucketAssign.ts` 也不 import `store/*`** ⇒ 向量层不依赖存储层
+ *   （桶归属的机制在向量层，**调用**它的才是存储层）。
  */
 
 import type Database from 'better-sqlite3';
