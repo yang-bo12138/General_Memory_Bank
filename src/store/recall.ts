@@ -8,7 +8,17 @@
  *   （两边的数都像正常值，测试也照样绿）。
  *   ⇒ 本文件**不实现任何打分公式**，也**不另算粗筛窗口**
  *     （两档窗口由 `scoring.ts` 的 `coarseGateWindow()` 独家提供 —— 「三路共用的唯一计算处」），
- *     只做：步骤 1 实体 → 步骤 2 三路候选 → 步骤 2.5 去重 → 步骤 3 调打分 → 步骤 4 排序截断 + 事件。
+ *     只做：步骤 1 实体名**归一** → 步骤 2 三路候选 → 步骤 2.5 去重
+ *     → 步骤 3 调打分 → 步骤 4 排序截断 + 事件。
+ *
+ * ⚠️ **库不抽取实体**（ADR-2 / ADR-P1-T08-GAP 缺口①）：
+ *   「上下文 → 实体名」由**调用方**完成；调用方把名字放进 `RecallOptions.entityNames`，
+ *   库只做「名字 → `entity_id`」的归一（逐名 `resolveEntity`，主名优先于别名）。
+ *   ⇒ `entityIds` 与 `entityNames` **互斥**（同传 ⇒ `INVALID_INPUT`）；
+ *     两者都不传 ⇒ 图谱路为空（退化为「文本路 + 向量路」）。
+ *   ⇒ 「按上下文匹配库里已知实体名」的**便利查询**由本文件**独立导出**
+ *     （`extractEntityNames()`），**不在流水线里**，由调用方显式调用
+ *     （成本 O(#实体 + #别名) 行扫描，**绝不能**放进每次 recall 都付的路径）。
  *
  * ⚠️ **流水线顺序不可换**（§4.6 首段）：
  *   路由（步骤 0，阶段 2 补）→ 三路候选（步骤 2）→ 融合打分（步骤 3）
@@ -41,6 +51,11 @@
  *
  * ⚠️ **查询路径禁止写库**（§4.6 步骤 1）：名字不认识**不得**就建实体
  *   ⇒ 本文件全程只发 `SELECT`；唯一的写发生在 `reinforce === true` 时的加固（§4.2）。
+ *
+ * ⚠️ **归档模式不做强度精筛**（ADR-P1-T08-GAP 小口径③）：
+ *   `includeArchived === true` ⇒ 应用层**不判强度**（只保留 `deleted = 0`）——
+ *   不是「阈值改成 0」（那是**严格大于** ⇒ 强度下溢成恰好 0.0 的记忆仍会被挡掉，
+ *   而它们**已经被 SQL 捞进来了** ⇒ 「显式查询归档层」名存实亡）。
  *
  * ⚠️ **C37 时钟注入**：真实时钟只经 `resolveNow()`（唯一入口 `src/core/clock.ts`）；
  *   本文件**不得**出现直接读真实时钟的写法 ⇒ 否则 `scripts/check-clock.ts` 判红。
@@ -148,11 +163,36 @@ export interface RecallOptions {
   /**
    * 已解析好的 canonical `entity_id` 列表。
    *
-   * ⚠️ **传入即完全跳过 §4.6 步骤 1**（不再做名称匹配）；
+   * ⚠️ **传入即完全跳过 §4.6 步骤 1 的名称解析**（不再逐名 `resolveEntity`）；
    *   传入空数组 `[]` 等价于「明确表示无实体」⇒ 图谱路转空。
+   * ⚠️ **与 `entityNames` 互斥**（ADR-P1-T08-GAP 缺口①）：同传 ⇒ 抛 `INVALID_INPUT`。
    */
   entityIds?: string[];
-  /** 是否显式查询归档层（默认 `false`；这是「显式查询归档层」的**唯一代码路径**）。 */
+  /**
+   * 调用方抽好的实体**名**列表。
+   *
+   * ⚠️ **库不抽取实体**（ADR-2 / ADR-P1-T08-GAP 缺口①）：
+   *   「上下文 → 名字」由**调用方**完成；库只做「名字 → `entity_id`」的归一
+   *   （逐名 `resolveEntity`，主名优先于别名）。
+   *   ⇒ 调用方想要「按库里已知的实体名做字典匹配」时，可显式调用本文件导出的
+   *     `extractEntityNames()`，再把结果放进这里（**它不在流水线里**）。
+   * ⚠️ **与 `entityIds` 互斥**：同传 ⇒ 抛 `INVALID_INPUT`。
+   * ⚠️ 解析不到的名字（`resolveEntity` 返回 `null`）**不进图谱路**，
+   *   但**仍参与文本路检索**（文本路检索的是正文，不需要实体表里有它）。
+   * ⚠️ **与 `entityIds` 都不传** ⇒ 图谱路为空（退化为「文本路 + 向量路」）。
+   */
+  entityNames?: string[];
+  /**
+   * 是否显式查询归档层（默认 `false`；这是「显式查询归档层」的**唯一代码路径**）。
+   *
+   * ⚠️ **归档模式下不做强度精筛**（ADR-P1-T08-GAP 小口径③）：
+   *   原稿的「阈值 = 0.0」与「只过滤 `deleted = 0`」**在数值上不等价** ——
+   *   精筛是**严格大于**，`intensity` 因 `exp` 下溢成**恰好 0.0** 的记忆
+   *   （Δt/τ > 745 天；schema 只要求 `stability > 0` ⇒ 常见）仍会被挡掉；
+   *   而那些行**已经被 SQL 捞进来了**（归档模式无时间窗）却在应用层被悄悄丢掉
+   *   ⇒ 「显式查询归档层」名存实亡。
+   *   ⇒ 本实现：**归档模式跳过强度精筛**（三路一致，铁律①）。
+   */
   includeArchived?: boolean;
   /** 扩散是否也过滤归档（默认 `true`；本阶段扩散未实现 ⇒ 恒不影响召回结果）。 */
   diffuseArchived?: boolean;
@@ -212,12 +252,12 @@ export interface RecallBreakdown {
  *
  * ⚠️ **`fromText` / `fromVector` / `fromGraph` 是 §4.6 步骤 2.5 的三个来源标记**：
  *   它们**只为排障与 `explain` 展示，不参与任何计算**（尤其不参与 `graphProximity`）。
- *   ⚠️ §6 的 `Hit` 字面量里没有这三个字段（设计稿在此处留了缺口），
- *     本实现放在**顶层**（而不是 `breakdown` 里）——
- *     因为它们的语义是「**这一条**是从哪几路来的」，
- *     与「本次这一路跑没跑」（`explain.routes`）分属**两个层级**，不能混在一起。
+ *   ⚠️ **放在顶层（而不是 `breakdown` 里）**（ADR-P1-T08-GAP 缺口②）：
+ *     它们的语义是「**这一条**是从哪几路来的」，
+ *     与「本次这一路跑没跑」（`explain.routes`）分属**两个层级**，不能混在一起；
+ *     且 `breakdown` 装的是「本次检索的**分项**」，塞来源会破坏语义单一性。
  */
-export interface RecallHit extends MemoryView {
+export interface Hit extends MemoryView {
   /** 本次的融合总分（= 五个分项之和，误差 ≤ 1e-9）。 */
   score: number;
   /** 分值明细（仅 `explain` / `diagnostics` 时给出）。 */
@@ -229,6 +269,12 @@ export interface RecallHit extends MemoryView {
   /** 本条是否由**图谱路**召回。 */
   fromGraph: boolean;
 }
+
+/**
+ * ⚠️ **弃用别名**：§6 的公开契约叫 **`Hit`**（C36：同一件事不得有两套词），
+ *   `RecallHit` 是本实现早期的命名 ⇒ 保留为别名，避免下游 import 断裂。
+ */
+export type RecallHit = Hit;
 
 /** 单条路的运行情况（§6 的 `explain.routes`）。 */
 export interface RecallRouteInfo {
@@ -296,7 +342,7 @@ export interface RecallDiffused {
 /** `recall` 的返回值（§6 的 `RecallResult`）。 */
 export interface RecallResult {
   /** 本次命中（按分数降序）。 */
-  hits: RecallHit[];
+  hits: Hit[];
   /** 调用级诊断（仅 `explain` / `diagnostics` 时给出）。 */
   explain?: RecallExplain;
   /** 被侧抑制挤掉的候选（本阶段恒为空；字段**恒在**，不省略）。 */
@@ -426,12 +472,15 @@ const GRAPH_SQL = `SELECT m.id AS id,
  LIMIT ${CANDIDATE_FETCH_LIMIT}`;
 
 /**
- * 上下文里出现过的实体名 / 别名（步骤 1 的名称抽取）。
+ * 「上下文里出现过的已知实体名 / 别名」的查询 SQL（**便利辅助函数专用**）。
  *
- * ⚠️ **只读**：这一步**绝不建实体**（§4.6 步骤 1：「查询路径禁止写库」——
+ * ⚠️ **只读**：这个查询**绝不建实体**（§4.6 步骤 1：「查询路径禁止写库」——
  *   不得因为「名字不认识」就建实体）。
  * ⚠️ **`instr(context, name) > 0` = 「名字出现在上下文里」**：
  *   只认**库里已经有的**名字 ⇒ 不认识的名字自然落进「不建实体」那一支。
+ * ⚠️ **它不在召回流水线里**（ADR-P1-T08-GAP 缺口①）：
+ *   库**不做**「上下文 → 名字」的抽取（ADR-2：实体抽取归调用方），
+ *   ⇒ 这段 SQL 只服务于**调用方显式调用**的辅助函数 `extractEntityNames()`。
  */
 const CONTEXT_ENTITY_NAMES_SQL = `SELECT name FROM entities
     WHERE length(name) > 0 AND instr(@context, name) > 0
@@ -440,22 +489,30 @@ const CONTEXT_ENTITY_NAMES_SQL = `SELECT name FROM entities
     WHERE length(alias) > 0 AND instr(@context, alias) > 0`;
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 三、步骤 1：实体抽取与别名消解
+// 三、步骤 1：实体名的**归一**（库不抽取，ADR-P1-T08-GAP 缺口①）
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * 从上下文里抽出「出现过的实体名 / 别名」（**只读**）。
+ * 便利辅助函数：找出「上下文里出现过的、**库里已知的**实体名 / 别名」（**只读**）。
  *
- * ⚠️ **为什么是「查库里已有的名字」而不是「猜上下文里哪些词是人名」**：
- *   本库不做 NER（§4.6 的「抽取」指的是「把上下文里出现的**已知实体**解析成 id」）。
- *   猜名字会把「我不认识这个词」与「这个词不是实体」混为一谈，
- *   而 §4.6 步骤 1 的语义恰恰要求**两者都只是「不进图谱路」**。
+ * ⚠️ **它不在召回流水线里**（ADR-P1-T08-GAP 缺口① / ADR-2）：
+ *   实体抽取（NER）**归调用方**——库里做 NER 会把「哪些词算实体」的控制权搬回库里，
+ *   而 §4.6 步骤 1 声明的成本模型是「**按名字索引查**」（O(log n)），
+ *   不是「扫全表找名字」。
+ *   ⇒ 调用方想要「用库里已知的实体名做字典匹配」时，**自己显式调它**，
+ *     再把结果作为 `RecallOptions.entityNames` 传回来。
+ *
+ * ⚠️ **成本**：每次调用 **O(#实体 + #别名) 的行扫描**（两次全表扫 + `instr` 过滤）。
+ *   ⚠️ **10 万级实体上就是几十~几百毫秒** ⇒ **绝不能**放进每次 recall 都付的路径。
+ * ⚠️ **`instr` 是子串匹配、没有词边界**：短名 / 英文短词会误命中
+ *   （上下文里有「AI」⇒ 实体名叫「ai」也会命中）⇒ 调用方拿到结果后**自己判断要不要用**。
+ * ⚠️ **只读**：绝不建实体。
  *
  * @param db 数据库句柄
  * @param context 上下文原文
  * @returns 出现过的实体名 / 别名（已去重）
  */
-function extractContextEntityNames(db: Database.Database, context: string): string[] {
+export function extractEntityNames(db: Database.Database, context: string): string[] {
   if (context === '') {
     return [];
   }
@@ -464,31 +521,67 @@ function extractContextEntityNames(db: Database.Database, context: string): stri
 }
 
 /**
- * 步骤 1：拿到本次上下文的 `entity_id` 集合。
+ * 步骤 1：把调用方给的名字**归一**成 `entity_id` 集合（§4.6 步骤 1）。
  *
- * ⚠️ **调用方传了 `entityIds` 就完全跳过名称匹配**（§4.6 步骤 1）：
- *   传空数组 `[]` 等价于「明确表示无实体」⇒ 图谱路转空。
+ * ⚠️ **库不抽取实体**（ADR-P1-T08-GAP 缺口① / ADR-2）：
+ *   「上下文 → 名字」由**调用方**完成；库只做「名字 → id」的归一。
+ *   ⇒ 四个分支（**互斥**，不静默取舍）：
+ *     ① `entityIds` 与 `entityNames` **同传** ⇒ 抛 `INVALID_INPUT`
+ *        （两者装的是**同一件事的两个阶段**；取舍 = 静默丢弃调用方的一半意图）。
+ *     ② 只传 `entityIds` ⇒ **完全跳过**名称解析（现状不变）；`[]` = 「明确表示无实体」。
+ *     ③ 只传 `entityNames` ⇒ 逐名 `resolveEntity`；解析不到的名字**跳过**
+ *        （它仍参与**文本路**检索 —— 文本路检索的是正文，不需要实体表里有它）。
+ *     ④ **都不传** ⇒ 图谱路为空（退化为「文本路 + 向量路」；
+ *        ADR-2 明写并接受这个代价：「调用方不传就退化为纯文本检索，功能仍完整」）。
+ *
  * ⚠️ **名称 → id 的解析一律走 `resolveEntity`**（§4.5 末尾的**唯一实现**）：
  *   主名优先于别名 ⇒ 同一个字符串不会给出两个答案。
  *   ⚠️ **不得**给 `resolveEntity` 加「不存在就建」的开关：查询路径禁止写库。
  *
  * @param db 数据库句柄
- * @param context 上下文原文
- * @param explicit 调用方直接传入的 `entity_id`（`undefined` = 未传 ⇒ 走名称匹配）
+ * @param explicitIds 调用方直接传入的 `entity_id` 列表（`undefined` = 未传）
+ * @param explicitNames 调用方抽好的实体名列表（`undefined` = 未传）
  * @returns 去重后的 `entity_id` 列表
+ * @throws {MemoryError} code = `INVALID_INPUT`（`entityIds` 与 `entityNames` 同传）
  */
 function resolveContextEntityIds(
   db: Database.Database,
-  context: string,
-  explicit: readonly string[] | undefined,
+  explicitIds: readonly string[] | undefined,
+  explicitNames: readonly string[] | undefined,
 ): string[] {
-  if (explicit !== undefined) {
-    return [...new Set(explicit.filter((id) => id !== ''))];
+  // ⚠️ **互斥**（ADR-P1-T08-GAP 缺口①）：同传 ⇒ `INVALID_INPUT`（五码封闭，不扩错误码）。
+  if (explicitIds !== undefined && explicitNames !== undefined) {
+    throw MemoryError.invalidInput(
+      'recall 的 entityIds 与 entityNames 互斥：两者装的是同一件事的两个阶段',
+      {
+        entityIds: {
+          current: String(explicitIds.length),
+          reason:
+            '两个都传就必须有一个被静默丢弃（= 丢弃调用方一半意图）；' +
+            '要已解析的 id 就只传 entityIds，要名字就只传 entityNames',
+        },
+        entityNames: {
+          current: String(explicitNames.length),
+          reason: '与 entityIds 互斥（见上）',
+        },
+      },
+    );
   }
 
-  const names = extractContextEntityNames(db, context);
+  if (explicitIds !== undefined) {
+    return [...new Set(explicitIds.filter((id) => id !== ''))];
+  }
+
+  if (explicitNames === undefined) {
+    // ⚠️ **都不传 ⇒ 图谱路为空**（ADR-2：「调用方不传就退化为纯文本检索，功能仍完整」）。
+    return [];
+  }
+
   const ids: string[] = [];
-  for (const name of names) {
+  for (const name of explicitNames) {
+    if (name === '') {
+      continue;
+    }
     // ⚠️ 解析不到就**跳过**（不建实体）：该名称仍会参与**文本路**检索
     //   （文本路检索的是正文，不需要实体表里有它）。
     const entityId = resolveEntity(db, name);
@@ -555,24 +648,37 @@ function coarseBindingsOf(coarse: CoarseGateWindow): {
  *   直接污染 `0.30 × intensity` 与 §4.4 的层级判定。
  * ⚠️ **精筛在截断之前**：先按强度剔除归档，再取前 N ⇒ 名额留给还活着的记忆。
  *
+ * ⚠️ **归档模式下本精筛整体不执行**（ADR-P1-T08-GAP 小口径③）：
+ *   `archiveLine === null` ⇒ **不调用** `passesIntensityFilter`。
+ *   ⇒ 原稿的「阈值 = 0.0」与「只过滤 `deleted = 0`」**在数值上不等价**：
+ *     精筛是**严格大于**，而 `intensity` 会因 `exp` **下溢成恰好 0.0**
+ *     （下溢条件 `Δt / τ > 745 天`；schema 只要求 `stability > 0` ⇒ 常见）
+ *     ⇒ 那些行**已经被 SQL 捞进来了**（归档模式无时间窗）却在应用层被悄悄丢掉
+ *     ⇒ 「显式查询归档层」**名存实亡**，而且**不报错**。
+ *   ⇒ 裁决：**归档模式不做强度精筛**（三路一致，铁律①）。
+ *
  * @param rows 该路的原始候选
- * @param archiveLine 精筛阈值（`includeArchived` ? 0 : `ARCHIVE_LINE`）
+ * @param archiveLine 精筛阈值（`null` = **不做这个判定**，归档模式）
  * @param now 注入时钟
  * @returns 精筛 + 截断后的候选
  */
 function filterAndSlice(
   rows: readonly CandidateRow[],
-  archiveLine: number,
+  archiveLine: number | null,
   now: number,
 ): CandidateRow[] {
   const kept: CandidateRow[] = [];
   for (const row of rows) {
-    const intensityValue = intensity(
-      { stability: row.stability, pin_factor: row.pin_factor, last_access: row.last_access },
-      now,
-    );
-    if (!passesIntensityFilter(intensityValue, archiveLine)) {
-      continue;
+    // ⚠️ **归档模式直接跳过强度判定**（`archiveLine === null`）——
+    //   被放行的记忆照常参与打分与排序（`intensity` 分项照常算，可能接近 0 ⇒ 自然沉底）。
+    if (archiveLine !== null) {
+      const intensityValue = intensity(
+        { stability: row.stability, pin_factor: row.pin_factor, last_access: row.last_access },
+        now,
+      );
+      if (!passesIntensityFilter(intensityValue, archiveLine)) {
+        continue;
+      }
     }
     kept.push(row);
   }
@@ -598,7 +704,7 @@ interface TextRouteResult {
  * @param db 数据库句柄
  * @param context 上下文原文
  * @param includeArchived 是否显式查询归档层
- * @param archiveLine 精筛阈值
+ * @param archiveLine 精筛阈值（`null` = 不做这个判定，归档模式）
  * @param now 注入时钟
  * @returns 文本路候选与分支
  */
@@ -607,7 +713,7 @@ function collectTextCandidates(
   context: string,
   params: Params,
   includeArchived: boolean,
-  archiveLine: number,
+  archiveLine: number | null,
   now: number,
 ): TextRouteResult {
   const { matchSql, fallbackLike } = buildMatchQuery(context);
@@ -644,7 +750,7 @@ function collectTextCandidates(
  * @param db 数据库句柄
  * @param entityIds 上下文的 `entity_id` 列表
  * @param includeArchived 是否显式查询归档层
- * @param archiveLine 精筛阈值
+ * @param archiveLine 精筛阈值（`null` = 不做这个判定，归档模式）
  * @param now 注入时钟
  * @returns 图谱路候选
  */
@@ -653,7 +759,7 @@ function collectGraphCandidates(
   entityIds: readonly string[],
   params: Params,
   includeArchived: boolean,
-  archiveLine: number,
+  archiveLine: number | null,
   now: number,
 ): CandidateRow[] {
   if (entityIds.length === 0) {
@@ -872,11 +978,13 @@ export function recall(store: RecallStore, options: RecallOptions): RecallResult
   const topN = clampTopN(options.topN, params.RECALL_TOP_N);
   const includeArchived = options.includeArchived === true;
   const diffuseArchived = options.diffuseArchived !== false;
-  const archiveLine = archiveFilterThreshold(params, includeArchived);
+  // ⚠️ **归档模式下「不做强度精筛」**（ADR-P1-T08-GAP 小口径③）⇒ 阈值取 `null`。
+  //   阈值本身仍由 `scoring.ts` 的 `archiveFilterThreshold()` 独家提供（非归档模式）。
+  const archiveLine = includeArchived ? null : archiveFilterThreshold(params, false);
   const withBreakdown = options.explain === true || options.diagnostics === true;
 
-  // ── 步骤 1：实体抽取与别名消解 ──
-  const entityIds = resolveContextEntityIds(db, context, options.entityIds);
+  // ── 步骤 1：实体名的**归一**（库不抽取；ADR-P1-T08-GAP 缺口①）──
+  const entityIds = resolveContextEntityIds(db, options.entityIds, options.entityNames);
 
   // ── 步骤 2：三路候选 ──
   const text = collectTextCandidates(db, context, params, includeArchived, archiveLine, at);
@@ -901,7 +1009,7 @@ export function recall(store: RecallStore, options: RecallOptions): RecallResult
   const top = ordered.slice(0, topN);
 
   // ── 组装命中（复用 `get()` 的视图映射 ⇒ 与 §6 的 `MemoryView` 逐字一致）──
-  const hits: RecallHit[] = [];
+  const hits: Hit[] = [];
   for (const candidate of top) {
     const view = get(store, candidate.id, at);
     if (view === null) {
@@ -909,7 +1017,7 @@ export function recall(store: RecallStore, options: RecallOptions): RecallResult
       //   而不是让下游拿到 `undefined`（未类型化的崩溃）。
       continue;
     }
-    const hit: RecallHit = {
+    const hit: Hit = {
       ...view,
       score: candidate.score,
       fromText: candidate.fromText,

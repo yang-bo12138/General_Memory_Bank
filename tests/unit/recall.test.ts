@@ -28,7 +28,7 @@ import {
   passesIntensityFilter,
 } from '../../src/core/scoring.js';
 import { tokenize } from '../../src/core/tokenize.js';
-import { recall } from '../../src/store/recall.js';
+import { extractEntityNames, recall } from '../../src/store/recall.js';
 import { countRows, createTestStore, readEvents } from '../fixtures/graph-store.js';
 
 /** 固定的「现在」（epoch 毫秒）——**全部时间都从它推导**，不写真死的天数常量。 */
@@ -311,15 +311,25 @@ describe('P1-T08 · recall 的准入闸门（§4.6 步骤 2 的两条铁律）',
     });
     // ⚠️ 这条在**粗筛窗口之外**（700 天 ≫ 539 天）⇒ 它能出现，
     //   **只可能**是因为 `includeArchived: true` 把粗筛窗口整体取消了。
-    // ⚠️ 用 700 天而不是 1000 天：Δt/τ = 700 ⇒ `exp(-700) ≈ 9.9e-305`（仍 > 0）；
-    //   再老下去 `exp` 会**下溢成 0**（IEEE754 的下溢边界在 ≈745 个时间常数），
-    //   而归档层的精筛阈值是 `0.0` 且判定是**严格大于** ⇒ 强度恰为 0 的那条会被挡掉。
-    //   （这是一个**浮点边界**而非语义边界，本用例刻意避开它，详见交付报告。）
     seedMemory(db, {
       id: 'm-deep-archived',
       content: '张三喜欢猫',
       stability: 1,
       lastAccess: NOW - 700 * MS_PER_DAY,
+    });
+    // ⚠️ 这条的 `intensity` **因下溢恰好等于 0.0**（τ = 0.001 天，200 天前访问
+    //   ⇒ Δt/τ = 200000 ⇒ `exp(-200000) = 0`）。
+    //   ⚠️ **IEEE754 的下溢边界在 ≈745 个时间常数**（`exp(-746)` 直接变 0.0），
+    //   而 schema 对 `stability` 只有 `CHECK (stability > 0)` ⇒ **没有下界**
+    //   ⇒ 小 `stability` 的记忆几十小时就能下溢到 0 ⇒ 归档层里**非常常见**。
+    //   ⇒ 这条是 ADR-P1-T08-GAP 小口径③ 的**边界用例**：
+    //     归档模式下它**必须出现**（「只过滤 deleted = 0」）；
+    //     默认模式下它**必须不出现**（强度 0 ≤ 归档线）。
+    seedMemory(db, {
+      id: 'm-underflow',
+      content: '张三喜欢猫',
+      stability: 0.001,
+      lastAccess: NOW - 200 * MS_PER_DAY,
     });
 
     const withoutArchived = recall(store, {
@@ -331,6 +341,8 @@ describe('P1-T08 · recall 的准入闸门（§4.6 步骤 2 的两条铁律）',
     expect(withoutArchived.hits.map((hit) => hit.id)).not.toContain('m-faint');
     expect(withoutArchived.hits.map((hit) => hit.id)).not.toContain('m-deep-archived');
     expect(withoutArchived.hits.map((hit) => hit.id)).toContain('m-live');
+    // ⚠️ 负控：默认模式下强度下溢成 0 的那条**必须不出现**（它过不了精筛）。
+    expect(withoutArchived.hits.map((hit) => hit.id)).not.toContain('m-underflow');
 
     // 性质：**默认路径**召回出来的每一条，其 intensity 都**严格大于**归档线。
     // ⚠️ 负控：把精筛的 `>` 写成 `>=` ⇒ 恰好落在归档线上的那条会混进来 ⇒ 这条变红。
@@ -355,16 +367,22 @@ describe('P1-T08 · recall 的准入闸门（§4.6 步骤 2 的两条铁律）',
     // ⚠️ 负控：`includeArchived: true` 时若**没有**取消粗筛窗口 ⇒
     //   `m-deep-archived`（在窗口之外）永远出不来 ⇒ 这条变红。
     expect(withArchived.hits.map((hit) => hit.id)).toContain('m-deep-archived');
+    // ★ **归档模式的边界**：强度**恰好下溢成 0.0** 的那条**必须出现**
+    //   （ADR-P1-T08-GAP 小口径③：归档模式**不做强度精筛**，只保留 `deleted = 0`）。
+    // ⚠️ 负控：若仍用「阈值 = 0.0 + 严格大于」⇒ 它会被挡掉 ⇒ 这条变红。
+    //   （而它**已经被 SQL 捞进来了** ⇒ 「显式查询归档层」名存实亡。）
+    expect(withArchived.hits.map((hit) => hit.id)).toContain('m-underflow');
 
-    // 性质：归档层的精筛阈值是 `0.0` ⇒ 召回出来的每一条 intensity 都**严格大于 0**
-    //   （仍不是「什么都能回来」：`deleted = 1` 的依然进不来）。
+    // 性质：归档模式**不判强度** ⇒ 召回出来的每一条 intensity 都**≥ 0**
+    //   （可能**恰好为 0** ⇒ 这正是上面那条；仍不是「什么都能回来」：
+    //   `deleted = 1` 的依然进不来）。
     for (const hit of withArchived.hits) {
       const row = readRow(db, hit.id);
       const value = intensity(
         { stability: row.stability, pin_factor: row.pin_factor, last_access: row.last_access },
         NOW,
       );
-      expect(value).toBeGreaterThan(0);
+      expect(value).toBeGreaterThanOrEqual(0);
     }
   });
 
@@ -546,13 +564,15 @@ describe('P1-T08 · 候选去重与各路证据的独立性（§4.6 步骤 2.5 /
       explain: true,
       now: NOW,
     });
-    // 第二次：**不传** `entityIds` ⇒ 上下文里没有已知的实体名 ⇒ 图谱路不执行 ⇒ 候选集只有三条文本命中。
+    // 第二次：**不传** `entityIds` 也不传 `entityNames` ⇒ 图谱路为空（ADR-P1-T08-GAP 缺口①：
+    //   库不抽取实体 ⇒ 调用方不点名就没有实体）⇒ 候选集只有三条文本命中。
     const withoutGraph = recall(store, {
       context: '张三住哪里',
       topN: 8,
       explain: true,
       now: NOW,
     });
+    expect(withoutGraph.explain?.routes.graph.ran).toBe(false);
 
     const graphOnly = withGraph.hits.find((hit) => hit.id === 'm4');
     expect(graphOnly).toBeDefined();
@@ -636,7 +656,15 @@ describe('P1-T08 · 候选去重与各路证据的独立性（§4.6 步骤 2.5 /
       linkEntity(db, `m-decoy-${index}`, 'e-wang');
     }
 
-    const result = recall(store, { context: '王五喜欢狗', topN: 8, explain: true, now: NOW });
+    const result = recall(store, {
+      context: '王五喜欢狗',
+      // ⚠️ **实体名由调用方给**（ADR-P1-T08-GAP 缺口①：库不抽取）⇒ 图谱路与
+      //   `graphProximity` 的「实体交集」才有判据（交集 = 调用方给的名字解析出的 id）。
+      entityNames: ['王五'],
+      topN: 8,
+      explain: true,
+      now: NOW,
+    });
 
     const target = result.hits.find((hit) => hit.id === 'm-target');
     expect(target).toBeDefined();
@@ -680,8 +708,8 @@ describe('P1-T08 · 候选去重与各路证据的独立性（§4.6 步骤 2.5 /
 // 五、步骤 1：实体抽取与别名消解（查询路径禁止写库）
 // ═══════════════════════════════════════════════════════════════════════════
 
-describe('P1-T08 · 步骤 1 的实体抽取与别名消解（§4.6 步骤 1）', () => {
-  it('★ 上下文里出现的已知实体名 ⇒ 进图谱路；别名也能解析', () => {
+describe('P1-T08 · 步骤 1 的实体名**归一**（库不抽取；ADR-P1-T08-GAP 缺口①）', () => {
+  it('★ 调用方传 `entityNames` ⇒ 逐名归一进图谱路；别名也能解析', () => {
     const { db, store } = createTestStore();
     seedEntity(db, 'e-zhang', '张三');
     db.prepare('INSERT INTO entity_aliases (alias, entity_id) VALUES (?, ?)').run(
@@ -691,31 +719,52 @@ describe('P1-T08 · 步骤 1 的实体抽取与别名消解（§4.6 步骤 1）'
     seedMemory(db, { id: 'm-zhang', content: '张三住在北京' });
     linkEntity(db, 'm-zhang', 'e-zhang');
 
-    const byPrimary = recall(store, { context: '张三住在哪里', topN: 8, explain: true, now: NOW });
+    // 性质：**主名**归一 ⇒ 进图谱路。
+    const byPrimary = recall(store, {
+      context: '住在哪里',
+      entityNames: ['张三'],
+      topN: 8,
+      explain: true,
+      now: NOW,
+    });
     expect(byPrimary.explain?.routes.graph.ran).toBe(true);
     expect(byPrimary.explain?.routes.graph.candidates).toBeGreaterThan(0);
     expect(byPrimary.hits.find((hit) => hit.id === 'm-zhang')?.fromGraph).toBe(true);
 
-    // 性质：别名同样能解析到**同一个** entity_id（§4.5 的唯一实现，主名优先于别名）。
-    const byAlias = recall(store, { context: '老张住在哪里', topN: 8, explain: true, now: NOW });
+    // 性质：**别名**同样能解析到**同一个** entity_id（§4.5 的唯一实现，主名优先于别名）。
+    const byAlias = recall(store, {
+      context: '住在哪里',
+      entityNames: ['老张'],
+      topN: 8,
+      explain: true,
+      now: NOW,
+    });
     expect(byAlias.explain?.routes.graph.ran).toBe(true);
     expect(byAlias.explain?.routes.graph.candidates).toBeGreaterThan(0);
+    expect(byAlias.hits.find((hit) => hit.id === 'm-zhang')?.fromGraph).toBe(true);
   });
 
-  it('★ 查询路径**禁止写库**：不认识的名字**不得**建实体', () => {
+  it('★ 解析不到的名字**不进图谱路**，且**不得**建实体（查询路径禁止写库）', () => {
     const { db, store } = createTestStore();
     seedMemory(db, { id: 'm-x', content: '查无此人喜欢狗' });
 
     const before = countRows(db, 'entities');
-    const result = recall(store, { context: '查无此人喜欢狗', topN: 8, explain: true, now: NOW });
+    const result = recall(store, {
+      context: '查无此人喜欢狗',
+      entityNames: ['查无此人'],
+      topN: 8,
+      explain: true,
+      now: NOW,
+    });
 
+    // ⚠️ 负控：名称解析若**顺手建了实体** ⇒ 库里多一行 ⇒ 这条变红。
     expect(countRows(db, 'entities')).toBe(before);
-    // 性质：不认识的名字 ⇒ 图谱路**不跑**（`ran=false`），但文本路照常。
+    // 性质：解析不到 ⇒ 图谱路**不跑**（`ran=false`），但文本路照常。
     expect(result.explain?.routes.graph.ran).toBe(false);
     expect(result.explain?.routes.text.ran).toBe(true);
   });
 
-  it('★ 调用方直接传 entityIds ⇒ 完全跳过名称匹配；传空数组 ⇒ 图谱路转空', () => {
+  it('★ 调用方传 `entityIds` ⇒ 直接用；传空数组 ⇒ 图谱路转空', () => {
     const { db, store } = createTestStore();
     seedEntity(db, 'e-li', '李四');
     seedMemory(db, { id: 'm-li', content: '李四在杭州' });
@@ -738,10 +787,72 @@ describe('P1-T08 · 步骤 1 的实体抽取与别名消解（§4.6 步骤 1）'
       explain: true,
       now: NOW,
     });
-    // ⚠️ 负控：把「空数组」当成「未传」⇒ 会去跑名称匹配 ⇒ `ran` 变成 true。
+    // ⚠️ 负控：把「空数组」当成「未传」⇒ 会去跑名称解析 ⇒ `ran` 变成 true。
     expect(withEmpty.explain?.routes.graph.ran).toBe(false);
     expect(withEmpty.explain?.routes.graph.candidates).toBe(0);
     expect(withEmpty.hits).toHaveLength(0);
+  });
+
+  it('★ 两者都不传 ⇒ 图谱路为空（**库不抽取实体**：ADR-P1-T08-GAP 缺口① / ADR-2）', () => {
+    const { db, store } = createTestStore();
+    // ⚠️ **上下文里明明有一个已知实体名** —— 但库**不抽取** ⇒ 图谱路必须仍然为空。
+    //   这条是「库内不得出现『扫全表找名字』的隐式路径」的**可执行守卫**：
+    //   若实现又偷偷做库内抽取 ⇒ 图谱路会跑起来 ⇒ 这条变红。
+    seedEntity(db, 'e-zhang', '张三');
+    seedMemory(db, { id: 'm-zhang', content: '张三住在北京' });
+    linkEntity(db, 'm-zhang', 'e-zhang');
+
+    const result = recall(store, {
+      context: '张三住在哪里',
+      topN: 8,
+      explain: true,
+      now: NOW,
+    });
+
+    expect(result.explain?.routes.graph.ran).toBe(false);
+    expect(result.explain?.routes.graph.candidates).toBe(0);
+    // 性质：文本路照常（**「谁配被想起」由词法与闸门决定，不因没有实体而停摆**）。
+    expect(result.explain?.routes.text.ran).toBe(true);
+    const hit = result.hits.find((item) => item.id === 'm-zhang');
+    expect(hit?.fromText).toBe(true);
+    expect(hit?.fromGraph).toBe(false);
+    // ⚠️ **没有实体 ⇒ `graphProximity` 恒 0**（没有交集可判）。
+    expect(hit?.breakdown?.graphPart).toBe(0);
+  });
+
+  it('★ `entityIds` 与 `entityNames` 同传 ⇒ 抛 `INVALID_INPUT`（互斥，不静默取舍）', () => {
+    const { db, store } = createTestStore();
+    seedEntity(db, 'e-li', '李四');
+
+    // ⚠️ 负控：若实现「优先取 entityIds、把 entityNames 静默丢掉」⇒ 不抛错 ⇒ 这条变红。
+    expect(() =>
+      recall(store, {
+        context: '随便什么话',
+        entityIds: ['e-li'],
+        entityNames: ['李四'],
+        topN: 8,
+        now: NOW,
+      }),
+    ).toThrowError(/互斥/);
+  });
+
+  it('★ `extractEntityNames` 是**独立**辅助函数（不在流水线里）：能找到上下文里的已知实体名/别名', () => {
+    const { db, store } = createTestStore();
+    seedEntity(db, 'e-zhang', '张三');
+    db.prepare('INSERT INTO entity_aliases (alias, entity_id) VALUES (?, ?)').run(
+      '老张',
+      'e-zhang',
+    );
+
+    // 性质：辅助函数能找到上下文里的**主名**与**别名**（只认库里已有的名字）。
+    expect(extractEntityNames(db, '张三住在哪里')).toContain('张三');
+    expect(extractEntityNames(db, '老张住在哪里')).toContain('老张');
+    expect(extractEntityNames(db, '查无此人')).toHaveLength(0);
+
+    // ★ 关键性质：**它不在流水线里** —— 调用方即使不把结果塞进 `entityNames`，
+    //   召回也**不会**因为「上下文里有已知实体名」而跑起图谱路。
+    const result = recall(store, { context: '张三住在哪里', topN: 8, explain: true, now: NOW });
+    expect(result.explain?.routes.graph.ran).toBe(false);
   });
 });
 
