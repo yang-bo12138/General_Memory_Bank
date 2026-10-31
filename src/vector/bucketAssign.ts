@@ -239,6 +239,90 @@ export function countBucketMembers(db: Database.Database, fineId: string): numbe
 }
 
 /**
+ * 桶侧**一次扫描**的产物（**对账与 P95 共用** ⇒ 桶表只扫一遍）。
+ *
+ * ⚠️ ★ **为什么要有它**（P2-T06）：
+ *   §9.3.2 ③ 的启动对账与 ④ 的 P95 退化检测**都要读桶侧**：
+ *   · 对账要**每一行**（要分出「真孤儿 / 软删 / 无向量」三分支 ⇒ 必须 JOIN `memories`）；
+ *   · P95 要**每桶的成员数**（聚合口径）。
+ *   ⇒ 两件事若各读一次 ⇒ **桶表被扫两遍**（百万行 ⇒ 白白多花一次全表扫）
+ *   ⇒ 而 §9.3.2 ④ 明写「这一遍**可与启动对账合并成同一次扫描**」。
+ *   ⇒ 本接口把「桶侧行 + 每桶计数」**一次扫描**同时产出 ⇒ 两边共用。
+ */
+export interface BucketSideScan {
+  /** 桶侧**每一行**（LEFT JOIN 后的原始行）。 */
+  rows: BucketSideRow[];
+  /**
+   * `fine_id` → 成员数（**只列有成员的桶**；不在结果里的桶 = 成员数 0）。
+   *
+   * ⚠️ **口径与 `listBucketMemberCounts()` 逐条相同**（同一个函数的两个出口 ⇒ C36）。
+   */
+  counts: Map<string, number>;
+}
+
+/**
+ * 桶侧的一行（LEFT JOIN 后的原始行）。
+ *
+ * ⚠️ ★ **只取「有没有向量」，不取向量本体**（`m.embedding IS NULL` 而非 `m.embedding`）：
+ *   百万行 × 3KB/行 = **3GB** ⇒ 取本体会让「只算计数」的调用方**平白吃掉 3GB**
+ *   ⇒ 而判据只需要知道「它有没有向量」⇒ **只取标志位**。
+ */
+export interface BucketSideRow {
+  /** 桶归属指向的记忆 id。 */
+  memoryId: string;
+  /** 归属所在的细桶 id。 */
+  fineId: string;
+  /** JOIN 到的 `memories.id`（`null` = **真孤儿**：JOIN 不到行）。 */
+  foundId: string | null;
+  /** `memories.deleted`（`null` = JOIN 不到行；`1` = 软删）。 */
+  deleted: number | null;
+  /** 该记忆**没有向量**？（`true` = `m.embedding IS NULL`）。 */
+  hasNoEmbedding: boolean;
+}
+
+/**
+ * 扫一遍桶侧（**对账与 P95 共用的唯一一次桶表行扫描**）。
+ *
+ * ⚠️ **LEFT JOIN，不丢硬删孤儿**（§9.3.2 ③）：
+ *   用 INNER JOIN 的话**真孤儿**（硬删且 FK 未开）会被一并放过 ⇒ 孤儿永久滞留。
+ *
+ * ⚠️ **只认「有没有向量」，不取向量本体**（见 `BucketSideRow` 的说明）⇒ 内存不炸。
+ *
+ * @param db 库句柄
+ * @returns 桶侧行 + 每桶成员数
+ */
+export function scanBucketSide(db: Database.Database): BucketSideScan {
+  const rows = db
+    .prepare(
+      'SELECT vcm.memory_id AS memoryId, vcm.fine_id AS fineId, m.id AS foundId, ' +
+        'm.deleted AS deleted, (m.embedding IS NULL) AS hasNoEmbedding ' +
+        'FROM vector_cell_members vcm LEFT JOIN memories m ON m.id = vcm.memory_id',
+    )
+    .all() as Array<{
+    memoryId: string;
+    fineId: string;
+    foundId: string | null;
+    deleted: number | null;
+    hasNoEmbedding: number;
+  }>;
+
+  const counts = new Map<string, number>();
+  const scanned: BucketSideRow[] = [];
+  for (const row of rows) {
+    scanned.push({
+      memoryId: row.memoryId,
+      fineId: row.fineId,
+      foundId: row.foundId,
+      deleted: row.deleted,
+      hasNoEmbedding: row.hasNoEmbedding === 1,
+    });
+    counts.set(row.fineId, (counts.get(row.fineId) ?? 0) + 1);
+  }
+
+  return { rows: scanned, counts };
+}
+
+/**
  * 算**所有细桶的成员数**（现算）—— 桶计数的**唯一口径**之一。
  *
  * ⚠️ **给 `p95BucketSize` / `maxBucketSize` / 兜底切分判定量用**（§4.15.5）：
@@ -246,18 +330,16 @@ export function countBucketMembers(db: Database.Database, fineId: string): numbe
  *   否则「同一个量有两份算法」必然漂移（C36）。
  *   ⚠️ **不在结果里的桶 = 成员数为 0**（本函数只列出**有成员**的桶）。
  *
+ * ⚠️ **实现走 `scanBucketSide()`**（P2-T06）：桶计数与对账的桶侧行**同源**
+ *   ⇒ 「桶计数」只有**一份**实现（C36）⇒ 不可能漂。
+ *   ⚠️ **代价**：以前是 `GROUP BY`（索引唯一扫描），现在是 LEFT JOIN 的行扫描
+ *   ⇒ 比以前慢 ⇒ 但它**只取标志位不取向量本体**（见 `BucketSideRow`）⇒ 内存不炸。
+ *
  * @param db 库句柄
  * @returns `fineId` → 成员数的映射
  */
 export function listBucketMemberCounts(db: Database.Database): Map<string, number> {
-  const rows = db
-    .prepare('SELECT fine_id, COUNT(*) AS count FROM vector_cell_members GROUP BY fine_id')
-    .all() as Array<{ fine_id: string; count: number }>;
-  const counts = new Map<string, number>();
-  for (const row of rows) {
-    counts.set(row.fine_id, row.count);
-  }
-  return counts;
+  return scanBucketSide(db).counts;
 }
 
 /**
@@ -328,6 +410,19 @@ export interface BucketMembershipDiff {
    *   ⇒ 必须另配 `COUNT(*) == COUNT(DISTINCT memory_id)`（本项就是那个判据）。
    */
   duplicates: string[];
+  /**
+   * ★ **库侧活记忆的条数**（`embedding IS NOT NULL AND deleted = 0`）——
+   * 对账的**覆盖率分母**（§6 的 `bucketCoverage`）。
+   *
+   * ⚠️ **新增字段，既有调用方零改动**（老调用方不看它 ⇒ 行为不变）。
+   */
+  liveCount: number;
+  /**
+   * ★ **桶侧归属的条数**（`vector_cell_members` 的行数）。
+   *
+   * ⚠️ **新增字段，既有调用方零改动**。
+   */
+  bucketCount: number;
 }
 
 /**
@@ -341,9 +436,14 @@ export interface BucketMembershipDiff {
  *   ⇒ 启动对账（§9.3.2 ③）与本轮的硬断言**共用这一个口径**（C36：同一件事两套实现必然漂移）。
  *
  * @param db 库句柄
+ * @param scan **已扫好的桶侧**（可选；不给则本函数自己扫一遍）
+ *   ⇒ 启动对账要同时用桶侧行与桶计数 ⇒ 传进来 ⇒ **桶表只扫一遍**（P2-T06）。
  * @returns 集合差异（四类）
  */
-export function diffBucketMembership(db: Database.Database): BucketMembershipDiff {
+export function diffBucketMembership(
+  db: Database.Database,
+  scan?: BucketSideScan,
+): BucketMembershipDiff {
   // ⚠️ **库侧：全库扫描**（ADR-P1-T07-DEC D-12）。
   //   ⚠️ **列名是 `id`，不是 `memory_id`**：`memories` 的主键叫 `id`
   //   ⇒ 抄成 `SELECT memory_id FROM memories` 会直接 SQL 报错。
@@ -352,18 +452,8 @@ export function diffBucketMembership(db: Database.Database): BucketMembershipDif
     .all() as Array<{ id: string }>;
 
   // ⚠️ **桶侧：LEFT JOIN**（不丢硬删孤儿，§9.3.2 ③）。
-  const bucketRows = db
-    .prepare(
-      'SELECT vcm.memory_id AS memoryId, m.id AS foundId, m.deleted AS deleted, ' +
-        'm.embedding AS embedding ' +
-        'FROM vector_cell_members vcm LEFT JOIN memories m ON m.id = vcm.memory_id',
-    )
-    .all() as Array<{
-    memoryId: string;
-    foundId: string | null;
-    deleted: number | null;
-    embedding: Buffer | null;
-  }>;
+  //   ⚠️ **给了 `scan` 就复用它** ⇒ 桶表**只扫一遍**（对账与 P95 共用，P2-T06）。
+  const bucketRows = (scan ?? scanBucketSide(db)).rows;
 
   // ⚠️ **判据 ②：COUNT(*) == COUNT(DISTINCT memory_id)**（抓「多」）。
   const duplicateRows = db
@@ -387,7 +477,7 @@ export function diffBucketMembership(db: Database.Database): BucketMembershipDif
       softDeleted.push(row.memoryId);
       continue;
     }
-    if (row.embedding === null) {
+    if (row.hasNoEmbedding) {
       // ⚠️ 无向量却还占着桶 ⇒ 该摘掉（§9.3.2 ③ 第三支）。
       vectorless.push(row.memoryId);
     }
@@ -399,6 +489,8 @@ export function diffBucketMembership(db: Database.Database): BucketMembershipDif
     softDeleted,
     vectorless,
     duplicates: duplicateRows.map((row) => row.memory_id),
+    liveCount: liveRows.length,
+    bucketCount: bucketRows.length,
   };
 }
 
