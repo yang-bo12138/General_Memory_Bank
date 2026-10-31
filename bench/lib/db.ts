@@ -15,7 +15,7 @@
  *   bench **不手工 INSERT 桶行**（§9.3.0 的「桶归属唯一写入点」纪律）。
  */
 
-import { existsSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 
 import type Database from 'better-sqlite3';
 
@@ -159,7 +159,22 @@ export interface PrepareBenchOptions {
   readonly nprobeCoarse: number;
   /** 是否跳过训练（**只测 flat 路线时用**）。 */
   readonly skipTraining?: boolean;
+  /**
+   * ★ **是否复用已准备好的库**（**百万级必用**）。
+   *
+   * ⚠️ **为什么需要它**：百万级的「灌库 + 训练」要 **~1.5 小时**
+   *   ⇒ 三个脚本各跑一次 = 4.5 小时 ⇒ **不可接受**；
+   *   ⇒ 而且**三个脚本必须测同一份语料与同一套分桶**才有可比性
+   *   ⇒ **一次准备、三次测量**才是对的。
+   *
+   * ⚠️ **复用的前提**：库里已有**同样规模**的语料与**已训练**的分桶
+   *   ⇒ 不满足就**重新准备**（绝不拿一个错的库去测）。
+   */
+  readonly reuseExisting?: boolean;
 }
+
+/** 准备结果的**清单文件**（**复用时读它** ⇒ 相位耗时不会丢）。 */
+const MANIFEST_SUFFIX = '.manifest.json';
 
 /**
  * 准备一份 bench 库（**建库 → 灌语料 → 训练 → 挂桶**）。
@@ -173,22 +188,125 @@ export interface PrepareBenchOptions {
  */
 export function prepareBench(options: PrepareBenchOptions): PreparedBench {
   const corpusOptions = options.corpus ?? DEFAULT_CORPUS_OPTIONS;
+  // ⚠️ ★ **复用已准备好的库**（百万级必需：一次准备 ≈ 1.5 小时）。
+  if (options.reuseExisting === true) {
+    const reused = tryReuse(options.dbPath, corpusOptions);
+    if (reused !== undefined) {
+      return reused;
+    }
+  }
   // ⚠️ ★ **每次都从空库开始**（bench 脚本必须**可重复跑**）：
   //   `memories.content_hash` 上有唯一索引 ⇒ 同一份语料灌第二遍会撞唯一索引
   //   ⇒ 「脚本跑第二遍就炸」⇒ 不可重复 ⇒ 基线不可复采。
   //   ⇒ 所以这里**先删旧库**（含 WAL 边车）⇒ 每次跑都是干净的同一份语料。
   removeDatabaseFiles(options.dbPath);
+  removeDatabaseFiles(`${options.dbPath}${MANIFEST_SUFFIX}`);
   const db = openBenchDatabase(options.dbPath);
 
   // ⚠️ **失败时必须关掉库句柄**：Windows 上「打开着的库文件」会锁住文件
   //   ⇒ 后续的临时目录清理会报 `EBUSY` ⇒ **真正的错误被掩盖成清理错误**。
   //   ⇒ 这里统一「失败即关库再抛」。
   try {
-    return prepareWithDatabase(db, options, corpusOptions);
+    const prepared = prepareWithDatabase(db, options, corpusOptions);
+    writeManifest(options.dbPath, prepared);
+    return prepared;
   } catch (error) {
     db.close();
     throw error;
   }
+}
+
+/**
+ * 试着**复用**一份已准备好的库（**规模与分桶都对得上才复用**）。
+ *
+ * ⚠️ **复用必须严格**：语料条数、向量条数、桶归属条数、细桶数**全都要对**
+ *   ⇒ 对不上就返回 `undefined`（调用方重新准备）
+ *   ⇒ 绝不拿「一个错的库」去测（那是在测空气）。
+ *
+ * @param dbPath 库文件路径
+ * @param corpus 语料参数
+ * @returns 复用结果（**不可复用时 `undefined`**）
+ */
+function tryReuse(dbPath: string, corpus: CorpusOptions): PreparedBench | undefined {
+  if (!existsSync(dbPath)) {
+    return undefined;
+  }
+  const manifestPath = `${dbPath}${MANIFEST_SUFFIX}`;
+  if (!existsSync(manifestPath)) {
+    return undefined;
+  }
+  let manifest: { corpusSize?: number; loadMs?: number; trainMs?: number; peakRssBytes?: number };
+  try {
+    manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as typeof manifest;
+  } catch {
+    return undefined;
+  }
+  if (manifest.corpusSize !== corpus.size) {
+    return undefined;
+  }
+  const db = openBenchDatabase(dbPath);
+  try {
+    const rows = (db.prepare('SELECT COUNT(*) AS n FROM memories').get() as { n: number }).n;
+    const vectorRows = (
+      db
+        .prepare('SELECT COUNT(*) AS n FROM memories WHERE embedding IS NOT NULL AND deleted = 0')
+        .get() as { n: number }
+    ).n;
+    const fineCells = (
+      db.prepare('SELECT COUNT(*) AS n FROM vector_fine_cells').get() as { n: number }
+    ).n;
+    const members = (
+      db.prepare('SELECT COUNT(*) AS n FROM vector_cell_members').get() as { n: number }
+    ).n;
+    if (rows !== corpus.size || vectorRows !== corpus.size || fineCells === 0 || members === 0) {
+      db.close();
+      return undefined;
+    }
+    return {
+      db,
+      rows,
+      vectorRows,
+      fineCells,
+      members,
+      loadMs: manifest.loadMs ?? 0,
+      trainMs: manifest.trainMs ?? 0,
+      trainPeakRssBytes: manifest.peakRssBytes ?? 0,
+      rssBeforeTrainBytes: 0,
+      options: corpus,
+    };
+  } catch (error) {
+    db.close();
+    throw error;
+  }
+}
+
+/**
+ * 把准备结果写成**清单文件**（**复用时读它** ⇒ 相位耗时不会丢）。
+ *
+ * @param dbPath 库文件路径
+ * @param prepared 准备结果
+ */
+function writeManifest(dbPath: string, prepared: PreparedBench): void {
+  writeFileSync(
+    `${dbPath}${MANIFEST_SUFFIX}`,
+    `${JSON.stringify(
+      {
+        corpusSize: prepared.options.size,
+        seed: prepared.options.seed,
+        rows: prepared.rows,
+        vectorRows: prepared.vectorRows,
+        fineCells: prepared.fineCells,
+        members: prepared.members,
+        loadMs: prepared.loadMs,
+        trainMs: prepared.trainMs,
+        peakRssBytes: prepared.trainPeakRssBytes,
+        rssBeforeTrainBytes: prepared.rssBeforeTrainBytes,
+      },
+      null,
+      2,
+    )}\n`,
+    'utf8',
+  );
 }
 
 /**

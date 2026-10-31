@@ -171,6 +171,7 @@ function main(): void {
     coarseCenters: DEFAULT_PARAMS.ROUTER_COARSE_CENTERS,
     fineCenters: DEFAULT_PARAMS.ROUTER_FINE_CENTERS,
     nprobeCoarse: DEFAULT_PARAMS.ROUTER_NPROBE_COARSE,
+    reuseExisting: args.reuse === 'true',
   });
   const db = prepared.db;
   const store = new MemoryStore({ dbPath });
