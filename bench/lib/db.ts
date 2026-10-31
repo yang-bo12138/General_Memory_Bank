@@ -245,6 +245,7 @@ function tryReuse(dbPath: string, corpus: CorpusOptions): PreparedBench | undefi
   }
   let manifest: {
     corpusSize?: number;
+    seed?: number;
     loadMs?: number;
     trainMs?: number;
     peakRssBytes?: number;
@@ -255,7 +256,9 @@ function tryReuse(dbPath: string, corpus: CorpusOptions): PreparedBench | undefi
   } catch {
     return undefined;
   }
-  if (manifest.corpusSize !== corpus.size) {
+  // ⚠️ ★ **连种子也要对**：规模相同但种子不同 ⇒ **是不同的语料**
+  //   ⇒ 若不比种子 ⇒ 复用的是**别的语料** ⇒ 结论无效。
+  if (manifest.corpusSize !== corpus.size || manifest.seed !== corpus.seed) {
     return undefined;
   }
   const db = openBenchDatabase(dbPath);
