@@ -35,6 +35,7 @@ import type { TouchEventPayload, WriteEventPayload } from '../core/events.types.
 import type { Params } from '../core/params.js';
 import { escapeFts5, normalize, tokenize } from '../core/tokenize.js';
 import { LOG_ACTIONS, type Logger } from '../util/log.js';
+import { MIN_VECTOR_NORM } from '../vector/dot.js';
 import { MEDIA_TYPES, MEMORY_KINDS, type MediaType, type MemoryKind } from './get.js';
 import {
   type MergeMemoryState,
@@ -82,8 +83,12 @@ const DIFFICULTY_CEILING = 0.95;
  *
  * ⚠️ 零向量没有方向 ⇒ 归一化会除零 ⇒ `NaN` 会一路写进库里
  *   （而 `NaN` 的比较恒为 false ⇒ 后面所有阈值判断对它都不生效，**不报错**）。
+ *
+ * ⚠️ **v2.1（P2-T01 后）：这个阈值的唯一权威声明在 `src/vector/dot.ts`**
+ *   （导出为 `MIN_VECTOR_NORM`）⇒ 本文件**引用**它，**不再本地声明一份**
+ *   ⇒ 否则「同一件事两处定义」⇒ 改一处不改另一处 ⇒ 写入路径与向量层的零向量判据**静默分叉**
+ *   （C36：同一件事不得有两套词）。
  */
-const MIN_VECTOR_NORM = 1e-8;
 
 // ─────────────────────────── 对外类型 ───────────────────────────
 
