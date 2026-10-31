@@ -136,7 +136,7 @@ function insertCandidate(
     content,
     tokens,
     hash: `hash-${id}`,
-    embedding: vector === null ? null : vectorToBlob(vector),
+    embedding: vector === null ? null : vectorToBlob(new Float32Array(vector)),
   });
 }
 
@@ -879,7 +879,7 @@ describe('P1-T07 · 裁决 D：候选排序是**全序**（四级 tie-break）',
       params: ReturnType<typeof createTestStore>['params'];
     } => {
       const context = createWriteContext();
-      const { db, store, params } = context;
+      const { db, params } = context;
       const vector = unitVector(params.EMBED_DIM, 0);
 
       // 两个候选：正文不同（⇒ hash 不同），但**前 3 个 bigram 相同**、向量相同、关联同样的两个实体
