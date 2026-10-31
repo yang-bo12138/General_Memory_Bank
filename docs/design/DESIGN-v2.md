@@ -5628,7 +5628,9 @@ Bigram 方案是为中文优化的，对拉丁文与数字有明确缺陷。以�
 
 ★ **机器可检约束（C37）**：**凡方法体读写时间戳或参与时间计算的，签名必须含 `now?`；  
 不接收 `now` 的方法必须在本表显式列出并写明理由**（本节已列全：`pin` / `unpin` / `restore` /  
-`setParams` / `setAlias` / `mergeEntities`）。  
+`setParams` / `setAlias` / `mergeEntities` / `rebuildVectorBuckets`——最后一个的理由是「桶中心的  
+`updated_at` 用真实时钟，且只用于观测（库级真相看 `vector_fine_cells.updated_at`）、不参与任何计算」，  
+与 `setParams` 的 `events.at` 口径相同）。  
 ⇒ **实现者新增任何方法时，若它碰时间戳而本表没有它 ⇒ 契约校验失败**——  
 这条把「时钟注入」从实现约定升级为**可被 CI 拦住的规则**，否则新方法很容易直接写 `Date.now()`，  
 而那种方法**在测试里无法复现**（衰减、共激活、归档三条时间相关链路会一起失真）。

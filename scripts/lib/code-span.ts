@@ -16,20 +16,99 @@
  *   ⚠️ 两套工具的分工是刻意的，不是重复：
  *     · `stripCommentLines` ⇒ 找 **SQL 字符串**（要保留字符串）；
  *     · `blankComments`      ⇒ 找 **标识符**（要抹掉注释、保留字面量）。
+ *
+ * ⚠️⚠️ **v2.1（P2 QA 第二轮 F4 修正）**：
+ *   原先 `blankComments` 的主循环里**引号判断排在注释判断之前** ⇒
+ *   ⇒ **注释里的一个引号会「开启一个假字符串」** ⇒ 从那里往后**所有注释都不再被涂白**
+ *   ⇒ 后果：`src/util/log.ts`（有 31 行注释里含引号/反引号）**32 行注释没被涂白**
+ *   ⇒ `check:bucket-write` 会把**注释里**提到的桶表 SQL **误报**成裸写
+ *   ⇒ 而「误报 ⇒ 大家开始忽略它」⇒ 闸门变成噪声（正是 F6 想消除的那类误报）。
+ *   ⇒ **修法**：**先判注释、后判引号**，并**识别正则字面量**
+ *     （正则内部可以有引号；`src/util/log.ts:95` 与 `src/core/tokenize.ts:131` 就有正则
+ *     ⇒ 原注释「`src/` 里没有正则字面量（已核）」**已失真**）。
+ *   ⇒ 判定正则起始的规则与 `scripts/check-clock.ts` 的 `stripComments` 一致（同一套规则）。
  */
 
 import { readFileSync } from 'node:fs';
 
 /**
+ * 判断一个 `/` 是不是**正则字面量的起始**。
+ *
+ * ⚠️ **为什么要认正则**：正则内部可以出现引号（`/[\s,="[\]{}()<>&;]/`）
+ *   ⇒ 若不识别它，就会把正则里的 `"` 当成字符串起始 ⇒ 后面整段被当字符串 ⇒ **失步**。
+ *   ⇒ `src/util/log.ts:95` 与 `src/core/tokenize.ts:131` **确实有正则字面量**
+ *   ⇒ 原注释「`src/` 里没有正则字面量（已核）」**已失真**。
+ *
+ * ⚠️ 判定规则与 `scripts/check-clock.ts` 的 `stripComments` **完全一致**（同一套规则 ⇒ 不会漂移）。
+ */
+const REGEX_PRECEDING_KEYWORDS = new Set([
+  'return',
+  'typeof',
+  'case',
+  'in',
+  'of',
+  'new',
+  'do',
+  'else',
+  'await',
+  'yield',
+  'delete',
+  'void',
+  'instanceof',
+]);
+
+const REGEX_PRECEDING_CHARS = new Set([
+  '',
+  '(',
+  ',',
+  '=',
+  ':',
+  '[',
+  '!',
+  '&',
+  '|',
+  '?',
+  '{',
+  '}',
+  ';',
+  '+',
+  '-',
+  '*',
+  '%',
+  '<',
+  '>',
+  '~',
+  '^',
+]);
+
+/**
  * 把源码里的**注释**就地涂白（长度不变 ⇒ 下标与原文一一对应）。
  *
  * ⚠️ **字符串字面量里的 `//` 不算注释**（例如 `'https://x'`）⇒ 必须跟踪引号状态。
- * ⚠️ 本项目的 `src/` 里没有正则字面量（已核）⇒ 不必处理「正则里的引号」这一族歧义。
+ * ⚠️⚠️ **判断顺序是「先注释、后引号」**（P2 QA 第二轮 F4）：反过来的话，
+ *   **注释里的引号会开启一个假字符串** ⇒ 从那里往后所有注释都不再被涂白
+ *   ⇒ 桶表门禁会**误报**注释里提到的 SQL。
+ * ⚠️ **正则字面量整体跳过**（其内部可以有引号 ⇒ 否则同样会失步）。
  */
 export function blankComments(source: string): string {
   const out = source.split('');
   let index = 0;
   let quote: string | undefined;
+  /** 最近的非空白代码字符（用于判断 `/` 是不是正则起始）。 */
+  let lastChar = '';
+  /** 最近的标识符 / 关键字（同上）。 */
+  let lastWord = '';
+
+  const track = (char: string): void => {
+    if (/\s/.test(char)) {
+      return;
+    }
+    lastChar = char;
+    lastWord = /[A-Za-z_$]/.test(char) ? lastWord + char : '';
+    if (!/[A-Za-z0-9_$]/.test(char)) {
+      lastWord = '';
+    }
+  };
 
   while (index < source.length) {
     const char = source[index] ?? '';
@@ -48,12 +127,10 @@ export function blankComments(source: string): string {
       continue;
     }
 
-    if (char === "'" || char === '"' || char === '`') {
-      quote = char;
-      index += 1;
-      continue;
-    }
-
+    // ⚠️⚠️ **判断顺序：先判注释，后判引号**（P2 QA 第二轮 F4 的核心修正）。
+    //   反过来（引号在前）的话 ⇒ **注释里的一个引号会「开启一个假字符串」**
+    //   ⇒ 从那里往后**所有注释都不再被涂白** ⇒ 桶表门禁把**注释里**的 SQL 误报成裸写
+    //   ⇒ 而「误报 ⇒ 大家开始忽略它」⇒ 闸门变成噪声（正是 F6 想消除的那类误报）。
     if (char === '/' && next === '/') {
       while (index < source.length && source[index] !== '\n') {
         out[index] = ' ';
@@ -78,6 +155,46 @@ export function blankComments(source: string): string {
       continue;
     }
 
+    // ⚠️ **正则字面量**：内部可以有引号 ⇒ 必须整体跳过，否则会失步。
+    //   `src/util/log.ts:95` 与 `src/core/tokenize.ts:131` 确实有正则
+    //   ⇒ 原注释「`src/` 里没有正则字面量（已核）」**已失真**。
+    if (
+      char === '/' &&
+      (REGEX_PRECEDING_CHARS.has(lastChar) || REGEX_PRECEDING_KEYWORDS.has(lastWord))
+    ) {
+      let cursor = index + 1;
+      let inCharClass = false;
+      while (cursor < source.length) {
+        const current = source[cursor] ?? '';
+        if (current === '\\') {
+          cursor += 2;
+          continue;
+        }
+        if (current === '[') {
+          inCharClass = true;
+        } else if (current === ']') {
+          inCharClass = false;
+        } else if (current === '/' && !inCharClass) {
+          break;
+        } else if (current === '\n') {
+          break;
+        }
+        cursor += 1;
+      }
+      // 正则的**内容不是注释** ⇒ 原样保留 ⇒ 只把终止符之后当作代码继续
+      index = cursor + 1;
+      track('/');
+      continue;
+    }
+
+    if (char === "'" || char === '"' || char === '`') {
+      quote = char;
+      index += 1;
+      track(char);
+      continue;
+    }
+
+    track(char);
     index += 1;
   }
 
@@ -97,6 +214,12 @@ export function blankComments(source: string): string {
  *   （设计稿正文里 `'absent'` / `'reinforce'` 这类**带引号的字面量**就是动作关键词本身）。
  *
  * ⚠️ 与 `blankComments` 的区别：那个**保留字符串**、涂白注释；这个**保留注释**、涂白字符串。
+ *
+ * ⚠️⚠️ **已知限制（写在这里，免得下一个读的人踩）**：**模板字符串的插值会被整体涂白**
+ *   （`` `${x}assignBucket${y}` `` ⇒ 整段被涂 ⇒ 关键词消失）
+ *   ⇒ 关键词若出现在**模板字符串的插值里**，本函数**判不出来**
+ *   ⇒ 当前三个 `code` 落点的关键词都不在模板串里（实测）⇒ 不影响现状
+ *   ⇒ 将来若把关键词放进插值 ⇒ 需要另想办法（例如先判「标识符形态」的关键词）。
  *   ⇒ 两者**顺序敏感**：若要「既无注释又无字符串」，需先涂白注释、再在**其结果上**涂白字符串
  *   （涂白不会改变其它字符的下标 ⇒ 可直接串联）。
  *

@@ -35,7 +35,12 @@ import {
   parseAnchorKeywords,
   parseAnchorPathLabels,
 } from './lib/anchor-match.js';
-import { blankStrings, extractFunctionBody, readSourceFile } from './lib/code-span.js';
+import {
+  blankComments,
+  blankStrings,
+  extractFunctionBody,
+  readSourceFile,
+} from './lib/code-span.js';
 import {
   extractSection,
   isSeparatorRow,
@@ -310,13 +315,29 @@ export const ANCHOR_PATH_BINDINGS: readonly AnchorRuleBinding[] = [
       },
       {
         label: '§0.2.2',
-        kind: 'code',
-        file: 'src/store/touch.ts',
+        // ⚠️⚠️ **v2.1（P2 QA 第二轮 F3）**：原先落点是 `src/store/touch.ts` 的**整个文件**。
+        //   ⇒ 但那条规则的动作关键词（「不建共激活边」/ `coacts`）在 `touch.ts` 里
+        //   **一个字面量都没有**：`touch.ts` 全文**不含 `coacts`**（实测）
+        //   ⇒ 因为**共激活边本身就是阶段 3 的产物**（P3-T01「coacts 写入路径（唯一入口：touch）」）
+        //   ⇒ ⇒ 阶段 2 **无代码可守** ⇒ 标成 `pending`（**不静默跳过**：会打印在输出里）。
+        //   ⇒ **诚实优先于「假绿」**：原先那两条落点守的其实是**注释里的那句话**，
+        //   ⇒ 把实现改成「建了共激活边」只要注释还在就照样绿（QA 实测 BL-7 全绿）。
+        //   ⇒ 阶段 3 建好 `coacts` 之后，把这一行改回 `code` 落点（标签不变 ⇒ 分母不变）。
+        kind: 'pending',
+        pendingReason:
+          '共激活边是阶段 3 的产物（P3-T01）⇒ 阶段 2 的 `src/store/touch.ts` 里没有任何 `coacts` 代码 ⇒ 无可检落点；阶段 3 建好后转 `code`。',
       },
       {
         label: '§0.2.3',
         kind: 'code',
         file: 'src/store/recall.ts',
+        // ⚠️ **v2.1（P2 QA 第二轮 F3）**：**必须限定到 `recall` 函数体**
+        //   ⇒ 否则整文件匹配时，关键词可能落在**注释**或**其它函数**里 ⇒ 守不住这条规则。
+        symbol: 'recall',
+        // ⚠️ **必需关键词用「标识符形态」**（不带引号）：规则里写的是 `'reinforce'`（**字符串字面量**）
+        //   ⇒ 而代码里真正的证据是**标识符** `options.reinforce === true` ⇒ 涂白字符串后
+        //   ⇒ 只剩标识符形态 ⇒ ⇒ 这里写死标识符形态 ⇒ 「这一段代码真的处理了 reinforce 开关」。
+        requiredKeywords: ['reinforce'],
       },
     ],
   },
@@ -523,7 +544,16 @@ function judgeAnchorPath(
   //   （例如 `const assignment = 'assignBucket(...)';` ⇒ 真调用已被删掉 ⇒ 承诺已失效却判绿）。
   //   ⇒ ⚠️ **只对 `code` 落点做**：`doc` 落点**必须保留字符串**
   //     （设计稿正文里 `'absent'` / `'reinforce'` 这类带引号的字面量**就是**动作关键词本身）。
-  const codeHaystack = blankStrings(haystack);
+  //
+  // ⚠️⚠️⚠️ **P2 QA 第二轮 F3**：**整文件落点（没有 `symbol`）必须先涂白注释**。
+  //   有 `symbol` 的落点走 `extractFunctionBody` ⇒ 它内部**已经** `blankComments` ⇒ 安全。
+  //   但**没有** `symbol` 的落点（`§0.2.2`→`touch.ts`、`§0.2.3`→`recall.ts`、
+  //   `§0.2.3 ④`→`flags.ts`）拿的是**整个文件** ⇒ 此前**只涂白字符串、不涂白注释**
+  //   ⇒ ⇒ **注释里的关键词照样命中** ⇒ 这两个落点守的
+  //   「reinforce 不建共激活边」**只被注释里的那句话证明** ⇒
+  //   ⇒ 把实现改成「建了共激活边」、只要注释还在，门禁照样绿（QA 实测：BL-7 全绿）。
+  //   ⇒ 现在：**一律先 `blankComments` 再 `blankStrings`** ⇒ 注释里的词不算证据。
+  const codeHaystack = blankStrings(blankComments(haystack));
 
   const hit = keywords.find((keyword) => containsAnchorKeyword(codeHaystack, keyword));
   // ⚠️ **P2 QA 验收 F3**：若该落点**写死了必需关键词** ⇒ 必须**全部**命中才算通过。

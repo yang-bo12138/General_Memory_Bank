@@ -141,17 +141,17 @@
 
 | # | 欠账 | 性质 | 归属 |
 |---|---|---|---|
-| 1 | **阶段 1 不写桶归属**：有向量但无桶归属的记忆必然存在（阶段 1 没有细桶，桶行会被 FK 直接拒绝） | 阶段间交接 | P2-T03 的**集合相等硬断言**（左侧口径：**全库** `embedding IS NOT NULL AND deleted = 0`）+ 启动对账 + 首次重训 |
-| 2 | **静态断言只保证「阶段 1 不写桶」，不保证「阶段 2 写了桶」** | ⚠️ 静默失效点 | 必须靠 P2-T03 自己的集合相等断言兜底 |
+| 1 | **阶段 1 不写桶归属**：有向量但无桶归属的记忆必然存在（阶段 1 没有细桶，桶行会被 FK 直接拒绝） | 阶段间交接 | ✅ **已闭环**（阶段 2 消化）：P2-T03 的**集合相等硬断言**（左侧口径：**全库** `embedding IS NOT NULL AND deleted = 0`）+ P2-T05 的 `rebuildVectorBuckets`（重训 + 全量重分配）+ P2-T06 的启动对账 |
+| 2 | **静态断言只保证「阶段 1 不写桶」，不保证「阶段 2 写了桶」** | ⚠️ 静默失效点 | ✅ **已闭环**（阶段 2 消化）：`tests/unit/bucketSync.test.ts`（四条 embedding 赋值路径**逐条**断言桶归属同步）+ `tests/unit/bucketAssign.test.ts`（换桶不残留 / 未传向量删归属）+ `check:bucket-write` 门禁（裸桶表 SQL 只许出现在唯一写入点） |
 | 3 | `alias` 事件的 `aliasAdded` = **布尔**，源主名本体记在 `alias` 键（C36：同一件事不得有两套词） | 已裁决 | 已落地 |
 | 4 | `entityAliases[].name` 目标不存在 ⇒ **建但不隐含关联** ⇒ 只声明别名、不在 `entities` 点名的调用方**静默达不到召回目的** | ⚠️ 明写的代价 | ✅ **已闭环**：新增 warning `ALIAS_TARGET_NOT_LINKED`（一个 `name` 一条）⇒ 边界可观测；**四处**白名单/镜像同步中（`errors.ts` + `check-contract-ids.ts` + DESIGN §11.2 + 两处测试镜像） |
-| 5 | 库未校验 `stability > 0`（F-08 ④） | 独立问题 | 阶段 2 的参数/校验面 |
+| 5 | 库未校验 `stability > 0`（F-08 ④） | 独立问题 | ⚠️ **措辞订正**（阶段 2 核对）：**库层其实有校验** —— `src/db/schema.sql.ts:78` 是 `stability REAL NOT NULL CHECK (stability > 0)` ⇒ 真正缺的是**应用层**的校验（写路径是否在入库前就拦住 ≤ 0）。**既有问题，未扩大** |
 | 6 | `intensity()` 两道钳制在正常输入下**行为等价** ⇒ 行为层无解 | 已知方法论边界 | ✅ **已闭环**：`scripts/check-clamp.ts`（**数据流判据**，堵住「补无关同形态调用」的绕过）+ 行为层探针（负 τ + 1 天偏移，分辨力 0.63） |
 | 7 | `LIMIT 100` / `slice(0,20)` / `topN ∈ 1~8` **刻意硬编码**，不进参数表 | 设计决定 | 改它们是设计变更，走 ADR |
 | 8 | `stats()` **不在阶段 1 的 10 个方法内**且未实现 ⇒ 基线断言顺延 | 计划口径 | 已收敛进 `DEVELOPMENT-PLAN.md` |
 | 9 | **`extractEntityNames` 阶段 1 不实现**（ADR-P1-T07-DEC D-1）⇒ 设计稿 §4.6 只留口子 | 已裁决 | ✅ 已落地（删除函数 + 删除导出 + 导出面守卫） |
 | 10 | 门禁**曾经**看不见「新增 warning code 未登记白名单」 | ⚠️ **静默失效点** | ✅ **已闭环**：`scripts/check-contract-ids.ts` 补「源码实发 warning code ⊆ 白名单」守卫 ⇒ **已在实战中生效**（登记缺失 ⇒ verify EXIT=1） |
-| 11 | 门禁只认 `code: 'XXX'` **字面量** ⇒ 动态实参（`code: someVar`）判不了 | 类型层加固 | **阶段 2**：把 `MemoryError` 构造签名收紧成 `code: MemoryErrorCode`（破坏性变更 ⇒ 走 ADR）。当前阶段 1 的 warning code 全是字面量 ⇒ **无实际风险** |
+| 11 | 门禁只认 `code: 'XXX'` **字面量** ⇒ 动态实参（`code: someVar`）判不了 | 类型层加固 | ✅ **类型层已收紧**（阶段 2 核对）：`src/core/errors.ts:71` 的构造签名**已经是** `constructor(code: MemoryErrorCode, ...)`，且 `MemoryErrorCode` 是**封闭的 5 值联合类型** ⇒ 「指定治法」已完成。**剩余的只是门禁的判据还是形状匹配**（`check-contract-ids.ts` 扫源码里的字面量）⇒ 那不是类型层的事 ⇒ 归入「门禁盲区」类 |
 | 12 | `archiveFilterThreshold(params, true)` 在归档模式下返回 `0.0` | ⚠️ **静默失效点** | ✅ **已改**：改为抛 `INVALID_INPUT`（0.0 仍是阈值 ⇒ 会把 `intensity === 0` 的归档记忆挡掉 ⇒ 静默少召回） |
 | 13 | 归档模式下**粗筛窗口取 0** ⇒ 候选池放大 | 性能 | **阶段 2**（向量路范畴）；阶段 1 的 `topN ∈ 1~8` + `LIMIT 100` 已兜住上限 |
 

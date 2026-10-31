@@ -225,7 +225,14 @@ export function parseDefaultCell(cell: string): DefaultValue | undefined {
   if (text === 'false') {
     return false;
   }
-  const numeric = /^(-?\d+(?:\.\d+)?)\s*[^0-9a-zA-Z]*$/.exec(text);
+  // ⚠️⚠️ **v2.1（P2 QA 第二轮 F1 修正）**：原来只认「整数或小数」，
+  //   **不认科学计数法**（`1e-8` / `1.5e-3`）⇒ 那种写法的默认值会解析失败
+  //   ⇒ 而 §5 的解析遇到失败**静默跳过整行** ⇒
+  //   ⇒ 「§5 表里写了一个参数、代码里根本没有」在**毫秒级阈值**这种常见写法下**完全隐形**
+  //   ⇒ 而 §5 是参数的**权威表**（G26 原话）⇒ 这是一整类「说了没做」的盲区。
+  // ⇒ 现在：**能认的写法都认**（含科学计数法）；**认不出的由 `parseSection5Params` 显式报错**
+  //   （两道防线：认得出的正常比对 ⇒ 认不出的绝不静默）。
+  const numeric = /^(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s*[^0-9a-zA-Z]*$/.exec(text);
   if (numeric !== null) {
     return Number(numeric[1]);
   }
