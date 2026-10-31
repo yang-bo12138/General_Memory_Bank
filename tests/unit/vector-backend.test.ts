@@ -23,7 +23,7 @@ import {
   FLAT_ALL_BUCKETS,
   FLAT_BACKEND_NAME,
   FlatVectorBackend,
-  type FlatVectorRow,
+  type VectorCandidateRow,
 } from '../../src/vector/flat.js';
 
 // ─────────────────────────── 测试夹具 ───────────────────────────
@@ -61,13 +61,18 @@ function pseudoUnitVector(seed: number): Float32Array {
 }
 
 /** 一行候选。 */
-function row(id: string, vector: Float32Array, lastAccess = 1000, pinFactor = 1): FlatVectorRow {
+function row(
+  id: string,
+  vector: Float32Array,
+  lastAccess = 1000,
+  pinFactor = 1,
+): VectorCandidateRow {
   return { id, vector, lastAccess, pinFactor };
 }
 
 /** 夹具：候选行 + 两个查询向量。 */
 interface Fixture {
-  rows: FlatVectorRow[];
+  rows: VectorCandidateRow[];
   /** 轴查询（`e0`）：能构造出**精确可算**的余弦（0.5 / 0 / -1）。 */
   axisQuery: Float32Array;
   /** 伪随机查询：各候选的分数**互不相同** ⇒ 能验排序。 */
@@ -92,7 +97,7 @@ function buildFixture(): Fixture {
   const anti = new Float32Array(DIM);
   anti[0] = -1;
 
-  const rows: FlatVectorRow[] = [
+  const rows: VectorCandidateRow[] = [
     row('m-axis0', e0),
     row('m-60deg', sixty),
     row('m-120deg', oneTwenty),
@@ -133,7 +138,7 @@ function referenceDot(a: Float32Array, b: Float32Array): number {
  *   排序规则是**契约的一部分**（不定死次序 ⇒ 两次检索顺序可能不同 ⇒ 不可复现）。
  */
 function referenceSearch(
-  rows: readonly FlatVectorRow[],
+  rows: readonly VectorCandidateRow[],
   query: Float32Array,
   k: number,
 ): VectorHit[] {
@@ -154,14 +159,14 @@ function referenceSearch(
 }
 
 /** 造一个已初始化、候选来源为 `rows` 的 flat 后端。 */
-function makeBackend(rows: readonly FlatVectorRow[]): FlatVectorBackend {
+function makeBackend(rows: readonly VectorCandidateRow[]): FlatVectorBackend {
   const backend = new FlatVectorBackend({ rows: () => rows });
   backend.init(CONFIG);
   return backend;
 }
 
 /** 在候选行里按 id 取一行（取不到就抛错，不静默给 `undefined`）。 */
-function findRow(rows: readonly FlatVectorRow[], id: string): FlatVectorRow {
+function findRow(rows: readonly VectorCandidateRow[], id: string): VectorCandidateRow {
   const found = rows.find((item) => item.id === id);
   if (found === undefined) {
     throw new Error(`夹具里没有 id = ${id} 的行`);
@@ -384,7 +389,7 @@ describe('P2-T01 · VectorBackend 契约与 flat 基线后端', () => {
     });
 
     it('时间窗：只保留 last_access >= timeFloor 的行（pinned 走宽松窗口）', () => {
-      const rows: FlatVectorRow[] = [
+      const rows: VectorCandidateRow[] = [
         row('m-fresh', pseudoUnitVector(1), 5000, 1),
         row('m-old', pseudoUnitVector(2), 1000, 1),
         row('m-old-pinned', pseudoUnitVector(3), 1000, 2),
