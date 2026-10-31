@@ -18,7 +18,15 @@ import type Database from 'better-sqlite3';
 import { describe, expect, it } from 'vitest';
 
 import { MS_PER_DAY, intensity } from '../../src/core/decay.js';
-import { SCORE_WEIGHTS, SCORE_WEIGHT_SUM, clampCos } from '../../src/core/scoring.js';
+import {
+  SCORE_WEIGHTS,
+  SCORE_WEIGHT_SUM,
+  clampCos,
+  coarseGateWindow,
+  fuseScore,
+  normBm25Sigmoid,
+  passesIntensityFilter,
+} from '../../src/core/scoring.js';
 import { tokenize } from '../../src/core/tokenize.js';
 import { recall } from '../../src/store/recall.js';
 import { countRows, createTestStore, readEvents } from '../fixtures/graph-store.js';
@@ -134,6 +142,27 @@ function snapshotMemories(db: Database.Database): unknown[] {
          FROM memories ORDER BY id`,
     )
     .all();
+}
+
+/**
+ * 截取源码里「从 `start` 标记到 `end` 标记」之间的片段（供源码级的负控用）。
+ *
+ * ⚠️ **为什么用「标记切片」而不是「正则匹配整段」**：正则一旦写得比实现还宽松，
+ *   就会变成「恒真」的摆设守卫（看上去有守卫、实际什么都不挡）；
+ *   而切片是**按实现的真实布局**取片段 ⇒ 实现改了布局，这条负控会**先红**（提示人同步）。
+ *
+ * @param source 源码全文
+ * @param start 起始标记
+ * @param end 结束标记
+ * @returns 片段原文
+ */
+function sliceBlock(source: string, start: string, end: string): string {
+  const from = source.indexOf(start);
+  const to = source.indexOf(end);
+  if (from < 0 || to < 0 || to <= from) {
+    throw new Error(`源码里找不到片段：${start} → ${end}`);
+  }
+  return source.slice(from, to);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -386,8 +415,11 @@ describe('P1-T08 · recall 的准入闸门（§4.6 步骤 2 的两条铁律）',
     const result = recall(store, { context: '张三喜欢猫', topN: 8, explain: true, now: NOW });
     const ids = result.hits.map((hit) => hit.id);
 
-    // ⚠️ 负控：把粗筛改成「一档窗口」或「给 pin 一律豁免」⇒ 这条会红。
-    //   「一档窗口」⇒ `m-pinned` 被粗筛挡掉；「一律豁免」⇒ `m-plain` 混进来。
+    // ⚠️ 负控：把粗筛改成「一档窗口」⇒ 这条会红（`m-pinned` 被粗筛挡掉）。
+    //   「一律豁免」的反事实**不在这里**：`m-plain` 的 τ 小（= `MAX_STABILITY`），
+    //   它的强度在 1500 天前就已经低于归档线 ⇒ **它是被精筛挡掉的**，
+    //   就算粗筛对它完全豁免，它也回不来 ⇒ 把「一律豁免」的负控挂在这里是**空判**。
+    //   ⇒ 「一律豁免」的反事实由下面的 **NC3** 承担（那里造的行的 τ **超过**粗筛窗口的上界）。
     expect(ids).toContain('m-pinned');
     expect(ids).not.toContain('m-plain');
 
@@ -611,8 +643,15 @@ describe('P1-T08 · 候选去重与各路证据的独立性（§4.6 步骤 2.5 /
     // 性质：它**没有**进图谱路候选（图谱路的前 100 名被挡道者占满）。
     expect(target?.fromGraph).toBe(false);
     expect(target?.fromText).toBe(true);
+    // ★ **可执行负控的前提**：直接查库证明「实体交集」**确实存在** ——
+    //   没有这一步，「按交集判定」与「按来源判定」就**没有可区分的观测**
+    //   （下面的断言也就成了恒真的摆设）。
+    const links = db
+      .prepare('SELECT entity_id FROM memory_entities WHERE memory_id = ?')
+      .all('m-target') as Array<{ entity_id: string }>;
+    expect(links.map((link) => link.entity_id)).toContain('e-wang');
     // ★ **核心断言**：按「实体交集」判定 ⇒ 它的 graphProximity 必须是 1.0。
-    // ⚠️ 负控：若按「来自哪条路」判定 ⇒ 这里会得到 0 ⇒ 它的 graph 项被抹掉。
+    // ⚠️ 负控：若按「来自哪条路」判定 ⇒ 这里会得到 0 ⇒ 它的 graph 项被抹掉 ⇒ 变红。
     expect(target?.breakdown?.graphPart).toBeCloseTo(SCORE_WEIGHTS.graphProximity * 1.0, 12);
   });
 
@@ -946,5 +985,262 @@ describe('P1-T08 · 流水线的静态纪律（ADR-16 / C37）', () => {
   it('★ 真实时钟只能经 `src/core/clock.ts`（C37）⇒ 本文件不出现直接读时钟的写法', () => {
     expect(source).not.toContain('Date.now(');
     expect(source).not.toContain('new Date(');
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 十、可执行的负控判据（**改坏 ⇒ 必失败**）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * ★ **负控的正确形态**：写在**测试文件里**的、可直接执行的判据 ——
+ *   每条都写明「把它改坏成什么样 ⇒ 这条会红、为什么」，并且**当场算出反事实值**
+ *   （坏掉之后实现会给出的那个数）与实现的实际值对照。
+ *
+ * ⚠️ **为什么不用「改源码再跑一遍」的脚本**：那种脚手架要么改工作区
+ *   （污染同仓的并行开发线），要么另开一份副本（测的就不是本仓的代码了）；
+ *   而**在测试里算出反事实**同样能判红，且**不需要动任何源码**。
+ * ⚠️ **反事实必须与实际值「可区分」**：每条 NC 都先断言「两种口径确实不同」
+ *   （否则判据恒真 = 没有判据）。
+ */
+describe('P1-T08 · 可执行的负控判据（改坏 ⇒ 必失败）', () => {
+  it('★ NC1 粗筛窗口：两档严格有序、公式逐项对齐 params、includeArchived ⇒ 整体取消', () => {
+    const { params } = createTestStore();
+
+    const window = coarseGateWindow(params, NOW, false);
+    expect(window.enabled).toBe(true);
+
+    // ⚠️ 负控：**漏乘 `MAX_PIN_FACTOR`** ⇒ 两档相等 ⇒ 「pin 的窗口更宽」这条塌掉 ⇒ 变红。
+    expect(window.coarseCutoffPinned).toBeLessThan(window.coarseCutoff);
+
+    // ⚠️ 负控：**把 `MAX_STABILITY` 换成逐行的 `stability`**（窗口随候选变化）
+    //   ⇒ 公式对不上 ⇒ 变红。
+    const archiveSpanDays = Math.log(1 / params.ARCHIVE_LINE);
+    expect(window.coarseCutoff).toBeCloseTo(
+      NOW - params.MAX_STABILITY * archiveSpanDays * MS_PER_DAY,
+      6,
+    );
+    expect(window.coarseCutoffPinned).toBeCloseTo(
+      NOW - params.MAX_STABILITY * params.MAX_PIN_FACTOR * archiveSpanDays * MS_PER_DAY,
+      6,
+    );
+
+    // ⚠️ 负控：`includeArchived` 时仍返回一档窗口 ⇒ 归档层被粗筛挡住 ⇒ 变红。
+    const archived = coarseGateWindow(params, NOW, true);
+    expect(archived.enabled).toBe(false);
+    expect(archived.coarseCutoff).toBe(0);
+    expect(archived.coarseCutoffPinned).toBe(0);
+  });
+
+  it('★ NC1b 流水线**只调用** `scoring.ts` 的现成能力，不另写公式（源码级）', () => {
+    const source = readFileSync(
+      fileURLToPath(new URL('../../src/store/recall.ts', import.meta.url)),
+      'utf8',
+    );
+
+    // ⚠️ 负控：在 `recall.ts` 里**另写一份**粗筛窗口公式 ⇒ 两份公式会漂移 ⇒ 变红。
+    //   （漂移不报错：两个数都像正常值，只是某一路的闸门悄悄变宽 ⇒ 遗忘曲线被废掉。）
+    expect(source).toContain('coarseGateWindow(');
+    expect(source).not.toContain('MAX_STABILITY');
+    expect(source).not.toContain('MS_PER_DAY');
+
+    // ⚠️ 负控：把闸门 / 打分**各写一份**（自建 `intensity > ARCHIVE_LINE` 之类）⇒ 变红。
+    for (const call of [
+      'archiveFilterThreshold(',
+      'passesIntensityFilter(',
+      'normalizeBm25(',
+      'assignGraphProximity(',
+      'fuseScore(',
+      'SCORE_WEIGHTS.',
+    ]) {
+      expect(source).toContain(call);
+    }
+    // ⚠️ 负控：绕过 `scoring.ts` 直接 `require`/内联权重表 ⇒ 变红。
+    expect(source).not.toMatch(/0\.3\s*\*|0\.25\s*\*|0\.15\s*\*|0\.1\s*\*/);
+  });
+
+  it('★ NC2 行为反事实（一档窗口）：落在两档之间的 pinned 记忆若只有一档就会被挡掉（实际没被挡 ⇒ 确有两档）', () => {
+    const { db, store, params } = createTestStore();
+    const window = coarseGateWindow(params, NOW, false);
+
+    // 造一条**恰好落在两档窗口之间**的 pinned 记忆：
+    //   · 普通档窗口 ⇒ 它在窗口**外**；
+    //   · pin 档窗口 ⇒ 它在窗口**内**。
+    const plainWindowDays = (NOW - window.coarseCutoff) / MS_PER_DAY;
+    const pinnedWindowDays = (NOW - window.coarseCutoffPinned) / MS_PER_DAY;
+    const elapsedDays = (plainWindowDays + pinnedWindowDays) / 2;
+
+    seedMemory(db, {
+      id: 'm-pinned-between',
+      content: '张三喜欢猫',
+      stability: params.MAX_STABILITY,
+      pinFactor: params.MAX_PIN_FACTOR,
+      lastAccess: NOW - elapsedDays * MS_PER_DAY,
+    });
+
+    const result = recall(store, { context: '张三喜欢猫', topN: 8, explain: true, now: NOW });
+
+    const row = readRow(db, 'm-pinned-between');
+    // 反事实的前提①：**若只有一档窗口**（普通档），它的 `last_access` 落在窗口外 ⇒ 会被挡掉。
+    expect(row.last_access).toBeLessThan(window.coarseCutoff);
+    // 反事实的前提②：**两档窗口**下，它落在 pin 档窗口内 ⇒ 不该被挡掉。
+    expect(row.last_access).toBeGreaterThanOrEqual(window.coarseCutoffPinned);
+    // 反事实的前提③：它**过得了精筛**（否则「粗筛挡了它」这件事无从谈起）。
+    const value = intensity(
+      { stability: row.stability, pin_factor: row.pin_factor, last_access: row.last_access },
+      NOW,
+    );
+    expect(value).toBeGreaterThan(params.ARCHIVE_LINE);
+
+    // 实际：它回来了 ⇒ 粗筛确实用的是**两档**窗口。
+    // ⚠️ 负控：把粗筛改成「一档窗口」⇒ 它会被挡掉 ⇒ 这条变红。
+    expect(result.hits.map((hit) => hit.id)).toContain('m-pinned-between');
+  });
+
+  it('★ NC3 行为反事实（对 pin 一律豁免）：τ 超过粗筛窗口上界的行即便过了精筛也进不了候选', () => {
+    const { db, store, params } = createTestStore();
+    const window = coarseGateWindow(params, NOW, false);
+
+    // ⚠️ 这条记忆的 `stability` **超过当前生效的 `MAX_STABILITY`**
+    //   （模拟「参数放宽时写入、之后又把 `MAX_STABILITY` 调小」的历史行）：
+    //   ⇒ 它的 τ 超过粗筛窗口按 `MAX_STABILITY` 推出的上界
+    //   ⇒ **它过得了精筛、却过不了粗筛** —— 这正是粗筛窗口存在的意义。
+    // ⚠️ **为什么非要造这种「越界行」**：在契约内（τ ≤ `MAX_STABILITY × MAX_PIN_FACTOR`）
+    //   粗筛窗口恒 ≥ 精筛窗口 ⇒ 「一律豁免」与「两档窗口」**观测不到差别** ⇒ 负控是空的。
+    const stability = params.MAX_STABILITY * 2;
+    const pinnedWindowDays = (NOW - window.coarseCutoffPinned) / MS_PER_DAY;
+    const elapsedDays = pinnedWindowDays * 1.5;
+
+    seedMemory(db, {
+      id: 'm-over-stability',
+      content: '张三喜欢猫',
+      stability,
+      pinFactor: params.MAX_PIN_FACTOR,
+      lastAccess: NOW - elapsedDays * MS_PER_DAY,
+    });
+
+    const result = recall(store, { context: '张三喜欢猫', topN: 8, explain: true, now: NOW });
+
+    // 反事实的前提：它**过得了精筛**（强度仍高于归档线）。
+    const row = readRow(db, 'm-over-stability');
+    const value = intensity(
+      { stability: row.stability, pin_factor: row.pin_factor, last_access: row.last_access },
+      NOW,
+    );
+    expect(value).toBeGreaterThan(params.ARCHIVE_LINE);
+    // 反事实的前提：它在**粗筛窗口之外**（两档都在它前面）。
+    expect(row.last_access).toBeLessThan(window.coarseCutoffPinned);
+
+    // 实际：粗筛把它挡在候选集之外 ⇒ 不出现。
+    // ⚠️ 负控：粗筛若对 pin「一律豁免」（或整体取消）⇒ 它会混进来 ⇒ 这条变红。
+    expect(result.hits.map((hit) => hit.id)).not.toContain('m-over-stability');
+  });
+
+  it('★ NC5 中位数污染的反事实：把非文本路候选按 0 塞进中位数会改变 textPart（实际没变 ⇒ 实现没被污染）', () => {
+    const { db, store } = createTestStore();
+    seedMemory(db, { id: 'm1', content: '张三住在北京' });
+    seedMemory(db, { id: 'm2', content: '张三喜欢猫' });
+    seedMemory(db, { id: 'm3', content: '张三在北京工作' });
+    seedEntity(db, 'e-li', '李四');
+    seedMemory(db, { id: 'm4', content: '李四在杭州' });
+    linkEntity(db, 'm4', 'e-li');
+
+    const result = recall(store, {
+      context: '张三住哪里',
+      entityIds: ['e-li'],
+      topN: 8,
+      explain: true,
+      now: NOW,
+    });
+
+    // 干净口径：只取 `rawBm25` **非空**的候选（文本路命中）。
+    const cleanRaws = result.hits
+      .map((hit) => hit.breakdown?.rawBm25 ?? null)
+      .filter((value): value is number => value !== null);
+    const cleanMedian = medianOf(cleanRaws);
+    // 被污染的口径：把非文本路命中的候选以 `0` 塞进去。
+    const pollutedMedian = medianOf(result.hits.map((hit) => hit.breakdown?.rawBm25 ?? 0));
+
+    // ⚠️ 反事实的前提：两种口径的中位数**确实不同** ⇒ 否则「污染」不会产生可观测差异。
+    expect(pollutedMedian).not.toBeCloseTo(cleanMedian, 12);
+
+    for (const id of ['m1', 'm2', 'm3']) {
+      const hit = result.hits.find((item) => item.id === id);
+      const raw = hit?.breakdown?.rawBm25;
+      expect(raw).not.toBeNull();
+      if (raw === undefined || raw === null) {
+        continue;
+      }
+      const cleanPart = SCORE_WEIGHTS.normBm25 * normBm25Sigmoid(raw, cleanMedian);
+      const pollutedPart = SCORE_WEIGHTS.normBm25 * normBm25Sigmoid(raw, pollutedMedian);
+      // 实际：实现用的是**干净口径**。
+      expect(hit?.breakdown?.textPart).toBeCloseTo(cleanPart, 12);
+      // ⚠️ 负控：若实现把 `null` 当 `0` 塞进中位数 ⇒ 实际值会等于 `pollutedPart` ⇒ 变红。
+      expect(hit?.breakdown?.textPart).not.toBeCloseTo(pollutedPart, 12);
+    }
+  });
+
+  it('★ NC6 文本路的分支顺序（源码级）：两个分支的条件不互相掺杂，且 FTS 判定排在 LIKE 判定之前', () => {
+    const source = readFileSync(
+      fileURLToPath(new URL('../../src/store/recall.ts', import.meta.url)),
+      'utf8',
+    );
+
+    const ftsBlock = sliceBlock(source, 'const TEXT_FTS_SQL =', 'const TEXT_LIKE_SQL =');
+    const likeBlock = sliceBlock(source, 'const TEXT_LIKE_SQL =', 'const GRAPH_SQL =');
+
+    // ⚠️ 负控：把两个分支的条件**无条件 AND 起来** ⇒ FTS 分支里出现 `fallbackLike` ⇒ 变红。
+    expect(ftsBlock).not.toContain('fallbackLike');
+    // ⚠️ 负控：LIKE 分支里出现 `matchSql` ⇒ 同上。
+    expect(likeBlock).not.toContain('matchSql');
+    // ⚠️ 负控：**给 pin 一律豁免**（把 pin 档写成无条件分支）⇒ 这条变红。
+    expect(ftsBlock).not.toContain('pin_factor > 1.0 AND');
+    expect(source).toContain('m.pin_factor > 1.0 AND m.last_access >= @coarseCutoffPinned');
+
+    // ⚠️ 负控：把判定顺序倒过来（先判 LIKE）⇒ 变红。
+    const ftsCheck = source.indexOf("matchSql !== null && matchSql !== ''");
+    const likeCheck = source.indexOf("fallbackLike !== null && fallbackLike !== ''");
+    expect(ftsCheck).toBeGreaterThan(-1);
+    expect(likeCheck).toBeGreaterThan(-1);
+    expect(ftsCheck).toBeLessThan(likeCheck);
+  });
+
+  it('★ NC7 精筛是**严格大于**：恰好落在归档线上的那条过不了闸门', () => {
+    const { params } = createTestStore();
+    // ⚠️ 负控：把 `>` 写成 `>=` ⇒ 第一条变红。
+    expect(passesIntensityFilter(params.ARCHIVE_LINE, params.ARCHIVE_LINE)).toBe(false);
+    expect(passesIntensityFilter(params.ARCHIVE_LINE * (1 + 1e-9), params.ARCHIVE_LINE)).toBe(true);
+    // ⚠️ 负控：归档层的阈值是 `0.0` ⇒ 强度**恰为 0** 的那条同样过不了
+    //   （「显式查归档层」不是「什么都能回来」）。
+    expect(passesIntensityFilter(0, 0)).toBe(false);
+  });
+
+  it('★ NC8 缺项**不重算分母**：向量路缺席时，满配候选的上限是 `1 - 0.25`（不是 1.0）', () => {
+    const { score } = fuseScore({
+      intensity: 1,
+      vectorSim: 0,
+      normBm25: 1,
+      graphProximity: 1,
+      recency: 1,
+    });
+    // ⚠️ 负控：若缺项时重算分母 ⇒ 这里会是 1.0 ⇒ 变红。
+    expect(score).toBeCloseTo(1 - SCORE_WEIGHTS.vectorSim, 12);
+    expect(score).toBeCloseTo(0.75, 12);
+  });
+
+  it('★ NC9 topN 被钳到 1~8（既不报错，也不照单全收）', () => {
+    const { db, store } = createTestStore();
+    for (let index = 0; index < 12; index += 1) {
+      seedMemory(db, { id: `m-${index}`, content: '张三喜欢猫' });
+    }
+
+    const many = recall(store, { context: '张三喜欢猫', topN: 100, now: NOW });
+    // ⚠️ 负控：去掉上界钳制 ⇒ 12 条全回 ⇒ 这条变红。
+    expect(many.hits.length).toBeLessThanOrEqual(8);
+    expect(many.hits.length).toBeGreaterThan(0);
+
+    const zero = recall(store, { context: '张三喜欢猫', topN: 0, now: NOW });
+    // ⚠️ 负控：把 `0` 当成「不要结果」⇒ 这里会是 0 条 ⇒ 变红。
+    expect(zero.hits.length).toBeGreaterThanOrEqual(1);
   });
 });
