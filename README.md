@@ -11,15 +11,23 @@
 
 ```bash
 pnpm install     # 装依赖
-pnpm run verify  # 门禁：类型检查 → 代码风格 → 单元测试 → 6 条契约脚本（共 9 段）
+pnpm run verify  # 门禁：类型检查 → 代码风格 → 单元测试 → 8 条契约脚本（共 11 段）
 pnpm build       # 构建产物（tsup：CJS + ESM + d.ts）
 ```
 
-> 📌 **当前实现范围**：阶段 0（骨架与不变量）已完成并通过独立验证；
-> 阶段 1（存储与基础运算）完成 3/9、部分 2/9；阶段 2~5 尚未开始。
+> 📌 **当前实现范围**（阶段 3 已收官，基线 `a121951`）：
+> 阶段 0（骨架与不变量）、阶段 1（存储与基础运算）、阶段 2（向量分桶与路由，8 任务）、
+> **阶段 3（神经元交互，6 任务 T01~T06）** —— **均已完成并通过对抗式验收**；
+> **阶段 4（向量桶内 LIMIT）尚未开始** ⇒ 两条性能硬门槛仍红（H1 = 12,782 行，是门槛的 6.39 倍）。
 > ⇒ 逐任务状态、验收证据、遗留清单与**下一步起点**见
-> [`docs/progress/stage0-stage1-progress.md`](docs/progress/stage0-stage1-progress.md)，
+> [`docs/progress/stage3-progress.md`](docs/progress/stage3-progress.md)，
 > 交付总览见 [`docs/DELIVERY.md`](docs/DELIVERY.md)。
+
+> 📌 **★ 写代码前请先读 [`docs/design/DEVELOPMENT-PLAN.md` §2.4](docs/design/DEVELOPMENT-PLAN.md)「通用工程纪律」**
+> —— 5 条跨阶段长期有效的纪律，每条都有真实事故支撑（**13 个实例 · 4 个人各撞至少一次**）：
+> ① 期望值必须外部写死 ② 新增断言前先想「什么变异会让它变红」
+> ③ 验证工具自己会不会失手 ④ 一切「从间接证据推出的结论」都要用一次实测复核
+> ⑤ 一切「会改状态的演练」必须隔离 ＋ 还原 ＋ 对账 ＋ 不可逆操作前先锚定
 
 > ⚠️ **需要 Node ≥ 22**（`package.json` 的 `engines.node`）。
 >
@@ -40,6 +48,6 @@ pnpm build       # 构建产物（tsup：CJS + ESM + d.ts）
 >
 > 门禁的形状由 `scripts/check-gate-entry.ts` **机器可检**：
 > `scripts.ci` 必须**恰好**是 `pnpm run verify` 的别名，
-> 且 `scripts.verify` 串起的 9 条子命令逐名齐全、每段都写成 `pnpm run <名>`。
+> 且 `scripts.verify` 串起的 11 条子命令逐名齐全、每段都写成 `pnpm run <名>`。
 >
 > CI 工作流在 `.github/workflows/ci.yml`，跑的是 `pnpm run verify`（**不是** `pnpm ci`）。
