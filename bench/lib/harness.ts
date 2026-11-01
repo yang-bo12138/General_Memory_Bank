@@ -706,6 +706,27 @@ export interface PageCacheStateInfo {
 }
 
 /**
+ * ★ **页缓存档位的「判档对照」（落进 `note` ⇒ 声明不再纯主观）。
+ *
+ * ⚠️ ★ **它不是仪器**（页缓存状态本身**无法直接测量** ⇒ 仍然**由跑的人声明**）
+ *   ⇒ ⇒ **本段只是给出「怎么判断自己该声明哪一档」的可复算旁证**
+ *   ⇒ ⇒ **不改变「缺省 unknown、不许猜」这条纪律**。
+ *
+ * ⚠️ ★ **旁证的来源**（工程师-7 在 2026-11-01 23:43 的补测里实测）：
+ *   **顺序读吞吐 ≈ 166 MB/s**（≈ **机械盘速度** ⇒ SATA HDD 的量级）
+ *   ⇒ ⇒ 页缓存只命中了 **~0.55 GB**（4.23 GiB 的库**装不下**）
+ *   ⇒ ⇒ ⇒ **随机读路径基本没命中缓存** ⇒ ⇒ **这就是「冷盘档」的物理含义**。
+ *
+ * ⚠️ **换机器必须用自己的盘速重算这个对照**（⇒ 本段带机器相关性）。
+ */
+const PAGE_CACHE_STATE_CROSS_CHECK =
+  '⚠️ **判档的可复算旁证（不是仪器）**：**先测一下顺序读吞吐** ⇒ ' +
+  '⚠️ 本机 2026-11-01 冷盘档实测 ≈ **166 MB/s**（≈ 机械盘速度）' +
+  '⇒ 页缓存只命中 **~0.55 GB**（4.23 GiB 的库装不下）⇒ ⇒ **随机读路径基本没命中缓存**' +
+  '⇒ ⇒ **「顺序读吞吐接近本机盘速」⇒ 多半是冷盘档**' +
+  '（⚠️ 本机是 SATA HDD ⇒ **换机器请用自己的盘速重算这个对照**）。';
+
+/**
  * 解析 `--cache-state` 参数（**缺省 `unknown`**；**非法值 ⇒ 报错**，不静默钳制）。
  *
  * ⚠️ **为什么非法值必须报错**（同 `intArg()` 的纪律）：
@@ -729,7 +750,8 @@ export function parsePageCacheState(raw: string | undefined): PageCacheStateInfo
       note:
         '⚠ **没声明**（缺省 `unknown` ⇒ **不许猜** —— 与介质探测同一纪律）' +
         '⇒ 页缓存状态**不可知** ⇒ ' +
-        '⚠️ **毫秒数不可跨次比较**（⇒ 但 H1 / H2 的行数判据不受影响）。',
+        '⚠️ **毫秒数不可跨次比较**（⇒ 但 H1 / H2 的行数判据不受影响）' +
+        '（⇒ **想让它变成可判的**：用 `--cache-state=cold|warm` 声明，并参照「判档的可复算旁证」自证）。',
     };
   }
   const normalized = raw.trim().toLowerCase();
@@ -746,7 +768,8 @@ export function parsePageCacheState(raw: string | undefined): PageCacheStateInfo
       declared: true,
       note:
         '⚠ **显式声明为 `unknown`** ⇒ 页缓存状态**不可知** ⇒ ' +
-        '⚠️ **毫秒数不可跨次比较**（⇒ 但 H1 / H2 的行数判据不受影响）。',
+        '⚠️ **毫秒数不可跨次比较**（⇒ 但 H1 / H2 的行数判据不受影响）' +
+        '（⇒ **想让它变成可判的**：改用 `--cache-state=cold|warm` 声明，并参照「判档的可复算旁证」自证）。',
     };
   }
   return {
@@ -755,7 +778,8 @@ export function parsePageCacheState(raw: string | undefined): PageCacheStateInfo
     declared: true,
     note:
       '⚠ **由跑的人声明**（不是仪器测量值 —— Windows 没有公开 API 能报「这个库有多少在页缓存里」）' +
-      '⇒ 本档的毫秒数**只能与同档比较**。',
+      '⇒ 本档的毫秒数**只能与同档比较**。' +
+      PAGE_CACHE_STATE_CROSS_CHECK,
   };
 }
 

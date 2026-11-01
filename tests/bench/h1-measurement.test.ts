@@ -199,6 +199,20 @@ describe('页缓存状态标注（冷 / 热 / 未知 —— 可标注，不可�
     }
   });
 
+  it('★ 声明的那一档要**带判档的可复算旁证**（⇒ 声明不再纯主观）', () => {
+    for (const state of ['cold', 'warm'] as const) {
+      const info = parsePageCacheState(state);
+      // ⚠️ ★ **旁证必须落在 note 里**（⇒ 读 JSON 的人能自证「这一档是怎么判的」）。
+      expect(info.note).toContain('顺序读吞吐');
+      expect(info.note).toContain('166 MB/s');
+      // ⚠️ **但它仍然只是「声明」**（⇒ 语义不许被旁证改成「测量」）。
+      expect(info.declared).toBe(true);
+      expect(info.note).toContain('由跑的人声明');
+    }
+    // ⚠️ **缺省那一档也要告诉人「怎么才能变成可判的」**（⇒ 不许只说「不可知」就完）。
+    expect(parsePageCacheState(undefined).note).toContain('--cache-state=cold|warm');
+  });
+
   it('★ 显式声明 `unknown` ⇒ 状态仍是 `unknown`，但 `declared = true`', () => {
     const info = parsePageCacheState('unknown');
     expect(info.state).toBe('unknown');
