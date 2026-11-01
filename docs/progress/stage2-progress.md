@@ -46,7 +46,7 @@
 | **P2-T05** `rebuildVectorBuckets`（重训/崩溃恢复/旧代桶清理） | ✅ | `0ccd44b`（`4cb8d76`） | `src/vector/rebuild.ts` + `src/store/maintain.ts` · 三步顺序不可颠倒 · 12 条断言 |
 | **P2-T06** 启动对账 + P95 桶质量退化检测 | ✅ | `6644793`（`a8b3566`） | `src/vector/{reconcile,bucketQuality}.ts` · 三条判据齐过 · 14 条断言 |
 | **P2-T07** 写入路径的去重候选收窄（§4.9 步骤 3a2） | ✅ | `aa3da4b`（`b36f34d`） | `src/store/dedupCandidates.ts` · 候选 ≤ 2000 · 不做全表扫 · C29 分母纪律 · 12 条断言 |
-| **P2-T08** 性能基线与门槛验收 | ✅ | `4c70582`（`0f81c1c` 等 9 条） | `bench/`（5 脚本）+ `scripts/bench-mutation.sh` + `docs/baseline/` |
+| **P2-T08** 性能基线与门槛验收 | ✅ | `4c70582`（`0f81c1c` 等 **8** 条） | `bench/`（5 脚本）+ `scripts/bench-mutation.sh` + `docs/baseline/` |
 
 **公开面**：阶段 2 只新增 **1 个**公开方法 `rebuildVectorBuckets`（§3.1 归位表）⇒ 门面共 **11** 个方法。
 
