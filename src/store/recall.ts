@@ -71,6 +71,7 @@ import { intensity } from '../core/decay.js';
 import { resolveEntity } from '../core/entities.js';
 import { MemoryError } from '../core/errors.js';
 import type { RecallEventPayload } from '../core/events.types.js';
+import { resolveFlags } from '../core/flags.js';
 import type { Params } from '../core/params.js';
 import {
   type Bm25Candidate,
@@ -86,6 +87,7 @@ import {
   recency,
 } from '../core/scoring.js';
 import { buildMatchQuery } from '../core/tokenize.js';
+import { inhibitCandidates, loadInhibitionFacts } from '../neuron/inhibit.js';
 import type { EventWriter } from './events.js';
 import { type MemoryKind, type MemoryView, get } from './get.js';
 import { touch } from './touch.js';
@@ -387,7 +389,7 @@ interface MergedCandidate {
 }
 
 /** 打分后的候选（步骤 3 的产物）。 */
-interface ScoredCandidate extends MergedCandidate {
+export interface ScoredCandidate extends MergedCandidate {
   score: number;
   intensityValue: number;
   normBm25Value: number;
@@ -654,7 +656,7 @@ function filterAndSlice(
 }
 
 /** 文本路的结果（候选 + 走了哪条分支）。 */
-interface TextRouteResult {
+export interface TextRouteResult {
   rows: CandidateRow[];
   /** 本次文本路走的分支（`none` = 整路没执行）。 */
   route: TextRouteMode;
@@ -894,11 +896,14 @@ function scoreCandidates(
  *
  * ⚠️ **钳制不是报错**：传 0 ⇒ 1；传 100 ⇒ 8。
  *
+ * ⚠️ **导出给 `inhibitionTrace` 用**（§6：trace 的 `selected` 必须与 `recall` 的 hits 同口径）
+ *   ⇒ 两边各写一份钳制 ⇒ 参数被调大时两边会给出**不同的名额** ⇒ 诊断输出失去意义。
+ *
  * @param value 调用方传入的 `topN`
  * @param fallback 缺省值（`RECALL_TOP_N`，来自参数表）
  * @returns 落在 `[1, 8]` 的整数
  */
-function clampTopN(value: number | undefined, fallback: number): number {
+export function clampTopN(value: number | undefined, fallback: number): number {
   const base = value === undefined || !Number.isFinite(value) ? fallback : Math.trunc(value);
   return Math.min(MAX_TOP_N, Math.max(1, base));
 }
@@ -906,6 +911,90 @@ function clampTopN(value: number | undefined, fallback: number): number {
 /** `context` 的 sha1 哈希（§4.6 步骤 4：**只存哈希不存原文**）。 */
 function sha1Hex(text: string): string {
   return createHash('sha1').update(text, 'utf8').digest('hex');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 七之二、步骤 1~3 的**共用流水线**（`recall` 与 `inhibitionTrace` 走同一段打分代码）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** 共用流水线的入参（步骤 1~3 需要的全部东西）。 */
+export interface CandidatePipelineInput {
+  /** 上下文原文（文本路与事件哈希用）。 */
+  context: string;
+  /** 已解析好的 canonical entity_id 列表（`undefined` = 不传 ⇒ 走名称解析）。 */
+  entityIds: string[] | undefined;
+  /** 调用方抽好的实体名列表（与 `entityIds` 互斥，§4.6 步骤 1）。 */
+  entityNames: string[] | undefined;
+  /** 是否显式查询归档层。 */
+  includeArchived: boolean;
+  /** 注入时钟（C37）。 */
+  now: number;
+}
+
+/** 共用流水线的产物（步骤 3 的候选 + 诊断所需的计数）。 */
+export interface CandidatePipeline {
+  /** 步骤 3 的产物：**打分后、未截断**的候选集（§4.13.3 的输入 C）。 */
+  scored: ScoredCandidate[];
+  /** 归一后的上下文实体 id（`explain` 的图谱路判据）。 */
+  contextEntityIds: string[];
+  /** 文本路的运行模式与原始行（`explain` 的判据）。 */
+  text: TextRouteResult;
+  /** 图谱路的候选条数（`explain` 的判据）。 */
+  graphCount: number;
+}
+
+/**
+ * 步骤 1~3 的**共用流水线**（实体名归一 → 三路候选 → 去重合并 → 融合打分）。
+ *
+ * ★ **为什么抽出来**（§6 的 `inhibitionTrace` 明写「**必须与 recall 走同一段打分代码**——
+ *   否则「trace 看到的」和「recall 实际发生的」会漂移」）：
+ *   `recall` 与 `inhibitionTrace` 各写一遍打分 ⇒ 两边的候选集与分数会**各自漂移**
+ *   ⇒ 「trace 说这条是 0.83、recall 给它 0.81」⇒ 诊断输出失去意义。
+ *   ⇒ **只有一处实现**，两边都调它 ⇒ 逐位相同是**结构上**保证的。
+ *
+ * ⚠️ **纯读**：本函数只发 `SELECT`（**不写库**）⇒ 抑制前后库内容不变（§4.13.1 硬约束②）。
+ *
+ * @param store 库句柄 + 生效参数
+ * @param input 步骤 1~3 的入参
+ * @returns 打分后的候选集与诊断计数
+ */
+export function collectScoredCandidates(
+  store: RecallStore,
+  input: CandidatePipelineInput,
+): CandidatePipeline {
+  const db = store.db;
+  const params = store.params;
+  const archiveLine = input.includeArchived ? null : archiveFilterThreshold(params, false);
+
+  // ── 步骤 1：实体名的**归一**（库不抽取；ADR-P1-T08-GAP 缺口①）──
+  const contextEntityIds = resolveContextEntityIds(db, input.entityIds, input.entityNames);
+
+  // ── 步骤 2：三路候选 ──
+  const text = collectTextCandidates(
+    db,
+    input.context,
+    params,
+    input.includeArchived,
+    archiveLine,
+    input.now,
+  );
+  const graph = collectGraphCandidates(
+    db,
+    contextEntityIds,
+    params,
+    input.includeArchived,
+    archiveLine,
+    input.now,
+  );
+  // ⚠️ 步骤 2c（向量路）：**本阶段整路缺席** —— 不是「向量分全 0」那种降级。
+
+  // ── 步骤 2.5：候选去重合并 ──
+  const candidates = mergeCandidates(text.rows, graph);
+
+  // ── 步骤 3：融合打分 ──
+  const scored = scoreCandidates(db, candidates, contextEntityIds, text.route, params, input.now);
+
+  return { scored, contextEntityIds, text, graphCount: graph.length };
 }
 
 /**
@@ -950,22 +1039,35 @@ export function recall(store: RecallStore, options: RecallOptions): RecallResult
   const diffuseArchived = options.diffuseArchived !== false;
   // ⚠️ **归档模式下「不做强度精筛」**（ADR-P1-T08-GAP 小口径③）⇒ 阈值取 `null`。
   //   阈值本身仍由 `scoring.ts` 的 `archiveFilterThreshold()` 独家提供（非归档模式）。
-  const archiveLine = includeArchived ? null : archiveFilterThreshold(params, false);
+  //   ⚠️ **本处不再取阈值**：它已下沉进共用流水线 `collectScoredCandidates()`
+  //   （`recall` 与 `inhibitionTrace` 走同一段代码 ⇒ 同一套门槛，§6）。
   const withBreakdown = options.explain === true || options.diagnostics === true;
 
-  // ── 步骤 1：实体名的**归一**（库不抽取；ADR-P1-T08-GAP 缺口①）──
-  const entityIds = resolveContextEntityIds(db, options.entityIds, options.entityNames);
+  // ── 步骤 1~3：实体名归一 + 三路候选 + 去重合并 + 融合打分 ──
+  // ⚠️ **走共用流水线**（`inhibitionTrace` 走的是同一段代码 ⇒ 分数逐位相同，§6）。
+  const pipeline = collectScoredCandidates(store, {
+    context,
+    entityIds: options.entityIds,
+    entityNames: options.entityNames,
+    includeArchived,
+    now: at,
+  });
+  const scored = pipeline.scored;
+  const contextEntityIds = pipeline.contextEntityIds;
+  const text = pipeline.text;
 
-  // ── 步骤 2：三路候选 ──
-  const text = collectTextCandidates(db, context, params, includeArchived, archiveLine, at);
-  const graph = collectGraphCandidates(db, entityIds, params, includeArchived, archiveLine, at);
-  // ⚠️ 步骤 2c（向量路）：**本阶段整路缺席** —— 不是「向量分全 0」那种降级。
-
-  // ── 步骤 2.5：候选去重合并 ──
-  const candidates = mergeCandidates(text.rows, graph);
-
-  // ── 步骤 3：融合打分 ──
-  const scored = scoreCandidates(db, candidates, entityIds, text.route, params, at);
+  // ── 步骤 4.5：侧抑制后置筛选（§4.13 / §4.6 步骤 4.5）──
+  // ⚠️ ★ **抑制不进 score**（§4.13.1 硬约束①）：本步骤**只改「谁进 hits」**，
+  //   `candidate.score` 一个字节都不动 ⇒ `Hit.score` 恒等于五项加权和。
+  // ⚠️ ★ **机制开关**（§5 的 `inhibition`）：关 ⇒ 候选带**不重排**，
+  //   直接按 base 分取 topN ⇒ **与 v1.0 逐位一致**（基线条件：四个开关全关）。
+  //   ⚠️ **开关是参数表里的机制开关**（`DEFAULT_PARAMS.inhibition`），
+  //   **不是** `RecallOptions` 的字段——§6 的 `RecallOptions` 里没有它，
+  //   而 §6 是公开契约 ⇒ **不新增第二套开关**（C36：同一件事不得有两套词）。
+  const inhibitionEnabled = resolveFlags(params).inhibition;
+  const inhibition = inhibitionEnabled
+    ? inhibitCandidates(loadInhibitionFacts(db, scored), topN, params)
+    : null;
 
   // ── 步骤 4：排序取 topN ──
   // ⚠️ **排序键带 id**：分数相同者按 id 字典序排 ⇒ 同分时的顺序**可复现**
@@ -976,7 +1078,13 @@ export function recall(store: RecallStore, options: RecallOptions): RecallResult
     }
     return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
   });
-  const top = ordered.slice(0, topN);
+  // ⚠️ **抑制开启时，hits = R 桶**（异质代表集，**已按同一全序排好**）
+  //   ⇒ 「宁少不冗余」：R 桶不足 topN 时**不补位**（补位会把刚挤掉的近义内容又塞回来）。
+  const keptIds = new Set(inhibition?.kept.map((kept) => kept.id) ?? []);
+  const top =
+    inhibition === null
+      ? ordered.slice(0, topN)
+      : ordered.filter((candidate) => keptIds.has(candidate.id));
 
   // ── 组装命中（复用 `get()` 的视图映射 ⇒ 与 §6 的 `MemoryView` 逐字一致）──
   const hits: Hit[] = [];
@@ -1008,6 +1116,33 @@ export function recall(store: RecallStore, options: RecallOptions): RecallResult
       };
     }
     hits.push(hit);
+  }
+
+  // ── 组装被抑制的候选（D 桶，§4.13.3）──
+  // ⚠️ **只收 D 桶，不收 O 桶**（§4.13.3）：O 桶（溢出）**根本没参与评估** ⇒
+  //   它们没有合法的 `redundantWith` ⇒ 标成「被抑制」是**语义污染**。
+  const suppressed: RecallSuppressed[] = [];
+  for (const entry of inhibition?.redundant ?? []) {
+    const view = get(store, entry.candidate.id, at);
+    if (view === null) {
+      // ⚠️ 理论上不可达（候选都来自 `deleted = 0` 的行）：但仍必须给一个**有类型**的跳过。
+      continue;
+    }
+    const item: RecallSuppressed = {
+      id: entry.candidate.id,
+      content: view.content,
+      // ⚠️ **被抑制前的 score**（抑制不改分数，§4.13.1 硬约束①）。
+      score: entry.candidate.score,
+      layer: view.layer,
+      redundantWith: entry.redundantWith,
+      // ⚠️ **reason 只有 `'redundant'` 一种**（§6）：溢出候选不收进 suppressed。
+      reason: 'redundant',
+    };
+    // ⚠️ **`redundancySim` 只在「该对可比」时给出**（双方缺向量 ⇒ 没有可比的相似度）。
+    if (entry.redundancySim !== null) {
+      item.redundancySim = entry.redundancySim;
+    }
+    suppressed.push(item);
   }
 
   // ── 步骤 4 的加固分支（§4.2 的加固形状；只加固、不建共激活边）──
@@ -1042,8 +1177,9 @@ export function recall(store: RecallStore, options: RecallOptions): RecallResult
       // ⚠️ **恒带该键**（§4.6 步骤 4）：事后复盘「这次为什么没命中」时，
       //   第一个要排除的就是「向量路根本没跑」——而这个事实在正文与 `scores` 里都看不出来。
       vectorUsed: false,
-      // ⚠️ 侧抑制与扩散本阶段尚未实现 ⇒ 两个数组恒为空（**键恒在**，不省略）。
-      suppressedIds: [],
+      // ⚠️ **键恒在**（不省略）：抑制挤掉的候选 id（D 桶）⇒ 事后可对账「谁被挤掉了」。
+      //   ⚠️ **溢出候选不在这里**（它们根本没参与评估，§4.13.3）。
+      suppressedIds: suppressed.map((item) => item.id),
       diffusedSeeds: [],
     };
     // ⚠️ **`memory_id` 传 `null`**（§8.4 的 recall 行：「无（涉及多条记忆，无法单值）」）。
@@ -1054,7 +1190,8 @@ export function recall(store: RecallStore, options: RecallOptions): RecallResult
     hits,
     // ⚠️ **两个字段恒在**（不省略）：调用方需要知道「有 N 条被挤掉了」才能区分
     //   「库里只有 3 条相关」与「有 5 条但 2 条被挤掉」——这是两个不同的产品事实。
-    suppressed: [],
+    //   ⚠️ **抑制关闭时恒为空**（机制关 ⇒ 候选带不重排，§5）。
+    suppressed,
     diffused: [],
   };
   if (withBreakdown) {
@@ -1065,7 +1202,7 @@ export function recall(store: RecallStore, options: RecallOptions): RecallResult
         // ⚠️ 本阶段向量路**整路缺席** ⇒ `ran=false`、`candidates=0`。
         vector: { ran: false, candidates: 0 },
         // ⚠️ `ran=false` = 本次没有解析出任何实体。
-        graph: { ran: entityIds.length > 0, candidates: graph.length },
+        graph: { ran: contextEntityIds.length > 0, candidates: pipeline.graphCount },
       },
       // ⚠️ 扩散本阶段未实现 ⇒ 全零 / `false`。
       diffusion: {
