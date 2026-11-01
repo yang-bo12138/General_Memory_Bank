@@ -344,7 +344,7 @@ describe('P1-T10 · 门面的 10 个公开方法（§6）', () => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe('P1-T10 · 门面的边界（公开面 / 错误透出 / 只读）', () => {
-  it('★ 公开方法恰好是那 11 个（阶段 1 的 10 个 + 阶段 2 的 rebuildVectorBuckets）', () => {
+  it('★ 公开方法恰好是那 13 个（阶段 1 的 10 个 + 阶段 2 的 1 个 + 阶段 3 的 2 个）', () => {
     const methods = Object.getOwnPropertyNames(MemoryStore.prototype)
       .filter((name) => name !== 'constructor')
       .filter((name) => {
@@ -355,14 +355,19 @@ describe('P1-T10 · 门面的边界（公开面 / 错误透出 / 只读）', () 
 
     // ⚠️ **阶段 2 新增的是 `rebuildVectorBuckets`**（DEVELOPMENT-PLAN.md §3.1 的方法归位表：
     //   阶段 2 = 1 个方法 = `rebuildVectorBuckets`）⇒ 公开面从 10 个长到 11 个。
+    // ⚠️ **阶段 3 新增两个**：`inhibitionTrace`（只读诊断，P3-T02）/
+    //   `recluster`（写方法，簇重算，P3-T03）⇒ 公开面从 11 个长到 13 个。
+    //   ⇒ **阶段 3 的第三个方法 `clusters` 仍未落地**（P3-T05 未做）⇒ **刻意不造空壳**。
     expect(methods).toEqual([
       'get',
+      'inhibitionTrace',
       'link',
       'linkByIds',
       'mergeEntities',
       'pin',
       'rebuildVectorBuckets',
       'recall',
+      'recluster',
       'setAlias',
       'touch',
       'unpin',
@@ -521,5 +526,134 @@ describe('P1-T10 · 门面的边界（公开面 / 错误透出 / 只读）', () 
 
     const recalled = readonly.recall({ context: '张三喜欢猫', topN: 3, now: T0 });
     expect(recalled.hits.length).toBeGreaterThan(0);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 三、阶段 3 的两个公开方法（`inhibitionTrace` / `recluster`）
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('P3 · 阶段 3 的两个公开方法（§6 的 `inhibitionTrace` / `recluster`）', () => {
+  /**
+   * 造一个「两条冗余 + 一条不冗余」的世界。
+   *
+   * ⚠️ **两条冗余的成因是共享两个实体**（`张三` + `猫` ⇒ 实体路径判冗余，§4.13.2）
+   *   ⇒ **不依赖 embedding**（库里一条向量都没有 ⇒ 语义路径整条不可用）。
+   * ⚠️ 第三条只共享 `张三`（交集 = 1 < `DEDUP_ENTITY_MIN` = 2）⇒ **不冗余**。
+   *
+   * ⚠️ ★ **正文必须「互不共享 bigram」**（`张三养猫` / `喜欢猫咪` / `三喜的猫`）：
+   *   否则**写入侧的去重**（§4.9 步骤 3c：共享 ≥ 2 个实体 ⇒ 判为「同一事实」⇒ 合并）
+   *   会把前两条**合并成一条** ⇒ 冗余对在库里根本不存在 ⇒ 断言变成空洞的。
+   *   ⇒ 三条正文两两不共享 bigram ⇒ 写入时互不看见 ⇒ 三条都独立落库；
+   *     而召回的查询 `张三喜欢猫`（4 个 bigram ⇒ OR 宽松召回）**三条都能命中**。
+   */
+  function seedRedundantWorld(h: Harness): { a: string; b: string; c: string } {
+    const a = h.store.write({ content: '张三养猫', entities: ['张三', '猫'], now: T0 });
+    const b = h.store.write({ content: '喜欢猫咪', entities: ['张三', '猫'], now: T0 });
+    const c = h.store.write({
+      content: '三喜的猫',
+      entities: ['张三', '李四'],
+      now: T0,
+    });
+    // ⚠️ **前提自检**：三条都**独立落库**了（写入侧没有把它们合并）。
+    expect(a.merged).toBe(false);
+    expect(b.merged).toBe(false);
+    expect(c.merged).toBe(false);
+    expect(countRows(h.reader, 'memories')).toBe(3);
+    return { a: a.id, b: b.id, c: c.id };
+  }
+
+  it('★ inhibitionTrace()：真调一次 ⇒ §6 的形状，且与 recall 的 hits **同口径**', () => {
+    const h = createHarness();
+    const world = seedRedundantWorld(h);
+    // ⚠️ **事件条数取「调用前」的快照**（写入本身会记事件 ⇒ 不能假设它是 0）。
+    const eventsBefore = countRows(h.reader, 'events');
+
+    const trace = h.store.inhibitionTrace('张三喜欢猫', { now: T0 });
+
+    // ⚠️ **前提自检**：候选集**真的**有三条（否则下面的断言是空洞的）。
+    expect(trace.candidates).toHaveLength(3);
+    // ★ 被判冗余的**恰好一条**（那两条共享两个实体 ⇒ 一条让位）。
+    const inhibited = trace.candidates.filter((item) => item.inhibited);
+    expect(inhibited).toHaveLength(1);
+    // ⚠️ **不写死「哪一条」**：那两条分数相同时按 id 字典序定序，而 id 是随机 UUID
+    //   ⇒ 断言「被抑制的是 a 还是 b」会**随机翻红** ⇒ 只断言「它是冗余对里的那条」。
+    expect([world.a, world.b]).toContain(inhibited[0]?.id);
+    // ★ **不冗余的那条一定不进 D 桶**。
+    expect(inhibited[0]?.id).not.toBe(world.c);
+    // ★ 被抑制的那条**有**合法的 `redundantWith`，且它**留在 hits 里**。
+    expect(inhibited[0]?.redundantWith).toBeDefined();
+    expect(trace.selected.map((item) => item.id)).toContain(inhibited[0]?.redundantWith);
+
+    // ★ **与 `recall` 同口径**（§6：「必须与 recall 走同一段打分代码」）
+    //   ⇒ `selected` 的 id 序列与 `hits` 的 id 序列**逐条相同**。
+    const recalled = h.store.recall({ context: '张三喜欢猫', now: T0 });
+    expect(trace.selected.map((item) => item.id)).toEqual(recalled.hits.map((hit) => hit.id));
+
+    // ★ **纯读**（§4.13.1 硬约束②）：不写库、不写事件。
+    expect(countRows(h.reader, 'events')).toBe(eventsBefore);
+  });
+
+  it('★ inhibitionTrace()：**纯读**（不写库、不写事件）', () => {
+    const h = createHarness();
+    seedRedundantWorld(h);
+
+    const before = {
+      memories: countRows(h.reader, 'memories'),
+      events: countRows(h.reader, 'events'),
+      clusters: countRows(h.reader, 'theme_clusters'),
+    };
+
+    h.store.inhibitionTrace('张三喜欢猫', { now: T0 });
+
+    expect(countRows(h.reader, 'memories')).toBe(before.memories);
+    expect(countRows(h.reader, 'events')).toBe(before.events);
+    expect(countRows(h.reader, 'theme_clusters')).toBe(before.clusters);
+  });
+
+  it('★ recluster()：真调一次 ⇒ 快照真的落库；第二次因间隔不足而**跳过**（幂等）', () => {
+    const h = createHarness();
+
+    const first = h.store.recluster(T0);
+
+    // ★ 第一次：**真的重算了**（库里还没有快照 ⇒ 不存在「距上次发布不足」）。
+    expect(first.computed).toBe(true);
+    expect(first.skipped).toBeNull();
+    expect(first.clusterCount).toBe(0);
+    expect(first.largestClusterRatio).toBe(0);
+
+    // ★ 快照**真的落库**了（不是只返回了一个摘要）。
+    expect(countRows(h.reader, 'cluster_snapshot_meta')).toBe(1);
+    expect(countRows(h.reader, 'theme_clusters')).toBe(0);
+    // ★ 事件：一条 `sweep`（§8.4 的 `action='recluster'`）。
+    const events = h.reader.prepare('SELECT type FROM events').all() as Array<{ type: string }>;
+    expect(events).toHaveLength(1);
+    expect(events[0]?.type).toBe('sweep');
+
+    // ★ 第二次（间隔不足 `CLUSTER_RECALC_INTERVAL_MS`）⇒ **跳过**，且**不再写事件**。
+    const second = h.store.recluster(T0 + 1000);
+    expect(second.computed).toBe(false);
+    expect(second.skipped).toBe('too_soon');
+    expect(countRows(h.reader, 'events')).toBe(1);
+  });
+
+  it('★ 只读实例：`recluster` 被拒绝（§7.1 的 16 个写方法之一），`inhibitionTrace` 照常可用', () => {
+    const h = createHarness();
+    seedRedundantWorld(h);
+
+    const readonly = new MemoryStore({ dbPath: h.dbPath, readonly: true });
+
+    // ── ① `recluster` 是**写方法** ⇒ 只读实例上抛 `READONLY_VIOLATION` ──
+    const error = captureMemoryError(() => readonly.recluster(T0));
+    expect(error.code).toBe('READONLY_VIOLATION');
+    expect(error.details.operation).toBe('recluster');
+    // ★ 零写入：快照表仍然没有行。
+    expect(countRows(h.reader, 'cluster_snapshot_meta')).toBe(0);
+
+    // ── ② `inhibitionTrace` 是**读方法** ⇒ 只读实例上照常可用（§7.1 的 7 个读方法之一）──
+    const eventsBefore = countRows(h.reader, 'events');
+    const trace = readonly.inhibitionTrace('张三喜欢猫', { now: T0 });
+    expect(trace.candidates.length).toBe(3);
+    expect(countRows(h.reader, 'events')).toBe(eventsBefore);
   });
 });

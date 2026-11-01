@@ -1,5 +1,6 @@
 /**
- * 门面 `MemoryStore` —— DESIGN-v2.md §6 的公开 API 入口（阶段 1 的 10 个方法 + 阶段 2 的 `rebuildVectorBuckets`）。
+ * 门面 `MemoryStore` —— DESIGN-v2.md §6 的公开 API 入口
+ * （阶段 1 的 10 个方法 + 阶段 2 的 `rebuildVectorBuckets` + 阶段 3 的 `inhibitionTrace` / `recluster`）。
  *
  * ⚠️ **本文件只做「委托」，一行业务逻辑都没有**（§14.3 边界原则 1：
  *   「每个承诺都要能指到唯一代码路径」）：
@@ -13,11 +14,18 @@
  * ⚠️ **公开面 = 已落地阶段的公开方法之和**（DEVELOPMENT-PLAN.md §3.1 的方法归位表）：
  *   · **阶段 1 的 10 个**：`write` / `recall` / `touch` / `get` / `pin` / `unpin` /
  *     `link` / `linkByIds` / `setAlias` / `mergeEntities`；
- *   · **阶段 2 的 1 个**：`rebuildVectorBuckets`（§4.15.5 的重训；P2-T05 落地）。
- *   ⇒ **刻意不实现 `stats`**（阶段 4）、**不提前实现其余 12 个**：
+ *   · **阶段 2 的 1 个**：`rebuildVectorBuckets`（§4.15.5 的重训；P2-T05 落地）；
+ *   · **阶段 3 的 2 个**：`inhibitionTrace`（§4.13 的抑制诊断；P3-T02 落地）/
+ *     `recluster`（§4.12.3 的簇重算；P3-T03 落地）。
+ *     ⇒ **阶段 3 的第三个方法 `clusters` 仍未落地**（P3-T05 未做 ⇒ 查簇快照的只读接口还不存在）
+ *       ⇒ **刻意不造空壳**：导出了却没实现 = 空承诺，比不导更糟。
+ * ⇒ **刻意不实现 `stats`**（阶段 4）、**不提前实现其余 10 个**：
  *   每多一个公开方法都是一次**公开承诺**，而 §6 的 23 个方法分属阶段 1~5
  *   ⇒ 门面只承诺**已落地阶段**的那几个，其余的等各自阶段落地时再加
  *   （**导出了却没实现 = 空承诺，比不导更糟**）。
+ * ⇒ **「已落地阶段的方法集合 == 公开面」这条不变量由门禁守着**：
+ *   `tests/contracts/export-surface.test.ts` 的「§6 方法逐阶段清单」断言
+ *   （漏挂 ⇒ 红；多挂 / 空壳 ⇒ 红）⇒ **门面漏挂方法时门禁能看见**。
  *
  * ⚠️ **签名全部从现有实现抄**（`src/store/*.ts`），不臆测、不「按设计稿再美化一次」：
  *   形参顺序、可选性、返回类型与实现**逐字一致**（含 `memoryId?: string | null` 这种
@@ -38,6 +46,7 @@ import { openDatabase, readUserVersion } from '../db/connection.js';
 import { assertV2TablesComplete, ensureSchema } from '../db/migrate.js';
 import { FileLogger, type Logger } from '../util/log.js';
 import { CentroidCache } from '../vector/centroids.js';
+import { type ReclusterResult, recluster as reclusterImpl } from './clusters.js';
 import {
   type MergeEntitiesResult,
   mergeEntities as mergeEntitiesImpl,
@@ -45,6 +54,11 @@ import {
 } from './entities.js';
 import { EventWriter } from './events.js';
 import { type MemoryReadStore, type MemoryView, get as getImpl } from './get.js';
+import {
+  type InhibitionTraceOptions,
+  type InhibitionTraceResult,
+  inhibitionTrace as inhibitionTraceImpl,
+} from './inhibition.js';
 import {
   type GraphStore,
   type LinkOptions,
@@ -161,11 +175,12 @@ function ensureSchemaForMode(db: Database.Database, readonly: boolean): void {
 /**
  * 门面 —— 库对外的唯一入口（§6）。
  *
- * ⚠️ **只暴露已落地阶段的公开方法**（阶段 1 的 10 个 + 阶段 2 的 `rebuildVectorBuckets`），
+ * ⚠️ **只暴露已落地阶段的公开方法**（阶段 1 的 10 个 + 阶段 2 的 `rebuildVectorBuckets`
+ *   + 阶段 3 的 `inhibitionTrace` / `recluster`），
  *   其余全是私有字段：
  *   公开面每多一个名字就是一次公开承诺（§14.3 原则 1），
  *   而 §6 的 23 个方法分属阶段 1~5 ⇒ 只承诺**已落地**的那几个。
- *
+ * *
  * ⚠️ **不提供 `close()`**：§6 的公开面里没有它，而阶段 1 的门面方法归位表里也没有它
  *   ⇒ 本阶段不加。调用方要释放句柄时，自行管理 `dbPath` 的生命周期即可
  *   （better-sqlite3 的句柄随进程退出而释放）。
@@ -459,5 +474,56 @@ export class MemoryStore {
    */
   rebuildVectorBuckets(options?: RebuildBucketsOptions): RebuildBucketsResult {
     return this.#maintainer.rebuildVectorBuckets(options);
+  }
+
+  /**
+   * 抑制诊断 —— §6 的 `inhibitionTrace(context, options?)`（§4.13 / §4.6 步骤 4.5）。
+   *
+   * ⚠️ ★ **纯读**：不写库、不写 events、不更新 `last_access`（§4.13.1 硬约束②）
+   *   ⇒ 只读实例上可直接调用（§7.1 的「7 个允许读的方法」之一）。
+   *
+   * ⚠️ ★ **必须与 `recall` 走同一段打分代码**（§6 的原文）：
+   *   「否则『trace 看到的』和『recall 实际发生的』会漂移。」
+   *   ⇒ 门面**不自己算分**：它调 `src/store/inhibition.ts` 的 `inhibitionTrace()`，
+   *     而那个实现内部走的是 `recall.ts` 的共用流水线 `collectScoredCandidates()`
+   *     ⇒ `baseScore` 与 `recall` 的 `Hit.score` **逐位相同**是**结构上**保证的。
+   *
+   * ⚠️ **签名与 §6 逐字一致**：`context` 必填、`options` 可选（只带 `now`）。
+   *
+   * @param context 召回上下文（与 `recall` 完全相同的入参）
+   * @param options 可选（注入时钟）
+   * @returns §6 的 `{ candidates, selected }`
+   */
+  inhibitionTrace(context: string, options?: InhibitionTraceOptions): InhibitionTraceResult {
+    return inhibitionTraceImpl(this.#context, context, options);
+  }
+
+  /**
+   * 重算主题簇并发布快照 —— §6 的 `recluster(now?)`（§4.12.3）。
+   *
+   * ⚠️ ★ **写方法**（§7.1 的 16 个写方法之一）⇒ 只读实例上抛 `READONLY_VIOLATION`。
+   *
+   * ⚠️ ★ **阻塞 1~3 分钟**：库是**全同步 API**（ADR-5）⇒ 同一线程调用会阻塞这么久
+   *   ⇒ 要让重算期间不阻塞请求：调用方须在**自己的另一个线程**里调用它，
+   *     并使用**独立的数据库连接**（§4.15.5 的同款纪律）。
+   *
+   * ⚠️ ★ **MCP 不得暴露**（§6 的维护方法注释 / §7.1 / §12 阶段 5 的 MCP 最小集）：
+   *   `rebuildArchivalSchedule` / `rebuildVectorBuckets` / `recluster`
+   *   三个阻塞维护方法**都不在** MCP 的最小集里 ⇒ 宿主接 MCP 时**不要**把本方法映射成工具。
+   *   ⇒ 本方法挂在**库门面**上（§6 的公开契约要求它在这里），
+   *     「不暴露」的纪律落在**MCP 那一层**，不是「库不提供」。
+   *
+   * ⚠️ **幂等跳过**：距上次发布不足 `CLUSTER_RECALC_INTERVAL_MS` ⇒ 返回
+   *   `computed: false` / `skipped: 'too_soon'`（宿主必须靠这两个字段判断有没有真算，
+   *   **不能靠 `clusterCount` 的值**）。
+   *
+   * @param now 注入时钟（C37）
+   * @returns §6 的 `{ clusterCount, largestClusterRatio, computed, skipped }`
+   * @throws {MemoryError} `READONLY_VIOLATION`（只读实例上的写方法）
+   */
+  recluster(now?: number): ReclusterResult {
+    // ⚠️ **`ClusterStore` 与 `GraphStore` 结构完全相同**（都是 `{ db, params, events }`）
+    //   ⇒ 复用同一个上下文对象即可，不必为每个实现各造一份（造多份只是把同一件事抄五遍）。
+    return reclusterImpl(this.#context, now);
   }
 }

@@ -188,7 +188,11 @@ export function compareInhibitionCandidates(
  * ```
  * poolHomogeneous = 「候选集里除最高分那条 C0 外，是否每一条都与 C0 冗余」
  *   ⚠️ 进入遍历前算一次并固定（不能随 R 的增长而重算 ⇒ 否则行为依赖遍历顺序）
- *   ⚠️ C0 不与自己比（那恒为真 ⇒ poolHomogeneous 永远为真）
+ *   ⚠️ C0 不与自己比（「C0 与 C0」**不是恒为真**：它为真当且仅当 C0 自己就冗余
+ *     —— 它有向量 ⇒ cos = 1；或它挂了 ≥ DEDUP_ENTITY_MIN 个实体）
+ *     ⇒ 把自己算进去只是给那个合取式**多加一项** ⇒ 不会让 poolHomogeneous **永远**为真
+ *     ⇒ 两种写法只差一个角落：「池里只有 C0 一条、而 C0 自己不冗余」时，含自己的写法会翻成假
+ *       （那一条的语义是「没有替代品 ⇒ 不抑制」⇒ 本实现按「不与自己比」写）
  *   ⚠️ |C| = 0 时恒为真，但遍历不执行 ⇒ hits = [] ⇒ 不变式仍成立
  *
  * for c of C（按 (score DESC, id ASC) 全序）:
@@ -219,7 +223,8 @@ export function inhibitCandidates(
     c0 === undefined
       ? // ⚠️ |C| = 0 ⇒ 恒为真（无候选可判）；此时遍历不执行 ⇒ hits = [] ⇒ 不变式仍成立。
         true
-      : // ⚠️ **C0 不与自己比** ⇒ 判断对象是「其余候选 c 与 C0 是否冗余」。
+      : // ⚠️ **C0 不与自己比** ⇒ 判断对象是「其余候选 c 与 C0 是否冗余」
+        //   （「C0 与 C0」不是恒为真 ⇒ 把自己算进去只会给合取式多加一项 ⇒ 见函数头的说明）。
         ordered
           .slice(1)
           .every((candidate) => isRedundant(redundancyEvidence(candidate, c0), params));

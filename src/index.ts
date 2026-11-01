@@ -236,6 +236,16 @@ export type {
   TouchReason,
 } from './store/touch.js';
 export type { WriteInput, WriteResult, WriteWarning } from './store/write.js';
+// ── 阶段 3（P3-T02 / P3-T03）的门面方法用到的公共类型 ──
+// ⚠️ **只导类型，不导实现函数**：`inhibitionTrace` / `recluster` 的**唯一公开入口**
+//   是门面 `MemoryStore` 上的那两个方法（§6）⇒ 导出实现函数会变成**第二条公开路径**
+//   （同一件事两套词，C36）⇒ 这里只导它们的**入参 / 返回类型**（调用方标注需要）。
+export type {
+  InhibitionTraceCandidate,
+  InhibitionTraceOptions,
+  InhibitionTraceResult,
+} from './store/inhibition.js';
+export type { ReclusterResult } from './store/clusters.js';
 export {
   FileLogger,
   flattenField,

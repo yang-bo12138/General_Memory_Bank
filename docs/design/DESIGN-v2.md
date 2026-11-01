@@ -3160,7 +3160,16 @@ isRedundant(A, B) =
   实现：**进入遍历前算一次并固定**。
     取候选集 score 最高的那条 **C0**，逐条检查**其余候选**是否与 C0 冗余。
   ⚠️ **C0 不与自己比**：判断对象是「候选 c 与 C0 是否冗余」，
-    **不是「C0 与 C0」**（那恒为真，会把 poolHomogeneous 永远判成真）。
+    **不是「C0 与 C0」**。
+    ⚠️ **「C0 与 C0」不是恒为真**（此处原先的措辞「那恒为真 ⇒ poolHomogeneous 永远判成真」**不准**，
+      准确的说法如下）：它为**真**当且仅当 C0 **自己**就冗余
+      （它有向量 ⇒ cos = 1；或它挂了 ≥ `DEDUP_ENTITY_MIN` 个实体），否则为**假**。
+      ⇒ 把自己算进去，只是给那个合取式**多加一项** ⇒ **不会**让 `poolHomogeneous` **永远**为真。
+    ⚠️ **两种写法的差别只在一个角落**：「其余候选全都冗余于 C0、而 C0 自己不冗余」时，
+      含自己的写法会**翻成假**；而这个角落只可能是「候选池里**只有 C0 一条**」
+      （别的候选与 C0 冗余 ⇒ C0 必然也自冗余：实体路径要求 C0 至少有两个实体，语义路径要求 C0 有向量）。
+      ⇒ 实现按「**不与自己比**」写（本节伪代码）；那一条的语义是
+        「池里只有一条 ⇒ 没有替代品 ⇒ 不抑制」。
   ⚠️ 候选池为空（|C| = 0）时 poolHomogeneous 恒为**真**（无候选可判），
     但此时遍历不执行 ⇒ hits = [] ⇒ 不变式 `hits.length ≥ min(topN, min(2, |C|))`
     仍然成立（|C| = 0 ⇒ 下界为 0）。
@@ -4116,12 +4125,13 @@ export interface Hit extends MemoryView {
     textPart: number;
     graphPart: number;
     recencyPart: number;
-    // v2.0 新增：侧抑制的**说明性**字段（不进求和、不参与 score，见 §4.13.1）
-    suppression?: {
-      clusterId: string | null;   // 触发的簇 id；无簇时为 null
-      rankInCluster: number;      // 该候选在本簇内按 score 的名次（1 = 簇内最强）
-      basis: 'cluster' | 'cluster-or-cosine';  // 判定依据；余弦不可用时退化为 'cluster'
-    };
+    // ⚠️ ★ **侧抑制的诊断字段（`suppression`）刻意不存在**（§4.13.1 硬约束①）：
+    //   「谁挤掉了谁、冗余度多少」属 `inhibitionTrace()` 的**诊断输出**，
+    //   **不进入 `Hit.breakdown`** ——
+    //   把它塞进 breakdown 会让 score 跨候选不可比，而 §4.6 的 `normBm25` 三分支设计整套就是为了保这个可比性。
+    //   ⇒ 需要这份诊断的调用方去调 `inhibitionTrace(context)`（§6 的只读方法，纯读、不写库）。
+    //   ⇒ **本版也不提供「簇参与判定」的形态**（§4.13.2：判据是纯逐对的，簇**不参与**判定）
+    //     ⇒ 原稿里那个 `basis: 'cluster' | 'cluster-or-cosine'` 字段**没有对应实现** ⇒ 一并撤掉。
     rawBm25: number | null;                    // LIKE 单字兜底路、纯图谱命中、纯向量命中时为 null（见 §4.6 步骤 3）
     cos: number | null;                        // ★ **纯原始证据**职责：本次语义余弦。
                                                //   未走向量路或该条无 embedding 时为 null。
