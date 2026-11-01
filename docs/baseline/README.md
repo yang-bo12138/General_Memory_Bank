@@ -30,9 +30,9 @@
 | `agreement-10000.json` | 吻合率（1 万条） | `pnpm exec tsx bench/agreement.ts --scale=10000 --queries=200` |
 | `perf-10000.json` | 三条 P99（1 万条） | `pnpm exec tsx bench/perf.ts --scale=10000 --queries=200 --writes=200` |
 | `baseline-flat-10000.json` | 前置测量：flat 路线的向量路占比（1 万条） | `pnpm exec tsx bench/baseline-flat.ts --scale=10000 --queries=200` |
-| `agreement-1000000.json` | 吻合率（**100 万条**） | `pnpm exec tsx bench/agreement.ts --scale=1000000 --queries=200 --reuse=true --db=.tmp/bench/shared-1000000.db` |
+| `agreement-1000000.json` | 吻合率（**100 万条**） | `pnpm exec tsx bench/agreement.ts --scale=1000000 --queries=10 --reuse=true --db=.tmp/bench/shared-1000000.db` |
 | `perf-1000000.json` | 三条 P99（**100 万条**） | `pnpm exec tsx bench/perf.ts --scale=1000000 --queries=200 --writes=200 --reuse=true --db=.tmp/bench/shared-1000000.db` |
-| `baseline-flat-1000000.json` | 前置测量（**100 万条**） | `pnpm exec tsx bench/baseline-flat.ts --scale=1000000 --queries=200 --reuse=true --db=.tmp/bench/shared-1000000.db` |
+| `baseline-flat-1000000.json` | 前置测量（**100 万条**） | `pnpm exec tsx bench/baseline-flat.ts --scale=1000000 --queries=2 --reuse=true --db=.tmp/bench/shared-1000000.db` |
 | `mutation.md` | **变异实测记录**（4 处 ⇒ 断言全部变红 ⇒ `cmp` 逐字节还原） | `bash scripts/bench-mutation.sh` |
 
 > ⚠️ **百万级的三个脚本共用同一份库**（`--db=... --reuse=true`）：
@@ -44,8 +44,15 @@
 > ⚠️ ★ **P99 的样本量下限（2026-11-01 补）**：`bench/perf.ts` 的 `--queries` / `--writes`
 > **必须 ≥ 100**（nearest-rank 口径下，**n < 100 时 P99 就是最大值** ⇒ 那个数不是 P99，
 > 是「最大的一次」）⇒ **样本量不足 ⇒ 该 P99 不可判定**（既不算达标、也不算不达标）。
-> ⇒ 上表的命令**全部用 `--queries=200 --writes=200`**（P99 至少要有 100 个样本才可判定）。
+> ⇒ **`perf-*.json` 用 `--queries=200 --writes=200`**（P99 至少要有 100 个样本才可判定）。
 > ⇒ ⚠️ **旧数据（`--queries=50` / `--writes=50`）的 P99 不可判定** ⇒ 已按新口径重刷。
+>
+> ⚠️ **为什么 `agreement` / `baseline-flat` 在百万级用小样本**（**它们不是 P99**）：
+> · `agreement` 的判据是**逐查询的精确断言**（错数 = 0 / 越界数 = 0 / 桶内逐位相同）
+>   ⇒ **不是统计量** ⇒ 10 条查询就足以判定「对不对」；
+>   （吻合率那个比例是统计量 ⇒ 它的采样精度受查询数限制 ⇒ **读它时要连 `queryCount` 一起读**。）
+> · `baseline-flat` 的**每次查询 = 一次全表精确扫描**（百万级 ≈ 15 分钟/次）⇒ 查询数直接乘在成本上
+>   ⇒ **2 条**是「跑得完」与「有代表性」之间的取舍 ⇒ **它是「证据」不是「验收条件」**（见计划稿原文）。
 
 ## 怎么读这些数字
 
