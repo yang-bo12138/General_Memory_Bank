@@ -32,7 +32,8 @@
       }
     ],
     "_三条纪律": "① **毫秒数跨档不可比** ⇒ 引用任何一档都必须带档位标签；② **H1 / H2 的行数判据跨档可比**（已由 `_priorPartialWarmRun` 与冷盘档逐位对照**实测**）；③ ⚠️ **本文件能对照的是「冷盘档 vs 部分热档」（两档都有 H1/H2）**⇒ ⇒ **「全热档 vs 冷盘档」的完整行数对照 —— 全热档**没有** H1/H2 字段 ⇒ **尚未实测**⇒ ⇒ **要补齐需要「跑时可用内存 ≥ 库体积（≥ 5 GB）」的机器**（已登记为待办）。",
-    "_别踩的坑": "⚠️ **「档位名」说的是「页缓存状态」，不是「性能排序」** —— **部分热档比冷盘档更慢**（每行读成本 280.5 vs 212.0 µs/行；recall P99 565 vs 164 ms）⇒ ⇒ **快慢取决于当时机器上还有谁在跑**，不取决于档位名。"
+    "_别踩的坑": "⚠️ **「档位名」说的是「页缓存状态」，不是「性能排序」** —— **部分热档比冷盘档更慢**（每行读成本 280.5 vs 212.0 µs/行；recall P99 565 vs 164 ms）⇒ ⇒ **快慢取决于当时机器上还有谁在跑**，不取决于档位名。",
+    "_页缓存状态的读法": "⚠️ **本文件三档的 `pageCacheState` 都是「回填」**（`declared = false`）—— 那两轮 bench 还没有 `--cache-state` 参数 ⇒ **不是跑的时候的声明**⇒ ⇒ **且 Windows 没有公开 API 能报「这个库有多少在页缓存里」** ⇒ 档位**永远是「推断 + 间接测量」**⇒ ⇒ **间接测量手段**：① 跑时可用内存 vs 库体积；② 顺序读吞吐（命中页缓存 ≫ 500 MB/s，机械盘 ~130~175 MB/s）；③ 与全热档的向量路 P99 倍数差。⇒ ⇒ **★ 工程师-8 已在 bench 侧补上 `--cache-state=cold|warm|unknown`（缺省 unknown，不许猜）**⇒ ⇒ **但那是「声明」不是「测量」** ⇒ **从「实测口径」重采的那一轮起，这个字段才会是跑时声明的**。"
   },
   "corpusSize": 1000000,
   "trainedCells": 9966,
@@ -57,6 +58,25 @@
     "p50": 4385,
     "p99": 10103,
     "max": 12782
+  },
+  "candidateReadRowsBasis": {
+    "mode": "derived",
+    "note": "⚠️ **本组 `candidateReadRows` 是「推算口径」采的**（2026-11-01 的两轮 bench 还没有行读计数器）⇒ **判据量 = 命中细桶的成员数之和**⇒ ⚠️ **它模型化了「桶内不设 LIMIT」这个实现** ⇒ **严格说属推导层**⇒ ⇒ **但「红 / 绿」的结论不变**（小规模已逐条核对：**实测 ≡ 推算** ⇒ 见 `tests/bench/h1-measurement.test.ts`）⇒ ⇒ **「实测口径」（`mode = 'measured'`）的百万级值需要重跑一次才能拿到** ⇒ 已登记为待办。",
+    "derivedCrossCheck": {
+      "count": 1000,
+      "min": 57,
+      "mean": 4502.959,
+      "p50": 4385,
+      "p99": 10103,
+      "max": 12782
+    },
+    "bucketMemberRowsRead": null
+  },
+  "pageCacheState": {
+    "state": "cold",
+    "source": "retroactive:perf-1000000.json",
+    "declared": false,
+    "note": "⚠️ **回填的判定**（这两轮 bench 还没有 `--cache-state` 参数 ⇒ **不是跑的时候的声明** ⇒ `declared = false`）⇒ 依据：① **顺序读吞吐 132~174 MB/s ≈ 机械盘速度**（命中页缓存的块很少）；② 与全热档（19:49）的向量路 P99 差 **21.6 倍**；③ 采集用的是**刚拷完的副本**（4.5 GB 刚写完 ⇒ 页缓存被挤空）⇒ ⇒ **判为 `cold`**⇒ ⚠️ **但 Windows 没有公开 API 能报「这个库有多少在页缓存里」⇒ 这是「推断 + 间接测量」，不是仪器测量**。"
   },
   "hitFineBuckets": {
     "count": 1000,
@@ -433,6 +453,25 @@
       },
       "fineCells": 9966,
       "members": 1000000
+    },
+    "candidateReadRowsBasis": {
+      "mode": "derived",
+      "note": "⚠️ **本组 `candidateReadRows` 是「推算口径」采的**（2026-11-01 的两轮 bench 还没有行读计数器）⇒ **判据量 = 命中细桶的成员数之和**⇒ ⚠️ **它模型化了「桶内不设 LIMIT」这个实现** ⇒ **严格说属推导层**⇒ ⇒ **但「红 / 绿」的结论不变**（小规模已逐条核对：**实测 ≡ 推算** ⇒ 见 `tests/bench/h1-measurement.test.ts`）⇒ ⇒ **「实测口径」（`mode = 'measured'`）的百万级值需要重跑一次才能拿到** ⇒ 已登记为待办。",
+      "derivedCrossCheck": {
+        "count": 1000,
+        "min": 57,
+        "mean": 4502.959,
+        "p50": 4385,
+        "p99": 10103,
+        "max": 12782
+      },
+      "bucketMemberRowsRead": null
+    },
+    "pageCacheState": {
+      "state": "unknown",
+      "source": "retroactive:perf-1000000.json",
+      "declared": false,
+      "note": "⚠️ **回填的判定**（这一轮 bench 还没有 `--cache-state` 参数 ⇒ **不是跑的时候的声明** ⇒ `declared = false`）⇒ **这一档是「部分热态」** ⇒ **Windows 没有公开 API 能报「这个库有多少在页缓存里」**⇒ ⇒ **只能标 `unknown`**（**不许猜 `warm`** —— 与 `detectStorageMedia()` / `--cache-state` 同一纪律）⇒ 实测依据：跑时可用内存 **2.90 GiB < 库 4.23 GiB** ⇒ **整个库装不进页缓存**；顺序读吞吐 **166 MB/s ≈ 机械盘速度**（命中页缓存的块仅 ~0.55 GB）⇒ ⇒ **它既不是 `cold`（有 ~0.55 GB 在缓存里），也不是 `warm`（4.23 GiB 装不下）⇒ `unknown` 是唯一诚实的取值**。"
     }
   }
 }
