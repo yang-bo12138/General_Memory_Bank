@@ -347,6 +347,13 @@ describe('P3-T06 · 开关逐条复验 ② `coactivation`（共激活 / 联想�
     // ── 断言③：**`recluster()` 自报「没算」**（宿主靠 `computed` 区分）──
     expect(result.computed).toBe(false);
     expect(result.clusterCount).toBe(0);
+    // ⚠️ ★ **`skipped` 必须说清「为什么没算」**（2026-11-02 架构师裁决 · v2.1 勘误）：
+    //   机制开关 `coactivation` 关 ⇒ `skipped = 'disabled'`（**不是** `'too_soon'`、**不是** `null`）
+    //   ⇒ ⚠️ 旧宿主若写「`skipped === 'too_soon'` ⇒ 跳过，否则 ⇒ 算了」
+    //     ⇒ 会把 `'disabled'` **误判成「算了」** ⇒ 这是**破坏性变更**（`docs/DELIVERY.md` 有登记）。
+    expect(result.skipped).toBe('disabled');
+    // ⚠️ **不变式**：`computed === (skipped === null)`（三个取值下都必须成立）。
+    expect(result.computed).toBe(result.skipped === null);
 
     // ── 断言④：**`clusters()` 返回空**（不读簇表、不现场重算）──
     const navigation = clusters({ db: off.db, params: off.store.params }, undefined, NOW);
@@ -372,6 +379,149 @@ describe('P3-T06 · 开关逐条复验 ② `coactivation`（共激活 / 联想�
       .prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'sweep'")
       .get() as { n: number };
     expect(onEvents.n).toBe(before.events.n + 1);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 三·补、`recluster()` 的 `skipped` 三值枚举（2026-11-02 架构师裁决 · v2.1 勘误）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * ★ **三张簇表 + `sweep` 事件条数**的快照（**「没写库、没记事件」的判据**）。
+ *
+ * ⚠️ **为什么是「表内容哈希」而不是「行数」**：行数不变**不蕴含**内容不变
+ *   （改内容不改行数是可能发生的）⇒ 哈希更强。
+ * ⚠️ **为什么连 `cluster_snapshot_meta` 一起断**：它是快照的**元信息**行
+ *   ⇒ 重算会**整行替换**它 ⇒ 它变了就说明「真的写了库」。
+ */
+interface ClusterWriteFootprint {
+  readonly clusters: string;
+  readonly members: string;
+  readonly meta: string;
+  readonly sweepEvents: number;
+}
+
+/** 采一份「簇表 + sweep 事件」的写入足迹。 */
+function clusterFootprint(db: Database.Database): ClusterWriteFootprint {
+  return {
+    clusters: tableHash(db, 'theme_clusters', 'cluster_id'),
+    members: tableHash(db, 'theme_cluster_members', 'cluster_id, memory_id'),
+    meta: tableHash(db, 'cluster_snapshot_meta', 'id'),
+    sweepEvents: (
+      db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'sweep'").get() as { n: number }
+    ).n,
+  };
+}
+
+describe('P3-T06 · 补 · `recluster()` 的 `skipped` 三值枚举（v2.1 勘误）', () => {
+  it("★ 三个取值：`'too_soon'` / `'disabled'` / `null` 都能被**真实触发**（不是构造出来的）", () => {
+    // ── 取值①：`'disabled'`（机制开关 `coactivation` 关）──
+    const off = makeStore({ ...BASELINE_GROUP });
+    seedAssociationWorld(off.db);
+    const disabled = recluster(off.store, NOW);
+    expect(disabled.skipped).toBe('disabled');
+    expect(disabled.computed).toBe(false);
+
+    // ── 取值②：`'too_soon'`（间隔闸门：距上次发布不足 `CLUSTER_RECALC_INTERVAL_MS`）──
+    const on = makeStore({ ...BASELINE_GROUP, coactivation: true });
+    seedAssociationWorld(on.db);
+    const first = recluster(on.store, NOW);
+    expect(first.skipped).toBe(null);
+    expect(first.computed).toBe(true);
+    // ⚠️ **同一时刻再调一次** ⇒ `at - previous.computed_at = 0` ⇒ 间隔闸门拦下。
+    const tooSoon = recluster(on.store, NOW);
+    expect(tooSoon.skipped).toBe('too_soon');
+    expect(tooSoon.computed).toBe(false);
+
+    // ── 取值③：`null`（真算了）──
+    // ⚠️ **跨过间隔闸门**（`NOW + CLUSTER_RECALC_INTERVAL_MS`）⇒ 真的重算并发布。
+    const later = recluster(on.store, NOW + DEFAULT_PARAMS.CLUSTER_RECALC_INTERVAL_MS);
+    expect(later.skipped).toBe(null);
+    expect(later.computed).toBe(true);
+  });
+
+  it('★ **不变式**：三个取值下 `computed === (skipped === null)` 都成立', () => {
+    const off = makeStore({ ...BASELINE_GROUP });
+    seedAssociationWorld(off.db);
+    const disabled = recluster(off.store, NOW);
+
+    const on = makeStore({ ...BASELINE_GROUP, coactivation: true });
+    seedAssociationWorld(on.db);
+    const computed = recluster(on.store, NOW);
+    const tooSoon = recluster(on.store, NOW);
+
+    // ⚠️ **三个取值都取到了**（否则下面的断言可能是「空集恒真」）。
+    expect([disabled.skipped, computed.skipped, tooSoon.skipped]).toEqual([
+      'disabled',
+      null,
+      'too_soon',
+    ]);
+    // ⚠️ **不变式本体**：`computed` 是**派生量**（`skipped` 的函数）⇒ 两者必须恒等。
+    expect(disabled.computed).toBe(disabled.skipped === null);
+    expect(computed.computed).toBe(computed.skipped === null);
+    expect(tooSoon.computed).toBe(tooSoon.skipped === null);
+    // ⚠️ **方向也要对**（不只是「两者相等」）：跳过的两个取值 ⇒ `computed = false`；
+    //   真算的那个 ⇒ `computed = true`。
+    expect(disabled.computed).toBe(false);
+    expect(tooSoon.computed).toBe(false);
+    expect(computed.computed).toBe(true);
+  });
+
+  it('★ **新不变式**：`skipped !== null` ⇒ **没有写库、没有记事件**（两个跳过取值都要守）', () => {
+    // ── `'disabled'`：机制开关关 ⇒ 连读共激活图都不读 ⇒ 三张簇表逐位不变 ──
+    const off = makeStore({ ...BASELINE_GROUP });
+    seedAssociationWorld(off.db);
+    const before = clusterFootprint(off.db);
+    const disabled = recluster(off.store, NOW);
+    expect(disabled.skipped).not.toBe(null);
+    const afterDisabled = clusterFootprint(off.db);
+    expect(afterDisabled.clusters).toBe(before.clusters);
+    expect(afterDisabled.members).toBe(before.members);
+    expect(afterDisabled.meta).toBe(before.meta);
+    expect(afterDisabled.sweepEvents).toBe(before.sweepEvents);
+
+    // ── `'too_soon'`：间隔闸门 ⇒ 幂等返回 ⇒ 三张簇表逐位不变、事件一条不多 ──
+    const on = makeStore({ ...BASELINE_GROUP, coactivation: true });
+    seedAssociationWorld(on.db);
+    const beforeComputed = clusterFootprint(on.db);
+    const computed = recluster(on.store, NOW);
+    expect(computed.skipped).toBe(null);
+    const afterComputed = clusterFootprint(on.db);
+    // ⚠️ **前提自检**：真的算过一次 ⇒ 事件**确实多了一条**、快照元信息**确实变了**
+    //   ⇒ 否则下面那些「没变」的断言可能是「本来就没东西可变」的恒绿守卫。
+    expect(afterComputed.sweepEvents).toBe(beforeComputed.sweepEvents + 1);
+    expect(afterComputed.meta).not.toBe(beforeComputed.meta);
+
+    const beforeTooSoon = clusterFootprint(on.db);
+    const tooSoon = recluster(on.store, NOW);
+    expect(tooSoon.skipped).toBe('too_soon');
+    expect(tooSoon.skipped).not.toBe(null);
+    const afterTooSoon = clusterFootprint(on.db);
+    expect(afterTooSoon.clusters).toBe(beforeTooSoon.clusters);
+    expect(afterTooSoon.members).toBe(beforeTooSoon.members);
+    expect(afterTooSoon.meta).toBe(beforeTooSoon.meta);
+    expect(afterTooSoon.sweepEvents).toBe(beforeTooSoon.sweepEvents);
+  });
+
+  it("★ **两个跳过取值的返回口径不同**：`'disabled'` ⇒ 簇数与占比都是 0；`'too_soon'` ⇒ 簇数是**上次快照的**", () => {
+    // ⚠️ 设计稿原文：「`'disabled'` ⇒ `clusterCount = 0`、`largestClusterRatio = 0`
+    //   （因为「簇」这件事**根本不存在**，不是「存在但为空」）；
+    //   `'too_soon'` ⇒ `clusterCount` = **上一次已发布快照**的簇数
+    //   （`largestClusterRatio` = 现算的「最大块 / 未删记忆数」）。
+    const off = makeStore({ ...BASELINE_GROUP });
+    seedAssociationWorld(off.db);
+    const disabled = recluster(off.store, NOW);
+    expect(disabled.clusterCount).toBe(0);
+    expect(disabled.largestClusterRatio).toBe(0);
+
+    const on = makeStore({ ...BASELINE_GROUP, coactivation: true });
+    seedAssociationWorld(on.db);
+    const computed = recluster(on.store, NOW);
+    expect(computed.clusterCount).toBeGreaterThan(0);
+    const tooSoon = recluster(on.store, NOW);
+    // ⚠️ 「跳过时 `clusterCount` 与真算出来「长得一样」」⇒ **不能靠它判断有没有重算**。
+    expect(tooSoon.clusterCount).toBe(computed.clusterCount);
+    expect(tooSoon.skipped).toBe('too_soon');
   });
 });
 

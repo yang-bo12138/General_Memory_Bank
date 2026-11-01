@@ -44,10 +44,26 @@ export interface ReclusterResult {
   clusterCount: number;
   /** 切分后的最大块占比（「现在有没有大簇」）。 */
   largestClusterRatio: number;
-  /** 本次**是否真的重算了**。 */
+  /**
+   * 本次**是否真的重算了**。
+   *
+   * ⚠️ ★ **它是派生量**：`computed === (skipped === null)`
+   *   ⇒ 保留它只是为了 §6 的**向后兼容**（宿主可以只读 `computed`）
+   *   ⇒ **宿主的读法**：先看 `computed`（有没有算）→ 再看 `skipped`（为什么没算）。
+   */
   computed: boolean;
-  /** 非 `null` ⇒ 因距上次发布不足 `CLUSTER_RECALC_INTERVAL_MS` 而跳过。 */
-  skipped: 'too_soon' | null;
+  /**
+   * ★ **没重算的原因**（`null` ⇒ 没有跳过）。
+   *
+   * ⚠️ **三个取值**（2026-11-02 架构师裁决 · v2.1 勘误）：
+   *   · `'too_soon'` ⇒ 因距上次发布不足 `CLUSTER_RECALC_INTERVAL_MS` 而跳过；
+   *   · `'disabled'` ⇒ 因机制开关 `coactivation` 关闭而**没算**；
+   *   · `null`      ⇒ 没有跳过（此时 `computed` 恒为 `true`）。
+   *
+   * ⚠️ ★ **不变式**：`computed === (skipped === null)`。
+   * ⚠️ ⚠️ **不要靠 `clusterCount` 的值判断有没有重算**（跳过的返回值见下）。
+   */
+  skipped: 'too_soon' | 'disabled' | null;
 }
 
 /** `recluster` 需要的上下文（库句柄 + 生效参数 + 事件写入器）。 */
@@ -225,6 +241,7 @@ function publishSnapshot(
  *
  * ⚠️ **距上次发布不足 `CLUSTER_RECALC_INTERVAL_MS` ⇒ 跳过**（幂等返回，`skipped = 'too_soon'`）
  *   ⇒ 宿主任意频繁调用都不会触发阻塞。
+ * ⚠️ **机制开关 `coactivation` 关 ⇒ 也没算**（幂等返回，`skipped = 'disabled'`）。
  * ⚠️ **跳过时 `clusterCount` 与真算出来「长得一样」** ⇒ 宿主必须靠 `computed` / `skipped` 区分，
  *   **不能靠 `clusterCount` 的值判断有没有重算**。
  *
@@ -253,11 +270,14 @@ export function recluster(store: ClusterStore, now?: number): ReclusterResult {
   //   ⚠️ **为什么放在只读守卫之后**：§6 把 `recluster` 列为**三个写方法**之一
   //   ⇒ 「在只读实例上调写方法」是**契约违规**，**与开关无关**
   //   ⇒ §7.1 的守卫**不得随开关变化**（否则「关掉开关就绕过了只读守卫」）。
-  //   ⚠️ **`skipped` 用设计稿已有的词汇**（`'too_soon' | null`）⇒ **不新增枚举值**：
-  //   「没重算」由 `computed: false` 表达；`skipped: null` 表示「**不是**因为间隔太短」
-  //   ⇒ 结合 `computed` 就能唯一地推出「机制被关掉了」（实现里只有这两种「没重算」）。
+  //   ⚠️ ★ **`skipped = 'disabled'`**（2026-11-02 架构师裁决 · v2.1 勘误）：
+  //   「没重算」的**原因**必须被说出来 ⇒ 旧宿主若写「`skipped === 'too_soon'` ⇒ 跳过，
+  //   否则 ⇒ 算了」会把 `'disabled'` **误判成「算了」** ⇒ 这是**破坏性变更**
+  //   （见 `docs/DELIVERY.md` 的破坏性变更清单）。
+  //   ⇒ 返回口径与 `'too_soon'` **不同**：`clusterCount = 0`、`largestClusterRatio = 0`
+  //     （因为「簇」这件事**根本不存在**，不是「存在但为空」）。
   if (!resolveFlags(params).coactivation) {
-    return { clusterCount: 0, largestClusterRatio: 0, computed: false, skipped: null };
+    return { clusterCount: 0, largestClusterRatio: 0, computed: false, skipped: 'disabled' };
   }
 
   const previous = readSnapshotMeta(db);
@@ -313,6 +333,8 @@ export function recluster(store: ClusterStore, now?: number): ReclusterResult {
   return {
     clusterCount: computation.clusters.length,
     largestClusterRatio: computation.largestClusterRatio,
+    // ⚠️ ★ **不变式 `computed === (skipped === null)`**（2026-11-02 架构师裁决）：
+    //   三个取值下都必须成立 ⇒ 这里「算了」⇒ `computed: true` + `skipped: null`。
     computed: true,
     skipped: null,
   };

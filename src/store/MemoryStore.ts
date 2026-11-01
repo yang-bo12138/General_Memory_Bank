@@ -522,6 +522,11 @@ export class MemoryStore {
    * ⚠️ **幂等跳过**：距上次发布不足 `CLUSTER_RECALC_INTERVAL_MS` ⇒ 返回
    *   `computed: false` / `skipped: 'too_soon'`（宿主必须靠这两个字段判断有没有真算，
    *   **不能靠 `clusterCount` 的值**）。
+   * ⚠️ ★ **`skipped` 是三值枚举**（2026-11-02 架构师裁决 · v2.1 勘误）：
+   *   `'too_soon'`（间隔不够）/ `'disabled'`（机制开关 `coactivation` 关）/ `null`（真算了）
+   *   ⇒ **不变式**：`computed === (skipped === null)`
+   *   ⇒ ⚠️ **宿主不要写「`skipped === 'too_soon'` ⇒ 跳过，否则 ⇒ 算了」**
+   *     （那会把 `'disabled'` 误判成「算了」⇒ **破坏性变更**，见 `docs/DELIVERY.md`）。
    *
    * @param now 注入时钟（C37）
    * @returns §6 的 `{ clusterCount, largestClusterRatio, computed, skipped }`

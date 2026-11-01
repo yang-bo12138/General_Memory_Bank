@@ -54,6 +54,55 @@
 
 ---
 
+## ★ 破坏性变更清单（宿主接入必读）
+
+⚠️ **本清单只记「旧宿主会静默判错」的变更** ——
+凡是「新 API、旧宿主压根调不到 ⇒ 立刻报错」的**不算破坏性**（那是加法）。
+⇒ ⚠️ **下面每一条都是「不报错、但结论错」的类型** ⇒ 接入前必须逐条核对。
+
+| # | 变更 | 旧宿主的写法（**会静默判错**） | 新口径 |
+|---|---|---|---|
+| 1 | ★ **`recluster()` 的 `skipped` 从两值扩成三值**：`'too_soon' \| null` ⇒ **`'too_soon' \| 'disabled' \| null`** | `if (r.skipped === 'too_soon') { /* 跳过 */ } else { /* 算了 */ }` | **先看 `computed`（有没有算）→ 再看 `skipped`（为什么没算）** |
+
+### 1.1 `recluster()` 的 `skipped` 三值枚举（**2026-11-02 架构师裁决 · v2.1 勘误**）
+
+⚠️ ★ **为什么这条是破坏性的（而不是加法）**：
+- **旧签名** `'too_soon' | null` ⇒ **`skipped === null` 唯一地意味着「真算了」**；
+- **新签名**多了 `'disabled'` ⇒ **`skipped === null` 仍然是「真算了」**（这条语义**没变**），
+  **但「`skipped !== 'too_soon'` ⇒ 算了」这句写法不再成立** ⇒ 旧宿主会把 `'disabled'`
+  **误判成「算了」**；
+- ⇒ ⇒ **误判的后果**：机制开关 `coactivation` 关时，主题簇**根本没算**
+  （§5：「主题簇不计算也不使用」）⇒ 宿主却以为「簇刚重算过」⇒
+  **面板会拿一份从未发布的簇快照当最新结果展示** ⇒ **静默的错误结论**。
+
+⇒ ⇒ **兼容写法（新旧宿主都能用）**：
+
+```ts
+const computed = result.computed;   // ★ 唯一安全的判据（派生量：computed === (skipped === null)）
+const reason = result.skipped;       // 'too_soon' | 'disabled' | null
+```
+
+⚠️ **`computed` 是派生量**（不变式 `computed === (skipped === null)`）⇒
+它被保留**只是为了向后兼容**（宿主可以只读 `computed`）。
+⚠️ ★ **两个跳过取值的返回口径不同（别混）**：
+- `'too_soon'` ⇒ `clusterCount` = **上一次已发布快照**的簇数
+  （`largestClusterRatio` = 现算的「最大块 / 未删记忆数」）
+  ⇒ **「跳过时 `clusterCount` 与真算出来「长得一样」」**
+  ⇒ ⇒ **不能靠 `clusterCount` 的值判断有没有重算**；
+- `'disabled'` ⇒ `clusterCount = 0`、`largestClusterRatio = 0`
+  ⇒ 因为「簇」这件事**根本不存在**（不是「存在但为空」）。
+
+⚠️ ★ **不变式（可被宿主依赖）**：`skipped !== null` ⇒ **没有写库、没有记事件**（幂等返回）
+⇒ 三张簇表（`theme_clusters` / `theme_cluster_members` / `cluster_snapshot_meta`）**逐位不变**
+＋ `events` 表里 `type='sweep'` 的条数**不变**。
+⚠️ **判定顺序（实现必须照这个顺序）**：① 只读守卫（§7.1）⇒ ② 机制开关 `coactivation` ⇒ ③ 间隔闸门
+⇒ **只读守卫在开关判定之前**（否则「关掉开关就绕过了只读守卫」）。
+
+📎 出处：`docs/design/DESIGN-v2.md` §6（`recluster` 签名 · 2026-11-02 架构师裁决 · v2.1 勘误）
+· 实现在 `src/store/clusters.ts` · 断言在 `tests/baseline/v1-equivalence-stage3.test.ts`。
+
+---
+
 ## 一、TL;DR
 
 阶段 0（骨架与不变量）**全部完成并经 QA 五轮独立复核**；阶段 1（存储与基础运算）的
