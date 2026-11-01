@@ -12,17 +12,25 @@
 
 | 文件 | 内容 | 生成命令 |
 |------|------|---------|
-| `agreement-10000.json` | 吻合率（1 万条） | `pnpm exec tsx bench/agreement.ts --scale=10000 --queries=50` |
-| `perf-10000.json` | 三条 P99（1 万条） | `pnpm exec tsx bench/perf.ts --scale=10000 --queries=50 --writes=50` |
-| `baseline-flat-10000.json` | 前置测量：flat 路线的向量路占比（1 万条） | `pnpm exec tsx bench/baseline-flat.ts --scale=10000 --queries=50` |
-| `agreement-1000000.json` | 吻合率（**100 万条**） | `pnpm exec tsx bench/agreement.ts --scale=1000000 --queries=30 --db=.tmp/bench/shared-1000000.db` |
-| `perf-1000000.json` | 三条 P99（**100 万条**） | `pnpm exec tsx bench/perf.ts --scale=1000000 --queries=50 --writes=50 --reuse=true --db=.tmp/bench/shared-1000000.db` |
-| `baseline-flat-1000000.json` | 前置测量（**100 万条**） | `pnpm exec tsx bench/baseline-flat.ts --scale=1000000 --queries=30 --reuse=true --db=.tmp/bench/shared-1000000.db` |
+| `agreement-10000.json` | 吻合率（1 万条） | `pnpm exec tsx bench/agreement.ts --scale=10000 --queries=200` |
+| `perf-10000.json` | 三条 P99（1 万条） | `pnpm exec tsx bench/perf.ts --scale=10000 --queries=200 --writes=200` |
+| `baseline-flat-10000.json` | 前置测量：flat 路线的向量路占比（1 万条） | `pnpm exec tsx bench/baseline-flat.ts --scale=10000 --queries=200` |
+| `agreement-1000000.json` | 吻合率（**100 万条**） | `pnpm exec tsx bench/agreement.ts --scale=1000000 --queries=200 --reuse=true --db=.tmp/bench/shared-1000000.db` |
+| `perf-1000000.json` | 三条 P99（**100 万条**） | `pnpm exec tsx bench/perf.ts --scale=1000000 --queries=200 --writes=200 --reuse=true --db=.tmp/bench/shared-1000000.db` |
+| `baseline-flat-1000000.json` | 前置测量（**100 万条**） | `pnpm exec tsx bench/baseline-flat.ts --scale=1000000 --queries=200 --reuse=true --db=.tmp/bench/shared-1000000.db` |
 | `mutation.md` | **变异实测记录**（4 处 ⇒ 断言全部变红 ⇒ `cmp` 逐字节还原） | `bash scripts/bench-mutation.sh` |
 
 > ⚠️ **百万级的三个脚本共用同一份库**（`--db=... --reuse=true`）：
-> 「灌库 + 训练」在百万级要 ~1.5 小时 ⇒ 三个脚本各跑一次 = 4.5 小时，不可接受；
+> 「灌库 + 训练」在百万级要 ~5 小时 ⇒ 三个脚本各跑一次 = 15 小时，不可接受；
 > 而且**三个脚本必须测同一份语料与同一套分桶**才有可比性 ⇒ **一次准备、三次测量**。
+> ⇒ **`--reuse=true` 是必须的**，且它**依赖库旁的 `*.manifest.json` 清单**（记录种子与规模）
+> ⇒ **清单丢了 ⇒ 下一次跑会删库重灌（5 小时）** ⇒ 复用期间**不要删那份清单**。
+
+> ⚠️ ★ **P99 的样本量下限（2026-11-01 补）**：`bench/perf.ts` 的 `--queries` / `--writes`
+> **必须 ≥ 100**（nearest-rank 口径下，**n < 100 时 P99 就是最大值** ⇒ 那个数不是 P99，
+> 是「最大的一次」）⇒ **样本量不足 ⇒ 该 P99 不可判定**（既不算达标、也不算不达标）。
+> ⇒ 上表的命令**全部用 `--queries=200 --writes=200`**（P99 至少要有 100 个样本才可判定）。
+> ⇒ ⚠️ **旧数据（`--queries=50` / `--writes=50`）的 P99 不可判定** ⇒ 已按新口径重刷。
 
 ## 怎么读这些数字
 
@@ -38,17 +46,31 @@
 ### 2. `machine`（机器环境）
 
 ⚠️ **P99 是「这份数据 + 这台机器」的结论** ⇒ 没有机器信息的 P99 不可复现、不可比较。
+⚠️ ★ **但 `machine` 块不能整体当「机器指纹」用**（2026-11-01 订正）：
+`freeMemoryBytes` / `usedMemoryBytes` 是**采集瞬间的快照**（`freemem()`）⇒ **每次运行必然不同**
+⇒ **不能**据「两个 JSON 的 `machine` 不完全相同」就断言「不是同一台机器 / 两个 P99 不可比」。
+⇒ **可比性看硬件标识**：`platform` / `node` / `cpuModel` / `cpuCount` / `totalMemoryBytes`
+（＋ `benchNow` / 语料规模）⇒ **这几项相同 ⇒ P99 可比**。
 
 ### 3. 百分位
 
 **nearest-rank**：`rank = ceil(p/100 × n)`（1 起数），样本升序。
 `n = 0` ⇒ 返回 `0`（不是 `NaN`）。
+⚠️ ★ **样本量下限（可判定性的前提）**：**n < 100 时 P99 落在最大值附近** ⇒ 那个数**不是 P99**，
+是「最大的一次」⇒ **不可判定**（既不算达标、也不算不达标）。
+⇒ 落盘数据的 `count` 字段**必须 ≥ 100** 才允许拿它的 P99 下结论。
 
 ### 4. 预热
 
 `warmupRounds = 20` 轮**不计入统计**（recall / 向量路 / **写入**都预热）。
 ⚠️ **写入也必须预热**：第一次写入会承担「WAL 首次落盘 + 页缓存装载 + 中心向量缓存建好」
 的一次性成本 ⇒ 不预热 ⇒ **P99 = max = 第一次写入**（实测 10k 规模：首次 245ms、后续 ~4ms）。
+⚠️ ★ **但预热只解决「第一次」，解决不了「周期性停顿」**（2026-11-01 实测）：
+1 万条 / 200 次写入的**逐样本**分布里，**离群样本是周期性出现的**（#2/#3、#52/#53、#98/#99、
+#147/#148、#196/#197 ⇒ 约每 49 次一轮），单次可达 **0.8~1.3 秒**，而其余样本 p50 ≈ 6.8ms。
+⇒ ⇒ **写入 P99 天然被周期性事件支配**（WAL checkpoint / FTS5 段合并一类），
+**不是**「某一次写慢了」⇒ **预热再多轮也不能把它压下去** ⇒ 读写入 P99 时**必须先看分布**（p50/p90/p95），
+不能只看 P99。
 
 ## 三条「口径」的读法
 
@@ -157,8 +179,18 @@ vec(doc)  = normalize( Σ_{word ∈ doc} dir(word) )
   门禁从「秒级」变成「小时级」；而且 **CI 机器的性能不代表**性能基线的结论
   （基线必须在**记录在案的**机器上采）。
 - ⇒ **重测靠人跑脚本，守门靠小规模冒烟**。
-- ⚠️ **门禁里只断言「逻辑正确」，不断言「性能达标」**：性能门槛是**软阈值**
-  （共享机器上是参考线）⇒ 放进门禁必然 flaky ⇒ 门禁只断
+- ⚠️ **门禁里只断言「逻辑正确」，不断言「性能达标」**：性能门槛**按归口分两档**
+  （★ 2026-11-01 架构裁决，详见 `docs/design/DEVELOPMENT-PLAN.md` 的 P2-T08 门槛表与
+  `docs/design/DESIGN-v2.md` §12 阶段 2 的验收清单）：
+  - **硬门槛（归 P2，不达标 = 分桶架构不成立）**：**向量路 P99 ≤ 20ms**、**向量路占总耗时 ≤ 20%**
+    ⇒ 量的是**分桶后向量路自己**的成本。
+  - **参考线（归文本路，不判 P2 收官）**：**recall P99 ≤ 200ms**、**写入 P99 ≤ 5ms**
+    ⇒ 量的是**整条流水线**（文本路 FTS5 + 图谱路 + 写入的索引维护）；**P2 既没造它、也没改它**
+    ⇒ 仍然**必须测、必须落盘、必须给出归因**（是文本路？索引维护？规模效应？）。
+  ⇒ **两档都放不进门禁**（共享机器上必然 flaky）⇒ 门禁只断
   「吻合率口径 / 只漏不错 / 桶内精确性 / 语料可复现 / embedder 确定性 / P99 工具自检」。
+- ⚠️ ★ **100 万条上 recall / 写入那两条参考线当前不达标**（旧数据：recall P99 678ms、写入 P99 658ms）
+  ⇒ 这是一个**归文本路的待办欠账**（见 `docs/progress/stage2-progress.md`），
+  **不是** P2 的失败；但也**不得**据此宣称「整条流水线性能达标」。
 - ⚠️ **构建产物不含 bench**：`tsconfig.json` 的 `include` 含 `bench`（**类型检查覆盖它**），
   但 `tsconfig.build.json` 的 `include` 只有 `src` ⇒ `pnpm run build` 不产出 bench。
