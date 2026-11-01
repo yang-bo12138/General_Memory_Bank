@@ -8,6 +8,21 @@
 > 的文件头与 `docs/design/DEVELOPMENT-PLAN.md` 行 2004~2052 为准。
 > 本文件只做**索引 + 读法说明**。
 
+> ⚠️⚠️ **★ 现状声明（2026-11-01，架构裁决）—— 100 万条上 recall / 写入那两条**当前不达标**
+>
+> | 指标 | 100 万条实测 | 门槛 | 状态 |
+> |---|---|---|---|
+> | recall P99 | **678ms**（旧数据，样本量不足 ⇒ 不可判定） | ≤ 200ms | ❌ **不达标** |
+> | 写入 P99 | **658ms**（旧数据，样本量不足 ⇒ 不可判定） | ≤ 5ms | ❌ **不达标** |
+> | 向量路 P99 | 13.35ms（旧数据，样本量不足 ⇒ 不可判定） | ≤ 20ms | ✅ 达标 |
+> | 向量路占总耗时 | 2.17% | ≤ 20% | ✅ 达标 |
+>
+> ⇒ **P2 **未**据此宣称「性能达标」**：按裁决（`DEVELOPMENT-PLAN.md` 的 P2-T08 门槛表），
+> recall / 写入那两条是**归文本路的参考线**（记实测值 + 归因，**不判 P2 收官**）——
+> **但它们在 100 万条上确实不达标 ⇒ 这是一个必须被写下来的待办欠账**
+> （阶段 3/4 的召回质量回归接手，见 `docs/progress/stage2-progress.md`）。
+> ⇒ **P2 收官 = 阶段 2 收官 ≠ 整条流水线性能达标。**
+
 ## 文件
 
 | 文件 | 内容 | 生成命令 |
@@ -15,9 +30,9 @@
 | `agreement-10000.json` | 吻合率（1 万条） | `pnpm exec tsx bench/agreement.ts --scale=10000 --queries=200 --allow-small-scale` |
 | `perf-10000.json` | 三条 P99（1 万条） | `pnpm exec tsx bench/perf.ts --scale=10000 --queries=200 --writes=200 --allow-small-scale` |
 | `baseline-flat-10000.json` | 前置测量：flat 路线的向量路占比（1 万条） | `pnpm exec tsx bench/baseline-flat.ts --scale=10000 --queries=200 --allow-small-scale` |
-| `agreement-1000000.json` | 吻合率（**100 万条**） | `pnpm exec tsx bench/agreement.ts --scale=1000000 --queries=200 --reuse=true --db=.tmp/bench/shared-1000000.db` |
+| `agreement-1000000.json` | 吻合率（**100 万条**） | `pnpm exec tsx bench/agreement.ts --scale=1000000 --queries=10 --reuse=true --db=.tmp/bench/shared-1000000.db` |
 | `perf-1000000.json` | 三条 P99（**100 万条**） | `pnpm exec tsx bench/perf.ts --scale=1000000 --queries=200 --writes=200 --reuse=true --db=.tmp/bench/shared-1000000.db` |
-| `baseline-flat-1000000.json` | 前置测量（**100 万条**） | `pnpm exec tsx bench/baseline-flat.ts --scale=1000000 --queries=200 --reuse=true --db=.tmp/bench/shared-1000000.db` |
+| `baseline-flat-1000000.json` | 前置测量（**100 万条**） | `pnpm exec tsx bench/baseline-flat.ts --scale=1000000 --queries=2 --reuse=true --db=.tmp/bench/shared-1000000.db` |
 | `mutation.md` | **变异实测记录**（4 处 ⇒ 断言全部变红 ⇒ `cmp` 逐字节还原） | `bash scripts/bench-mutation.sh` |
 
 > ⚠️ ★ **规模守卫（2026-11-01 补 · P2-T08 硬断言「规模写进验收行」）**：
@@ -42,8 +57,15 @@
 > ⚠️ ★ **P99 的样本量下限（2026-11-01 补）**：`bench/perf.ts` 的 `--queries` / `--writes`
 > **必须 ≥ 100**（nearest-rank 口径下，**n < 100 时 P99 就是最大值** ⇒ 那个数不是 P99，
 > 是「最大的一次」）⇒ **样本量不足 ⇒ 该 P99 不可判定**（既不算达标、也不算不达标）。
-> ⇒ 上表的命令**全部用 `--queries=200 --writes=200`**（P99 至少要有 100 个样本才可判定）。
+> ⇒ **`perf-*.json` 用 `--queries=200 --writes=200`**（P99 至少要有 100 个样本才可判定）。
 > ⇒ ⚠️ **旧数据（`--queries=50` / `--writes=50`）的 P99 不可判定** ⇒ 已按新口径重刷。
+>
+> ⚠️ **为什么 `agreement` / `baseline-flat` 在百万级用小样本**（**它们不是 P99**）：
+> · `agreement` 的判据是**逐查询的精确断言**（错数 = 0 / 越界数 = 0 / 桶内逐位相同）
+>   ⇒ **不是统计量** ⇒ 10 条查询就足以判定「对不对」；
+>   （吻合率那个比例是统计量 ⇒ 它的采样精度受查询数限制 ⇒ **读它时要连 `queryCount` 一起读**。）
+> · `baseline-flat` 的**每次查询 = 一次全表精确扫描**（百万级 ≈ 15 分钟/次）⇒ 查询数直接乘在成本上
+>   ⇒ **2 条**是「跑得完」与「有代表性」之间的取舍 ⇒ **它是「证据」不是「验收条件」**（见计划稿原文）。
 
 ## 怎么读这些数字
 
