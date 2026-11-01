@@ -51,6 +51,7 @@
 | 脚本 | 检查什么 | 依据 |
 | --- | --- | --- |
 | `scripts/audit-tier-qualifiers.mjs` | `docs/baseline/README.md` 的**档位限定一致性**：① **只属于某一档的数**（毫秒 / 占比 / 每行读成本）**必须**带档位限定词；② **跨档一致的数**（H1 = 12,782 行 / H2 = 1.2782%）**不许**被写成「只在这一档成立」（但**允许**出现在「这组数采自哪一次」的出处陈述里 ⇒ 那只作提示不判红） | `docs/baseline/README.md`「★★ 冷盘 / 热盘两档对照」与「★★★ 三处口径修正」；`docs/progress/stage3-progress.md` §十二 |
+| `scripts/audit-two-layer.mjs` | **「两个层次必须分开列」的审计**（§2.4 纪律 4 的写法要求）：凡是出现「**逐位相同**」**且处于跨档对照语境**的句子，必须点名【被比较的量】（`行数` / `候选读取行数` / `candidateReadRows` / `hitFineBuckets` / `vectorCandidateRows` / `H1` / `H2` …）⇒ **指不出是哪个量 ⇒ 判为「不可发」**。⚠️ **范围刻意收窄到「跨档语境」**：裸触发词在 `docs/` 里有 **98 行**，其中绝大多数是合法的（衰减公式两种写法相同、`top-K` 逐位相等……）⇒ ⇒ **若不收窄 ⇒ 会产出 ~76 个假阳性**⇒ ⇒ **一个假阳性泛滥的检查会被加白名单绕过 ⇒ 等于没有检查**。★ **白名单自检**：`CODE_FIELD_NAMES` 里的**代码字段名必须逐个出现在 `bench/perf.ts`** ⇒ 否则白名单已漂移 ⇒ 判红。**实测：触发行 98 / 判定数 30 / 真缺 0** | §2.4 **纪律第 4 条**的「写法要求」；`docs/progress/stage3-progress.md` §13.9.6（规格 ＋ 落地过程）＋ §13.9.2 **实例 ⑤**（原型事故） |
 
 ```bash
 # 审计默认目标（仓库根的 docs/baseline/README.md）
@@ -58,6 +59,9 @@ node scripts/audit-tier-qualifiers.mjs
 
 # 审计别处的同名文件（用于比对别的分支的快照）
 node scripts/audit-tier-qualifiers.mjs path/to/README.md
+
+# 审计「两个层次必须分开列」（全仓 docs/，排除 docs/qa/）
+node scripts/audit-two-layer.mjs
 ```
 
 ⚠️ **它为什么值得存在**（**不是「再写一遍检查」**）：百万级基线有**三档采集**，
