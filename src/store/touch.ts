@@ -326,12 +326,21 @@ export function touch(
     //   「与 v1.0 逐位一致」的基线条件是「四个开关全关」⇒ v1.0 的 `touch` 事件里
     //   **没有** `coactPairs` / `coactPairsTruncated` / `activationWrites` / `coactSkipped`
     //   ⇒ 开关关着还带 ⇒ 基线断言红（**那正是「与 v1.0 逐位一致」这条承诺的实现**）。
-    const coactivationOn = resolveFlags(store.params).coactivation;
+    // ⚠️ ★ **机制开关 `writeBack`**（§5 机制开关表）：
+    //   关 ⇒ 关闭「**扩散唤起 → 采纳 → 回写**」的**联动**部分
+    //   ⇒ **`touch` 的 `coActivateWith` 交叉强化不发生**
+    //   ⇒ ⇒ **这里就不把声明传下去**（`coacts.ts` 那侧另有一道**权威**短路 ⇒ 双保险，
+    //   与 `coactivation` 的「调用点 + 写入点各判一次」是**同一个既有模式**）。
+    //   ⚠️ **`touch` 自身的 `growStability` 加固不受影响**（§5 明写）⇒
+    //   **只挡声明，不挡加固**（加固在上面第 ①② 步，与本处无关）。
+    //   ⚠️ **`writeBack` 关掉 ≠ 不写 `coacts`**：普通共激活（机制 A）**照旧**。
+    const flags = resolveFlags(store.params);
+    const coactivationOn = flags.coactivation;
     const coacts: CoactWriteResult =
       reason === 'explicit' && coactivationOn
         ? writeCoactivations(store, {
             ids: requested,
-            declarations: options?.coActivateWith,
+            declarations: flags.writeBack ? options?.coActivateWith : undefined,
             now: at,
           })
         : EMPTY_COACT_RESULT;
