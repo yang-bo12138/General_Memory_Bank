@@ -185,6 +185,14 @@ export interface PrepareBenchOptions {
    *   ⇒ 不满足就**重新准备**（绝不拿一个错的库去测）。
    */
   readonly reuseExisting?: boolean;
+  /**
+   * ★ **「明知要重灌」的显式声明**（**默认 `false`**）。
+   *
+   * ⚠️ **为什么需要它**：`--reuse=true` 而**复用不了**时 ⇒ **默认直接报错**
+   *   （不许悄悄删库重灌 ⇒ 那是 3~5 小时的活）
+   *   ⇒ 真的要重灌时 ⇒ 由调用方**显式**声明 ⇒ 意图写在命令行上 ⇒ 可追溯。
+   */
+  readonly forceRebuild?: boolean;
 }
 
 /** 准备结果的**清单文件**（**复用时读它** ⇒ 相位耗时不会丢）。 */
@@ -225,6 +233,24 @@ export function prepareBench(options: PrepareBenchOptions): PreparedBench {
     const reused = tryReuse(options.dbPath, corpusOptions);
     if (reused !== undefined) {
       return reused;
+    }
+    // ⚠️ ★★★ **「要求复用但复用不了」⇒ 必须**当场报错**，不许悄悄删库重灌**
+    //   （P2 收官 · Q-04 期间实测踩到）：
+    //   · 触发形状：库在、但**清单丢了**（或规模/种子对不上）⇒ `tryReuse` 返回 `undefined`
+    //     ⇒ 旧行为 = **删掉那个库** ⇒ 然后从零灌 100 万条（**3 小时**）
+    //     ⇒ 而调用方（人）以为「我只是复用了已有的库」⇒ **3 小时的活白干**；
+    //   · ⚠️ **实测**：另一个 bench 进程正开着那个库 ⇒ 删除被 Windows 文件锁挡下
+    //     ⇒ 报的是「删除失败」这个**误导性的错**（真正的问题是「清单没了」）；
+    //   · ⇒ **现在**：`--reuse=true` 却复用不了 ⇒ **立刻报错并说清原因**
+    //     ⇒ 要重灌必须**显式** `--force-rebuild=true`（⇒ 人的意图写在命令行上）。
+    if (options.forceRebuild !== true) {
+      throw new Error(
+        `bench：要求复用已准备好的库（--reuse=true），但**复用不了**：${options.dbPath}` +
+          `（清单缺失 / 规模或种子对不上 ⇒ 见 ${options.dbPath}${MANIFEST_SUFFIX}）。` +
+          '⇒ **不会**自动删库重灌（那是 3~5 小时的活）。' +
+          '⇒ 若确实要重灌 ⇒ 显式加 --force-rebuild=true；' +
+          '⇒ 若只是清单丢了 ⇒ 把那份清单找回来（复用期间不要删它）。',
+      );
     }
   }
   // ⚠️ ★ **每次都从空库开始**（bench 脚本必须**可重复跑**）：
@@ -285,6 +311,12 @@ function tryReuse(dbPath: string, corpus: CorpusOptions): PreparedBench | undefi
   // ⚠️ ★ **连种子也要对**：规模相同但种子不同 ⇒ **是不同的语料**
   //   ⇒ 若不比种子 ⇒ 复用的是**别的语料** ⇒ 结论无效。
   if (manifest.corpusSize !== corpus.size || manifest.seed !== corpus.seed) {
+    return undefined;
+  }
+  // ⚠️ ★ **清单版本不能比本代码新**（前向兼容）：
+  //   新版清单的字段含义可能已变 ⇒ 用旧代码读它 ⇒ **读出来的数是错的**
+  //   ⇒ 宁可**重新准备**（贵但正确）⇒ 绝不拿一个「读不懂的清单」去测。
+  if (manifest.manifestVersion !== undefined && manifest.manifestVersion > MANIFEST_VERSION) {
     return undefined;
   }
   const db = openBenchDatabase(dbPath);
@@ -465,14 +497,19 @@ function prepareWithDatabase(
   const sampler = new PeakRssSampler();
   sampler.start();
   const trainStart = process.hrtime.bigint();
-  const trained = trainBenchBuckets(db, {
-    coarseCenters: options.coarseCenters,
-    fineCenters: options.fineCenters,
-    nprobeCoarse: options.nprobeCoarse,
-    now: BENCH_NOW,
-  });
+  let trained: ReturnType<typeof trainBenchBuckets>;
+  try {
+    trained = trainBenchBuckets(db, {
+      coarseCenters: options.coarseCenters,
+      fineCenters: options.fineCenters,
+      nprobeCoarse: options.nprobeCoarse,
+      now: BENCH_NOW,
+    });
+  } finally {
+    // ⚠️ **失败也要停采样**（worker 线程不该泄漏）⇒ 训练抛错时也要收尾。
+    sampler.stop();
+  }
   const trainEnd = process.hrtime.bigint();
-  sampler.stop();
   const sampleCount = sampler.sampleCount();
   const trainPeakRss: PeakRssMeasurement = {
     kernelPeakBytes: sampler.kernelPeakBytes(),

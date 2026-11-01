@@ -375,6 +375,9 @@ function main(): void {
     fineCenters: DEFAULT_PARAMS.ROUTER_FINE_CENTERS,
     nprobeCoarse: DEFAULT_PARAMS.ROUTER_NPROBE_COARSE,
     reuseExisting: args.reuse === 'true',
+    // ⚠️ ★ **「明知要重灌」的显式声明**（默认 false）⇒
+    //   `--reuse=true` 而复用不了时**默认报错**（不许悄悄删库重灌 ⇒ 3~5 小时的活）。
+    forceRebuild: args['force-rebuild'] === 'true',
   });
   const db = prepared.db;
 
