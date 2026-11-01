@@ -246,6 +246,13 @@ export type {
   InhibitionTraceResult,
 } from './store/inhibition.js';
 export type { ReclusterResult } from './store/clusters.js';
+// ⚠️ `clusters()` 的返回类型**同样只导类型**（理由同上：唯一公开入口是门面方法）
+export type {
+  ClustersOptions,
+  ClustersResult,
+  ClusterSplitInfo,
+  ClusterView,
+} from './store/clusters.js';
 export {
   FileLogger,
   flattenField,

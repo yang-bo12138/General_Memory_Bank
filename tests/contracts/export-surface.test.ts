@@ -202,13 +202,14 @@ const LANDED_STAGES: readonly number[] = [0, 1, 2, 3];
 /**
  * ★ **已落地阶段里、但门面上还没有的方法**（**唯一**的例外清单）。
  *
- * ⚠️ **当前只有 `clusters` 一个**（阶段 3 的第三个方法；**P3-T05 未做**）
- *   ⇒ 「簇快照的只读导航接口」还不存在 ⇒ **刻意不造空壳方法**
- *   （导出了却没实现 = 空承诺，比不导更糟）。
- * ⇒ **P3-T05 落地时**：把 `clusters` 从这里删掉 + 把方法挂到 `MemoryStore` 上
- *   ⇒ 本断言**继续成立**（两边同时变）⇒ 这就是「可逐步推进」的形态。
+ * ⚠️ **当前是空的**：阶段 3 的三个方法（`clusters` / `inhibitionTrace` / `recluster`）
+ *   **全部已挂到 `MemoryStore` 上**（`clusters` 是 P3-T05 落的）
+ *   ⇒ 「簇快照的只读导航接口」已存在 ⇒ **不再有例外**。
+ * ⇒ 将来某个阶段落地时：如果那个阶段的方法**还没挂上** ⇒ 把它加进这里
+ *   （**刻意不造空壳方法**：导出了却没实现 = 空承诺，比不导更糟）；
+ *   挂上之后 ⇒ 从这里删掉 ⇒ 本断言**继续成立**（两边同时变）。
  */
-const NOT_YET_LANDED: readonly string[] = ['clusters'];
+const NOT_YET_LANDED: readonly string[] = [];
 
 /** `MemoryStore.prototype` 上的**公开方法名**（构造器与私有字段都不算）。 */
 function facadeMethodNames(): string[] {
