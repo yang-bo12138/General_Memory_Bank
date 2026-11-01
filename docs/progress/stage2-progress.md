@@ -38,17 +38,27 @@
 
 | 任务 | 状态 | 落点 commit | 关键交付 |
 |---|---|---|---|
-| **P2-T01** VectorBackend 契约 + flat 基线 | ✅ | `cba9e3a`（`41e079b`） | `src/vector/{backend,flat}.ts` · §4.15.2 逐字契约 · 25 条硬断言 |
-| **P2-T02** 两级 k-means 分桶（确定性训练 + IVF 后端） | ✅ | `c713c80`（`438cf06`） | `src/vector/{kmeans,ivf,centroids,dot}.ts` · 29 条硬断言 |
-| **P2-T03** 桶归属的唯一写入点 | ✅ | `f76b3ab`（`bad597c`） | `src/vector/bucketAssign.ts` · 桶计数**现算** · 21 条硬断言 |
+| **P2-T01** VectorBackend 契约 + flat 基线 | ✅ | `cba9e3a`（`41e079b`） | `src/vector/{backend,flat}.ts` · §4.15.2 逐字契约 · **6/6** 条硬断言 |
+| **P2-T02** 两级 k-means 分桶（确定性训练 + IVF 后端） | ✅ | `c713c80`（`438cf06`） | `src/vector/{kmeans,ivf,centroids,dot}.ts` · **5.5/6** 条硬断言（余下 ½ 条是「训练三时机」⇒ 属调度层，见 §四）|
+| **P2-T03** 桶归属的唯一写入点 | ✅ | `f76b3ab`（`bad597c`） | `src/vector/bucketAssign.ts` · 桶计数**现算** · **7/8** 条硬断言 |
 | **P2-T03-b** 四条 embedding 路径挂接 + **集合相等**断言 | ✅ | `e8861e7`（`86bc581`） | `src/store/{write,merge}.ts` · **全库口径**（非本批次）的集合相等断言 |
-| **P2-T04** lint 规则 + 跨节锚定检查 | ✅ | `8638a5f`（`596e1a9`） | `scripts/check-{bucket-write,anchor}.ts` · 挂进 `pnpm run verify` |
-| **P2-T05** `rebuildVectorBuckets`（重训/崩溃恢复/旧代桶清理） | ✅ | `0ccd44b`（`4cb8d76`） | `src/vector/rebuild.ts` + `src/store/maintain.ts` · 三步顺序不可颠倒 · 12 条断言 |
-| **P2-T06** 启动对账 + P95 桶质量退化检测 | ✅ | `6644793`（`a8b3566`） | `src/vector/{reconcile,bucketQuality}.ts` · 三条判据齐过 · 14 条断言 |
-| **P2-T07** 写入路径的去重候选收窄（§4.9 步骤 3a2） | ✅ | `aa3da4b`（`b36f34d`） | `src/store/dedupCandidates.ts` · 候选 ≤ 2000 · 不做全表扫 · C29 分母纪律 · 12 条断言 |
-| **P2-T08** 性能基线与门槛验收 | ✅ | `4c70582`（`0f81c1c` 等 **8** 条） | `bench/`（5 脚本）+ `scripts/bench-mutation.sh` + `docs/baseline/` |
+| **P2-T04** lint 规则 + 跨节锚定检查 | ✅ | `8638a5f`（`596e1a9`） | `scripts/check-{bucket-write,anchor}.ts` · 挂进 `pnpm run verify` · **4/4** 条硬断言 |
+| **P2-T05** `rebuildVectorBuckets`（重训/崩溃恢复/旧代桶清理） | ✅ | `0ccd44b`（`4cb8d76`） | `src/vector/rebuild.ts` + `src/store/maintain.ts` · 三步顺序不可颠倒 · **8/8** 条硬断言 |
+| **P2-T06** 启动对账 + P95 桶质量退化检测 | ✅ | `6644793`（`a8b3566`） | `src/vector/{reconcile,bucketQuality}.ts` · 三条判据齐过 · **7/7** 条硬断言 |
+| **P2-T07** 写入路径的去重候选收窄（§4.9 步骤 3a2） | ✅ | `aa3da4b`（`b36f34d`） | `src/store/dedupCandidates.ts` · 候选 ≤ 2000 · 不做全表扫 · C29 分母纪律 · **5/5** 条硬断言 |
+| **P2-T08** 性能基线与门槛验收 | ✅ | `4c70582`（`0f81c1c` 等 **8** 条） | `bench/`（5 脚本）+ `scripts/bench-mutation.sh` + `docs/baseline/` · **4/8** 条硬断言 |
 
 **公开面**：阶段 2 只新增 **1 个**公开方法 `rebuildVectorBuckets`（§3.1 归位表）⇒ 门面共 **11** 个方法。
+
+> ⚠️ **「条断言」的两种口径**（别混）：上表的 **N/M** 是 QA 收官报告 §2.1 的**逐任务硬断言条数**
+> （`docs/qa/p2-verify-qa2.md`）⇒ **权威**；
+> 而各 merge commit 的说明里写的「25 条 / 29 条 / 21 条 …」是**该任务落地的 `it()` 总数**
+> （含非硬断言的参数化用例等）⇒ **两个数都对，但量的不是同一件事** ⇒ 本表用 QA 的口径。
+> ⇒ **P2-T02 的 5.5/6**：缺的 ½ 条是「**训练三个触发时机**」⇒ 属**调度层**（阶段 3+）⇒ 见 §四 4.1 的 Q 表。
+> ⇒ **P2-T08 的 4/8**：缺的 4 条 = **文本路不受影响** / **三路准入闸门** /
+> **软删不被向量路召回** / **规模（默认 ✅ 但断言 ❌）**
+> ⇒ 前三条都需要**接线向量路的 `recall()`**才有意义 ⇒ 属**阶段 4**（同 §五.2 的那条边界）；
+> ⇒ 最后一条（「规模」**有默认值但没有断言**）正是 **Q-02**（规模无下限）⇒ 属**工程师**的欠账。
 
 ---
 
