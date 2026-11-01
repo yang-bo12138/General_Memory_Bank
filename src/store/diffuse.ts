@@ -340,6 +340,11 @@ function runEntityLeg(
     }
 
     for (const entityRow of entityRows) {
+      // ⚠️ **外层的预算闸门也要有**（否则预算耗尽后还会**一条条去查库**）
+      //   ⇒ 那正是「预算记在边上」要挡的事：预算要挡的是**查询次数**，不只是候选数。
+      if (scanned >= limit) {
+        break;
+      }
       const entityId = entityRow.entity_id;
       const edges = entityEdges.all({ entityId }) as EdgeRow[];
 

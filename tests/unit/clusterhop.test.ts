@@ -830,7 +830,7 @@ function seedRecallWorld(db: Database.Database): void {
   });
   insertMemory(db, 'm-b', {
     content: '猫粮品牌采购记录',
-    entities: ['e-1', 'e-2'],
+    entities: ['e-1', 'e-2', 'e-5'],
     lastAccess: NOW - 2 * 60 * 60 * 1000,
   });
   insertMemory(db, 'm-c', {
@@ -849,6 +849,18 @@ function seedRecallWorld(db: Database.Database): void {
   // ── 共激活 + 簇：簇跳也能捞到 m-d ──
   insertCoact(db, 'm-a', 'm-d', 0.75);
   insertCluster(db, 'c-1', ['m-a', 'm-d']);
+  // ⚠️ ★ **m-b 有自己的「专属路径」**（实体 e-5 → e-6 ⇒ m-e）。
+  //   ⚠️ **为什么必须有这一段**：若 m-a / m-b / m-c 触达的扩散结果**完全一样**，
+  //   那「种子取抑制前 topN」与「种子取抑制后 hits」就**不可区分**
+  //   ⇒ 「抑制不作用于 diffused」那条断言会退化成**恒绿守卫**。
+  //   ⇒ m-e **只**能由 m-b 触达 ⇒ 抑制把 m-b 挤掉之后，种子若取抑制后的 hits，
+  //   m-e 就会消失 ⇒ 两腿的种子口径一旦漂移，这条断言立刻变红。
+  insertMemory(db, 'm-e', {
+    content: '货架清单',
+    entities: ['e-6'],
+    lastAccess: NOW - 2 * MS_PER_DAY,
+  });
+  insertEdge(db, 'ed-2', 'e-5', 'e-6', 0.8);
 }
 
 describe('P3-T04 · 集成：扩散接进召回流水线', () => {
@@ -867,6 +879,11 @@ describe('P3-T04 · 集成：扩散接进召回流水线', () => {
     // ── 前提自检②：**扩散确实产出了东西**（这正是 P3-T02 留的那条账）──
     expect(withInhibition.diffused.length).toBeGreaterThan(0);
     expect(withoutInhibition.diffused.length).toBeGreaterThan(0);
+    // ⚠️ ★ **前提自检③：扩散结果里有一条「只有被抑制的那条种子才触达得到」的**
+    //   （`m-e` 只能由 `m-b` 触达）⇒ 种子口径一旦从「抑制前 topN」漂移到「抑制后 hits」，
+    //   `m-e` 就会消失 ⇒ 这条断言**不是恒绿守卫**。
+    expect(withInhibition.diffused.map((item) => item.id).sort()).toEqual(['m-d', 'm-e']);
+    expect(withoutInhibition.diffused.map((item) => item.id).sort()).toEqual(['m-d', 'm-e']);
 
     // ★ **逐条相同**（抑制没有碰 diffused）
     expect(withInhibition.diffused).toEqual(withoutInhibition.diffused);

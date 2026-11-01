@@ -35,6 +35,7 @@ import { normalizeNumbers } from '../../src/vector/dot.js';
 import {
   countRows,
   createTestStore,
+  insertEdge,
   insertEntity,
   insertMemory,
   readEvents,
@@ -411,13 +412,34 @@ function seedInhibitionWorld(
     rank: 0,
   });
   seedMemory(db, 'c-b', '猫粮品牌偏好记录', {
-    entityIds: ['e-1', 'e-2'],
+    entityIds: ['e-1', 'e-2', 'e-6'],
     rank: 1,
   });
   seedMemory(db, 'c-c', '猫粮品牌偏好记录', {
     entityIds: ['e-3', 'e-4'],
     rank: 2,
   });
+
+  // ⚠️ ★ **P3-T04 补：让联想路（扩散）在这个世界里**真的产出东西**。
+  //   c-d 的正文**不含「猫粮品牌」** ⇒ 它**不进候选集**（不改变上面三条的分数与排序）
+  //   ⇒ 但它挂在 e-5 上，而 c-a / c-b 的实体 e-1 与 e-5 之间有一条边
+  //   ⇒ 扩散（实体跳）能把 c-d 捞出来。
+  //   ⚠️ **为什么必须补这一段**：没有它 ⇒ `diffused` 恒空 ⇒ 「抑制不作用于 diffused」
+  //   那条断言是**恒绿守卫**（证明不了任何事）⇒ P3-T02 的验收报告 §三·3 留的就是这条账。
+  seedMemory(db, 'c-d', '仓库盘点清单', {
+    entityIds: ['e-5'],
+    rank: 3,
+  });
+  insertEdge(db, 'ed-1', 'e-1', 'p-1', 'e-5', 0.8, NOW);
+  // ⚠️ ★ **c-b 的「专属路径」**（实体 e-6 → e-7 ⇒ c-e）。
+  //   ⚠️ **为什么必须有这一段**：c-e **只**能由 c-b 触达 ⇒ 若扩散的种子取的是
+  //   「抑制后的 hits」，抑制把 c-b 挤掉之后 c-e 就会从 `diffused` 里消失
+  //   ⇒ 「抑制不作用于 diffused」那条断言**会立刻变红** ⇒ 它不是恒绿守卫。
+  seedMemory(db, 'c-e', '货架清单', {
+    entityIds: ['e-7'],
+    rank: 4,
+  });
+  insertEdge(db, 'ed-2', 'e-6', 'p-2', 'e-7', 0.8, NOW);
 
   if (options.withEmbedding === true) {
     // ⚠️ 三条互不相似（余弦 < REDUNDANCY_COS）⇒ 冗余**只**可能来自实体路径
@@ -654,7 +676,21 @@ describe('P3-T02 · 集成：抑制接进召回流水线', () => {
     const withInhibition = recallOnce(on.store);
     const withoutInhibition = recallOnce(off.store);
 
+    // ⚠️ ★ **前提自检（P3-T04 补）**：**扩散确实产出了东西**。
+    //   ⚠️ **为什么必须补这一条**：P3-T02 写下这条断言时 `diffused` 恒为空（联想路未实现）
+    //   ⇒ 它是一条**恒绿守卫**（什么都能通过）⇒ 证明不了「抑制没碰 diffused」。
+    //   ⇒ P3-T04 把 `diffused` 接成非空之后，这条断言**才真正可执行**
+    //   （QA 的 `docs/qa/p3-t02-acceptance-report.md` §三·3 留的就是这条账）。
+    expect(withInhibition.diffused.length).toBeGreaterThan(0);
+    expect(withoutInhibition.diffused.length).toBeGreaterThan(0);
+    // ⚠️ ★ **其中有一条只由「被抑制的那条种子」（c-b）触达得到**（c-e）
+    //   ⇒ 种子口径一旦漂移到「抑制后的 hits」，c-e 就会消失 ⇒ 这条断言不是恒绿守卫。
+    expect(withInhibition.diffused.map((item) => item.id).sort()).toEqual(['c-d', 'c-e']);
+    expect(withoutInhibition.diffused.map((item) => item.id).sort()).toEqual(['c-d', 'c-e']);
+
     expect(withInhibition.diffused.length).toBe(withoutInhibition.diffused.length);
+    // ⚠️ ★ **逐条相同**（不只是条数相同）：抑制既不改内容，也不改顺序。
+    expect(withInhibition.diffused).toEqual(withoutInhibition.diffused);
   });
 
   it('★ 守卫 · 抑制只在 `explicit` 的语义下改「谁进 hits」，**不改事件的 scores**（跨两次召回逐位比对）', () => {
