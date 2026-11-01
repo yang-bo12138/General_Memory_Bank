@@ -50,14 +50,14 @@
 
 | 脚本 | 检查什么 | 依据 |
 | --- | --- | --- |
-| `scripts/audit-tier-qualifiers.ts` | `docs/baseline/README.md` 的**档位限定一致性**：① **只属于某一档的数**（毫秒 / 占比 / 每行读成本）**必须**带档位限定词；② **跨档一致的数**（H1 = 12,782 行 / H2 = 1.2782%）**不许**被写成「只在这一档成立」（但**允许**出现在「这组数采自哪一次」的出处陈述里 ⇒ 那只作提示不判红） | `docs/baseline/README.md`「★★ 冷盘 / 热盘两档对照」与「★★★ 三处口径修正」；`docs/progress/stage3-progress.md` §十二 |
+| `scripts/audit-tier-qualifiers.mjs` | `docs/baseline/README.md` 的**档位限定一致性**：① **只属于某一档的数**（毫秒 / 占比 / 每行读成本）**必须**带档位限定词；② **跨档一致的数**（H1 = 12,782 行 / H2 = 1.2782%）**不许**被写成「只在这一档成立」（但**允许**出现在「这组数采自哪一次」的出处陈述里 ⇒ 那只作提示不判红） | `docs/baseline/README.md`「★★ 冷盘 / 热盘两档对照」与「★★★ 三处口径修正」；`docs/progress/stage3-progress.md` §十二 |
 
 ```bash
 # 审计默认目标（仓库根的 docs/baseline/README.md）
-pnpm exec tsx scripts/audit-tier-qualifiers.ts
+node scripts/audit-tier-qualifiers.mjs
 
 # 审计别处的同名文件（用于比对别的分支的快照）
-pnpm exec tsx scripts/audit-tier-qualifiers.ts path/to/README.md
+node scripts/audit-tier-qualifiers.mjs path/to/README.md
 ```
 
 ⚠️ **它为什么值得存在**（**不是「再写一遍检查」**）：百万级基线有**三档采集**，
@@ -78,6 +78,12 @@ pnpm exec tsx scripts/audit-tier-qualifiers.ts path/to/README.md
 **未做到**第 2 条（串进 `package.json` 的 `ci`）与第 3 条（`tests/contracts/` 里**含反例**的单测）
 ⇒ ⇒ **故它现在是「可复跑的审计」，不是「门禁」** ⇒ ⇒ **接上那两步要动 `package.json` 与 `tests/contracts/**`
 （⇒ 均不在工程师-7 的边界内）⇒ ⇒ **待主理人指定**。
+
+⚠️ **为什么是 `.mjs` 而不是本仓库其余 15 个脚本那样的 `.ts`**（**主理人指定的交付形态**）：
+· **好处**：**纯 `node` 即可跑，不依赖 `tsx`** ⇒ ⇒ 一个独立审计脚本不该要求装 TS 运行器；
+· **代价**：**它不进 `tsc --noEmit` 的类型检查**（`tsconfig.json` 的 `include` 里的 `scripts/` 只覆盖 `.ts`）
+  ⇒ ⇒ **类型信息改用 JSDoc 承载**（编辑器仍可推断）；
+· ⇒ ⇒ **⇒ 若日后要把它当门禁**，建议连同单测一起改成 `.ts`（与本仓库其余脚本对齐）。
 
 ## C25~C37 对照表
 
