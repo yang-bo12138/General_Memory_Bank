@@ -441,6 +441,42 @@ export interface StorageMediaInfo {
 }
 
 /**
+ * ★ **外部命令的执行器**（**可注入 ⇒ 负控能在「不依赖真实硬件」的前提下测**）。
+ *
+ * ⚠️ **为什么要抽出来**（本仓库方法论第 2 条：「守卫的判据要抽成可注入的纯函数
+ *   ⇒ 负控才能在不污染源码/正文的前提下测它」）：
+ *   介质探测是**唯一**会问操作系统的地方 ⇒ 它的失败路径（「命令不存在 / 被策略禁用 /
+ *   超时」）**必须能被测**，而**不能**靠「在一台没有 PowerShell 的机器上跑」来测
+ *   ⇒ ⇒ **把「怎么执行命令」变成一个参数**，测试就能**注入**一个「必失败」的执行器。
+ *
+ * @param file 可执行文件名
+ * @param args 参数
+ * @returns 命令的标准输出
+ */
+export type CommandRunner = (file: string, args: readonly string[]) => string;
+
+/**
+ * 探测的**可注入项**（**缺省 = 真实行为** ⇒ 生产路径一行不改）。
+ */
+export interface StorageMediaProbeOptions {
+  /**
+   * 平台（缺省 `process.platform`）。
+   *
+   * ⚠️ **为什么可注入**：三条平台分支（PowerShell / `lsblk` / `diskutil`）
+   *   **必须在任意一台机器上都能被测**（否则 Windows 上的 CI 永远测不到 Linux 分支）
+   *   ⇒ ⇒ 注入平台 ⇒ **三条分支都能被测**。
+   */
+  readonly platform?: NodeJS.Platform;
+  /**
+   * 命令执行器（缺省 `execFileSync`）。
+   *
+   * ⚠️ **注入一个「必失败」的执行器 ⇒ 就能测「拿不到 ⇒ 记 `unknown` 且绝不抛错」**
+   *   这条**最关键的纪律**（bench 必须能在任何机器上跑）。
+   */
+  readonly runner?: CommandRunner;
+}
+
+/**
  * 采集**存储介质类别**（**失败 ⇒ `unknown`；绝不抛错**）。
  *
  * ⚠️ ★ **「拿不到就记 `unknown`」是硬要求**：
@@ -452,23 +488,37 @@ export interface StorageMediaInfo {
  *   ⇒ ⚠️ **有超时**（默认 5 秒）⇒ 机器上 PowerShell 被策略禁用时**不会**把 bench 拖死。
  *
  * @param targetPath 要判定的路径（缺省 = 工作目录 ⇒ bench 的库都落在工作目录下的同一卷）
+ * @param options 可注入项（**缺省 = 真实行为**）
  * @returns 介质信息（**永不抛错**）
  */
-export function detectStorageMedia(targetPath: string = process.cwd()): StorageMediaInfo {
-  if (process.platform === 'win32') {
-    return detectWindowsMedia(targetPath);
+export function detectStorageMedia(
+  targetPath: string = process.cwd(),
+  options: StorageMediaProbeOptions = {},
+): StorageMediaInfo {
+  const platform = options.platform ?? process.platform;
+  const runner = options.runner ?? defaultCommandRunner;
+  if (platform === 'win32') {
+    return detectWindowsMedia(targetPath, runner);
   }
-  if (process.platform === 'linux') {
-    return detectLinuxMedia(targetPath);
+  if (platform === 'linux') {
+    return detectLinuxMedia(targetPath, runner);
   }
-  if (process.platform === 'darwin') {
-    return detectDarwinMedia(targetPath);
+  if (platform === 'darwin') {
+    return detectDarwinMedia(targetPath, runner);
   }
   return { mediaClass: 'unknown', source: 'none', detected: false, detail: null };
 }
 
+/** 默认的命令执行器（**真实行为**）：`execFileSync` + 5 秒超时 + 隐藏窗口。 */
+const defaultCommandRunner: CommandRunner = (file, args) =>
+  execFileSync(file, [...args], {
+    encoding: 'utf8',
+    timeout: 5000,
+    windowsHide: true,
+  });
+
 /** Windows 的介质探测（PowerShell）；失败 ⇒ `'unknown'`。 */
-function detectWindowsMedia(targetPath: string): StorageMediaInfo {
+function detectWindowsMedia(targetPath: string, runner: CommandRunner): StorageMediaInfo {
   const root = parsePath(targetPath).root;
   const driveLetter = root.replace(/[:\\/]/g, '').toUpperCase();
   if (driveLetter === '') {
@@ -488,11 +538,7 @@ function detectWindowsMedia(targetPath: string): StorageMediaInfo {
     `} else { Write-Output 'MediaType=' }`,
   ].join('; ');
   try {
-    const output = execFileSync(
-      'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-Command', script],
-      { encoding: 'utf8', timeout: 5000, windowsHide: true },
-    );
+    const output = runner('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script]);
     const mediaType = readField(output, 'MediaType');
     const busType = readField(output, 'BusType');
     const friendlyName = readField(output, 'FriendlyName');
@@ -524,25 +570,16 @@ function detectWindowsMedia(targetPath: string): StorageMediaInfo {
 }
 
 /** Linux 的介质探测（`findmnt` + `lsblk`）；失败 ⇒ `'unknown'`。 */
-function detectLinuxMedia(targetPath: string): StorageMediaInfo {
+function detectLinuxMedia(targetPath: string, runner: CommandRunner): StorageMediaInfo {
   try {
-    const device = execFileSync('findmnt', ['-no', 'SOURCE', '--target', targetPath], {
-      encoding: 'utf8',
-      timeout: 5000,
-    }).trim();
+    const device = runner('findmnt', ['-no', 'SOURCE', '--target', targetPath]).trim();
     if (device === '') {
       return { mediaClass: 'unknown', source: 'lsblk', detected: false, detail: null };
     }
     // ⚠️ **`rota` = 1 ⇒ 机械盘（HDD）；`rota` = 0 ⇒ 固态（SSD 或 NVMe）**。
     //   ⇒ SSD 与 NVMe 的区分靠 `tran`（传输类型）。
-    const rota = execFileSync('lsblk', ['-ndo', 'rota', device], {
-      encoding: 'utf8',
-      timeout: 5000,
-    }).trim();
-    const tran = execFileSync('lsblk', ['-ndo', 'tran', device], {
-      encoding: 'utf8',
-      timeout: 5000,
-    }).trim();
+    const rota = runner('lsblk', ['-ndo', 'rota', device]).trim();
+    const tran = runner('lsblk', ['-ndo', 'tran', device]).trim();
     if (rota === '') {
       return { mediaClass: 'unknown', source: 'lsblk', detected: false, detail: null };
     }
@@ -563,12 +600,9 @@ function detectLinuxMedia(targetPath: string): StorageMediaInfo {
 }
 
 /** macOS 的介质探测（`diskutil info`）；失败 ⇒ `'unknown'`。 */
-function detectDarwinMedia(targetPath: string): StorageMediaInfo {
+function detectDarwinMedia(targetPath: string, runner: CommandRunner): StorageMediaInfo {
   try {
-    const output = execFileSync('diskutil', ['info', targetPath], {
-      encoding: 'utf8',
-      timeout: 5000,
-    });
+    const output = runner('diskutil', ['info', targetPath]);
     const lower = output.toLowerCase();
     // ⚠️ **`diskutil info` 的措辞**：「Solid State」⇒ SSD；「Rotational」⇒ HDD；「NVMe」⇒ NVMe。
     const mediaClass: StorageMediaClass = lower.includes('nvme')

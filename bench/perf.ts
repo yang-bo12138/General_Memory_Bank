@@ -458,11 +458,18 @@ export function measurePerf(
     otherMeanMs,
     otherMeanShare: writeTotal.meanMs === 0 ? 0 : otherMeanMs / writeTotal.meanMs,
     note:
-      'vectorCandidateScan = **独立实测**（单独调用生产的那条向量候选扫描路径；' +
+      '① vectorCandidateScan = **独立实测段**（单独调用生产的那条向量候选扫描路径 ' +
+      '`collectVectorCandidates()` ⇒ 内部就是 `src/vector/ivf.ts` 的 `scanBucketCandidates()`；' +
       '**不是**从写入总耗时里切出来的 ⇒ 与写入那一次**不是同一次调用**）；' +
-      'otherMeanMs / otherMeanShare = **推导值**（写入总耗时均值 − 向量扫描段均值）' +
+      '② otherMeanMs / otherMeanShare = **推导值段**（写入总耗时均值 − 向量扫描段均值）' +
       '⇒ 其余段 = 「FTS5 + 索引维护 + 合并判定 + 事件写入」；' +
-      '⚠️ **可能为负** ⇒ 说明「独立实测的扫描段」比「整次写入」还贵（页缓存状态不同）⇒ 不可当精确拆分。',
+      '③ ⚠️⚠️ **「① + ② ≠ 写入总耗时」**（**读这两个数时必须知道**）：' +
+      '两段**不是同一次写入里的两段** ⇒ ① 跑在**写入循环之后**的**单独一轮**里 ' +
+      '⇒ 那时库里已经多了本轮写入的 N 条记忆 ⇒ 候选面更大一点、页缓存状态也不同 ' +
+      '⇒ ⇒ **① 与 ② 相加没有「等于写入总耗时」的含义** ⇒ **只能当归因的量级参考**，' +
+      '**不是精确拆分** ⇒ 若要精确拆分，必须在 `src/store/write.ts` 里加一个只读观测点；' +
+      '⚠️ 另：otherMeanMs **可能为负** ⇒ 说明「独立实测的扫描段」比「整次写入」还贵 ' +
+      '（页缓存状态不同）⇒ 同样不可当精确拆分。',
   };
 
   return {
