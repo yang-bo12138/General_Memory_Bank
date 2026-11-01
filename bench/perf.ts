@@ -60,6 +60,7 @@ import { prepareBench } from './lib/db.js';
 import {
   BENCH_NOW,
   benchWorkDir,
+  formatLoadMs,
   formatPeakRss,
   intArg,
   machineInfo,
@@ -410,7 +411,7 @@ function main(): void {
       `  写入 P99 = ${result.writeP99Ms.toFixed(3)}ms（门槛 ${THRESHOLDS.writeP99Ms}ms，样本 ${result.writeSamples}）\n` +
       `  向量路 P99 = ${result.vectorRouteP99Ms.toFixed(3)}ms（门槛 ${THRESHOLDS.vectorRouteP99Ms}ms，样本 ${result.vectorRouteSamples}）\n` +
       `  向量路占总耗时 = ${(result.vectorRouteShare * 100).toFixed(2)}%（门槛 ≤ ${(THRESHOLDS.vectorRouteShare * 100).toFixed(0)}%）\n` +
-      `  灌库 ${prepared.loadMs.toFixed(0)}ms / 训练 ${prepared.trainMs.toFixed(0)}ms / ` +
+      `  灌库 ${formatLoadMs(prepared.loadMs)} / 训练 ${prepared.trainMs.toFixed(0)}ms / ` +
       `${formatPeakRss(prepared.trainPeakRss)}\n` +
       `  结果已写入 ${outPath}\n`,
   );

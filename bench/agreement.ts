@@ -60,6 +60,7 @@ import { flatCandidateUniverse, flatTopK, flatTopKMulti } from './lib/flat.js';
 import {
   BENCH_NOW,
   benchWorkDir,
+  formatLoadMs,
   formatPeakRss,
   intArg,
   machineInfo,
@@ -473,7 +474,7 @@ function main(): void {
       `（下限 ${SYNONYM_COSINE_MIN}）\n` +
       `  分桶候选 ${result.bucketCandidateTotal} 条 ⊆ flat 候选全集 ${result.flatCandidateUniverse} 条\n` +
       `  查询耗时 p50/p99 = ${latency.p50Ms.toFixed(3)} / ${latency.p99Ms.toFixed(3)} ms\n` +
-      `  灌库 ${prepared.loadMs.toFixed(0)}ms / 训练 ${prepared.trainMs.toFixed(0)}ms / ` +
+      `  灌库 ${formatLoadMs(prepared.loadMs)} / 训练 ${prepared.trainMs.toFixed(0)}ms / ` +
       `${formatPeakRss(prepared.trainPeakRss)}\n` +
       `  结果已写入 ${outPath}\n`,
   );

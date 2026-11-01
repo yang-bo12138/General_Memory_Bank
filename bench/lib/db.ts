@@ -140,10 +140,32 @@ export interface PreparedBench {
   readonly fineCells: number;
   /** 桶归属条数。 */
   readonly members: number;
-  /** 灌库耗时（毫秒）。 */
-  readonly loadMs: number;
+  /**
+   * 灌库耗时（毫秒）。
+   *
+   * ⚠️ ★ **`null` ⇒ 这次运行没测到**（**不是 `0`**）：
+   *   **复用**一份「别人已经灌好」的库时 ⇒ 灌库发生在**别的进程 / 别的机器状态**下
+   *   ⇒ 本次运行**没有测到**它 ⇒ 记 `0` 会被读成「灌库耗时 0 毫秒」（假）
+   *   ⇒ 与 `peakRss.sampledPeakBytes` 同一纪律（**没测到 ⇒ `null`，不许退化成 `0`**）。
+   *   ⚠️ **自己灌的库**（`prepareBench` 的非复用路径）⇒ 这里一定是**实测值**。
+   */
+  readonly loadMs: number | null;
   /** 训练耗时（毫秒）。 */
   readonly trainMs: number;
+  /**
+   * 训练第一段（「**读向量 + 建中心**」）的耗时（毫秒）。
+   *
+   * ⚠️ ★ **`null` ⇒ 这次运行没测到 / 拆不开**（**不是 `0`**）：
+   *   · **自己灌库 + 训练**的路径 ⇒ **不拆段** ⇒ 一定是 `null`；
+   *   · **复用**时 ⇒ 取清单里记的值（清单没记 ⇒ `null`）。
+   */
+  readonly trainReadAndKmeansMs: number | null;
+  /**
+   * 训练第二段（「**迁移 100 万条归属**」）的耗时（毫秒）。
+   *
+   * ⚠️ **`null` ⇒ 没测到 / 拆不开**（同上纪律）。
+   */
+  readonly trainMigrateMs: number | null;
   /**
    * 训练期峰值 RSS 的**完整测量口径**（**两个数 + 采样次数 + 是否 worker**）。
    *
@@ -153,8 +175,15 @@ export interface PreparedBench {
    *     （`null` ⇒ **没测到** ⇒ 不许当成 0）。
    */
   readonly trainPeakRss: PeakRssMeasurement;
-  /** 训练**前**的 RSS（字节）—— 与峰值对比 ⇒ 训练自身的增量。 */
-  readonly rssBeforeTrainBytes: number;
+  /**
+   * 训练**前**的 RSS（字节）—— 与峰值对比 ⇒ 训练自身的增量。
+   *
+   * ⚠️ ★ **`null` ⇒ 这次运行没测到**（**不是 `0`**）：
+   *   「峰值 − 训练前」= **训练自身的增量** ⇒ 训练前没测到 ⇒ **增量也测不到**
+   *   ⇒ 记 `0` ⇒ 增量会被算成「峰值 − 0 = 峰值」⇒ **把上界当成增量** ⇒ 偏大。
+   *   ⇒ 与 `loadMs` / `sampledPeakBytes` 同一纪律（**没测到 ⇒ `null` ⇒ 不许退化成 `0`**）。
+   */
+  readonly rssBeforeTrainBytes: number | null;
   /** 语料参数（**写进报告 ⇒ 规模与种子可核对**）。 */
   readonly options: CorpusOptions;
 }
@@ -207,6 +236,34 @@ const MANIFEST_SUFFIX = '.manifest.json';
  *   ⇒ **版本号让「没测到」能被如实表达**（`null`）。
  */
 export const MANIFEST_VERSION = 2;
+
+/**
+ * ★ **「有向量的活记忆」条数**的**唯一口径**（**读法与写法都只有这一份** ⇒ C36）。
+ *
+ * ⚠️ ★★ **为什么必须带 `NOT INDEXED`**（2026-11-01 实测踩坑）：
+ *   **同样的 SQL、同样的结果**，但**查询计划**差了一个数量级：
+ *   · **默认计划** = `SCAN memories USING INDEX idx_mem_created_at`
+ *     ⇒ 该索引是 `WHERE deleted = 0` 的**部分索引**、**不含 `embedding`**
+ *     ⇒ 对**每一行**都要**回表**读一次 3KB 的 `embedding` ⇒ **100 万次随机行读**
+ *     ⇒ 在**机械硬盘**（本机 `D:` = SATA HDD）上实测 **~1.75MB/s ⇒ 30~45 分钟**；
+ *   · **`NOT INDEXED`** = 强制**全表顺序扫**（4.5GB 连续读）
+ *     ⇒ 实测 **28.6 秒**（**同一条 SQL、逐条相同的语义、同一个数**）⇒ **快约 60 倍**。
+ *   ⇒ ⇒ **本函数是「复用路径」上最贵的一步**（百万级每次复用都要跑）
+ *   ⇒ ⇒ 不修的话，「跑一次百万级 perf」光计数就要多花一个多小时。
+ *   ⚠️ **`NOT INDEXED` 不改变语义**：它只禁止**索引**参与，**过滤条件一字未改**
+ *   ⇒ **计数结果逐位相同**（实测 `n = 1000000` 两条路径一致）。
+ *
+ * @param db 库句柄
+ * @returns 有向量的活记忆条数
+ */
+function countVectorMemories(db: Database.Database): number {
+  const row = db
+    .prepare(
+      'SELECT COUNT(*) AS n FROM memories NOT INDEXED WHERE embedding IS NOT NULL AND deleted = 0',
+    )
+    .get() as { n: number };
+  return row.n;
+}
 
 /** 清单里**峰值内存**那一块的形状（**新清单**才有 ⇒ 旧清单走兜底）。 */
 interface ManifestPeakRss {
@@ -299,8 +356,11 @@ function tryReuse(dbPath: string, corpus: CorpusOptions): PreparedBench | undefi
     seed?: number;
     loadMs?: number;
     trainMs?: number;
+    trainReadAndKmeansMs?: number;
+    trainMigrateMs?: number;
     peakRssBytes?: number;
     sampledPeakRssBytes?: number;
+    rssBeforeTrainBytes?: number;
     peakRss?: ManifestPeakRss;
   };
   try {
@@ -322,11 +382,7 @@ function tryReuse(dbPath: string, corpus: CorpusOptions): PreparedBench | undefi
   const db = openBenchDatabase(dbPath);
   try {
     const rows = (db.prepare('SELECT COUNT(*) AS n FROM memories').get() as { n: number }).n;
-    const vectorRows = (
-      db
-        .prepare('SELECT COUNT(*) AS n FROM memories WHERE embedding IS NOT NULL AND deleted = 0')
-        .get() as { n: number }
-    ).n;
+    const vectorRows = countVectorMemories(db);
     const fineCells = (
       db.prepare('SELECT COUNT(*) AS n FROM vector_fine_cells').get() as { n: number }
     ).n;
@@ -343,13 +399,23 @@ function tryReuse(dbPath: string, corpus: CorpusOptions): PreparedBench | undefi
       vectorRows,
       fineCells,
       members,
-      loadMs: manifest.loadMs ?? 0,
+      loadMs: manifest.loadMs ?? null,
       trainMs: manifest.trainMs ?? 0,
+      // ⚠️ ★ **训练的两段耗时也要从清单里带回来**（没记 ⇒ 如实写 `null`）。
+      //   「百万级一次跑完会被环境掐掉」⇒ 实测拆两段跑 ⇒ `trainMs` 是个**和**
+      //   ⇒ ⇒ **两段的数必须能单独读出来**（否则「这个和是怎么来的」说不清）。
+      trainReadAndKmeansMs: manifest.trainReadAndKmeansMs ?? null,
+      trainMigrateMs: manifest.trainMigrateMs ?? null,
       // ⚠️ ★ **峰值内存：旧清单没有 `peakRss` ⇒ 「没测到」必须如实写成 `null`**，
       //   **不许**退化成 `0`（`0` 会被读成「测到了 0 字节」⇒ 掩盖了「没测到」这件事）。
       //   ⇒ 上界（进程高水位）从旧字段 `peakRssBytes` 兜底 ⇒ **上界不丢**。
       trainPeakRss: readManifestPeakRss(manifest),
-      rssBeforeTrainBytes: 0,
+      // ⚠️ ★ **训练前的 RSS 也要从清单里带回来**（复用时它有值）：
+      //   「峰值 − 训练前」= **训练自身的增量** ⇒ 这是**唯一**能算出那个增量的两个数。
+      //   ⇒ 复用时若写死 `0` ⇒ 增量会被算成「峰值 − 0 = 峰值」⇒ **把上界当成增量**
+      //   ⇒ **报告里的数会偏大** ⇒ 宁可如实带回来。
+      //   ⚠️ **清单里没有这个字段（旧清单）⇒ 如实写 `null`（= 没测到）**，**不许**退化成 `0`。
+      rssBeforeTrainBytes: manifest.rssBeforeTrainBytes ?? null,
       options: corpus,
     };
   } catch (error) {
@@ -414,6 +480,8 @@ function writeManifest(dbPath: string, prepared: PreparedBench): void {
         members: prepared.members,
         loadMs: prepared.loadMs,
         trainMs: prepared.trainMs,
+        trainReadAndKmeansMs: prepared.trainReadAndKmeansMs,
+        trainMigrateMs: prepared.trainMigrateMs,
         // ⚠️ **峰值内存整块存**（两个数 + 采样次数 + 是否 worker）⇒
         //   复用时**不必**再猜「这个 0 是没测到还是测到了 0」。
         peakRss: prepared.trainPeakRss,
@@ -457,11 +525,7 @@ function prepareWithDatabase(
   corpusOptions: CorpusOptions,
 ): PreparedBench {
   const load = loadCorpus(db, corpusOptions);
-  const vectorRows = (
-    db
-      .prepare('SELECT COUNT(*) AS n FROM memories WHERE embedding IS NOT NULL AND deleted = 0')
-      .get() as { n: number }
-  ).n;
+  const vectorRows = countVectorMemories(db);
 
   if (options.skipTraining === true) {
     return {
@@ -472,13 +536,15 @@ function prepareWithDatabase(
       members: 0,
       loadMs: load.elapsedMs,
       trainMs: 0,
+      trainReadAndKmeansMs: null,
+      trainMigrateMs: null,
       trainPeakRss: {
         kernelPeakBytes: 0,
         sampledPeakBytes: null,
         sampleCount: 0,
         workerActive: false,
       },
-      rssBeforeTrainBytes: 0,
+      rssBeforeTrainBytes: null,
       options: corpusOptions,
     };
   }
@@ -527,6 +593,9 @@ function prepareWithDatabase(
     members: trained.members,
     loadMs: load.elapsedMs,
     trainMs: Number(trainEnd - trainStart) / 1_000_000,
+    // ⚠️ **自己跑的整段训练不拆段**（拆段是「分段跑」那次的口径）⇒ 如实写 。
+    trainReadAndKmeansMs: null,
+    trainMigrateMs: null,
     trainPeakRss,
     rssBeforeTrainBytes: rssBeforeTrain,
     options: corpusOptions,

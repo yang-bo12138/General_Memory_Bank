@@ -26,7 +26,7 @@
  */
 
 import { createHash } from 'node:crypto';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, statfsSync, writeFileSync } from 'node:fs';
 import { cpus as cpus_, freemem, totalmem } from 'node:os';
 import { dirname, join } from 'node:path';
 import { Worker } from 'node:worker_threads';
@@ -495,6 +495,13 @@ export function encodeVector(vector: Float32Array): Buffer {
  *
  * ⚠️ **为什么必须记**：P99 是「**这份数据 + 这台机器**」的结论
  *   ⇒ 换一台机器数字就变 ⇒ 没有机器信息的 P99 **不可复现、不可比较**。
+ *
+ * ⚠️ ★ **磁盘也要记**（2026-11-01 补）：百万级的库本体 **~4.4GB**（100 万行 × 3KB BLOB）
+ *   ⇒ 「这台机器的磁盘装不装得下 / 还剩多少空间」**直接决定这个规模跑不跑得动**
+ *   ⇒ 与「可用内存」是同一类**资源约束** ⇒ 必须进机器信息。
+ *   ⚠️ **口径**：`totalDiskBytes` = 文件系统**总量**（硬件属性 ⇒ 属「可比性标识」）、
+ *   `freeDiskBytes` = 采集时刻的**可用量**（**瞬时快照** ⇒ 同 `freeMemoryBytes`，
+ *   **不能**当机器指纹用）。
  */
 export interface MachineInfo {
   /** 平台（`process.platform` + `process.arch`）。 */
@@ -511,6 +518,43 @@ export interface MachineInfo {
   readonly freeMemoryBytes: number;
   /** 采集时刻的**已用**内存（字节）。 */
   readonly usedMemoryBytes: number;
+  /**
+   * 工作目录所在文件系统的**总量**（字节）。
+   *
+   * ⚠️ **硬件属性** ⇒ 与 `totalMemoryBytes` 同类 ⇒ **属「可比性标识」**
+   *   （两台机器的这个数相同 ⇒ 磁盘规模相同 ⇒ P99 可比）。
+   */
+  readonly totalDiskBytes: number;
+  /**
+   * 采集时刻工作目录所在文件系统的**可用量**（字节）。
+   *
+   * ⚠️ **瞬时快照**（同 `freeMemoryBytes`）⇒ **不能**当机器指纹用。
+   */
+  readonly freeDiskBytes: number;
+}
+
+/**
+ * 取工作目录所在文件系统的容量（字节）。
+ *
+ * ⚠️ **为什么用 `statfsSync`**：Node 自带（`node:fs`）⇒ **不引第三方依赖**
+ *   ⇒ 与 bench「只有 better-sqlite3 一个依赖」的纪律一致。
+ * ⚠️ **为什么取 `cwd` 而不是库文件路径**：`machineInfo()` 不带库路径
+ *   ⇒ 而 bench 的库一律落在工作目录（`.tmp/bench/`）下 ⇒ **同一个卷** ⇒ 取 `cwd` 即可。
+ * ⚠️ **拿不到就报 0，不抛错**：机器信息是**记录**用的 ⇒ 取不到不该让整轮测量失败
+ *   ⇒ 但 **0 是「没测到」**（不是「磁盘为 0」）⇒ 报告里要这么读。
+ *
+ * @returns 磁盘总量与可用量（字节）
+ */
+function diskInfo(): { totalDiskBytes: number; freeDiskBytes: number } {
+  try {
+    const stats = statfsSync(process.cwd());
+    return {
+      totalDiskBytes: Number(stats.blocks) * Number(stats.bsize),
+      freeDiskBytes: Number(stats.bavail) * Number(stats.bsize),
+    };
+  } catch {
+    return { totalDiskBytes: 0, freeDiskBytes: 0 };
+  }
 }
 
 /**
@@ -522,6 +566,7 @@ export function machineInfo(): MachineInfo {
   const cpus = cpus_();
   const totalMemoryBytes = totalmem();
   const freeMemoryBytes = freemem();
+  const disk = diskInfo();
   return {
     platform: `${process.platform}-${process.arch}`,
     node: process.version,
@@ -530,6 +575,8 @@ export function machineInfo(): MachineInfo {
     totalMemoryBytes,
     freeMemoryBytes,
     usedMemoryBytes: totalMemoryBytes - freeMemoryBytes,
+    totalDiskBytes: disk.totalDiskBytes,
+    freeDiskBytes: disk.freeDiskBytes,
   };
 }
 
@@ -557,15 +604,58 @@ export function formatPeakRss(measurement: PeakRssMeasurement): string {
 }
 
 /**
+ * 把「灌库耗时」排成一行人话（**`null` ⇒ 「未测到」**，**不许**写成 `0`）。
+ *
+ * ⚠️ **为什么单独一个函数**：三个 bench 脚本都要打这一行
+ *   ⇒ 抄三份必然漂 ⇒ 漂了就会有一处把 `null` 打成 `0` ⇒ **假数进报告**。
+ *
+ * @param loadMs 灌库耗时（`null` ⇒ 没测到）
+ * @returns 一行说明
+ */
+export function formatLoadMs(loadMs: number | null): string {
+  return loadMs === null ? '**未测到**' : `${loadMs.toFixed(0)}ms`;
+}
+
+/**
  * 训练阶段的**相位信息**（**报告里必须带** ⇒ 规模与耗时可核对）。
  */
 export interface PhaseInfo {
-  /** 灌库耗时（毫秒）。 */
-  readonly loadMs: number;
+  /**
+   * 灌库耗时（毫秒）。
+   *
+   * ⚠️ ★ **`null` ⇒ 这次运行没测到**（**不是 `0`**）：
+   *   复用一份「别人已经灌好」的库时 ⇒ 灌库发生在**别的进程**下 ⇒ 本次**没测到**
+   *   ⇒ 记 `0` 会被读成「灌库耗时 0 毫秒」（假）⇒ 与 `sampledPeakRssBytes` 同一纪律。
+   */
+  readonly loadMs: number | null;
   /** 训练耗时（毫秒）。 */
   readonly trainMs: number;
-  /** 训练**前**的 RSS（字节）。 */
-  readonly rssBeforeTrainBytes: number;
+  /**
+   * 训练第一段（「**读向量 + 建中心**」）的耗时（毫秒）。
+   *
+   * ⚠️ ★ **`null` ⇒ 这次运行没测到 / 拆不开**（**不是 `0`**）：
+   *   · **自己灌库 + 训练**的路径（`prepareBench` 的非复用分支）**不拆段**
+   *     ⇒ 这里一定是 `null`（**不是 0** ⇒ 0 会被读成「这段 0 毫秒」（假））；
+   *   · **复用**一份「别人训好的库」时 ⇒ 取决于那份清单有没有记这两段。
+   * ⇒ **为什么要拆**（2026-11-01 实测）：百万级的训练**一次跑完会被环境的后台进程时限掐掉**
+   *   ⇒ 实测拆成「建中心段 ~98 分钟」+「迁移段 ~36 分钟」两段跑
+   *   ⇒ ⇒ **两段都要能单独读出来**（否则 `trainMs` 是个说不清来源的和）。
+   */
+  readonly trainReadAndKmeansMs: number | null;
+  /**
+   * 训练第二段（「**迁移 100 万条归属**」）的耗时（毫秒）。
+   *
+   * ⚠️ **`null` ⇒ 没测到 / 拆不开**（同 `trainReadAndKmeansMs` 的纪律）。
+   */
+  readonly trainMigrateMs: number | null;
+  /**
+   * 训练**前**的 RSS（字节）。
+   *
+   * ⚠️ ★ **`null` ⇒ 这次运行没测到**（**不是 `0`**）：
+   *   「峰值 − 训练前」= 训练自身的增量 ⇒ 训练前没测到 ⇒ **增量也测不到**
+   *   ⇒ 记 `0` ⇒ 增量会被算成「峰值 − 0 = 峰值」⇒ **把上界当成增量** ⇒ 偏大。
+   */
+  readonly rssBeforeTrainBytes: number | null;
   /**
    * 训练期峰值 RSS 的**上界**（字节）—— **进程高水位**（含灌库阶段的占用）。
    *
@@ -599,9 +689,11 @@ export interface PhaseInfo {
  * @returns 相位信息
  */
 export function phaseInfo(prepared: {
-  loadMs: number;
+  loadMs: number | null;
   trainMs: number;
-  rssBeforeTrainBytes: number;
+  trainReadAndKmeansMs: number | null;
+  trainMigrateMs: number | null;
+  rssBeforeTrainBytes: number | null;
   trainPeakRss: PeakRssMeasurement;
   fineCells: number;
   members: number;
@@ -610,6 +702,8 @@ export function phaseInfo(prepared: {
   return {
     loadMs: prepared.loadMs,
     trainMs: prepared.trainMs,
+    trainReadAndKmeansMs: prepared.trainReadAndKmeansMs,
+    trainMigrateMs: prepared.trainMigrateMs,
     rssBeforeTrainBytes: prepared.rssBeforeTrainBytes,
     peakRssBytes: Math.max(prepared.trainPeakRss.kernelPeakBytes, sampled ?? 0),
     sampledPeakRssBytes: sampled,

@@ -50,6 +50,7 @@ import { flatTopK } from './lib/flat.js';
 import {
   BENCH_NOW,
   benchWorkDir,
+  formatLoadMs,
   formatPeakRss,
   intArg,
   machineInfo,
@@ -227,7 +228,7 @@ function main(): void {
       `  **向量路耗时占比 = ${(result.vectorShare * 100).toFixed(2)}%**` +
       `（参考线 ≥ ${(FLAT_SHARE_REFERENCE * 100).toFixed(0)}% ⇒ ` +
       `${result.shareDelta >= 0 ? '达标' : '未达标'}）\n` +
-      `  灌库 ${prepared.loadMs.toFixed(0)}ms / 训练 ${prepared.trainMs.toFixed(0)}ms / ` +
+      `  灌库 ${formatLoadMs(prepared.loadMs)} / 训练 ${prepared.trainMs.toFixed(0)}ms / ` +
       `${formatPeakRss(prepared.trainPeakRss)}\n` +
       `  结果已写入 ${outPath}\n`,
   );
