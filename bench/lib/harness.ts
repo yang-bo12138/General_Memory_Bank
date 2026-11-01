@@ -352,6 +352,8 @@ export class PeakRssSampler {
    *
    * ⚠️ **这是「训练段自己的峰值」**（不含灌库阶段的占用）⇒
    *   与 `kernelPeakBytes()`（进程高水位 = 上界）是**两条不同的数**。
+   * ⚠️ **worker 的读数含 worker 自己那点开销**（约 10MB 量级的 isolate + 栈）
+   *   ⇒ 它是**进程级**的 RSS ⇒ 略高于「纯主线程」的读数 ⇒ **偏保守（不低报）**。
    */
   sampledPeakBytes(): number {
     const shared = Number(Atomics.load(this.shared, SHARED_SLOT_PEAK));
