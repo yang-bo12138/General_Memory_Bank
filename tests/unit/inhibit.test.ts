@@ -260,26 +260,80 @@ describe('P3-T02 · 三桶模型（R / D / overflow）', () => {
     expect(outcome.kept.map((item) => item.id)).toContain('c0');
   });
 
-  it('★ 不变式：多组候选 ⇒ hits.length >= min(topN, min(2,|C|)) 且 <= min(topN,|C|)', () => {
+  it('★ 不变式：多组候选（含**同质池**）⇒ hits.length >= min(topN, min(2,|C|)) 且 <= min(topN,|C|)，且三桶恰好划分候选集', () => {
+    // ⚠️ ★ **夹具必须真的制造冗余**（QA 的 F-4 结论）：
+    //   原来的随机夹具里，每条候选至多共享 **1 个**实体（`'shared'` + 各自的 `'u{i}'`）
+    //   ⇒ 共享实体数 **< DEDUP_ENTITY_MIN(2)** ⇒ **一条冗余都造不出来**
+    //   ⇒ **D 桶恒空** ⇒ 不变式退化成「hits == min(topN, |C|)」（恒等式）
+    //   ⇒ **任何分桶错误都打不红它**（22 条变异实测一条没抓）⇒ 那不是守卫，是重言式。
+    //   ⇒ **这里显式给出「同组共享两个实体」的构造** ⇒ 组内冗余、组间不冗余。
+    const grouped = (id: string, score: number, group: string): InhibitionCandidate =>
+      candidate(id, score, [`${group}-x`, `${group}-y`]);
+
+    // ── ① 同质池（整池同质 ⇒ **没有替代品** ⇒ 不抑制）──
+    const homogeneous = [grouped('h0', 1.0, 'g'), grouped('h1', 0.9, 'g'), grouped('h2', 0.8, 'g')];
+    // ── ② 异质池（两条冗余 + 一条不冗余）──
+    const heterogeneous = [
+      grouped('x0', 1.0, 'ga'),
+      grouped('x1', 0.9, 'ga'),
+      grouped('x2', 0.8, 'gb'),
+    ];
+    // ── ③ 溢出池（|C| = 5 > topN = 2 ⇒ 必有溢出候选）──
+    const overflowPool = [
+      grouped('o0', 1.0, 'oa'),
+      grouped('o1', 0.9, 'oa'),
+      grouped('o2', 0.8, 'ob'),
+      grouped('o3', 0.7, 'oc'),
+      grouped('o4', 0.6, 'od'),
+    ];
+
+    // ── 前提自检（**前提不成立 ⇒ 这条断言是空的**）──
+    const homogeneousOutcome = inhibitCandidates(homogeneous, 5, DEFAULT_PARAMS);
+    expect(homogeneousOutcome.poolHomogeneous).toBe(true);
+    expect(homogeneousOutcome.redundant).toHaveLength(0);
+
+    const heterogeneousOutcome = inhibitCandidates(heterogeneous, 5, DEFAULT_PARAMS);
+    expect(heterogeneousOutcome.poolHomogeneous).toBe(false);
+    // ★ **D 桶非空** ⇒ 抑制**真的**发生了（否则下面那条下界是空洞的）。
+    expect(heterogeneousOutcome.redundant.length).toBeGreaterThan(0);
+
+    const overflowOutcome = inhibitCandidates(overflowPool, 2, DEFAULT_PARAMS);
+    // ★ **O 桶非空** ⇒ 「溢出」这条路径真的被走到了。
+    expect(overflowOutcome.overflow.length).toBeGreaterThan(0);
+
+    // ── 断言（三个显式池 + 随机池，形状完全相同）──
+    const assertInvariant = (pool: readonly InhibitionCandidate[], topN: number): void => {
+      const outcome = inhibitCandidates(pool, topN, DEFAULT_PARAMS);
+      const hits = outcome.kept.length;
+
+      expect(hits).toBeGreaterThanOrEqual(Math.min(topN, Math.min(2, pool.length)));
+      expect(hits).toBeLessThanOrEqual(Math.min(topN, pool.length));
+      // 三个桶合起来恰好是全部候选（**没有候选被弄丢**）
+      expect(hits + outcome.redundant.length + outcome.overflow.length).toBe(pool.length);
+    };
+
+    assertInvariant(homogeneous, 5);
+    assertInvariant(heterogeneous, 5);
+    assertInvariant(overflowPool, 2);
+
+    // ── 随机组（确定性伪随机 ⇒ 失败可复现）──
     const random = makeRandom(20260901);
+    let redundantSeen = 0;
     for (let round = 0; round < 200; round += 1) {
       const size = 1 + Math.floor(random() * 12);
       const topN = 1 + Math.floor(random() * 8);
       const pool: InhibitionCandidate[] = [];
       for (let index = 0; index < size; index += 1) {
-        // 随机实体：偶尔共享 ⇒ 制造冗余；分数带随机扰动 ⇒ 制造同分边界
-        const shared = random() < 0.4 ? ['shared'] : [];
-        const unique = random() < 0.5 ? [`u${index}`] : [];
-        pool.push(candidate(`m${index}`, Math.round(random() * 10) / 10, [...shared, ...unique]));
+        // ⚠️ **三组轮转** ⇒ 组内冗余、组间不冗余 ⇒ D 桶真的会非空。
+        const group = `g${Math.floor(random() * 3)}`;
+        // 分数带随机扰动 ⇒ 制造同分边界（全序的 id tiebreak 才参与）
+        pool.push(grouped(`m${index}`, Math.round(random() * 10) / 10, group));
       }
-      const outcome = inhibitCandidates(pool, topN, DEFAULT_PARAMS);
-      const hits = outcome.kept.length;
-
-      expect(hits).toBeGreaterThanOrEqual(Math.min(topN, Math.min(2, size)));
-      expect(hits).toBeLessThanOrEqual(Math.min(topN, size));
-      // 三个桶合起来恰好是全部候选（**没有候选被弄丢**）
-      expect(hits + outcome.redundant.length + outcome.overflow.length).toBe(size);
+      redundantSeen += inhibitCandidates(pool, topN, DEFAULT_PARAMS).redundant.length;
+      assertInvariant(pool, topN);
     }
+    // ★ **前提自检**：随机组里**确实**出现过冗余（否则随机部分也在退化成恒等式）。
+    expect(redundantSeen).toBeGreaterThan(0);
   });
 
   it('★ poolHomogeneous 是**池级**的：整池同质 ⇒ hits = min(topN,|C|) 条、suppressed 为空', () => {
@@ -382,13 +436,54 @@ function recallOnce(
 }
 
 describe('P3-T02 · 集成：抑制接进召回流水线', () => {
-  it('★ 抑制**不进 score**：Hit.score 恒等于五项加权和（误差 <= 1e-9）', () => {
+  it('★ 守卫 · 抑制**不进 score**（§4.13.1 硬约束①）：抑制开 vs 抑制关 ⇒ **每一条候选**的分数逐位相同', () => {
+    const withInhibition = createTestStore();
+    seedInhibitionWorld(withInhibition.db);
+    const withoutInhibition = createStoreWithParams({ inhibition: false });
+    seedInhibitionWorld(withoutInhibition.db);
+
+    const on = recallOnce(withInhibition.store);
+    const off = recallOnce(withoutInhibition.store);
+
+    // ── 前提自检（**前提不成立 ⇒ 这条断言是空的**）──
+    // ★ 抑制**确实**发生了：有一条被挤掉，且 hits 比抑制关时少。
+    expect(on.suppressed).toHaveLength(1);
+    expect(on.hits.length).toBeLessThan(off.hits.length);
+
+    // ── 守卫：逐位比较**每一条候选**的分数（hits + suppressed 都要比）──
+    // ⚠️ ★ **必须把 `suppressed` 也算进去**（QA 的 F-4 实测）：
+    //   「抑制路径里把 `candidate.score` 改掉」这类变异（M-D1）**只影响被抑制那条**的分数
+    //   ⇒ 只比 `hits` 的话，**恒绿**（这正是原来那条「Hit.score 恒等于五项加权和」漏掉它的原因）。
+    const scoresOn = new Map<string, number>([
+      ...on.hits.map((hit) => [hit.id, hit.score] as const),
+      ...on.suppressed.map((item) => [item.id, item.score] as const),
+    ]);
+    const scoresOff = new Map<string, number>([
+      ...off.hits.map((hit) => [hit.id, hit.score] as const),
+      ...off.suppressed.map((item) => [item.id, item.score] as const),
+    ]);
+    expect(scoresOn.size).toBe(3);
+    expect(scoresOff.size).toBe(3);
+    // ★ **逐位**（不是 `toBeCloseTo`）：抑制不得引入第二个分 ⇒ 同一个数必须**同一个浮点数**。
+    for (const [id, score] of scoresOff) {
+      expect(scoresOn.get(id)).toBe(score);
+    }
+  });
+
+  it('○ 特性刻画（**不是守卫**）：`Hit.score` 恒等于五项加权和（误差 <= 1e-9），且 hits 严格按分数降序', () => {
     const { db, store } = createTestStore();
     seedInhibitionWorld(db);
 
     // ⚠️ **必须带 `explain`** 才有 `breakdown`（否则断言无从下手）
     const result = recall(store, { context: '猫粮品牌', explain: true, now: NOW });
 
+    // ⚠️ ★ **这条是「特性刻画」，不是「守卫」**（QA 的 F-4）：
+    //   它比的是**同一次调用内**的 `Hit.score` 与 `breakdown` 的五项之和
+    //   ⇒ 而 `fuseScore()` 的总分**就是**五个分项相加（`scoring.ts` 明写「五项加权和 == score
+    //   这条恒等式在结构上不可能被破坏」）⇒ **任何实现都成立** ⇒ 它**抓不到**「抑制路径改了 score」。
+    //   ⇒ **真正的那条守卫在上面**（跨两次召回逐位比对）。
+    //   ⇒ 留它的理由：它把「score 就是五项加权和、且权重之和恒为 1.0」这条**契约**写在测试里
+    //     （一旦有人改了 `fuseScore` 的公式或 `SCORE_WEIGHTS`，它会红）。
     expect(result.hits.length).toBeGreaterThan(0);
     for (const hit of result.hits) {
       const breakdown = hit.breakdown;
@@ -408,32 +503,6 @@ describe('P3-T02 · 集成：抑制接进召回流水线', () => {
     }
     const scores = result.hits.map((hit) => hit.score);
     expect([...scores].sort((left, right) => right - left)).toEqual(scores);
-  });
-
-  it('★ 抑制**不改任何候选的分数**（与「开关关闭」那一次逐位相同）', () => {
-    const withInhibition = createTestStore();
-    seedInhibitionWorld(withInhibition.db);
-    const withoutInhibition = createStoreWithParams({ inhibition: false });
-    seedInhibitionWorld(withoutInhibition.db);
-
-    const on = recallOnce(withInhibition.store);
-    const off = recallOnce(withoutInhibition.store);
-
-    // ★ 逐位比较**每一条候选**的分数（hits + suppressed 都要比）
-    const scoresOn = new Map<string, number>([
-      ...on.hits.map((hit) => [hit.id, hit.score] as const),
-      ...on.suppressed.map((item) => [item.id, item.score] as const),
-    ]);
-    const scoresOff = new Map<string, number>([
-      ...off.hits.map((hit) => [hit.id, hit.score] as const),
-      ...off.suppressed.map((item) => [item.id, item.score] as const),
-    ]);
-    expect(scoresOn.size).toBe(scoresOff.size);
-    for (const [id, score] of scoresOff) {
-      expect(scoresOn.get(id)).toBe(score);
-    }
-    // 性质：抑制**确实**改变了结果（否则上面那条断言是空洞的）
-    expect(on.hits.length).toBeLessThan(off.hits.length);
   });
 
   it('★ 抑制**不写库**：抑制前后 memories 表的内容哈希完全相同', () => {
@@ -588,23 +657,64 @@ describe('P3-T02 · 集成：抑制接进召回流水线', () => {
     expect(withInhibition.diffused.length).toBe(withoutInhibition.diffused.length);
   });
 
-  it('★ 抑制只在 `explicit` 的语义下改「谁进 hits」，**不改事件的 scores**', () => {
-    const { db, store } = createTestStore();
-    seedInhibitionWorld(db);
+  it('★ 守卫 · 抑制只在 `explicit` 的语义下改「谁进 hits」，**不改事件的 scores**（跨两次召回逐位比对）', () => {
+    const withInhibition = createTestStore();
+    seedInhibitionWorld(withInhibition.db);
+    const withoutInhibition = createStoreWithParams({ inhibition: false });
+    seedInhibitionWorld(withoutInhibition.db);
 
-    const result = recall(store, { context: '猫粮品牌', explain: true, now: NOW });
-    const events = readEvents(db, 'recall');
+    const on = recall(withInhibition.store, { context: '猫粮品牌', explain: true, now: NOW });
+    const off = recall(withoutInhibition.store, { context: '猫粮品牌', explain: true, now: NOW });
 
-    expect(events).toHaveLength(1);
-    const payload = events[0]?.payload as {
+    // ── 前提自检（**前提不成立 ⇒ 这条断言是空的**）──
+    expect(on.suppressed).toHaveLength(1);
+    expect(on.hits.length).toBeLessThan(off.hits.length);
+
+    /** 读一条 `recall` 事件的 payload（**两条断言共用同一个读法**）。 */
+    const payloadOf = (
+      db: Database.Database,
+    ): {
       hitIds: string[];
       scores: number[];
       suppressedIds: string[];
+    } => {
+      const events = readEvents(db, 'recall');
+      expect(events).toHaveLength(1);
+      const payload = events[0]?.payload as {
+        hitIds: string[];
+        scores: number[];
+        suppressedIds: string[];
+      };
+      return payload;
     };
-    // ★ 事件里的分数与返回的分数**逐位相同**（抑制没改分）
-    expect(payload.scores).toEqual(result.hits.map((hit) => hit.score));
-    // ★ 事件里的 suppressedIds 与返回的 suppressed **一致**
-    expect(payload.suppressedIds).toEqual(result.suppressed.map((item) => item.id));
+    const payloadOn = payloadOf(withInhibition.db);
+    const payloadOff = payloadOf(withoutInhibition.db);
+
+    // ── 守卫 ①：同一个候选的分数，在「抑制开 / 抑制关」两次调用里**逐位相同** ──
+    // ⚠️ ★ **这是「跨两次召回」的形状**（QA 的 F-4 结论）：
+    //   原先那条只比「事件 vs 同一次调用的返回值」⇒ 它对「抑制路径污染了事件的 scores」不敏感
+    //   ⇒ 22 条变异里一条都抓不到 ⇒ 恒绿守卫。
+    // ⚠️ **抑制开时，那条被抑制的候选**不在事件的 `hitIds` 里 ⇒ 它的分数取自 `suppressed`
+    //   ⇒ 两边合起来才是「**每一条候选各一个分数**」的完整表（否则会漏比一条）。
+    const onScores = new Map<string, number>([
+      ...payloadOn.hitIds.map((id, index) => [id, payloadOn.scores[index] ?? Number.NaN] as const),
+      ...on.suppressed.map((item) => [item.id, item.score] as const),
+    ]);
+    const offScores = new Map<string, number>(
+      payloadOff.hitIds.map((id, index) => [id, payloadOff.scores[index] ?? Number.NaN] as const),
+    );
+    expect(offScores.size).toBe(3);
+    expect(onScores.size).toBe(3);
+    for (const [id, score] of offScores) {
+      expect(onScores.get(id)).toBe(score);
+    }
+
+    // ── 守卫 ②：事件**如实记录了本次命中**（`hitIds` / `scores` 与返回值逐条相同）──
+    expect(payloadOn.hitIds).toEqual(on.hits.map((hit) => hit.id));
+    expect(payloadOn.scores).toEqual(on.hits.map((hit) => hit.score));
+
+    // ── 守卫 ③：事件里的 `suppressedIds` 与返回的 `suppressed` **一致** ──
+    expect(payloadOn.suppressedIds).toEqual(on.suppressed.map((item) => item.id));
   });
 });
 
