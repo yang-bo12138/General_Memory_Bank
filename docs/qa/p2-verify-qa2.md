@@ -196,13 +196,47 @@ EXIT_CODE=0
 | **Q-13** | **Major** | `docs/DELIVERY.md:15,19-24,28` | **交付文档断链 + 严重过时**：① 第 28 行「阶段 2 的进度与欠账见 `docs/progress/stage2-progress.md`」⇒ **该文件不存在**（`docs/progress/` 下只有 `stage0-stage1-progress.md` 与 `stage1-closing-snapshot.md`）⇒ **断链**；② 状态表自称「**截至 `95bd5e2`**」，而 main 已到 `4c70582`/`720deec`；③ 表里的数字全部过时：「测试 **37 文件 / 764 条**」⇒ 实际 **41 文件 / 809 条**；「源码 `src/` **43 个 `.ts`**」⇒ 实际 **46 个**；「阶段 2：T01~T05 已合并（T06~T08 在做）」⇒ **T01~T08 全部已合并**。⇒ ⇒ **主理人问的「阶段 2 进度文档」＝ 缺**（这一条应补写）。 | `ls docs/progress/` ⇒ 无 `stage2-progress.md`；`find src -name '*.ts' \| wc -l` ⇒ 46；`find tests -name '*.test.ts' \| wc -l` + 3 ⇒ 41 | `cd D:/Git/repo && ls docs/progress/ && grep -n "95bd5e2\|stage2-progress" docs/DELIVERY.md` |
 | **Q-14** | Minor | `bench/lib/harness.ts:378-391` | `machine` 块里的 `freeMemoryBytes` / `usedMemoryBytes` 是**采集时刻的瞬时值**（源码注释自己写着「采集时刻的**可用**内存」）⇒ **同一台机器的两次运行必然不同** ⇒ ⇒ **`machine` 块不能当「机器指纹」用**（README:40「没有机器信息的 P99 不可复现」需要限定：**硬件标识**（cpuModel / cpuCount / totalMemoryBytes / node）才是身份，free/used 是当次运行的资源余量）。<br>⚠️ **更正一条并行 QA 的推断**：三份 1 万条 JSON 的 `machine` 块**并非「互不相同 ⇒ P99 互不可比」** —— 硬件字段**完全相同**（同一 CPU / 16 核 / 同 node / 同 `benchNow`），**只有 freeMemoryBytes 这个瞬时快照不同** ⇒ **P99 是可比的**。 | `perf-10000` free=4638208000 / `agreement-10000` free=5129768960 / `baseline-flat-10000` free=4690395136；**cpuModel / cpuCount / node / benchNow 三份完全一致** | `cd D:/Git/repo && for f in perf-10000 agreement-10000 baseline-flat-10000; do python -c "import json;d=json.load(open('docs/baseline/$f.json'));print('$f', d['machine']['cpuModel'].strip(), d['machine']['cpuCount'], d['machine']['node'], d['benchNow'])"; done` |
 | **Q-15** | Minor | `src/vector/dot.ts:230-236`；`src/store/merge.ts:331`；`src/vector/bucketAssign.ts:147` | **「向量写入只允许经 `write.ts`」这条纪律目前只有注释、没有机器守卫**（与「桶归属只允许经 `assignBucket`」那条**有 lint 门禁**的纪律形成对比）。⚠️ **须先澄清三个既有事实**（否则容易误判成缺陷）：① **写入点守卫已存在** —— `tests/unit/merge.test.ts:624`「★ 改写 content / content_hash / embedding 的写入点**只在** store/merge.ts」⇒ **谁**能写 embedding 是守住的；② **口径守卫已存在** —— `tests/unit/write.test.ts:1516`「★ 写入路径的向量归一化口径（**唯一**守住『写入口径 = double 域归一化』这条承诺的守卫）」；③ **`merge.ts` / `bucketAssign.ts` 不校验 L2 归一化是**刻意**的** —— `src/vector/dot.ts:230-233` 明写「⚠️ **本函数只验，不改**：向量是否**已 L2 归一化**由调用方保证…本函数**不代为归一化**（代劳会掩盖调用方的 bug，也会让『后端不做任何再归一化』这条边界失守）」。<br>⇒ ⇒ **真正的缺口**是：`mergeMemory()`（`merge.ts:331` 直接 `vectorToBlob(input.vector)`）与 `assignBucket()`（`bucketAssign.ts:147` 只调 `assertValidEmbedding`）**都假定入参已归一化，而这条假定只靠注释维持** ⇒ **将来若有人绕过 `write.ts` 直接调这两个内部函数，落库的就是未归一化向量** ⇒ 余弦 ≠ 点积 ⇒ **与 `dot.ts` 自己警告的「老库与新库的向量不可比 ⇒ 静默劣化」同一类失效**。<br>⇒ **当前所有内部调用方都自洽**（`write.ts:1050` 传的 `vector` 来自 `resolveVector` ⇒ 已归一化）⇒ **不是活 bug，是「纪律没有守卫」的观察项**。<br>⇒ **建议**：比照 `scripts/check-bucket-write.ts` 加一条 `scripts/check-vector-write.ts`（或并入它），把「向量只能经 `write.ts` 的 `resolveVector` 落库」变成**生产侧硬门禁** ⇒ 挂进 `pnpm run verify`。<br>⚠️ **但要换个正则形状**：`check-bucket-write.ts` 的正则是 `/\b(?:INSERT\s+(?:OR\s+\w+\s+)?INTO|UPDATE|DELETE\s+FROM)\s+vector_cell_members\b/gi`
-| **Q-16** | **Major** | `bench/perf.ts:329-330`；`bench/perf.ts:319` | **门槛判定的「两个输入」都是自由的** —— 与 **Q-02（规模无下限）**同型：**样本量也没有下限**。<br>① **规模无下限**（= Q-02）：`--scale` 无校验 ⇒ 实测 `--scale=1500` 照样跑完落盘、**退出码 0**。<br>② **★ 样本量无下限**（新增）：`bench/perf.ts:329-330` 的 `intArg(args,'queries',200)` / `intArg(args,'writes',200)` **没有任何下限校验**；`checkPerf()` 里唯一的样本数守卫是 `=== 0`（`:319`，「样本数为 0 ⇒ P99 是真空通过」）⇒ **n=20 时 P99 就是最大值**（nearest-rank，**n < 100 ⇒ P99 == max**）。<br>⇒ ⇒ **「规模 ≥ 100 万」与「样本 ≥ 200（建议 ≥1000）」两个下限都要钉死** —— 只补规模那条，结论**仍然不可用**（n=10 的 recall P99 与 n=50 的写入 P99 都只是「最差的那一次」）。<br>⇒ **本轮最可复用的检查式**（建议写进下一轮 QA 清单）：对每条「验收行」问三句 —— ① **判定输入**（规模 / 样本量 / 口径）**有没有下限**？② **不达标时退出码是不是非 0**？③ **判定逻辑写在代码里，还是只写在文档里**？ | `bench/perf.ts:329-330`：`const queryCount = intArg(args,'queries',200); const writeCount = intArg(args,'writes',200);`（**无下限**）<br>`bench/perf.ts:319`：`if (result.recallSamples === 0 || result.writeSamples === 0 || result.vectorRouteSamples === 0)`（**只挡 0**）<br>并行 QA 实证：`pnpm exec tsx bench/perf.ts --scale=1500 --queries=20 --writes=20` ⇒ **落盘 + 退出码 0**<br>P99 边界实测（复刻 `bench/lib/harness.ts` 的 nearest-rank）：n=1/5/10/20/50 ⇒ **P99==max**；n=100 ⇒ 第 99 个；n=200 ⇒ 第 198 个 | `cd D:/Git/repo && grep -n "intArg(args, 'queries'\|intArg(args, 'writes'" bench/perf.ts` |
+| **Q-16** | **Major** | `bench/perf.ts:329-330`；`bench/perf.ts:319` | **门槛判定的「两个输入」都是自由的** —— 与 **Q-02（规模无下限）**同型：**样本量也没有下限**。<br>① **规模无下限**（= Q-02）：`--scale` 无校验 ⇒ 实测 `--scale=1500` 照样跑完落盘、**退出码 0**。<br>② **★ 样本量无下限**（新增）：`bench/perf.ts:329-330` 的 `intArg(args,'queries',200)` / `intArg(args,'writes',200)` **没有任何下限校验**；`checkPerf()` 里唯一的样本数守卫是 `=== 0`（`:319`，「样本数为 0 ⇒ P99 是真空通过」）⇒ **n=20 时 P99 就是最大值**（nearest-rank，**n < 100 ⇒ P99 == max**）。<br>⇒ ⇒ **「规模 ≥ 100 万」与「样本 ≥ 200（建议 ≥1000）」两个下限都要钉死** —— 只补规模那条，结论**仍然不可用**（n=10 的 recall P99 与 n=50 的写入 P99 都只是「最差的那一次」）。<br>⇒ **本轮最可复用的检查式**（建议写进下一轮 QA 清单）：对每条「验收行」问三句 —— ① **判定输入**（规模 / 样本量 / 口径）**有没有下限**？② **不达标时退出码是不是非 0**？③ **判定逻辑写在代码里，还是只写在文档里**？<br>⚠️⚠️ **+ 一条硬要求（本轮唯二的新门禁 ⇒ 特别强调）**：**Q-02 / Q-15 要新增的门禁，必须自带「注入即红」的负控**（照 `tests/contracts/scripts.test.ts` 里那些负控的形状写）⇒ **理由**：**Q-01 恰恰就是「没带负控 ⇒ 恒绿」的活例**（那条断言存在、却因为前提从未成立而永不失败）⇒ ⇒ **本轮新增的门禁若不配负控，就会复制 Q-01 那个模式**。<br>⚠️ **另**：Q-02 / Q-16 的下限**必须钉在代码里**（`bench/perf.ts` 的 `intArg` 之后立刻校验 + 越界即 `exitCode=1`），**不能只写在文档里** —— 否则重跑的人照旧会拿 1500 条 / 20 样本去测。 | `bench/perf.ts:329-330`：`const queryCount = intArg(args,'queries',200); const writeCount = intArg(args,'writes',200);`（**无下限**）<br>`bench/perf.ts:319`：`if (result.recallSamples === 0 || result.writeSamples === 0 || result.vectorRouteSamples === 0)`（**只挡 0**）<br>并行 QA 实证：`pnpm exec tsx bench/perf.ts --scale=1500 --queries=20 --writes=20` ⇒ **落盘 + 退出码 0**<br>P99 边界实测（复刻 `bench/lib/harness.ts` 的 nearest-rank）：n=1/5/10/20/50 ⇒ **P99==max**；n=100 ⇒ 第 99 个；n=200 ⇒ 第 198 个 | `cd D:/Git/repo && grep -n "intArg(args, 'queries'\|intArg(args, 'writes'" bench/perf.ts` |
 —— 它**要求表名紧跟在动词后面**（`UPDATE vector_cell_members`）。
 ⇒ 而向量写入的形态是 `UPDATE memories SET embedding = …`（**目标不是紧跟动词的那个词**）
 ⇒ ⇒ **照抄那个正则形状会一条都抓不到** ⇒ 必须另写一个锚在 `SET embedding` 上的模式。
 ⚠️ **好消息**（我实测过，**更正我自己一版错误的措辞**）：那个扫描器**不是逐行匹配** ——
 它在**全文**上 `exec`（`\s` 含 `\n`）⇒ **跨行、带 `WHERE`、`INSERT OR REPLACE` 三种形态都能命中**（实测均 YES）
 ⇒ ⇒ **扫描器本身的能力足够，不需要改造；需要改的只是「匹配哪个形态」。**<br>⇒ **通用教训**：**Q-02（规模断言）、Q-15（向量写入门禁）这类「加门禁」的活，必须自带负控**（像 `check-bucket-write.ts` 那样断言「命中数 > 0」+「白名单里的文件真的被扫到」），否则就是下一个恒绿守卫。 | `src/vector/dot.ts:230-233`：「本函数只验，不改：向量是否已 L2 归一化**由调用方保证**」<br>`src/store/merge.ts:331`：`embedding: input.vector === null ? null : vectorToBlob(input.vector)`（**不归一化**）<br>`grep -rn "SET embedding" scripts/` ⇒ **0 命中**（静态守卫只存在于 `tests/unit/merge.test.ts`，**不在 `scripts/` 门禁链里**）<br>正则实测：紧跟表名 **YES** / 跨行 **YES** / 带 WHERE **YES** / `INSERT OR REPLACE` **YES** | `cd D:/Git/repo && sed -n '228,236p' src/vector/dot.ts && sed -n '329,333p' src/store/merge.ts` |
+
+---
+
+## 4.1 ⚠️ 证据类型标注（**实测** / **读码推断**）—— 本轮新加的自我约束
+
+> ⚠️ **为什么加这一节**：本轮我与并行 QA **各有一条「推断伪装成事实」被对方抓出来**
+> （我那条：「扫描器是逐行匹配」—— **实测证明是错的**；他那条：「三个 P99 互不可比」—— **复算证明是错的**）
+> ⇒ ⇒ **「这条结论是实测的，还是读码推出来的？」必须显式标注**，不许混着写。
+> （并行 QA 也给自己的报告做了同样的标注，见 `p2-final-qa1.md` 附录五③。）
+
+### ✅ **实测**（我亲自跑过命令 / 做过变异 / 逐字段比对过）
+
+| 条目 | 我实测了什么 |
+|---|---|
+| **Q-01 / M1~M6** | 6 条变异的**改坏 → 跑测试 → 看红了哪几条 → `cp` 还原 → `cmp` 校验**全流程；M3 另配了**探针脚本**（真·等条数场景） |
+| **Q-02** | `pnpm exec tsx bench/perf.ts --scale=1500 --queries=20 --writes=20` ⇒ **跑完、落盘、退出码 0** |
+| **Q-03** | 两份落盘 JSON 的**字段逐个读取**（p50/p99/count/failures）；`percentile()` 的 **n=1/5/10/20/50/100/200/500/1000 边界实测** |
+| **Q-04 / Q-12 / Q-13** | 文件**存在性**与**行数/计数**（`ls` / `wc -l` / `find` / `grep`） |
+| **Q-08** | 两份文档的 §7.1 **grep 实测**（「软阈值\|P99\|200ms\|5ms」**零命中**） |
+| **Q-11** | `.tmp/` 下 `*.test.ts` **实际计数**（35） |
+| **Q-14** | 三份 10k JSON 的 `machine` **逐字段比对**（7 个字段，只有 free/used 不同） |
+| **Q-15** | 那条正则的**四种形态实测**（紧跟/跨行/带 WHERE/INSERT OR REPLACE ⇒ 全 YES） |
+| **Q-16** | `intArg` 无下限 + `checkPerf` 只挡 0 的**代码定位**；percentile 边界实测 |
+| **导出面 / 门禁** | `node_modules/.bin` **24 个条目逐个列出**；`biome check .` **126 files / 0 error**；嵌套目录**逐个探测** |
+
+### ⚠️ **读码推断**（我**没有**实测，写在这里以免被当成事实）
+
+| 条目 | 推断内容 | 为什么仍是推断 |
+|---|---|---|
+| **Q-06** | 「`.all()` 的行数组（~3.3GB）与 `blobToVector` 的 Float32Array 数组（~3.07GB）**同时存活** ⇒ 峰值 ≈ 之和（~6.4GB）+ Node/SQLite ⇒ 8.47GB」 | 我**核实了代码结构**（两者确实在同一函数作用域内依次存活），但**没有自己测过内存**。⚠️ **8.47GB 这个数是落盘 JSON 里别人的实测值**，不是我测的 ⇒ **因果链是我的推断，数字是引用** |
+| **Q-15** | 「若有人绕过 `write.ts` 直接调 `mergeMemory`/`assignBucket` ⇒ 落库未归一化向量 ⇒ 余弦 ≠ 点积」 | **未构造该场景实测**（当前所有内部调用方都自洽 ⇒ 无法在现网复现） |
+| **Q-08** | 「1M 不达标的成因是**端到端开销**（含 FTS5 / 图谱路 / 去重）」 | **未做分项 profiling**。我实测的只是**分布事实**：「不达标的是整体 recall/写入，而向量路那两条达标」⇒ **「成因」是推断**（⇒ 所以我给架构师的问题措辞是「门槛的**口径**是否包含非向量开销」，而不是断言「就是 FTS5 慢」） |
+
+⇒ ⇒ **凡本报告写「实测」处，可照着重跑；凡写「推断」处，请当假设看，不要当结论用。**
 
 ---
 
