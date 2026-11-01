@@ -30,6 +30,12 @@
  *
  * ⚠️ **规模**：默认 **100 万条**（§7.1 的验收行：规模必须写进验收行）。
  *   ⇒ 实测跑不动时**不许**把小规模说成 100 万 ⇒ 报告里必须写清**实际规模**。
+ * ⚠️ ★ **规模守卫**（P2 收官 · Q-02）：**规模 < 100 万 ⇒ 直接失败**
+ *   （抛错 + **非零退出码** + **不落盘**）⇒ 因为「小库根本走不到分桶路径」
+ *   ⇒ **在小库上测得的吻合率什么也没验到** ⇒ 不许冒充验收结论。
+ *   ⚠️ **降级开关 `--allow-small-scale`（默认关闭）**：只为冒烟 / 自检 / 工具链联调
+ *   留一条**合法的小规模路径**（否则每次自检都要 5 小时）；
+ *   **默认必须拒绝** ⇒ 降级跑出来的文件名**带规模数字** ⇒ 一眼可辨。
  *
  * 用法：
  * ```
@@ -54,6 +60,7 @@ import { flatCandidateUniverse, flatTopK, flatTopKMulti } from './lib/flat.js';
 import {
   BENCH_NOW,
   benchWorkDir,
+  formatPeakRss,
   intArg,
   machineInfo,
   parseArgs,
@@ -62,6 +69,7 @@ import {
   summarizeLatency,
   writeJsonFile,
 } from './lib/harness.js';
+import { enforceBenchScale } from './lib/scale.js';
 
 /** 吻合率的**软阈值**（§7.1 验收行：吻合率 ≥ 0.98）。 */
 export const AGREEMENT_THRESHOLD = 0.98;
@@ -395,6 +403,17 @@ function main(): void {
   const dbPath = stringArg(args, 'db', `${benchWorkDir()}/agreement-${scale}.db`);
   const outPath = stringArg(args, 'out', `docs/baseline/agreement-${scale}.json`);
 
+  // ⚠️ ★ **规模守卫**（硬断言「规模写进验收行」）⇒ **在最前面**：
+  //   不达标就**别开始灌库**（百万级一次 3 小时 ⇒ 跑完再报错是浪费）。
+  //   ⇒ 不达标 ⇒ 非零退出码 ⇒ **直接 return ⇒ 绝不落盘**。
+  const scaleCheck = enforceBenchScale(args, scale);
+  if (!scaleCheck.allowed) {
+    return;
+  }
+  if (scaleCheck.downgraded) {
+    process.stdout.write(`⚠ ${scaleCheck.reason}\n`);
+  }
+
   const options: CorpusOptions = { ...DEFAULT_CORPUS_OPTIONS, size: scale, seed };
   // ⚠️ **机器信息在开始时采集**（不是结束时）：
   //   “运行开始时还有多少可用内存”才是“这个规模跑得动”的证据。
@@ -452,7 +471,7 @@ function main(): void {
       `  分桶候选 ${result.bucketCandidateTotal} 条 ⊆ flat 候选全集 ${result.flatCandidateUniverse} 条\n` +
       `  查询耗时 p50/p99 = ${latency.p50Ms.toFixed(3)} / ${latency.p99Ms.toFixed(3)} ms\n` +
       `  灌库 ${prepared.loadMs.toFixed(0)}ms / 训练 ${prepared.trainMs.toFixed(0)}ms / ` +
-      `峰值 RSS ${(prepared.trainPeakRssBytes / 1024 / 1024).toFixed(0)}MB\n` +
+      `${formatPeakRss(prepared.trainPeakRss)}\n` +
       `  结果已写入 ${outPath}\n`,
   );
 

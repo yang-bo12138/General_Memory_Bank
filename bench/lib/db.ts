@@ -29,6 +29,7 @@ import {
 } from '../corpus.js';
 import {
   BENCH_NOW,
+  type PeakRssMeasurement,
   PeakRssSampler,
   encodeVector,
   openBenchDatabase,
@@ -143,10 +144,15 @@ export interface PreparedBench {
   readonly loadMs: number;
   /** 训练耗时（毫秒）。 */
   readonly trainMs: number;
-  /** 训练期峰值 RSS（字节）—— **进程高水位**（含灌库阶段的占用）。 */
-  readonly trainPeakRssBytes: number;
-  /** 训练段**采样**到的峰值 RSS（字节）—— 只覆盖训练那一段。 */
-  readonly trainSampledPeakRssBytes: number;
+  /**
+   * 训练期峰值 RSS 的**完整测量口径**（**两个数 + 采样次数 + 是否 worker**）。
+   *
+   * ⚠️ **两个数必须一起报**（P2 收官 · Q-06）：
+   *   · `kernelPeakBytes` = **进程高水位**（含灌库阶段）⇒ 「训练期峰值内存」的**上界**；
+   *   · `sampledPeakBytes` = **采样器独立观察**到的峰值 ⇒ **训练段自己的峰值**
+   *     （`null` ⇒ **没测到** ⇒ 不许当成 0）。
+   */
+  readonly trainPeakRss: PeakRssMeasurement;
   /** 训练**前**的 RSS（字节）—— 与峰值对比 ⇒ 训练自身的增量。 */
   readonly rssBeforeTrainBytes: number;
   /** 语料参数（**写进报告 ⇒ 规模与种子可核对**）。 */
@@ -183,6 +189,24 @@ export interface PrepareBenchOptions {
 
 /** 准备结果的**清单文件**（**复用时读它** ⇒ 相位耗时不会丢）。 */
 const MANIFEST_SUFFIX = '.manifest.json';
+
+/**
+ * 清单的**版本号**（**每次改清单结构就 +1** ⇒ 读的时候能判「这是哪一版的清单」）。
+ *
+ * ⚠️ **为什么要有版本**：清单里新增了 `peakRss`（**峰值内存的完整口径**）
+ *   ⇒ **旧清单里没有这个字段** ⇒ 若不判版本，就会把「没有这个字段」误当成
+ *   「测到了 0」（**这正是 `sampledPeakRssBytes: 0` 的由来**）⇒
+ *   ⇒ **版本号让「没测到」能被如实表达**（`null`）。
+ */
+export const MANIFEST_VERSION = 2;
+
+/** 清单里**峰值内存**那一块的形状（**新清单**才有 ⇒ 旧清单走兜底）。 */
+interface ManifestPeakRss {
+  readonly kernelPeakBytes?: number;
+  readonly sampledPeakBytes?: number | null;
+  readonly sampleCount?: number;
+  readonly workerActive?: boolean;
+}
 
 /**
  * 准备一份 bench 库（**建库 → 灌语料 → 训练 → 挂桶**）。
@@ -244,12 +268,14 @@ function tryReuse(dbPath: string, corpus: CorpusOptions): PreparedBench | undefi
     return undefined;
   }
   let manifest: {
+    manifestVersion?: number;
     corpusSize?: number;
     seed?: number;
     loadMs?: number;
     trainMs?: number;
     peakRssBytes?: number;
     sampledPeakRssBytes?: number;
+    peakRss?: ManifestPeakRss;
   };
   try {
     manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as typeof manifest;
@@ -287,8 +313,10 @@ function tryReuse(dbPath: string, corpus: CorpusOptions): PreparedBench | undefi
       members,
       loadMs: manifest.loadMs ?? 0,
       trainMs: manifest.trainMs ?? 0,
-      trainPeakRssBytes: manifest.peakRssBytes ?? 0,
-      trainSampledPeakRssBytes: manifest.sampledPeakRssBytes ?? 0,
+      // ⚠️ ★ **峰值内存：旧清单没有 `peakRss` ⇒ 「没测到」必须如实写成 `null`**，
+      //   **不许**退化成 `0`（`0` 会被读成「测到了 0 字节」⇒ 掩盖了「没测到」这件事）。
+      //   ⇒ 上界（进程高水位）从旧字段 `peakRssBytes` 兜底 ⇒ **上界不丢**。
+      trainPeakRss: readManifestPeakRss(manifest),
       rssBeforeTrainBytes: 0,
       options: corpus,
     };
@@ -296,6 +324,42 @@ function tryReuse(dbPath: string, corpus: CorpusOptions): PreparedBench | undefi
     db.close();
     throw error;
   }
+}
+
+/**
+ * 从清单里读**峰值内存的测量口径**（**旧清单 ⇒ 「没测到」**）。
+ *
+ * ⚠️ **两条兜底**：
+ *   · **上界**（`kernelPeakBytes`）：新清单取 `peakRss.kernelPeakBytes`；
+ *     旧清单退回旧的 `peakRssBytes`（**那时候它就是进程高水位**）⇒ **上界不丢**。
+ *   · **采样峰值**（`sampledPeakBytes`）：新清单取 `peakRss.sampledPeakBytes`；
+ *     旧清单**没有这个字段** ⇒ **`null`（= 没测到）** ⇒ **绝不写 `0`**。
+ *
+ * @param manifest 清单内容
+ * @returns 峰值内存的测量口径
+ */
+function readManifestPeakRss(manifest: {
+  peakRssBytes?: number;
+  sampledPeakRssBytes?: number;
+  peakRss?: ManifestPeakRss;
+}): PeakRssMeasurement {
+  const peakRss = manifest.peakRss;
+  if (peakRss !== undefined) {
+    const sampled = peakRss.sampledPeakBytes;
+    return {
+      kernelPeakBytes: peakRss.kernelPeakBytes ?? manifest.peakRssBytes ?? 0,
+      sampledPeakBytes: sampled === undefined || sampled === null ? null : sampled,
+      sampleCount: peakRss.sampleCount ?? 0,
+      workerActive: peakRss.workerActive ?? false,
+    };
+  }
+  // ⚠️ **旧清单**：只有进程高水位 ⇒ 采样峰值**没测到**（`null`）。
+  return {
+    kernelPeakBytes: manifest.peakRssBytes ?? 0,
+    sampledPeakBytes: null,
+    sampleCount: 0,
+    workerActive: false,
+  };
 }
 
 /**
@@ -309,6 +373,7 @@ function writeManifest(dbPath: string, prepared: PreparedBench): void {
     `${dbPath}${MANIFEST_SUFFIX}`,
     `${JSON.stringify(
       {
+        manifestVersion: MANIFEST_VERSION,
         corpusSize: prepared.options.size,
         seed: prepared.options.seed,
         rows: prepared.rows,
@@ -317,8 +382,9 @@ function writeManifest(dbPath: string, prepared: PreparedBench): void {
         members: prepared.members,
         loadMs: prepared.loadMs,
         trainMs: prepared.trainMs,
-        peakRssBytes: prepared.trainPeakRssBytes,
-        sampledPeakRssBytes: prepared.trainSampledPeakRssBytes,
+        // ⚠️ **峰值内存整块存**（两个数 + 采样次数 + 是否 worker）⇒
+        //   复用时**不必**再猜「这个 0 是没测到还是测到了 0」。
+        peakRss: prepared.trainPeakRss,
         rssBeforeTrainBytes: prepared.rssBeforeTrainBytes,
       },
       null,
@@ -374,8 +440,12 @@ function prepareWithDatabase(
       members: 0,
       loadMs: load.elapsedMs,
       trainMs: 0,
-      trainPeakRssBytes: 0,
-      trainSampledPeakRssBytes: 0,
+      trainPeakRss: {
+        kernelPeakBytes: 0,
+        sampledPeakBytes: null,
+        sampleCount: 0,
+        workerActive: false,
+      },
       rssBeforeTrainBytes: 0,
       options: corpusOptions,
     };
@@ -384,10 +454,13 @@ function prepareWithDatabase(
   // ⚠️ **训练期的峰值内存**（§12 的 R-04：≥3.5GB 是资源规划的下限）：
   //   生产的重训序列一次性把全部向量读进内存 ⇒ 峰值 RSS 就是「训练期峰值内存」。
   const rssBeforeTrain = process.memoryUsage().rss;
-  // ⚠️ **两个峰值一起报**（互为兜底）：
-  //   · `PeakRssSampler`：**采样**到的峰值（训练是同步长任务 ⇒ 采样器可能一次都跑不到
-  //     ⇒ 这个值可能偏低 ⇒ 不能单独用）；
-  //   · `process.resourceUsage().maxRSS`：**内核维护的高水位**（永不丢失，但含灌库阶段）。
+  // ⚠️ **两个峰值一起报**（互为兜底，但**各司其职**）：
+  //   · `sampledPeakBytes`：**采样器独立观察**到的峰值（**训练段自己的峰值**）
+  //     ⇒ 采样器跑在 **worker 线程**上 ⇒ **同步长任务期间也采得到**
+  //       （主线程的定时器在同步长任务期间**一次都不会触发** ⇒ 这就是历史上
+  //        「采样峰值采不到数」的**根因**）；
+  //   · `kernelPeakBytes`：**内核维护的进程高水位**（含灌库阶段）⇒ **上界**，
+  //     永不丢失。
   //   ⇒ 报告里写「进程高水位（含灌库）」+「采样峰值（仅训练段）」两个数。
   const sampler = new PeakRssSampler();
   sampler.start();
@@ -400,7 +473,14 @@ function prepareWithDatabase(
   });
   const trainEnd = process.hrtime.bigint();
   sampler.stop();
-  const trainSampledPeakRssBytes = sampler.peakBytes();
+  const sampleCount = sampler.sampleCount();
+  const trainPeakRss: PeakRssMeasurement = {
+    kernelPeakBytes: sampler.kernelPeakBytes(),
+    // ⚠️ **一次都没采到 ⇒ `null`（= 没测到）**，**不是 `0`**。
+    sampledPeakBytes: sampleCount > 0 ? sampler.sampledPeakBytes() : null,
+    sampleCount,
+    workerActive: sampler.isWorkerActive(),
+  };
 
   return {
     db,
@@ -410,9 +490,7 @@ function prepareWithDatabase(
     members: trained.members,
     loadMs: load.elapsedMs,
     trainMs: Number(trainEnd - trainStart) / 1_000_000,
-    // ⚠️ **内核高水位**（不会因为采样器没跑到而丢失）。
-    trainPeakRssBytes: Math.max(process.resourceUsage().maxRSS * 1024, trainSampledPeakRssBytes),
-    trainSampledPeakRssBytes,
+    trainPeakRss,
     rssBeforeTrainBytes: rssBeforeTrain,
     options: corpusOptions,
   };
