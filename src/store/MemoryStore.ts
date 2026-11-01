@@ -1,6 +1,7 @@
 /**
  * 门面 `MemoryStore` —— DESIGN-v2.md §6 的公开 API 入口
- * （阶段 1 的 10 个方法 + 阶段 2 的 `rebuildVectorBuckets` + 阶段 3 的 `inhibitionTrace` / `recluster`）。
+ * （阶段 1 的 10 个方法 + 阶段 2 的 `rebuildVectorBuckets`
+ *   + 阶段 3 的 `inhibitionTrace` / `recluster` / `clusters`）。
  *
  * ⚠️ **本文件只做「委托」，一行业务逻辑都没有**（§14.3 边界原则 1：
  *   「每个承诺都要能指到唯一代码路径」）：
@@ -15,10 +16,9 @@
  *   · **阶段 1 的 10 个**：`write` / `recall` / `touch` / `get` / `pin` / `unpin` /
  *     `link` / `linkByIds` / `setAlias` / `mergeEntities`；
  *   · **阶段 2 的 1 个**：`rebuildVectorBuckets`（§4.15.5 的重训；P2-T05 落地）；
- *   · **阶段 3 的 2 个**：`inhibitionTrace`（§4.13 的抑制诊断；P3-T02 落地）/
- *     `recluster`（§4.12.3 的簇重算；P3-T03 落地）。
- *     ⇒ **阶段 3 的第三个方法 `clusters` 仍未落地**（P3-T05 未做 ⇒ 查簇快照的只读接口还不存在）
- *       ⇒ **刻意不造空壳**：导出了却没实现 = 空承诺，比不导更糟。
+ *   · **阶段 3 的 3 个**：`inhibitionTrace`（§4.13 的抑制诊断；P3-T02 落地）/
+ *     `recluster`（§4.12.3 的簇重算；P3-T03 落地）/
+ *     `clusters`（§4.12 的簇导航；P3-T05 落地）。
  * ⇒ **刻意不实现 `stats`**（阶段 4）、**不提前实现其余 10 个**：
  *   每多一个公开方法都是一次**公开承诺**，而 §6 的 23 个方法分属阶段 1~5
  *   ⇒ 门面只承诺**已落地阶段**的那几个，其余的等各自阶段落地时再加
@@ -46,7 +46,13 @@ import { openDatabase, readUserVersion } from '../db/connection.js';
 import { assertV2TablesComplete, ensureSchema } from '../db/migrate.js';
 import { FileLogger, type Logger } from '../util/log.js';
 import { CentroidCache } from '../vector/centroids.js';
-import { type ReclusterResult, recluster as reclusterImpl } from './clusters.js';
+import {
+  type ClustersOptions,
+  type ClustersResult,
+  type ReclusterResult,
+  clusters as clustersImpl,
+  recluster as reclusterImpl,
+} from './clusters.js';
 import {
   type MergeEntitiesResult,
   mergeEntities as mergeEntitiesImpl,
@@ -176,7 +182,7 @@ function ensureSchemaForMode(db: Database.Database, readonly: boolean): void {
  * 门面 —— 库对外的唯一入口（§6）。
  *
  * ⚠️ **只暴露已落地阶段的公开方法**（阶段 1 的 10 个 + 阶段 2 的 `rebuildVectorBuckets`
- *   + 阶段 3 的 `inhibitionTrace` / `recluster`），
+ *   + 阶段 3 的 `inhibitionTrace` / `recluster` / `clusters`），
  *   其余全是私有字段：
  *   公开面每多一个名字就是一次公开承诺（§14.3 原则 1），
  *   而 §6 的 23 个方法分属阶段 1~5 ⇒ 只承诺**已落地**的那几个。
@@ -525,5 +531,34 @@ export class MemoryStore {
     // ⚠️ **`ClusterStore` 与 `GraphStore` 结构完全相同**（都是 `{ db, params, events }`）
     //   ⇒ 复用同一个上下文对象即可，不必为每个实现各造一份（造多份只是把同一件事抄五遍）。
     return reclusterImpl(this.#context, now);
+  }
+
+  /**
+   * 主题簇导航（只读）—— §6 的 `clusters(options?, now?)`（§4.12 / §4.12.4）。
+   *
+   * ⚠️ ★ **纯读**：不写库、不写 events、不更新 `last_access`
+   *   ⇒ 只读实例上可直接调用（§7.1 的「7 个允许读的方法」之一）。
+   *
+   * ⚠️ ★ **物化 / 现场重算的分流**（§6，按 `minAffinity` 判）：
+   *   · `minAffinity` **缺省 / 等于快照自己记录的阈值** ⇒ 读**已发布快照**（瞬时，但可能是旧的）；
+   *   · `minAffinity` **显式给了别的值** ⇒ **现场重算**（当前值，但 `clusterId` 不保证持久）。
+   *   ⚠️ **比对的是「快照自己记录的阈值」**（`cluster_snapshot_meta.min_affinity`），
+   *     **不是常量 `COACT_AFFINITY_MIN`**——否则「重算换了阈值而快照没换」时，分流会走错路径。
+   *   ⚠️ **`minSize` / `limit` 不得触发重算**（纯展示侧过滤）。
+   *
+   * ⚠️ **成本**：现场重算路径 = 全表扫 `coacts` + union-find ⇒ **几百毫秒量级的显式调用**，
+   *   **不是 recall 的热路径组件**。
+   *
+   * ⚠️ **签名与 §6 逐字一致**：`options` 可选（`minAffinity` / `minSize` / `limit`）、
+   *   `now` 可选（注入时钟，C37）。
+   *
+   * @param options 可选（`minAffinity` / `minSize` / `limit`）
+   * @param now 注入时钟（C37）
+   * @returns §6 的 `ClustersResult`
+   */
+  clusters(options?: ClustersOptions, now?: number): ClustersResult {
+    // ⚠️ **只读上下文刻意不含 `events`**（`ClusterQueryStore` 只有 `db` + `params`）
+    //   ⇒ **结构上**杜绝了「顺手记一条事件」的写法（§6：只读导航不记事件）。
+    return clustersImpl(this.#readContext, options, now);
   }
 }
