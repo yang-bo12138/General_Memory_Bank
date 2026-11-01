@@ -29,6 +29,7 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { cpus as cpus_, freemem, totalmem } from 'node:os';
 import { dirname, join } from 'node:path';
+import { Worker } from 'node:worker_threads';
 
 import type Database from 'better-sqlite3';
 
@@ -199,6 +200,56 @@ export function summarizeLatency(samples: readonly number[]): LatencySummary {
 // ═══════════════════════════════ 峰值内存（训练期 ≥ 3.5GB 的测量） ═══════════════════════════════
 
 /**
+ * **采样器 worker 的源码**（用 `eval: true` 内联 ⇒ 不依赖任何额外文件）。
+ *
+ * ⚠️ ★ **为什么必须是 worker 线程**（这是「采样峰值一直采不到」的**根因**）：
+ *   Node 的**定时器在主线程的同步长任务期间不会触发** ⇒ 训练（同步、几十秒~几小时）
+ *   期间**主线程的 `setInterval` 一次都跑不到** ⇒ 「采样峰值」永远是「训练开始前」的那一次。
+ *   ⇒ **worker 线程有自己的事件循环** ⇒ 主线程被同步代码占住时，worker **照样在跑**
+ *     ⇒ 而且 `process.memoryUsage.rss()` 报的是**进程级**的 RSS
+ *     （不是「线程自己的」）⇒ **worker 量到的就是整个进程的 RSS**。
+ *   ⇒ 实测（`D:/Git/wt/p2-final` 的探针）：主线程跑 2 秒同步忙等期间，
+ *     主线程的 `setInterval` **一次都没触发**，而 worker 稳定采到了进程 RSS。
+ *
+ * ⚠️ **为什么用 `SharedArrayBuffer` 而不是「postMessage 回报」**：
+ *   主线程在训练期间**不跑事件循环** ⇒ worker 的消息会**堆在队列里**，
+ *   直到训练结束才被处理 ⇒ `stop()` 那一刻读到的是**过期值**。
+ *   ⇒ `SharedArrayBuffer` + `Atomics` ⇒ worker **直接写共享内存**，
+ *     主线程**随时同步读**（不依赖事件循环）⇒ 且 64 位写入是**原子的**（不会读到「半截值」）。
+ */
+const RSS_SAMPLER_WORKER_SOURCE = `
+const { workerData, parentPort } = require('node:worker_threads');
+const shared = new BigInt64Array(workerData.sharedBuffer);
+const intervalMs = workerData.intervalMs;
+let peak = 0n;
+let count = 0n;
+const timer = setInterval(() => {
+  const rss = process.memoryUsage.rss();
+  count += 1n;
+  if (BigInt(rss) > peak) {
+    peak = BigInt(rss);
+    Atomics.store(shared, 0, peak);
+  }
+  Atomics.store(shared, 1, count);
+}, intervalMs);
+parentPort.on('message', (message) => {
+  if (message === 'stop') {
+    clearInterval(timer);
+    Atomics.store(shared, 0, peak);
+    Atomics.store(shared, 1, count);
+    parentPort.close();
+  }
+});
+`;
+
+/** 共享内存里的槽位下标（`BigInt64Array`）。 */
+const SHARED_SLOT_PEAK = 0;
+/** 共享内存里的槽位下标：采样次数。 */
+const SHARED_SLOT_COUNT = 1;
+/** 共享内存的槽位数（8 字节 × 3）。 */
+const SHARED_SLOT_COUNT_TOTAL = 3;
+
+/**
  * 峰值 RSS 采样器（**字节**）。
  *
  * ⚠️ **为什么采样 `rss` 而不是 `heapUsed`**：
@@ -208,17 +259,32 @@ export function summarizeLatency(samples: readonly number[]): LatencySummary {
  *   · `rss`（常驻集）是**进程实际占用的物理内存** ⇒ 才是「这台机器要留多少内存」的答案。
  *   ⇒ 而 §12 的 R-04 说「训练期峰值内存 ≥ 3.5GB」⇒ 说的是**资源规划** ⇒ 必须用 RSS。
  *
- * ⚠️ **采样是「尽力而为」**：Node 的定时器在**同步长任务**期间不触发
- *   ⇒ 训练（同步、几十秒~几分钟）期间**采样器可能一次都跑不到**。
- *   ⇒ 故本采样器**同时**用 `process.resourceUsage().maxRSS` 兜底
- *     （那是内核维护的**高水位**，**不会**因为采样器没跑到而丢失）。
+ * ⚠️ ★ **两个数必须分开报**（P2 收官 · Q-06）：
+ *   · **`kernelPeakBytes`** = `process.resourceUsage().maxRSS * 1024`
+ *     ⇒ **内核维护的高水位**（永不丢失）⇒ 但它是**进程级**的 ⇒ **含灌库阶段的占用**
+ *       ⇒ 它是「训练期峰值内存」的**上界**，**不是**「训练段自己的峰值」。
+ *   · **`sampledPeakBytes`** = **采样器独立观察**到的峰值
+ *     ⇒ 只覆盖**采样器活着的那一段时间** ⇒ **才是「训练段自己的峰值」**。
+ *   ⚠️ **曾经这两个数是同一个**（`peakBytes()` 取了两者的 max）
+ *     ⇒ 「采样峰值」其实是高水位 ⇒ **它从来不是一个独立测量值**
+ *     ⇒ 而复用旧库时旧清单里没有这个字段 ⇒ `?? 0` ⇒ 落盘成 **`sampledPeakRssBytes: 0`**
+ *     ⇒ **看起来像「测到 0」，其实是「没测到」** ⇒ 现在**分开**，且「没测到」用 `null`。
  */
 export class PeakRssSampler {
-  /** 采样到的最高 RSS（字节）。 */
-  private sampledPeak = 0;
+  /** 与 worker 共享的内存（`BigInt64Array` 视图）。 */
+  private readonly shared: BigInt64Array;
 
-  /** 定时器句柄。 */
-  private timer: NodeJS.Timeout | undefined;
+  /** worker 线程（**采样真正靠它**）。 */
+  private worker: Worker | undefined;
+
+  /** worker 是否成功启动（`false` ⇒ 退回了主线程定时器）。 */
+  private workerActive = false;
+
+  /** 降级路径的主线程定时器（worker 起不来时用）。 */
+  private fallbackTimer: NodeJS.Timeout | undefined;
+
+  /** 降级路径采到的峰值（字节）。 */
+  private localPeak = 0;
 
   /** 采样间隔（毫秒）。 */
   private readonly intervalMs: number;
@@ -228,45 +294,120 @@ export class PeakRssSampler {
    */
   constructor(intervalMs = 50) {
     this.intervalMs = intervalMs;
+    const buffer = new SharedArrayBuffer(SHARED_SLOT_COUNT_TOTAL * 8);
+    this.shared = new BigInt64Array(buffer);
+    Atomics.store(this.shared, SHARED_SLOT_PEAK, 0n);
+    Atomics.store(this.shared, SHARED_SLOT_COUNT, 0n);
   }
 
   /** 开始采样。 */
   start(): void {
-    this.sample();
-    this.timer = setInterval(() => {
-      this.sample();
-    }, this.intervalMs);
-    // ⚠️ **不 `unref()`**：我们要它活到 `stop()`（否则进程可能提前退出 ⇒ 采样丢失）。
+    this.sampleLocal();
+    try {
+      this.worker = new Worker(RSS_SAMPLER_WORKER_SOURCE, {
+        eval: true,
+        workerData: { sharedBuffer: this.shared.buffer, intervalMs: this.intervalMs },
+      });
+      // ⚠️ **`unref()`**：worker **不阻止进程退出** ⇒ 万一忘了 `stop()` 也不会挂住脚本。
+      //   ⇒ 它仍然会**照常运行**（unref 只影响「是否让进程等它」）。
+      this.worker.unref();
+      this.workerActive = true;
+    } catch {
+      // ⚠️ **降级**：worker 起不来（受限环境 / 资源不足）⇒ 用主线程定时器。
+      //   ⇒ 此时**同步长任务期间采不到** ⇒ `sampleCount()` 会是 0 ⇒ 报告里如实写「没采到」。
+      this.worker = undefined;
+      this.workerActive = false;
+      this.fallbackTimer = setInterval(() => {
+        this.sampleLocal();
+      }, this.intervalMs);
+    }
   }
 
   /** 停止采样（幂等）。 */
   stop(): void {
-    if (this.timer !== undefined) {
-      clearInterval(this.timer);
-      this.timer = undefined;
+    // ⚠️ **先在主线程采一次**：worker 的最后一次采样可能还没发生 ⇒ 用主线程此刻的 RSS 兜底。
+    this.sampleLocal();
+    if (this.fallbackTimer !== undefined) {
+      clearInterval(this.fallbackTimer);
+      this.fallbackTimer = undefined;
     }
-    this.sample();
+    if (this.worker !== undefined) {
+      // ⚠️ **不用等 worker 的回信**（主线程此刻拿不到事件循环）⇒ 直接读共享内存。
+      this.worker.postMessage('stop');
+      void this.worker.terminate();
+      this.worker = undefined;
+    }
   }
 
-  /** 立即采一次。 */
-  sample(): void {
+  /** 立即采一次（**主线程自己的 RSS** —— 进程级）。 */
+  private sampleLocal(): void {
     const rss = process.memoryUsage().rss;
-    if (rss > this.sampledPeak) {
-      this.sampledPeak = rss;
+    if (rss > this.localPeak) {
+      this.localPeak = rss;
     }
   }
 
   /**
-   * 峰值 RSS（字节）。
+   * **采样器独立观察**到的峰值 RSS（字节）。
+   *
+   * ⚠️ **这是「训练段自己的峰值」**（不含灌库阶段的占用）⇒
+   *   与 `kernelPeakBytes()`（进程高水位 = 上界）是**两条不同的数**。
+   */
+  sampledPeakBytes(): number {
+    const shared = Number(Atomics.load(this.shared, SHARED_SLOT_PEAK));
+    return Math.max(shared, this.localPeak);
+  }
+
+  /**
+   * **内核维护的进程高水位**（字节）—— **上界**（含灌库阶段的占用）。
+   *
+   * ⚠️ **`maxRSS` 的单位是 KB**（本机 Windows 实测：`maxRSS=71792` ⇒ `×1024` 后
+   *   与 `process.memoryUsage().rss` 同量级）⇒ 所以这里要 `× 1024`。
+   */
+  kernelPeakBytes(): number {
+    return process.resourceUsage().maxRSS * 1024;
+  }
+
+  /** 采样器实际采样次数（`0` ⇒ **一次都没采到** ⇒ 那个峰值不可信）。 */
+  sampleCount(): number {
+    return Number(Atomics.load(this.shared, SHARED_SLOT_COUNT));
+  }
+
+  /** 采样器是否跑在 **worker 线程**上（`true` ⇒ 能在**同步长任务**期间采样）。 */
+  isWorkerActive(): boolean {
+    return this.workerActive;
+  }
+
+  /**
+   * 峰值 RSS（字节）—— **上界**（采样峰值与内核高水位取大）。
    *
    * ⚠️ **取「采样峰值」与「内核高水位」的较大者**：
-   *   同步长任务期间采样器可能没跑到 ⇒ 采样值会偏小；
+   *   采样峰值只覆盖「采样器活着的那段」⇒ 可能偏低；
    *   而 `maxRSS` 永远正确（内核高水位）⇒ 两者取大 ⇒ **既不漏报也不虚报**。
    */
   peakBytes(): number {
-    const kernelPeak = process.resourceUsage().maxRSS * 1024;
-    return Math.max(this.sampledPeak, kernelPeak);
+    return Math.max(this.sampledPeakBytes(), this.kernelPeakBytes());
   }
+}
+
+/**
+ * **峰值内存的测量口径**（**两个数必须一起报** ⇒ 报告里不许只写一个）。
+ */
+export interface PeakRssMeasurement {
+  /** **内核高水位**（进程级、含灌库阶段）⇒ 「训练期峰值内存」的**上界**（字节）。 */
+  readonly kernelPeakBytes: number;
+  /**
+   * **采样器独立观察**到的峰值（**只覆盖采样器活着的这段时间**）（字节）。
+   *
+   * ⚠️ **`null` ⇒ 这次运行没采到**（采样器一次都没触发 / 复用了旧清单里没有这个字段）
+   *   ⇒ **`null` 与 `0` 是两件事**：`0` 是「测到了 0 字节」（不可能），
+   *   `null` 是「**没测到**」⇒ 报告里必须这么写。
+   */
+  readonly sampledPeakBytes: number | null;
+  /** 采样次数（`0` ⇒ 没采到）。 */
+  readonly sampleCount: number;
+  /** 采样器是否跑在 **worker 线程**上（`true` ⇒ 同步长任务期间也采得到）。 */
+  readonly workerActive: boolean;
 }
 
 // ═══════════════════════════════ 库与训练（复用生产代码） ═══════════════════════════════
@@ -391,6 +532,29 @@ export function machineInfo(): MachineInfo {
 }
 
 /**
+ * 把**峰值内存的测量口径**排成一行人话（**报告与控制台输出共用这一份**）。
+ *
+ * ⚠️ **两个数必须都在**（否则读者会把「上界」当成「训练段自己的峰值」）：
+ *   · **进程高水位** = 上界（含灌库阶段）；
+ *   · **采样峰值** = 训练段自己的峰值（`null` ⇒ **没测到**，**不许**写成 0）。
+ *
+ * @param measurement 测量口径
+ * @returns 一行说明
+ */
+export function formatPeakRss(measurement: PeakRssMeasurement): string {
+  const kernelMb = (measurement.kernelPeakBytes / 1024 / 1024).toFixed(0);
+  const sampled =
+    measurement.sampledPeakBytes === null
+      ? '**未采到**'
+      : `${(measurement.sampledPeakBytes / 1024 / 1024).toFixed(0)}MB`;
+  const worker = measurement.workerActive ? '，worker 线程' : '';
+  return (
+    `峰值 RSS：进程高水位 ${kernelMb}MB（上界，含灌库阶段）/ ` +
+    `采样峰值 ${sampled}（仅训练段，采样 ${measurement.sampleCount} 次${worker}）`
+  );
+}
+
+/**
  * 训练阶段的**相位信息**（**报告里必须带** ⇒ 规模与耗时可核对）。
  */
 export interface PhaseInfo {
@@ -400,10 +564,21 @@ export interface PhaseInfo {
   readonly trainMs: number;
   /** 训练**前**的 RSS（字节）。 */
   readonly rssBeforeTrainBytes: number;
-  /** 训练**后**的进程高水位 RSS（字节）—— **含灌库阶段的占用**。 */
+  /**
+   * 训练期峰值 RSS 的**上界**（字节）—— **进程高水位**（含灌库阶段的占用）。
+   *
+   * ⚠️ **口径**：它是**进程级**的 ⇒ 不是「纯训练峰值」⇒ 报告里必须这么写。
+   */
   readonly peakRssBytes: number;
-  /** 训练段**采样**到的峰值 RSS（字节）—— 只覆盖训练那一段。 */
-  readonly sampledPeakRssBytes: number;
+  /**
+   * 训练段**采样**到的峰值 RSS（字节）—— **只覆盖采样器活着的这段时间**。
+   *
+   * ⚠️ **`null` ⇒ 这次运行没采到**（复用了旧清单 / 采样器没触发）
+   *   ⇒ **`null` ≠ `0`**：`0` 是「测到了 0 字节」（不可能），`null` 是「**没测到**」。
+   */
+  readonly sampledPeakRssBytes: number | null;
+  /** 峰值内存的**完整测量口径**（两个数 + 采样次数 + 是否 worker）。 */
+  readonly peakRss: PeakRssMeasurement;
   /** 细桶数。 */
   readonly fineCells: number;
   /** 桶归属条数。 */
@@ -416,6 +591,7 @@ export interface PhaseInfo {
  * ⚠️ **峰值口径必须写清**：`peakRssBytes` 是**进程高水位**
  *   （内核维护）⇒ 它**包含灌库阶段的占用** ⇒ 它是「训练期峰值内存」的**上界**。
  *   ⇒ 报告里必须这么写，**不能**说成「纯训练峰值」。
+ *   ⇒ 而 `sampledPeakRssBytes` 才是**采样器独立观察**到的值（**训练段自己的峰值**）。
  *
  * @param prepared 库准备结果
  * @returns 相位信息
@@ -424,17 +600,18 @@ export function phaseInfo(prepared: {
   loadMs: number;
   trainMs: number;
   rssBeforeTrainBytes: number;
-  trainPeakRssBytes: number;
-  trainSampledPeakRssBytes: number;
+  trainPeakRss: PeakRssMeasurement;
   fineCells: number;
   members: number;
 }): PhaseInfo {
+  const sampled = prepared.trainPeakRss.sampledPeakBytes;
   return {
     loadMs: prepared.loadMs,
     trainMs: prepared.trainMs,
     rssBeforeTrainBytes: prepared.rssBeforeTrainBytes,
-    peakRssBytes: prepared.trainPeakRssBytes,
-    sampledPeakRssBytes: prepared.trainSampledPeakRssBytes,
+    peakRssBytes: Math.max(prepared.trainPeakRss.kernelPeakBytes, sampled ?? 0),
+    sampledPeakRssBytes: sampled,
+    peakRss: prepared.trainPeakRss,
     fineCells: prepared.fineCells,
     members: prepared.members,
   };

@@ -77,11 +77,21 @@ export function vectorToBlob(vector: Float32Array): Buffer {
  * ⚠️ **必须显式逐个读**（而不是 `new Float32Array(buf.buffer, buf.byteOffset, n)`）：
  *   后者要求 `byteOffset` 是 4 的倍数，而 `Buffer` 的 `byteOffset` **不保证**对齐
  *   ⇒ 落在非对齐地址上会抛 `RangeError`（或在不同平台上读到错位的值）。
+ *
+ * ⚠️ ★ **不再 `Buffer.from(blob)` 整份拷贝**（P2 收官 · Q-06：训练峰值内存）：
+ *   · **曾经**：每行都 `Buffer.from(blob)`（**整份 3KB 拷贝**）**再**分配
+ *     `new Float32Array(768)` ⇒ 100 万行 = **3GB 的垃圾** ⇒
+ *     ① 峰值内存被这批垃圾顶高（GC 不及时 ⇒ 外部内存一路涨）；
+ *     ② GC 成为主要耗时（`bench/lib/flat.ts` 早就为此**另写了一份「复用缓冲」的解码器**）。
+ *   · **现在**：直接在**原 Buffer** 上用 `DataView` 读。
+ *     ⇒ **为什么不需要那份拷贝**：`DataView.getFloat32()` **不要求对齐**
+ *       （它按字节读，任意 `byteOffset` 都合法）⇒ 那次拷贝**从来不是为了对齐**。
+ *   · **结果逐位相同**：输出**仍然是新分配的 `Float32Array`**（值是拷贝出来的）
+ *     ⇒ **不与源 Buffer 别名** ⇒ 调用方**不可能**看到源 Buffer 后续被改动。
  */
 export function blobToVector(blob: Buffer): Float32Array {
-  const bytes = Buffer.from(blob);
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const count = Math.floor(bytes.byteLength / 4);
+  const view = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
+  const count = Math.floor(blob.byteLength / 4);
   const vector = new Float32Array(count);
   for (let index = 0; index < count; index += 1) {
     vector[index] = view.getFloat32(index * 4, true);
