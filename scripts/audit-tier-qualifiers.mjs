@@ -1,4 +1,4 @@
-#!/usr/bin/env tsx
+#!/usr/bin/env node
 /**
  * `docs/baseline/README.md` 的**档位限定一致性审计** —— 把「哪些数必须带档位、哪些数不许带档位」
  * 这条纪律做成**可复跑**的脚本，使它在每次重采基线后能被机械地重新核对一遍。
@@ -25,10 +25,11 @@
  *
  *   ```bash
  *   # 审计默认目标（仓库根的 docs/baseline/README.md）
- *   pnpm exec tsx scripts/audit-tier-qualifiers.ts
+ *   node scripts/audit-tier-qualifiers.mjs
+ *   #   （也可用 pnpm exec tsx scripts/audit-tier-qualifiers.mjs —— 两者等价）
  *
  *   # 审计别处的同名文件（用于比对别的分支的快照）
- *   pnpm exec tsx scripts/audit-tier-qualifiers.ts path/to/README.md
+ *   node scripts/audit-tier-qualifiers.mjs path/to/README.md
  *   ```
  *
  *   **退出码**：`0` = 无真缺；`1` = 有真缺（⇒ 可直接当门禁用）。
@@ -40,12 +41,20 @@
  *
  *   · **必须自证**：输出里给出**三个数**（扫了多少处 / 判了多少处 / 发现几处真缺）
  *     ⇒ 不许只输出「通过」⇒ ⇒ **数字变了它就该变** ⇒ 它自己也有判别力。
- *     （实测：删掉一处档位限定 ⇒ 三个数从 `69 / 69 / 0` 变成 `69 / 69 / 4` ⇒ 退出码 1。）
+ *     （实测：删掉一处档位限定 ⇒ 三个数从 `69 / 69 / 0` 变成 `69 / 69 / 2` ⇒ 退出码 1。）
  *   · **必须可复跑且幂等**：连续跑两次输出**逐字相同** ⇒ **无随机性、无时间依赖**。
  *   · **核对必须用「机制自己的读法」**：它按**读者读 Markdown 的方式**分层定位
  *     （本行 / 所在表的表头 / 上下文窗口 / 所属小节标题），
  *     **不是**「文件里出现过这个词就算」⇒ ⇒ 这是 §2.4 纪律 5 ③ 的镜像：
  *     **「文件存在」≠「机制在用」⇒ 要用机制自己的读法去核。**
+ *
+ * ────────────────────────────────────────────────────────────────────────────
+ * 【它第一版踩过的坑】（留给后人）
+ *
+ *   小节标题的正则原本写成 `^\*\*（[a-z]\)`（**半角 `)`**），
+ *   而文档里是 `**（b）★ …`（**全角 `）`**）⇒ ⇒ **那条正则永远匹配不上**
+ *   ⇒ ⇒ 整节被误判成「真缺」（4 处假缺口）⇒ ⇒ **一个「看起来红」的守卫其实是坏的**
+ *   ⇒ ⇒ **如果只信它的输出，就会去改本来正确的文档** ⇒ ⇒ **这正是纪律 3「先让工具失手一次」的价值**。
  *
  * ────────────────────────────────────────────────────────────────────────────
  * 【与本仓库「新增门禁的做法」的差距】（`scripts/README.md` §「新增门禁的做法」）
@@ -56,6 +65,11 @@
  *   **含反例**的单测）—— ⇒ **故本脚本目前是「可复跑的审计」，还不是「门禁」**
  *   ⇒ ⇒ **接入门禁的两步由谁做，等主理人定**（第 2 步要动 `package.json`；
  *   第 3 步要动 `tests/contracts/**` ⇒ **都不在工程师-7 的边界内**）。
+ *
+ * ⚠️ **交付形态说明**：本脚本按主理人指定用 **`.mjs`**（⇒ **纯 `node` 即可跑，不依赖 `tsx`**）
+ *   ⇒ ⇒ **代价**：它**不进 `tsc --noEmit` 的类型检查**（`tsconfig.json` 的 `include` 里的
+ *   `scripts/` 只覆盖 `.ts`）⇒ ⇒ **类型信息改用 JSDoc 承载**（编辑器仍可推断）。
+ *   ⇒ ⇒ **⇒ 若日后要把它当门禁**，建议连同单测一起改成 `.ts`（本仓库其余 15 个脚本都是 `.ts`）。
  */
 import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -65,7 +79,7 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const DEFAULT_TARGET = join(REPO_ROOT, 'docs', 'baseline', 'README.md');
 
 /** 档位词表：**任何**能说明「这个数属于哪一档」的词都算。 */
-const TIER_WORDS: readonly string[] = [
+const TIER_WORDS = [
   '冷盘档',
   '部分热档',
   '部分预热档',
@@ -93,15 +107,10 @@ const TIER_WORDS: readonly string[] = [
  *
  * ⚠️ 类目按「同一个语义量」归并 ⇒ 同一个数出现在多处时被**逐处**判定
  * ⇒ ⇒ 漏一处就会被抓出一处。
+ *
+ * @typedef {{ name: string, pattern: RegExp }} TierSpecificClass
  */
-export interface TierSpecificClass {
-  /** 人类可读的类目名（出现在输出里 ⇒ 便于定位）。 */
-  readonly name: string;
-  /** 该类量在文档里的写法。 */
-  readonly pattern: RegExp;
-}
-
-export const TIER_SPECIFIC_CLASSES: readonly TierSpecificClass[] = [
+export const TIER_SPECIFIC_CLASSES = [
   {
     name: '① 写入毫秒拆分',
     pattern: /12\.1%|87\.9%|21\.6%|78\.4%|243\.59|161\.84|33\.44|44\.67|277\.03|206\.51/g,
@@ -124,10 +133,10 @@ export const TIER_SPECIFIC_CLASSES: readonly TierSpecificClass[] = [
  *
  * ⚠️ 只作**提示**：文档里**允许**出现「这组数采自哪一次」的出处陈述。
  */
-export const CROSS_TIER_PATTERN: RegExp = /12,782|1\.2782%|12\.782/g;
+export const CROSS_TIER_PATTERN = /12,782|1\.2782%|12\.782/g;
 
 /** 出处陈述的标志词 ⇒ 出现它们 ⇒ 那句里的档位词是在说「出处」而非「适用范围」。 */
-const PROVENANCE_MARKERS: readonly string[] = [
+const PROVENANCE_MARKERS = [
   '实测',
   '采集',
   '出处',
@@ -145,47 +154,51 @@ const CONTEXT_WINDOW = 5;
 /** 所属小节标题的向上搜索上限。 */
 const SECTION_WINDOW = 40;
 
-/** 一次审计里的一处判定（真缺或提示）。 */
-export interface AuditFinding {
-  /** 文档内行号（1 起）。 */
-  readonly line: number;
-  /** 类目名（提示项用固定的说明）。 */
-  readonly className: string;
-  /** 命中的那一行原文（截断后）。 */
-  readonly text: string;
-}
+/**
+ * 一次审计里的一处判定（真缺或提示）。
+ *
+ * @typedef {{ line: number, className: string, text: string }} AuditFinding
+ */
 
-/** 一次审计的计数（⇒ 输出里的三个数）。 */
-export interface AuditCounts {
-  /** 扫了多少处「只属于某一档的数」。 */
-  readonly scanned: number;
-  /** 判了多少处（= 扫到的处数，逐处都判了）。 */
-  readonly adjudicated: number;
-  /** 发现几处真缺（既缺本行限定、也缺所在表头 / 上下文 / 小节标题的限定）。 */
-  readonly missing: number;
-  /** 几处「行数类判据出现在带档位词的句子里」（只提示，不判红）。 */
-  readonly advisories: number;
-}
+/**
+ * 一次审计的计数（⇒ 输出里的三个数）。
+ *
+ * @typedef {{ scanned: number, adjudicated: number, missing: number, advisories: number }} AuditCounts
+ */
 
-/** 一次审计的完整结果。 */
-export interface AuditResult {
-  readonly counts: AuditCounts;
-  readonly gaps: readonly AuditFinding[];
-  readonly advisories: readonly AuditFinding[];
-}
+/**
+ * 一次审计的完整结果。
+ *
+ * @typedef {{ counts: AuditCounts, gaps: AuditFinding[], advisories: AuditFinding[] }} AuditResult
+ */
 
-/** 判定「本行是否含档位词」。 */
-export function hasTier(text: string): boolean {
+/**
+ * 判定「本行是否含档位词」。
+ *
+ * @param {string} text
+ * @returns {boolean}
+ */
+export function hasTier(text) {
   return TIER_WORDS.some((word) => text.includes(word));
 }
 
-/** 判定「本行是否含出处陈述标志」。 */
-export function hasProvenance(text: string): boolean {
+/**
+ * 判定「本行是否含出处陈述标志」。
+ *
+ * @param {string} text
+ * @returns {boolean}
+ */
+export function hasProvenance(text) {
   return PROVENANCE_MARKERS.some((marker) => text.includes(marker));
 }
 
-/** 判定「本行是否是 Markdown 表格的分隔行」。 */
-export function isTableSeparator(line: string): boolean {
+/**
+ * 判定「本行是否是 Markdown 表格的分隔行」。
+ *
+ * @param {string} line
+ * @returns {boolean}
+ */
+export function isTableSeparator(line) {
   return /^\|[\s|:-]+\|$/.test(line.trim());
 }
 
@@ -195,11 +208,11 @@ export function isTableSeparator(line: string): boolean {
  * ⚠️ **四层缺一不可**：本行 / 所在表的表头 / 上下文窗口 / 所属小节标题
  * ⇒ ⇒ 只查本行会把「表头已限定」的行误判成缺口 ⇒ ⇒ 只查表头会把散文段落误判。
  *
- * @param lines 文档全文按行切分
- * @param index 命中行下标
- * @returns 是否已带档位限定
+ * @param {readonly string[]} lines 文档全文按行切分
+ * @param {number} index 命中行下标
+ * @returns {boolean} 是否已带档位限定
  */
-export function scopeHasTier(lines: readonly string[], index: number): boolean {
+export function scopeHasTier(lines, index) {
   // ① 本行自带档位词。
   if (hasTier(lines[index] ?? '')) return true;
 
@@ -218,9 +231,8 @@ export function scopeHasTier(lines: readonly string[], index: number): boolean {
   }
 
   // ④ 所属小节标题（`### …` 或 `**（x）…**` 这类加粗小标题）。
-  //    ⚠️ **括号要用全角 `）`** —— 文档里写的是 `**（b）★ …`（全角）⇒
-  //    用半角 `)` 的话这条正则**永远匹配不上** ⇒ ⇒ 整节都被判成「真缺」
-  //    ⇒ ⇒ **⇒ 这就是「工具自己会不会失手」的现场**：本脚本第一版就踩了这个坑。
+  //    ⚠️ **括号要全角 `）`** —— 文档里写的是 `**（b）★ …` ⇒ 用半角 `)` 的话
+  //    这条正则**永远匹配不上** ⇒ ⇒ 整节都被判成「真缺」⇒ ⇒ **见头注释里那个坑**。
   for (let k = index - 1; k >= 0 && k >= index - SECTION_WINDOW; k -= 1) {
     const candidate = lines[k] ?? '';
     if (/^#{1,6} /.test(candidate) || /^\*\*（[a-z][)）]/.test(candidate.trim())) {
@@ -237,12 +249,12 @@ export function scopeHasTier(lines: readonly string[], index: number): boolean {
  *
  * ⚠️ **无随机性、无时间依赖** ⇒ ⇒ 连跑两次结果逐字相同（幂等）。
  *
- * @param lines 文档全文按行切分
- * @returns 审计结果
+ * @param {readonly string[]} lines 文档全文按行切分
+ * @returns {AuditResult} 审计结果
  */
-export function auditTierQualifiers(lines: readonly string[]): AuditResult {
-  const gaps: AuditFinding[] = [];
-  const advisories: AuditFinding[] = [];
+export function auditTierQualifiers(lines) {
+  const gaps = [];
+  const advisories = [];
   let scanned = 0;
   let adjudicated = 0;
 
@@ -290,13 +302,13 @@ export function auditTierQualifiers(lines: readonly string[]): AuditResult {
 /**
  * **纯函数**：把审计结果渲染成报告文本。
  *
- * @param target 被审计的文件路径（写进报告头）
- * @param result 审计结果
- * @returns 报告文本（**逐字确定** ⇒ 便于比对两次运行）
+ * @param {string} target 被审计的文件路径（写进报告头）
+ * @param {AuditResult} result 审计结果
+ * @returns {string} 报告文本（**逐字确定** ⇒ 便于比对两次运行）
  */
-export function renderAudit(target: string, result: AuditResult): string {
+export function renderAudit(target, result) {
   const { counts } = result;
-  const out: string[] = [];
+  const out = [];
   out.push('════ 档位限定一致性审计 ════');
   out.push(`目标：${target}`);
   out.push(`扫了 ${counts.scanned} 处「只属于某一档的数」`);
@@ -335,7 +347,7 @@ export function renderAudit(target: string, result: AuditResult): string {
 }
 
 /** CLI 薄壳（★ 逻辑都在上面的纯函数里 ⇒ 便于写单测）。 */
-function main(): void {
+function main() {
   const target = resolve(process.argv[2] ?? DEFAULT_TARGET);
   const lines = readFileSync(target, 'utf8').split(/\r?\n/);
   const result = auditTierQualifiers(lines);
