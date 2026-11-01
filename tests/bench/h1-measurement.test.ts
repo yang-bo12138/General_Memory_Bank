@@ -24,6 +24,8 @@ import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
+import type Database from 'better-sqlite3';
+
 import { DEFAULT_CORPUS_OPTIONS, generateQueries } from '../../bench/corpus.js';
 import { prepareBench } from '../../bench/lib/db.js';
 import { installRowReadCounter, parsePageCacheState } from '../../bench/lib/harness.js';
@@ -212,5 +214,128 @@ describe('页缓存状态标注（冷 / 热 / 未知 —— 可标注，不可�
   it('★ 大小写与首尾空白宽容（`COLD` / ` warm ` ⇒ 认）', () => {
     expect(parsePageCacheState('COLD').state).toBe('cold');
     expect(parsePageCacheState(' warm ').state).toBe('warm');
+  });
+});
+
+/**
+ * ★★★ **两条「有牙」的守卫**（2026-11-02 主理人验收后补）。
+ *
+ * ⚠️ ★ **为什么上一轮的 10 条断言抓不到「口径被换掉」**（**本仓库的老坑，值得记住**）：
+ *   上一轮的核心断言是「**实测 == 推算**」这个恒等式
+ *   ⇒ 而**当前实现下两者本来就相等** ⇒ ⇒ **任何以「当前实现下的具体数值」为断言的测试，
+ *   对「两个来源被调换」这类变异天然失明**
+ *   ⇒ ⇒ 两个变异（① `mode` 恒为 `measured`；② `candidateReadRows` 取推算值）**都跑绿**。
+ * ⇒ ⇒ **教训（进自查清单）**：**新增断言时先想「什么变异会让它变红」，再写它**
+ *   ⇒ **想不出 ⇒ 那条断言可能就是恒绿的**。
+ *
+ * ⚠️ ★ **本文件两条守卫的分工**：
+ * · **守卫一**：制造「**计数器失效**」⇒ 断言 **兜底把 `mode` 标成 `derived`**
+ *   ⇒ **专打变异 ①**（`mode` 恒为 `measured`）；
+ * · **守卫二**：制造「**实测 ≠ 推算**」⇒ 断言 **判据量跟着实测走**
+ *   ⇒ **专打变异 ②**（`candidateReadRows` 取推算值）。
+ */
+
+// ── ★ **制造「实测 ≠ 推算」的场景**（守卫二的注入点）──────────────────────────
+/**
+ * 在**每个细桶**里塞一条**软删**的记忆（`deleted = 1`）并给它挂上桶归属。
+ *
+ * ⚠️ ★ **为什么这个场景是「生产真实状态」而不是人造的**：
+ *   `DESIGN-v2.md` §8.2：**软删记忆保留向量、也保留桶归属**（§9.3.2 ② 明确「软删不删桶归属」）
+ *   ⇒ ⇒ **桶成员里坐着软删行，是生产里真实存在的状态**
+ *   ⇒ ⇒ **而这正是「推算」与「实测」两个口径的真实差异所在**：
+ *   · **推算**（`countBucketMembers`）= 桶里的**全部成员**（**含软删**）；
+ *   · **实测**（候选 SQL 物化的行）= `deleted = 0 AND embedding IS NOT NULL` 的**候选行**（**不含软删**）。
+ *
+ * @param db 库句柄
+ * @returns 塞进去的软删行条数（= 细桶数）
+ */
+function insertSoftDeletedMembers(db: Database.Database): number {
+  const fineIds = (
+    db.prepare('SELECT fine_id FROM vector_fine_cells ORDER BY fine_id').all() as Array<{
+      fine_id: string;
+    }>
+  ).map((row) => row.fine_id);
+  const now = 1_700_000_000_000;
+  const insertMemory = db.prepare(
+    'INSERT INTO memories (id, kind, content, content_tokens, content_hash, embedding, ' +
+      'stability, difficulty, created_at, last_access, deleted, deleted_at) ' +
+      'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)',
+  );
+  const insertMember = db.prepare(
+    'INSERT INTO vector_cell_members (fine_id, memory_id) VALUES (?, ?)',
+  );
+  // ⚠️ **给它一个合法的向量**（3072 字节）⇒ ⇒ 它被排除**只因为 `deleted = 1`**
+  //   （⇒ 守卫考的就是「软删」这一条 ⇒ 不是「向量缺失」那条）。
+  const embedding = new Float32Array(DEFAULT_PARAMS.EMBED_DIM);
+  embedding[0] = 1;
+  const embeddingBlob = Buffer.from(embedding.buffer);
+  for (const fineId of fineIds) {
+    const id = `soft-deleted-${fineId}`;
+    insertMemory.run(
+      id,
+      'fact',
+      `软删测试行 ${id}`,
+      `软删 测试 行 ${id}`,
+      `hash-${id}`,
+      embeddingBlob,
+      1,
+      0.5,
+      now,
+      now,
+      now,
+    );
+    insertMember.run(fineId, id);
+  }
+  return fineIds.length;
+}
+
+describe('★ 两条「有牙」的守卫（防「口径被悄悄换掉」）', () => {
+  it('★ 守卫一：计数器失效 ⇒ 兜底必须把 `mode` 标成 `derived`（不许假装它是实测）', () => {
+    const { dbPath, db } = buildSmokeBench(newWorkDir());
+    const options = { ...DEFAULT_CORPUS_OPTIONS, size: SMOKE_SIZE };
+    const store = new MemoryStore({ dbPath });
+    // ⚠️ ★ **注入「计数器装了但不计数」** ⇒ 实测值恒为 0 ⇒ 兜底必须接手。
+    const result = measurePerf(db.db, store, options, 5, 5, { disableRowReadCounter: true });
+    // ⚠️ ★ **这条断言专打「`mode` 恒为 `measured`」那个变异**。
+    expect(result.candidateReadRowsBasis.mode).toBe('derived');
+    expect(result.candidateReadRowsBasis.note).toContain('推算');
+    // ⚠️ **判据量必须退回到推算值**（⇒ 有值 ⇒ 不是「真空通过」）。
+    expect(result.candidateReadRowsBasis.derivedCrossCheck?.max).toBeGreaterThan(0);
+    expect(result.candidateReadRows.max).toBe(result.candidateReadRowsBasis.derivedCrossCheck?.max);
+    // ⚠️ ★ **违规清单里必须标明「口径 = 推算」**（⇒ 不许让人误以为那是实测）。
+    const failures = checkPerf(result);
+    const h1Failure = failures.find((failure) => failure.includes('（H1）'));
+    if (h1Failure !== undefined) {
+      expect(h1Failure).toContain('推算');
+    }
+    db.db.close();
+  });
+
+  it('★ 守卫二：实测 ≠ 推算时，判据量必须跟着**实测**走（不是跟着推算走）', () => {
+    const { dbPath, db } = buildSmokeBench(newWorkDir());
+    const options = { ...DEFAULT_CORPUS_OPTIONS, size: SMOKE_SIZE };
+    const store = new MemoryStore({ dbPath });
+    // ⚠️ ★ **制造「实测 ≠ 推算」**：每个细桶塞一条软删成员
+    //   ⇒ **推算**（桶成员数之和）**含**它、**实测**（候选行）**不含**它。
+    const softDeletedCount = insertSoftDeletedMembers(db.db);
+    expect(softDeletedCount).toBeGreaterThan(0);
+
+    const result = measurePerf(db.db, store, options, 5, 5);
+    // ⚠️ **前提**：这一轮两个口径**确实不相等**（否则下面的断言是恒绿的 ⇒ 没有牙）。
+    const derived = result.candidateReadRowsBasis.derivedCrossCheck;
+    expect(derived).not.toBeNull();
+    expect((derived?.mean ?? 0) - result.candidateReadRows.mean).toBeGreaterThan(0);
+
+    // ⚠️ ★★ **核心断言**：**差的量 = 命中细桶数**（每个命中桶恰好多一条软删成员）
+    //   ⇒ ⇒ **判据量（`candidateReadRows`）取的是「实测」那一侧**
+    //   ⇒ ⇒ **这条断言专打「`candidateReadRows` 取推算值」那个变异**
+    //   （该变异下差值 = 0 ⇒ 与命中细桶数（> 0）不符 ⇒ 必红）。
+    expect((derived?.mean ?? 0) - result.candidateReadRows.mean).toBeCloseTo(
+      result.hitFineBuckets.mean,
+      6,
+    );
+    // ⚠️ **口径声明仍然是「实测」**（⇒ 这一轮计数器是好的 ⇒ 不许退回推算）。
+    expect(result.candidateReadRowsBasis.mode).toBe('measured');
+    db.db.close();
   });
 });

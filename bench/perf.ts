@@ -318,6 +318,24 @@ export function toDistribution(samples: readonly number[]): LatencyDistribution 
 }
 
 /**
+ * ★ **`measurePerf` 的测量选项**（**仅测试用的注入点**）。
+ */
+export interface PerfMeasurementOptions {
+  /**
+   * ★ **仅测试用**：让行读计数器「**装了但不计数**」⇒ 实测值恒为 0
+   * ⇒ ⇒ 用来验证「**计数器失效 ⇒ 兜底必须把 `mode` 标成 `derived`**」这条纪律。
+   *
+   * ⚠️ **为什么必须有这个注入点**（门禁必须有「牙」）：
+   *   「实测 == 推算」这个恒等式在**当前实现下天然成立**
+   *   ⇒ ⇒ **任何以它为断言的测试，对「口径被悄悄换掉」这类变异天然失明**
+   *   ⇒ ⇒ **必须能人为制造「实测拿不到」的场景** ⇒ **本选项就是它**。
+   *
+   * ⚠️ **生产路径不传这个选项** ⇒ **零影响**（默认值 `false` ⇒ 计数照常）。
+   */
+  readonly disableRowReadCounter?: boolean;
+}
+
+/**
  * 测一次 P99（全流程）。
  *
  * ⚠️ **预热轮次不计入统计**（理由见文件头）。
@@ -327,6 +345,7 @@ export function toDistribution(samples: readonly number[]): LatencyDistribution 
  * @param options 语料参数
  * @param queryCount 查询条数
  * @param writeCount 写入条数
+ * @param measurementOptions 测量选项（**仅测试用的注入点** ⇒ 生产路径省略）
  * @returns 测量结果
  */
 export function measurePerf(
@@ -335,6 +354,7 @@ export function measurePerf(
   options: CorpusOptions,
   queryCount: number,
   writeCount: number,
+  measurementOptions: PerfMeasurementOptions = {},
 ): PerfResult {
   const queries = generateQueries(options, queryCount);
   const model = loadCentroidModel(db);
@@ -367,7 +387,9 @@ export function measurePerf(
   // ⚠️ ★★★ **行读计数器**（H1 的「实测口径」的取数装置 —— **bench 侧只读观测，不改 `src/**`**）。
   //   ⇒ 它统计**生产 SQL 实际物化**了多少候选行 ⇒ ⇒ **对任何实现都成立**
   //   （阶段 4 引入「桶内 LIMIT」/「两段式读」⇒ 这个数**会跟着降** ⇒ 不再有假红）。
-  const rowCounter = installRowReadCounter(db);
+  const rowCounter = installRowReadCounter(db, {
+    forceDisabled: measurementOptions.disableRowReadCounter === true,
+  });
 
   // ⚠️ ★ **桶成员数的缓存**（`countBucketMembers()` 是桶计数的**唯一口径**）：
   //   命中桶数在多次查询间高度重复 ⇒ 缓存后每个细桶只 COUNT 一次

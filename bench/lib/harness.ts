@@ -793,6 +793,24 @@ export interface RowReadCounter {
 }
 
 /**
+ * ★ **行读计数器的选项**（**仅测试用的注入点**）。
+ */
+export interface RowReadCounterOptions {
+  /**
+   * ★ **仅测试用**：**装了计数器但不计数**（⇒ 实测值恒为 0）。
+   *
+   * ⚠️ ★ **为什么需要它**（门禁必须有「牙」）：
+   *   「**计数器失效 ⇒ 兜底必须把 `mode` 标成 `derived`**」这条纪律
+   *   ⇒ **单靠「实测 == 推算」的恒等式断言是抓不到它的**
+   *   （⇒ 那个恒等式在当前实现下天然成立 ⇒ **对「口径被换掉」这类变异天然失明**）
+   *   ⇒ ⇒ **必须有一个能制造「计数器抓不到」的注入点** ⇒ **本选项就是它**。
+   *
+   * ⚠️ **生产路径不传这个选项** ⇒ **零影响**（默认值 `false` ⇒ 计数照常）。
+   */
+  readonly forceDisabled?: boolean;
+}
+
+/**
  * ★ **给库句柄装一个行读计数器**（**H1 的「实测口径」的取数装置**）。
  *
  * ⚠️ ★ **为什么需要它**（2026-11-02 架构师裁决的落地）：
@@ -819,12 +837,19 @@ export interface RowReadCounter {
  *       （**不许假装它是实测**）。
  *
  * @param db 库句柄（**会被就地改造** ⇒ 用完请 `uninstall()`）
+ * @param options 选项（**仅测试用的注入点** ⇒ 生产路径不传）
  * @returns 计数器句柄
  */
-export function installRowReadCounter(db: Database.Database): RowReadCounter {
+export function installRowReadCounter(
+  db: Database.Database,
+  options: RowReadCounterOptions = {},
+): RowReadCounter {
   type ReadKind = 'candidate' | 'bucketMember';
   const counters: Record<ReadKind, number> = { candidate: 0, bucketMember: 0 };
   let counting = false;
+  // ⚠️ **「装了但不计数」**（**仅测试用的注入点**）⇒ 实测值恒为 0
+  //   ⇒ ⇒ 用来验证「计数器失效 ⇒ 兜底把 `mode` 标成 `derived`」这条纪律。
+  const forceDisabled = options.forceDisabled === true;
 
   const handle = db as unknown as { prepare: (source: string) => unknown };
   // ⚠️ **存「原函数对象」而不是它的 bind 产物** ⇒ `uninstall()` 能**逐位**还原
@@ -889,7 +914,10 @@ export function installRowReadCounter(db: Database.Database): RowReadCounter {
 
   return {
     start(): void {
-      counting = true;
+      // ⚠️ **「装了但不计数」的注入点** ⇒ `start()` 不生效（实测值恒为 0）。
+      if (!forceDisabled) {
+        counting = true;
+      }
     },
     stop(): void {
       counting = false;
