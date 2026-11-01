@@ -6,8 +6,10 @@
  *     （把档位限定词删掉 / 把档位限定词换成只说明「哪一次」的弱词），
  *     断言「守卫会红」⇒ 证明守卫**真的能发现不一致**（否则守卫只是装饰）。
  *   · 反例一律用**合成输入**（不动仓库里的真实文件）⇒ 测试可重复、且不会污染工作树。
- *   · **不写死快照数字**：期望值写成「真缺数 > 0」「提示数增加」这类**性质**。
+ *   · **不写死快照数字**：期望值写成「真缺数 > 0」「自带档位数下降」这类**性质**。
  *   · ★ **额外守一条「白名单漂移」**：档位词表若被改坏（把弱词塞回强词表）⇒ 本文件立刻红。
+ *   · ★ **额外守一条「声明漂移」**：`scripts/audit-tier-qualifiers.d.mts` 若漏声明了某个导出
+ *     ⇒ 本文件立刻红 ⇒ ⇒ **类型声明与实现不会各走各的**。
  *   · ★ **所有变异都走 `mustReplace`** ⇒ **变异若没生效就直接抛错**
  *     ⇒ ⇒ **「变异没生效 ⇒ 断言是空的」这种假绿被从根上堵死**
  *     （★ 主理人那封里「我第一次的变异无效、第二次才有效 ⇒ 这一步不能省」⇒ ⇒ **把它固化进测试**）。
@@ -16,6 +18,12 @@
  *   它的档位词表里混进了「本次 / 上一轮」这类**只说明「是哪一次」的代词**，
  *   于是「这一段谈过档位 ⇒ 这一行的数就都算有档位限定」⇒ **作用域被几个代词撑起来**
  *   ⇒ ⇒ **任何变异都打不红它** ⇒ ⇒ **只测「通过」的话，那时的它照样全绿**。
+ *
+ * ⚠️ **断言必须与脚本的两级判定对齐**（本文件第一版在这里栽过 ⇒ 记下来）：
+ *   脚本的判定是**两级**的 ⇒ 「真缺」要求**片段 ∪ 表头 ∪ 上下文 ∪ 小节标题全无强档位词**；
+ *   ⇒ **只把行内 / 表头的强词换成弱词，而上下文仍有强词** ⇒ 正确结果是「提示」（不判红），
+ *   ⇒ **不是「真缺」** ⇒ ⇒ 断言必须写成「自带档位的数变少了」（**性质**），
+ *   ⇒ 而不是硬写「真缺数 > 0」（**那是对两级判定的误读** ⇒ ⇒ 会逼着人改对的东西）。
  */
 
 import { readFileSync } from 'node:fs';
@@ -34,6 +42,8 @@ import {
 
 const REPO_ROOT = fileURLToPath(new URL('../..', import.meta.url));
 const README_PATH = join(REPO_ROOT, 'docs/baseline/README.md');
+const IMPL_PATH = join(REPO_ROOT, 'scripts/audit-tier-qualifiers.mjs');
+const DECL_PATH = join(REPO_ROOT, 'scripts/audit-tier-qualifiers.d.mts');
 
 /**
  * 替换并**断言变异真的生效**。
@@ -56,7 +66,12 @@ function mustReplace(text: string, from: string, to: string): string {
 
 /** 表头单元格：含**强档位词**（`冷盘档`）＋ **弱指示词**（`本次`）。 */
 const HEADER_CELL = '**本次 · 冷盘档**';
-/** 本行片段：含**强档位词**（`冷盘档`）＋ 同行另一个数带**弱指示词**（`上一轮`）。 */
+/**
+ * 本行片段：含**强档位词**（`冷盘档`）＋ 同行另一个数带**弱指示词**（`上一轮`）。
+ *
+ * ⚠️ **为什么这一格里有两个数**：这是「**同一格里两个数分属不同档位**」的最小样本
+ *   ⇒ ⇒ 判定必须落到**片段**级才分得开 ⇒ ⇒ 也让「自带档位的数」有了一个可数的基数。
+ */
 const ROW_CELL = '**1199.99 ms**（**冷盘档**；样本 500；⚠️ **热盘档上一轮 = 644.06ms**）';
 /** 上下文行：只含**强档位词**（`冷盘档`）⇒ 它是「宽作用域」那一层。 */
 const CONTEXT_LINE = '> ⚠️ 以下三行都是**冷盘档**的数 ⇒ 上下文层能给出档位。';
@@ -89,12 +104,39 @@ const SYNTHETIC_NO_TIER_AT_ALL = mustReplace(
   '档位未标的数',
 );
 
-/** 变体 C：把本行片段里的强档位词换成**弱指示词**（`上一轮`）⇒ 弱词撑不起作用域。 */
+/**
+ * 变体 C：把本行片段里的强档位词换成**弱指示词**（`上一轮`）⇒ **弱词撑不起作用域**。
+ *
+ * ⚠️ **上下文那一行仍留着强词** ⇒ ⇒ 按脚本的**两级**判定，正确结果是「提示」而不是「真缺」
+ *   ⇒ ⇒ 这条反例断言的是**性质**（「自带档位的数变少了」），不是硬写「真缺数 > 0」。
+ */
 const SYNTHETIC_WEAK_TIER_ONLY = mustReplace(
   mustReplace(SYNTHETIC_README, ROW_CELL, ROW_CELL.replace('**冷盘档**；', '上一轮；')),
   HEADER_CELL,
   '**上一轮 · 档位未标**',
 );
+
+/** 变体 D：变体 C **再把上下文里的强词也换成弱词** ⇒ 四层都没有强词 ⇒ 这才是「真缺」。 */
+const SYNTHETIC_WEAK_TIER_NO_CONTEXT = mustReplace(
+  SYNTHETIC_WEAK_TIER_ONLY,
+  '**冷盘档**的数',
+  '上一轮的数',
+);
+
+/**
+ * 一次审计里「**自带档位**」的处数。
+ *
+ * ⚠️ **为什么单独抽出来**：脚本的判定分两级 ⇒ 「真缺」与「提示」都不是「自带档位」
+ *   ⇒ ⇒ 「自带档位」= 判定了 − 真缺 − 提示 ⇒ ⇒ **这是「档位限定还剩多少」的真正读数**。
+ *
+ * @param result 审计结果
+ * @returns 自带档位的处数
+ */
+function selfQualifiedCount(result: {
+  counts: { adjudicated: number; missing: number; advisories: number };
+}): number {
+  return result.counts.adjudicated - result.counts.missing - result.counts.advisories;
+}
 
 describe('档位限定一致性审计（scripts/audit-tier-qualifiers.mjs）', () => {
   it('★ 白名单自检：弱词不得进强词表（漂移守卫）', () => {
@@ -106,6 +148,18 @@ describe('档位限定一致性审计（scripts/audit-tier-qualifiers.mjs）', (
     for (const weak of ['本次', '上一轮', '两档', '三档', '跨档']) {
       expect(WEAK_TIER_WORDS).toContain(weak);
       expect(STRONG_TIER_WORDS).not.toContain(weak);
+    }
+  });
+
+  it('★ 白名单自检：`.d.mts` 的声明必须覆盖 `.mjs` 的每一个导出（防声明漂移）', () => {
+    const impl = readFileSync(IMPL_PATH, 'utf8');
+    const decl = readFileSync(DECL_PATH, 'utf8');
+    const exported = [...impl.matchAll(/^export (?:const|function) ([A-Za-z0-9_]+)/gm)].map(
+      (match) => match[1] ?? '',
+    );
+    expect(exported.length).toBeGreaterThan(0);
+    for (const name of exported) {
+      expect(decl).toContain(name);
     }
   });
 
@@ -124,8 +178,17 @@ describe('档位限定一致性审计（scripts/audit-tier-qualifiers.mjs）', (
     expect(result.counts.missing).toBe(0);
   });
 
-  it('★ 反例：把强档位词换成弱指示词 ⇒ 必须判红（弱词撑不起作用域）', () => {
-    const result = auditTierQualifiers(SYNTHETIC_WEAK_TIER_ONLY.split('\n'));
+  it('★ 反例：把强档位词换成弱指示词 ⇒ 该数必须从「自带档位」降级（弱词撑不起作用域）', () => {
+    const before = auditTierQualifiers(SYNTHETIC_README.split('\n'));
+    const after = auditTierQualifiers(SYNTHETIC_WEAK_TIER_ONLY.split('\n'));
+    // ★ 核心性质：**自带档位的处数必须变少** ⇒ 弱词没有替强词撑住作用域。
+    expect(selfQualifiedCount(after)).toBeLessThan(selfQualifiedCount(before));
+    // ⇒ 且它必须落进「档位标得不够近」这一级（上下文仍有强词 ⇒ 按两级判定不打红）。
+    expect(after.counts.advisories).toBeGreaterThan(before.counts.advisories);
+  });
+
+  it('★ 反例：弱指示词 + 上下文也没有强词 ⇒ 四层皆无 ⇒ 必须判红', () => {
+    const result = auditTierQualifiers(SYNTHETIC_WEAK_TIER_NO_CONTEXT.split('\n'));
     expect(result.counts.missing).toBeGreaterThan(0);
   });
 
@@ -134,7 +197,7 @@ describe('档位限定一致性审计（scripts/audit-tier-qualifiers.mjs）', (
     expect(result.counts.missing).toBeGreaterThan(0);
   });
 
-  it('★ 反例：只删本行与表头的档位限定、上下文仍在 ⇒ 判定必须变（守「档位标得不够近」看得见）', () => {
+  it('★ 反例：只删本行与表头的档位限定、上下文仍在 ⇒ 判定必须变（守「档位标得不够近」这件事看得见）', () => {
     const before = auditTierQualifiers(SYNTHETIC_README.split('\n'));
     const after = auditTierQualifiers(SYNTHETIC_NO_LOCAL_TIER.split('\n'));
     expect(after.counts.missing).toBe(before.counts.missing);
@@ -146,6 +209,8 @@ describe('档位限定一致性审计（scripts/audit-tier-qualifiers.mjs）', (
     expect(SYNTHETIC_NO_TIER_AT_ALL).not.toEqual(SYNTHETIC_NO_LOCAL_TIER);
     expect(SYNTHETIC_NO_TIER_AT_ALL).not.toContain('冷盘档');
     expect(SYNTHETIC_WEAK_TIER_ONLY).not.toEqual(SYNTHETIC_README);
+    expect(SYNTHETIC_WEAK_TIER_NO_CONTEXT).not.toEqual(SYNTHETIC_WEAK_TIER_ONLY);
+    expect(SYNTHETIC_WEAK_TIER_NO_CONTEXT).not.toContain('冷盘档');
   });
 
   it('幂等：同一输入两次 ⇒ 判定与渲染逐字相同', () => {
