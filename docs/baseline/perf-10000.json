@@ -1,0 +1,69 @@
+{
+  "corpusSize": 10000,
+  "trainedCells": 6710,
+  "trainedMembers": 10000,
+  "thresholds": {
+    "recallP99Ms": 200,
+    "writeP99Ms": 5,
+    "vectorRouteP99Ms": 20,
+    "vectorRouteShare": 0.2
+  },
+  "recallP99Ms": 5.785,
+  "writeP99Ms": 233.6425,
+  "firstWriteMs": 4.5762,
+  "vectorRouteP99Ms": 7,
+  "vectorRouteShare": 0.6370417042397897,
+  "warmupRounds": 20,
+  "recallLatency": {
+    "count": 50,
+    "minMs": 2.0758,
+    "p50Ms": 2.3205,
+    "p90Ms": 3.369,
+    "p95Ms": 4.6634,
+    "p99Ms": 5.785,
+    "maxMs": 5.785,
+    "meanMs": 2.637194
+  },
+  "writeLatency": {
+    "count": 50,
+    "minMs": 3.3282,
+    "p50Ms": 4.4864,
+    "p90Ms": 6.2522,
+    "p95Ms": 8.0258,
+    "p99Ms": 233.6425,
+    "maxMs": 233.6425,
+    "meanMs": 9.406282000000001
+  },
+  "vectorRouteLatency": {
+    "count": 50,
+    "minMs": 2.655,
+    "p50Ms": 4.3067,
+    "p90Ms": 6.3902,
+    "p95Ms": 6.8498,
+    "p99Ms": 7,
+    "maxMs": 7,
+    "meanMs": 4.6286380000000005
+  },
+  "failures": [
+    "写入 P99 233.643ms > 5ms（样本 50、预热 20）",
+    "向量路占总耗时 63.70% > 20%"
+  ],
+  "benchNow": 1749873600000,
+  "machine": {
+    "platform": "win32-x64",
+    "node": "v22.22.2",
+    "cpuModel": "AMD Ryzen 7 2700 Eight-Core Processor          ",
+    "cpuCount": 16,
+    "totalMemoryBytes": 17120718848,
+    "freeMemoryBytes": 4638208000,
+    "usedMemoryBytes": 12482510848
+  },
+  "phases": {
+    "loadMs": 4798.9657,
+    "trainMs": 65772.0605,
+    "rssBeforeTrainBytes": 225460224,
+    "peakRssBytes": 380137472,
+    "fineCells": 6710,
+    "members": 10000
+  }
+}

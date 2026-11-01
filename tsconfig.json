@@ -26,5 +26,9 @@
     "forceConsistentCasingInFileNames": true,
     "noEmit": true
   },
-  "include": ["src", "tests", "scripts", "vitest.config.ts", "tsup.config.ts"]
+  /* ⚠️ `bench` 进 include（**类型检查要覆盖它**），
+   * 但 `tsconfig.build.json` 的 include 只有 `src` ⇒ **构建产物里不含 bench**。
+   * ⇒ 理由：bench 是**仓库内的一等代码**（它 import 生产模块、也被冒烟测试 import）
+   *   ⇒ 不该脱离类型检查；又它是**测量工具**⇒ 不该进 npm 产物（`files: ["dist"]`）。 */
+  "include": ["src", "tests", "scripts", "bench", "vitest.config.ts", "tsup.config.ts"]
 }
