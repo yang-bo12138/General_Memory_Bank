@@ -8,45 +8,46 @@
     "vectorRouteP99Ms": 20,
     "vectorRouteShare": 0.2
   },
-  "recallP99Ms": 678.1187,
-  "writeP99Ms": 658.1894,
-  "firstWriteMs": 269.5286,
-  "vectorRouteP99Ms": 13.3456,
-  "vectorRouteShare": 0.021667415242094895,
+  "recallP99Ms": 108.9891,
+  "writeP99Ms": 644.0557,
+  "firstWriteMs": 81.4584,
+  "vectorRouteP99Ms": 229.6563,
+  "vectorRouteShare": 0.8357163317678774,
   "warmupRounds": 20,
   "recallLatency": {
-    "count": 10,
-    "minMs": 192.11,
-    "p50Ms": 267.8322,
-    "p90Ms": 326.6025,
-    "p95Ms": 678.1187,
-    "p99Ms": 678.1187,
-    "maxMs": 678.1187,
-    "meanMs": 307.36718
+    "count": 1000,
+    "minMs": 9.6732,
+    "p50Ms": 13.0368,
+    "p90Ms": 25.2989,
+    "p95Ms": 40.665,
+    "p99Ms": 108.9891,
+    "maxMs": 538.1253,
+    "meanMs": 18.567743499999995
   },
   "writeLatency": {
-    "count": 50,
-    "minMs": 14.9,
-    "p50Ms": 108.3729,
-    "p90Ms": 220.4665,
-    "p95Ms": 269.5286,
-    "p99Ms": 658.1894,
-    "maxMs": 658.1894,
-    "meanMs": 129.323866
+    "count": 500,
+    "minMs": 5.4685,
+    "p50Ms": 36.496,
+    "p90Ms": 68.5112,
+    "p95Ms": 79.6151,
+    "p99Ms": 644.0557,
+    "maxMs": 740.0612,
+    "meanMs": 50.31164060000001
   },
   "vectorRouteLatency": {
-    "count": 10,
-    "minMs": 5.3521,
-    "p50Ms": 5.9024,
-    "p90Ms": 6.9877,
-    "p95Ms": 13.3456,
-    "p99Ms": 13.3456,
-    "maxMs": 13.3456,
-    "meanMs": 6.807350000000001
+    "count": 1000,
+    "minMs": 5.0165,
+    "p50Ms": 89.5882,
+    "p90Ms": 157.0766,
+    "p95Ms": 175.1537,
+    "p99Ms": 229.6563,
+    "maxMs": 350.0805,
+    "meanMs": 94.4547114999999
   },
   "failures": [
-    "recall P99 678.119ms > 200ms（样本 10、预热 20）",
-    "写入 P99 658.189ms > 5ms（样本 50、预热 20）"
+    "写入 P99 644.056ms > 5ms（样本 500、预热 20）",
+    "向量路 P99 229.656ms > 20ms（样本 1000、预热 20）",
+    "向量路占总耗时 83.57% > 20%"
   ],
   "benchNow": 1749873600000,
   "machine": {
@@ -55,15 +56,25 @@
     "cpuModel": "AMD Ryzen 7 2700 Eight-Core Processor          ",
     "cpuCount": 16,
     "totalMemoryBytes": 17120718848,
-    "freeMemoryBytes": 8204775424,
-    "usedMemoryBytes": 8915943424
+    "freeMemoryBytes": 6220910592,
+    "usedMemoryBytes": 10899808256,
+    "totalDiskBytes": 1000203087872,
+    "freeDiskBytes": 841426706432
   },
   "phases": {
-    "loadMs": 10376413.6528,
-    "trainMs": 7652354.0848,
-    "rssBeforeTrainBytes": 0,
-    "peakRssBytes": 8474386432,
-    "sampledPeakRssBytes": 0,
+    "loadMs": null,
+    "trainMs": 8180639.0263,
+    "trainReadAndKmeansMs": 5870899,
+    "trainMigrateMs": 2309740.0263,
+    "rssBeforeTrainBytes": 467464192,
+    "peakRssBytes": 8805285888,
+    "sampledPeakRssBytes": 8805232640,
+    "peakRss": {
+      "kernelPeakBytes": 8805285888,
+      "sampledPeakBytes": 8805232640,
+      "sampleCount": 40226,
+      "workerActive": true
+    },
     "fineCells": 9966,
     "members": 1000000
   }

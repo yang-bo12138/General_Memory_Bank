@@ -60,6 +60,7 @@ import { flatCandidateUniverse, flatTopK, flatTopKMulti } from './lib/flat.js';
 import {
   BENCH_NOW,
   benchWorkDir,
+  formatLoadMs,
   formatPeakRss,
   intArg,
   machineInfo,
@@ -429,6 +430,9 @@ function main(): void {
     fineCenters: DEFAULT_PARAMS.ROUTER_FINE_CENTERS,
     nprobeCoarse: DEFAULT_PARAMS.ROUTER_NPROBE_COARSE,
     reuseExisting: args.reuse === 'true',
+    // ⚠️ ★ **「明知要重灌」的显式声明**（默认 false）⇒
+    //   `--reuse=true` 而复用不了时**默认报错**（不许悄悄删库重灌 ⇒ 3~5 小时的活）。
+    forceRebuild: args['force-rebuild'] === 'true',
   });
   const db = prepared.db;
   const result = measureAgreement(db, options, queryCount);
@@ -470,7 +474,7 @@ function main(): void {
       `（下限 ${SYNONYM_COSINE_MIN}）\n` +
       `  分桶候选 ${result.bucketCandidateTotal} 条 ⊆ flat 候选全集 ${result.flatCandidateUniverse} 条\n` +
       `  查询耗时 p50/p99 = ${latency.p50Ms.toFixed(3)} / ${latency.p99Ms.toFixed(3)} ms\n` +
-      `  灌库 ${prepared.loadMs.toFixed(0)}ms / 训练 ${prepared.trainMs.toFixed(0)}ms / ` +
+      `  灌库 ${formatLoadMs(prepared.loadMs)} / 训练 ${prepared.trainMs.toFixed(0)}ms / ` +
       `${formatPeakRss(prepared.trainPeakRss)}\n` +
       `  结果已写入 ${outPath}\n`,
   );

@@ -50,6 +50,7 @@ import { flatTopK } from './lib/flat.js';
 import {
   BENCH_NOW,
   benchWorkDir,
+  formatLoadMs,
   formatPeakRss,
   intArg,
   machineInfo,
@@ -194,6 +195,9 @@ function main(): void {
     fineCenters: DEFAULT_PARAMS.ROUTER_FINE_CENTERS,
     nprobeCoarse: DEFAULT_PARAMS.ROUTER_NPROBE_COARSE,
     reuseExisting: args.reuse === 'true',
+    // ⚠️ ★ **「明知要重灌」的显式声明**（默认 false）⇒
+    //   `--reuse=true` 而复用不了时**默认报错**（不许悄悄删库重灌 ⇒ 3~5 小时的活）。
+    forceRebuild: args['force-rebuild'] === 'true',
   });
   const db = prepared.db;
   const store = new MemoryStore({ dbPath });
@@ -224,7 +228,7 @@ function main(): void {
       `  **向量路耗时占比 = ${(result.vectorShare * 100).toFixed(2)}%**` +
       `（参考线 ≥ ${(FLAT_SHARE_REFERENCE * 100).toFixed(0)}% ⇒ ` +
       `${result.shareDelta >= 0 ? '达标' : '未达标'}）\n` +
-      `  灌库 ${prepared.loadMs.toFixed(0)}ms / 训练 ${prepared.trainMs.toFixed(0)}ms / ` +
+      `  灌库 ${formatLoadMs(prepared.loadMs)} / 训练 ${prepared.trainMs.toFixed(0)}ms / ` +
       `${formatPeakRss(prepared.trainPeakRss)}\n` +
       `  结果已写入 ${outPath}\n`,
   );
