@@ -12,11 +12,13 @@
  *   「什么都没发生」当然也不会长 ⇒ 那是一条**恒真**的假绿。
  *   ⇒ 每条用例都同时断言「**加固确实发生了**」（稳定度涨了、访问计数 +1）。
  *
- * ⚠️ **显式共激活入口（`touch(ids, { coActivateWith })`）目前尚未实现**：
- *   §4.11 的共激活机制整体未落地（`src/` 里**没有任何**共激活写入路径）。
- *   ⇒ 「显式共激活会写 `coacts`、而 reinforce 不写」这一对断言，
- *     要等 §4.11 落地时才能补齐另一半；本文件先守住「**reinforce 不写**」这一半，
- *     并用下面的「正控」证明探针是灵的（不是探针坏了所以没报）。
+ * ⚠️ **显式共激活入口（`touch(ids, { coActivateWith })`）现已落地**（P3-T01）：
+ *   §4.11 的共激活写入路径在 `src/neuron/coacts.ts`（**全库唯一的 `coacts` 写入点**）。
+ *   ⇒ 本文件的守卫从「**还没有**共激活写入」升级成「**只有那一个地方**写共激活」——
+ *     这正是它原先的注释要求的：§4.11 落地时必须**同时**
+ *     ① 把守卫扩展成「显式共激活会写 `coacts`、而 reinforce 不写」这一对断言，
+ *     ② 并把 §4.6 的 `reinforce` 通道与 §0.2 的「topN 自我强化禁令」一起复核。
+ *   ⇒ 两条都做了（见下面「显式共激活会写 coacts」与「全库只有一处写 coacts」两条用例）。
  */
 
 import { readFileSync, readdirSync, statSync } from 'node:fs';
@@ -28,6 +30,7 @@ import { describe, expect, it } from 'vitest';
 import { MS_PER_DAY } from '../../src/core/decay.js';
 import { tokenize } from '../../src/core/tokenize.js';
 import { recall } from '../../src/store/recall.js';
+import { touch } from '../../src/store/touch.js';
 import { countRows, createTestStore, readMemory } from '../fixtures/graph-store.js';
 
 /** 固定的「现在」（epoch 毫秒）——全部时间从它推导。 */
@@ -142,11 +145,26 @@ describe('§4.11.2 · reinforce 只加固、不建共激活边', () => {
     expect(hasCoactWrite(mutated)).toBe(true);
   });
 
-  it('★ 全库现状：src/ 里还没有任何共激活写入（§4.11 未落地）⇒ 上面那条守卫不是空洞的', () => {
+  it('★ 全库现状：**只有** src/neuron/coacts.ts 这一个地方写 coacts（§4.11.2 的唯一写入源）', () => {
     const offenders = listSourceFiles().filter((file) => hasCoactWrite(readFileSync(file, 'utf8')));
-    expect(offenders).toEqual([]);
-    // ⚠️ **这条是「未来的提醒」**：§4.11 落地时它会红 ⇒ 那时必须**同时**
-    //   ① 把本文件的守卫扩展成「显式共激活会写 coacts、而 reinforce 不写」这一对断言，
-    //   ② 并把 §4.6 的 `reinforce` 通道与 §0.2 的「topN 自我强化禁令」一起复核。
+    // ⚠️ **不是「一个都没有」**（§4.11 已落地），而是「**有且只有那一处**」——
+    //   多一处就意味着共激活边可以被绕过「唯一写入入口」那条纪律（§14.3 边界原则 1）。
+    expect(offenders.map((file) => file.replace(/\\/g, '/'))).toEqual([
+      `${join(process.cwd(), 'src', 'neuron', 'coacts.ts').replace(/\\/g, '/')}`,
+    ]);
+  });
+
+  it('★ 对照组：显式共激活**会**写 coacts（与上面「reinforce 不写」构成一对）', () => {
+    const { db, store } = createTestStore();
+    seedMemory(db, 'm-1', '张三喜欢猫粮');
+    seedMemory(db, 'm-2', '张三在买猫粮');
+
+    const before = countRows(db, 'coacts');
+    touch(store, ['m-1', 'm-2'], NOW, {
+      coActivateWith: [{ memoryId: 'm-2', seedIds: ['m-1'] }],
+    });
+
+    // ★ 这一对断言的另一半：**显式声明确实写了 coacts** ⇒ 上面那条不是「探针坏了所以没报」
+    expect(countRows(db, 'coacts')).toBe(before + 1);
   });
 });
