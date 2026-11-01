@@ -56,17 +56,29 @@
  *   ⇒ ⇒ **所以落盘 JSON 必须带上「存储介质类别」与「每行读成本」**
  *     （否则**换一块盘，判据的含义会静默改变**）。
  *
- * ⚠️ ★ **本文件新增的三件事**（各自的口径写在对应函数的头注释里）：
+ * ⚠️ ★ **本文件新增的四件事**（各自的口径写在对应函数的头注释里）：
  *   ① **候选读取行数**（H1/H2 的判据本身）——**bench 侧统计**，**不改 `src/**`**：
- *     走**生产的公开 API**（`IvfVectorBackend.route()` 拿命中的细桶 id
- *     ＋ `countBucketMembers()` 拿桶成员数——**桶计数的唯一口径**）。
+ *     ⚠️ ★ **2026-11-02 架构师裁决的「口径加固」** —— **取数来源从「推算」换成「实测」**：
+ *     · **实测口径（现在的判据量）** = **生产 SQL 实际物化的候选行数**
+ *       （`memories` 表 ⇒ 与写入路径那个「候选 ≤ 2000」**同一口径**）
+ *       ⇒ 由 **bench 侧的行读计数器**（`bench/lib/harness.ts` 的 `installRowReadCounter()`）
+ *         统计**生产代码真正跑的那条 SQL** ⇒ ⇒ **对任何实现都成立**
+ *         （阶段 4 引入「桶内 LIMIT」/「两段式读」⇒ 这个数**会跟着降** ⇒ 不再有假红）；
+ *     · **推算口径（只作对照，不再判 H1）** = 命中细桶的成员数之和
+ *       （`IvfVectorBackend.route()` ＋ `countBucketMembers()`）
+ *       ⇒ ⚠️ **它模型化了「桶内不设 LIMIT」这个实现** ⇒ **阶段 4 引入桶内 LIMIT 后它不会跟着降**
+ *       ⇒ ⇒ **不许用它判 H1**（但保留它 ⇒ 读的人能看见「实测 vs 推算」的差）。
  *   ② **每行读成本（µs/行）**——**推导值**（向量路均耗时 ÷ 候选读取行数均值），
  *     **不是直接测量值** ⇒ 落盘时必须这么标。
  *   ③ **写入路径的分段计时**——「FTS5 + 索引维护」vs「向量候选扫描（P2 的代码）」。
+ *   ④ **页缓存状态（冷 / 热 / 未知）**——⚠️ **Windows 没有公开 API 能报「这个库有多少在页缓存里」**
+ *     ⇒ ⇒ **只能「可标注」不能「可测量」** ⇒ 由 **跑的人声明**（`--cache-state=cold|warm|unknown`）
+ *     ⇒ **缺省 `unknown`**（**不许猜**）⇒ 落盘进 JSON ⇒ **让机器能读出这个档位**。
  *
  * 用法：
  * ```
  * pnpm exec tsx bench/perf.ts --scale=1000000 --queries=200 --writes=200
+ * pnpm exec tsx bench/perf.ts --scale=1000000 --cache-state=cold   # 显式声明「冷盘档」
  * ```
  */
 
@@ -84,13 +96,16 @@ import { embedText } from './embedder.js';
 import { prepareBench } from './lib/db.js';
 import {
   BENCH_NOW,
+  type PageCacheStateInfo,
   type StorageMediaInfo,
   benchWorkDir,
   formatLoadMs,
   formatPeakRss,
+  installRowReadCounter,
   intArg,
   machineInfo,
   parseArgs,
+  parsePageCacheState,
   percentile,
   phaseInfo,
   stringArg,
@@ -149,6 +164,38 @@ export interface CountSummary {
 }
 
 /**
+ * ★ **H1 的口径声明**（**必须落盘** ⇒ 读 JSON 的人**不会**把「推算」误读成「实测」）。
+ *
+ * ⚠️ ★ **为什么必须有它**（2026-11-02 架构师裁决）：
+ *   「⚠️ **别让读 JSON 的人误以为它是实测。**」
+ * ⇒ ⇒ **口径模式（`mode`）是显式的一个字段**，不是一个「读的人自己该知道」的隐含约定。
+ */
+export interface CandidateReadRowsBasis {
+  /**
+   * 口径模式：
+   * · `'measured'` = **实测**：生产 SQL **实际物化**的行数（bench 侧行读计数器）；
+   * · `'derived'` = **推算**：按「命中桶成员数之和」算出来的
+   *   （⚠️ **它模型化了「桶内不设 LIMIT」这个实现** ⇒ **不可用它判 H1**）。
+   */
+  readonly mode: 'measured' | 'derived';
+  /** 口径说明（**必须落盘** ⇒ 读的人不用猜）。 */
+  readonly note: string;
+  /**
+   * **对照用**：同一次测量里的「推算值」（命中细桶的成员数之和）。
+   *
+   * ⚠️ **它模型化了「桶内不设 LIMIT」** ⇒ 阶段 4 引入桶内 LIMIT 后**它不会跟着降**
+   * ⇒ ⇒ **保留它是为了让「实测 vs 推算」的差可见**，**不是**拿它判 H1。
+   */
+  readonly derivedCrossCheck: CountSummary | null;
+  /**
+   * **附加信息**：桶成员侧（`vector_cell_members`）**实际读到**的行数。
+   *
+   * ⚠️ **不判 H1**（H1 判的是**候选行**，与写入路径那个「候选 ≤ 2000」同一口径）。
+   */
+  readonly bucketMemberRowsRead: CountSummary | null;
+}
+
+/**
  * ★ **写入路径的分段计时**（2026-11-02 架构师裁决）。
  *
  * ⚠️ **为什么必须分段**：
@@ -203,11 +250,19 @@ export interface PerfResult {
   /**
    * ★ **H1 的量**：向量路单次查询的**候选读取行数**的分布。
    *
-   * ⚠️ **口径** = **命中细桶里的成员数之和**
-   *   （= `route()` 命中的细桶 → `countBucketMembers()` 的成员数）
-   *   ⇒ **这就是「桶内全量精确点积」要读的行数** ⇒ **桶内不设 LIMIT**（§4.15.3）。
+   * ⚠️ ★ **口径（2026-11-02 架构师裁决的「口径加固」）** = **生产 SQL 实际物化的候选行数**
+   *   （`memories` 表 ⇒ 与写入路径那个「候选 ≤ 2000」**同一口径**）
+   *   ⇒ 由 **bench 侧的行读计数器**实测 ⇒ ⇒ **对任何实现都成立**
+   *   （**不再模型化「桶内不设 LIMIT」这个实现** ⇒ 阶段 4 引入桶内 LIMIT / 两段式读 ⇒ 这个数会跟着降）。
+   * ⚠️ **口径细节见 `candidateReadRowsBasis`**（**必须落盘** ⇒ 读的人不会误读）。
    */
   readonly candidateReadRows: CountSummary;
+  /**
+   * ★ **H1 的口径声明**（**实测还是推算** ⇒ 读 JSON 的人不会误读）。
+   *
+   * ⚠️ **必须在落盘的 JSON 里**（与 `candidateReadRows` 并排）⇒ **不许假装它是实测**。
+   */
+  readonly candidateReadRowsBasis: CandidateReadRowsBasis;
   /** 每次查询命中的**细桶数**的分布（探针口径的可核对证据）。 */
   readonly hitFineBuckets: CountSummary;
   /**
@@ -301,9 +356,18 @@ export function measurePerf(
   // ★ **H1 的两个计数样本**（候选读取行数 / 命中细桶数）。
   const candidateRowSamples: number[] = [];
   const hitBucketSamples: number[] = [];
+  // ★ **推算口径的对照样本**（命中细桶的成员数之和 ⇒ **模型化了「桶内不设 LIMIT」**）。
+  const candidateRowDerivedSamples: number[] = [];
+  // ★ **桶成员侧的行读样本**（附加信息；不判 H1）。
+  const bucketMemberRowSamples: number[] = [];
   // ★ **写入路径的分段计时**：向量候选扫描段的样本（P2 的代码）。
   const writeVectorScanSamples: number[] = [];
   const writeVectorScanRowSamples: number[] = [];
+
+  // ⚠️ ★★★ **行读计数器**（H1 的「实测口径」的取数装置 —— **bench 侧只读观测，不改 `src/**`**）。
+  //   ⇒ 它统计**生产 SQL 实际物化**了多少候选行 ⇒ ⇒ **对任何实现都成立**
+  //   （阶段 4 引入「桶内 LIMIT」/「两段式读」⇒ 这个数**会跟着降** ⇒ 不再有假红）。
+  const rowCounter = installRowReadCounter(db);
 
   // ⚠️ ★ **桶成员数的缓存**（`countBucketMembers()` 是桶计数的**唯一口径**）：
   //   命中桶数在多次查询间高度重复 ⇒ 缓存后每个细桶只 COUNT 一次
@@ -354,12 +418,16 @@ export function measurePerf(
   }
 
   // ── 向量路（**生产后端**：route + search）──
-  // ⚠️ ★ **候选读取行数在计时之外统计**（H1 的判据）：
+  // ⚠️ ★ **候选读取行数的统计口径**（H1 的判据）：
+  //   ⚠️ ★ **2026-11-02 口径加固：取数来源 = 「实测」**（不再是「推算」）：
   //   ① `route()` 给出**命中的细桶 id**（生产后端的公开 API ⇒ 拿到的就是
   //      `search()` 内部用的那批桶 ⇒ 路由是确定性的 ⇒ 两次必然一致）；
-  //   ② 每个细桶的**成员数**走 `countBucketMembers()`（桶计数的**唯一口径**）
-  //      ⇒ **候选读取行数 = 命中细桶的成员数之和**
-  //      （= 「桶内全量精确点积」要读的行数；桶内**不设 LIMIT**，§4.15.3）。
+  //   ② ★ **实测**：`search()` 内部的生产 SQL **实际物化**了多少**候选行**
+  //      （`memories` 表 ⇒ 与写入路径那个「候选 ≤ 2000」同一口径）
+  //      ⇒ 由**行读计数器**统计 ⇒ ⇒ **不再模型化「桶内不设 LIMIT」这个实现**；
+  //   ③ **推算**（只作对照）：命中细桶的成员数之和
+  //      （= 「桶内全量精确点积」要读的行数；桶内**不设 LIMIT**，§4.15.3）
+  //      ⇒ ⚠️ **它模型化了实现** ⇒ 阶段 4 引入桶内 LIMIT 后**它不会跟着降** ⇒ **不判 H1**。
   for (const query of queries) {
     const start = process.hrtime.bigint();
     const fineIds = backend.route(
@@ -367,16 +435,29 @@ export function measurePerf(
       DEFAULT_PARAMS.ROUTER_NPROBE_COARSE,
       DEFAULT_PARAMS.ROUTER_NPROBE_FINE,
     );
+    // ⚠️ **计数窗口只包住 `search()`**（`route()` 不读行 ⇒ 读的是中心向量，在内存里）。
+    const before = rowCounter.snapshot();
+    rowCounter.start();
     backend.search(query.embedding, DEFAULT_PARAMS.VECTOR_TOPK);
+    // ⚠️ **计时在 `search()` 之后立刻取**（⇒ 计数器自己的开销不落在被测区间里
+    //   ⇒ 与历史基线的毫秒数**可比**）。
     const end = process.hrtime.bigint();
+    rowCounter.stop();
+    const after = rowCounter.snapshot();
     vectorRouteSamples.push(Number(end - start) / 1_000_000);
-    let candidateRows = 0;
+    // ★ **实测**：生产 SQL 实际物化的候选行数（H1 的判据量）。
+    candidateRowSamples.push(after.candidateRows - before.candidateRows);
+    bucketMemberRowSamples.push(after.bucketMemberRows - before.bucketMemberRows);
+    // ★ **推算**（对照用）：命中细桶的成员数之和。
+    let candidateRowsDerived = 0;
     for (const fineId of fineIds) {
-      candidateRows += membersOf(fineId);
+      candidateRowsDerived += membersOf(fineId);
     }
-    candidateRowSamples.push(candidateRows);
+    candidateRowDerivedSamples.push(candidateRowsDerived);
     hitBucketSamples.push(fineIds.length);
   }
+  // ⚠️ **计数器用完就拆**（把 `db.prepare` 恢复原状 ⇒ 后面那些调用不再被包装）。
+  rowCounter.uninstall();
 
   // ── 写入（**生产的 `MemoryStore.write()`**）──
   // ⚠️ **写入用新正文**（不复用语料里的正文 ⇒ 不触发「完全重复」那条合并路径
@@ -437,8 +518,36 @@ export function measurePerf(
     recallMean + vectorMean === 0 ? 0 : vectorMean / (recallMean + vectorMean);
 
   // ── ★ **候选读取行数（H1/H2 的判据）** ──
-  const candidateReadRows = toCountSummary(candidateRowSamples);
+  const candidateReadRowsMeasured = toCountSummary(candidateRowSamples);
+  const candidateReadRowsDerived = toCountSummary(candidateRowDerivedSamples);
   const hitFineBuckets = toCountSummary(hitBucketSamples);
+
+  // ⚠️ ★★★ **口径的兜底（不许假装它是实测）**：
+  //   实测值全为 0、而推算值不为 0 ⇒ **行读计数器没抓到东西**
+  //   （装桩失败 / 生产 SQL 变了 / 候选宇宙口径变了）⇒ ⇒ **退回推算口径**
+  //   ⇒ ⇒ 且 `mode` 标成 `'derived'` ⇒ **落盘 JSON 里读的人不会误以为它是实测**。
+  const measuredLooksBroken =
+    candidateReadRowsMeasured.max === 0 && candidateReadRowsDerived.max > 0;
+  const candidateReadRows = measuredLooksBroken
+    ? candidateReadRowsDerived
+    : candidateReadRowsMeasured;
+  const candidateReadRowsBasis: CandidateReadRowsBasis = {
+    mode: measuredLooksBroken ? 'derived' : 'measured',
+    note: measuredLooksBroken
+      ? '⚠️ **本轮退回「推算口径」**（行读计数器没抓到候选行 ⇒ 装桩失败 / 生产 SQL 变了）' +
+        '⇒ **判据量 = 命中细桶的成员数之和** ⇒ ⚠️ **它模型化了「桶内不设 LIMIT」这个实现**' +
+        '⇒ ⇒ **阶段 4 引入桶内 LIMIT 后它不会跟着降** ⇒ ⇒ **这条要修好行读计数器才作数**。'
+      : '① **mode = "measured"**（★ 2026-11-02 口径加固）：判据量 = **生产 SQL 实际物化的候选行数**' +
+        '（`memories` 表 ⇒ 与写入路径那个「候选 ≤ 2000」**同一口径**）' +
+        '⇒ 由 **bench 侧的行读计数器**统计**生产代码真正跑的那条 SQL**' +
+        '⇒ ⇒ **不再模型化「桶内不设 LIMIT」这个实现** ⇒ **阶段 4 引入桶内 LIMIT / 两段式读 ⇒ 这个数会跟着降**' +
+        '⇒ ⇒ **判据对任何实现都成立**（不会再出现「实现降了、判据却还红」的假红）；' +
+        '② **derivedCrossCheck = 推算值**（命中细桶的成员数之和）—— ⚠️ **它模型化了「桶内不设 LIMIT」**' +
+        '⇒ **阶段 4 引入桶内 LIMIT 后它不会跟着降** ⇒ ⇒ **只作对照，不判 H1**；' +
+        '③ **bucketMemberRowsRead = 桶成员侧的行读**（`vector_cell_members`）—— **附加信息**，不判 H1。',
+    derivedCrossCheck: candidateReadRowsDerived,
+    bucketMemberRowsRead: toCountSummary(bucketMemberRowSamples),
+  };
 
   // ── ★ **每行读成本（推导值）** ──
   // ⚠️ **推导式**：向量路均耗时 ÷ 候选读取行数均值 ⇒ 单位 µs/行。
@@ -484,6 +593,7 @@ export function measurePerf(
     vectorRouteP99Ms: percentile(vectorRouteSamples, 99),
     vectorRouteShare,
     candidateReadRows,
+    candidateReadRowsBasis,
     hitFineBuckets,
     perRowReadCostUs,
     writeSegments,
@@ -568,17 +678,26 @@ export function checkPerf(result: PerfResult): string[] {
     );
   }
 
-  // ⚠️ ★★★ **H1（硬门槛 · 归 P2 · 2026-11-02 重新定档）** ───
+  // ⚠️ ★★★ **H1（硬门槛 · 归 P2 · 2026-11-02 重新定档 + 同日口径加固）** ───
   //   **向量路单次查询的候选读取行数 ≤ 2,000 行** ⇒ **纯计数 ⇒ 与介质无关**。
   // ⚠️ **判定口径 = 样本的 `max`**（「**单次**查询」⇒ 每一次都要满足 ⇒ 最严口径）
   //   ⇒ 而 `mean` / `p50` / `p99` 一并落盘 ⇒ **换口径不用重跑百万级**。
+  // ⚠️ ★ **口径加固（2026-11-02）**：判据量现在是**实测**（生产 SQL 实际物化的候选行数）
+  //   ⇒ ⇒ **不再模型化「桶内不设 LIMIT」** ⇒ 阶段 4 引入桶内 LIMIT / 两段式读 ⇒ 这个数会跟着降
+  //   ⇒ ⇒ **判据对任何实现都成立**（不会再有「实现降了、判据却还红」的假红）。
+  // ⚠️ **但若本轮退回推算口径**（行读计数器没抓到 ⇒ `mode === 'derived'`）
+  //   ⇒ ⇒ **这条判定就是「模型化实现」的那个数** ⇒ **必须显式写进违规清单**（不许假装它是实测）。
+  const h1BasisNote =
+    result.candidateReadRowsBasis.mode === 'measured'
+      ? '口径：实测（生产 SQL 实际物化的候选行数）'
+      : '⚠️ 口径：**推算**（模型化了「桶内不设 LIMIT」⇒ 阶段 4 引入桶内 LIMIT 后不会跟着降）';
   if (result.candidateReadRows.count === 0) {
     failures.push('候选读取行数的样本数为 0 ⇒ H1 是真空通过（必须有样本）');
   } else if (result.candidateReadRows.max > THRESHOLDS.candidateReadRowsMax) {
     failures.push(
       `候选读取行数（H1）${result.candidateReadRows.max} 行 > ${THRESHOLDS.candidateReadRowsMax} 行` +
         `（判定取 max；均值 ${result.candidateReadRows.mean.toFixed(1)} 行、` +
-        `p99 ${result.candidateReadRows.p99} 行、样本 ${result.candidateReadRows.count}）`,
+        `p99 ${result.candidateReadRows.p99} 行、样本 ${result.candidateReadRows.count}；${h1BasisNote}）`,
     );
   }
 
@@ -611,6 +730,10 @@ function main(): void {
   const seed = intArg(args, 'seed', DEFAULT_CORPUS_OPTIONS.seed);
   const dbPath = stringArg(args, 'db', `${benchWorkDir()}/perf-${scale}.db`);
   const outPath = stringArg(args, 'out', `docs/baseline/perf-${scale}.json`);
+  // ⚠️ ★ **页缓存状态（冷 / 热 / 未知）** —— ⚠️ **Windows 没有公开 API 能报「这个库有多少在页缓存里」**
+  //   ⇒ ⇒ **只能「可标注」不能「可测量」** ⇒ **由跑的人声明**
+  //   ⇒ ⇒ **缺省 `unknown`**（**不许猜**）⇒ **非法值 ⇒ 报错**（不静默钳制 ⇒ 否则档位是假的）。
+  const pageCacheState: PageCacheStateInfo = parsePageCacheState(args['cache-state']);
 
   // ⚠️ ★ **规模守卫**（硬断言「规模写进验收行」）⇒ **在最前面**：
   //   不达标就**别开始灌库**（百万级一次 3 小时 ⇒ 跑完再报错是浪费）。
@@ -664,6 +787,8 @@ function main(): void {
     vectorRouteShare: result.vectorRouteShare,
     // ⚠️ ★★★ **H1 / H2 的判据本身（纯计数）** ───
     candidateReadRows: result.candidateReadRows,
+    // ⚠️ ★★★ **H1 的口径声明**（★ 实测还是推算 ⇒ **读 JSON 的人不许误读**）。
+    candidateReadRowsBasis: result.candidateReadRowsBasis,
     hitFineBuckets: result.hitFineBuckets,
     // ⚠️ ★ **每行读成本（µs/行）—— 推导值，不是直接测量值**。
     perRowReadCostUs: result.perRowReadCostUs,
@@ -671,6 +796,8 @@ function main(): void {
     writeSegments: result.writeSegments,
     // ⚠️ ★ **存储介质类别**（HDD / SSD / NVMe / `unknown`）——「换一块盘 ⇒ 判据含义静默改变」的防线。
     storageMedia,
+    // ⚠️ ★ **页缓存状态（冷 / 热 / 未知）** ——「换一种缓存状态 ⇒ 毫秒数含义静默改变」的防线。
+    pageCacheState,
     warmupRounds: result.warmupRounds,
     recallLatency: result.recallLatency,
     writeLatency: result.writeLatency,
@@ -688,14 +815,19 @@ function main(): void {
       `  向量路占总耗时 = ${(result.vectorRouteShare * 100).toFixed(2)}%（门槛 ≤ ${(THRESHOLDS.vectorRouteShare * 100).toFixed(0)}%）\n` +
       `  ★ H1 候选读取行数 = ${result.candidateReadRows.max} 行（判定取 max；均值 ${result.candidateReadRows.mean.toFixed(1)} 行，` +
       `门槛 ≤ ${THRESHOLDS.candidateReadRowsMax} 行，样本 ${result.candidateReadRows.count}）\n` +
+      `    ★ H1 口径 = **${result.candidateReadRowsBasis.mode === 'measured' ? '实测（生产 SQL 实际物化的候选行数）' : '⚠ 推算（模型化了「桶内不设 LIMIT」）'}**` +
+      `（对照推算值 max = ${result.candidateReadRowsBasis.derivedCrossCheck?.max ?? 0} 行）\n` +
       '  ★ H2 候选行数 ÷ 库规模 = ' +
       `${(result.corpusSize > 0 ? (result.candidateReadRows.max / result.corpusSize) * 100 : 0).toFixed(4)}%` +
       `（门槛 ≤ ${(THRESHOLDS.candidateReadRowsRatioMax * 100).toFixed(1)}%）\n` +
       '  ★ 每行读成本 = ' +
       `${result.perRowReadCostUs === null ? '**未测到**' : `${result.perRowReadCostUs.toFixed(3)} µs/行`}` +
       `（推导值；介质 ${storageMedia.mediaClass}${storageMedia.detected ? '' : '（**未探测到**）'}）\n` +
+      `  ★ 页缓存状态 = **${pageCacheState.state}**` +
+      `${pageCacheState.declared ? '（跑的人声明）' : '（**没声明 ⇒ 不可知**）'}` +
+      '（⚠️ 由跑的人声明，不是仪器测量值）\n' +
       `  ★ 写入分段：向量候选扫描 均 ${result.writeSegments.vectorCandidateScan.meanMs.toFixed(3)}ms` +
-      `/ 其余（FTS5 + 索引维护）均 ${result.writeSegments.otherMeanMs.toFixed(3)}ms（推导值）\n` +
+      `/ 其余（FTS5 + 索引维护 + 合并判定 + 事件写入）均 ${result.writeSegments.otherMeanMs.toFixed(3)}ms（推导值）\n` +
       `  灌库 ${formatLoadMs(prepared.loadMs)} / 训练 ${prepared.trainMs.toFixed(0)}ms / ` +
       `${formatPeakRss(prepared.trainPeakRss)}\n` +
       `  结果已写入 ${outPath}\n`,

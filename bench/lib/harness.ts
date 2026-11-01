@@ -672,6 +672,263 @@ function classifyMediaType(mediaType: string, busType: string | null): StorageMe
   return 'unknown';
 }
 
+// ═══════════════════════════════ 页缓存状态（判据的运行档位标注） ═══════════════════════════════
+
+/**
+ * ★ **页缓存状态**（**冷 / 热 / 未知**）—— **判据的运行档位标注**。
+ *
+ * ⚠️ ★ **为什么必须有它（且只能是「可标注」而不是「可测量」）**：
+ *   **Windows 没有公开 API 能告诉你「这个库有多少在页缓存里」**
+ *   （Linux 可以读 `/proc/meminfo` 的 `Cached`，但那也不是「这个库」的那一部分）
+ *   ⇒ ⇒ **页缓存状态无法直接测量** ⇒ ⇒ **只能由跑的人声明**
+ *   ⇒ ⇒ ⚠️ **缺省必须是 `unknown`**（**不许猜**）——
+ *   与 `detectStorageMedia()` 同一纪律：**拿不到就记 `unknown`，绝不假装测到了**。
+ *
+ * ⚠️ ★ **为什么它必须机器可读**（而不是只写在报告的人话里）：
+ *   冷 / 热两档的毫秒数**差 21.6 倍** ⇒ 现在这个区分**只靠人记**
+ *   ⇒ ⇒ **让机器能读出来** ⇒ 以后每次采集都自带这个标注
+ *   ⇒ ⇒ **换一块盘 / 换一个缓存状态 ⇒ 毫秒数的含义会静默改变** ⇒ 必须落进 JSON。
+ */
+export type PageCacheState = 'cold' | 'warm' | 'unknown';
+
+/**
+ * 页缓存状态的采集结果（**由跑的人声明** ⇒ 不是仪器测量值）。
+ */
+export interface PageCacheStateInfo {
+  /** 状态（**`unknown` ⇒ 没声明 / 不可知**，不是「测到了未知」）。 */
+  readonly state: PageCacheState;
+  /** 声明来源（`cli:--cache-state` / `none`）。 */
+  readonly source: string;
+  /** 是否由**跑的人显式声明**（`false` ⇒ 缺省 `unknown` ⇒ **不许猜**）。 */
+  readonly declared: boolean;
+  /** 说明（**必须落盘** ⇒ 读的人不会把「声明」误读成「测量」）。 */
+  readonly note: string;
+}
+
+/**
+ * 解析 `--cache-state` 参数（**缺省 `unknown`**；**非法值 ⇒ 报错**，不静默钳制）。
+ *
+ * ⚠️ **为什么非法值必须报错**（同 `intArg()` 的纪律）：
+ *   静默钳制 ⇒ 「我以为我采的是冷盘档、其实跑的是热盘档」⇒ **毫秒数的档位就是假的**
+ *   ⇒ ⇒ **宁可失败**。
+ *
+ * ⚠️ **「`warm`」这一档的定义**（**写死在这里 ⇒ 报告与断言同源**）：
+ *   **库文件本体已在 OS 页缓存中**（⇒ 候选行读基本不落盘）
+ *   ⇒ 对照「`cold`」= **库文件本体不在 OS 页缓存中**（⇒ 每次候选行读都是真实随机读）。
+ *
+ * @param raw `--cache-state=` 的原始值（`undefined` ⇒ 没给这个参数）
+ * @returns 页缓存状态信息
+ * @throws {Error} 值不在 `cold` / `warm` / `unknown` 三个里
+ */
+export function parsePageCacheState(raw: string | undefined): PageCacheStateInfo {
+  if (raw === undefined) {
+    return {
+      state: 'unknown',
+      source: 'none',
+      declared: false,
+      note:
+        '⚠ **没声明**（缺省 `unknown` ⇒ **不许猜** —— 与介质探测同一纪律）' +
+        '⇒ 页缓存状态**不可知** ⇒ ' +
+        '⚠️ **毫秒数不可跨次比较**（⇒ 但 H1 / H2 的行数判据不受影响）。',
+    };
+  }
+  const normalized = raw.trim().toLowerCase();
+  if (normalized !== 'cold' && normalized !== 'warm' && normalized !== 'unknown') {
+    throw new Error(
+      `bench 参数 --cache-state 只能是 cold / warm / unknown，收到 "${raw}"` +
+        '（⚠️ 非法值必须报错而不是静默钳制 ⇒ 否则「档位」是假的）',
+    );
+  }
+  if (normalized === 'unknown') {
+    return {
+      state: 'unknown',
+      source: 'cli:--cache-state',
+      declared: true,
+      note:
+        '⚠ **显式声明为 `unknown`** ⇒ 页缓存状态**不可知** ⇒ ' +
+        '⚠️ **毫秒数不可跨次比较**（⇒ 但 H1 / H2 的行数判据不受影响）。',
+    };
+  }
+  return {
+    state: normalized,
+    source: 'cli:--cache-state',
+    declared: true,
+    note:
+      '⚠ **由跑的人声明**（不是仪器测量值 —— Windows 没有公开 API 能报「这个库有多少在页缓存里」）' +
+      '⇒ 本档的毫秒数**只能与同档比较**。',
+  };
+}
+
+// ═══════════════════════════════ 行读计数（H1 的「实测口径」取数装置） ═══════════════════════════════
+
+/**
+ * ★ **行读计数器的快照**（**累计值**；两次快照相减 = 那段窗口里读的行数）。
+ */
+export interface RowReadSnapshot {
+  /**
+   * **候选行读数**（`memories` 表**实际物化**的行数）—— **H1 的判据量**。
+   *
+   * ⚠️ **口径**：与**写入路径**那个「候选 ≤ 2000」（§4.9 步骤 3a2 的扫描量）**同一口径**
+   *   （都是「候选行」⇒ **同一个库、同一个量、同一个被考核方**）。
+   */
+  readonly candidateRows: number;
+  /**
+   * **桶成员行读数**（`vector_cell_members` 表**实际物化**的行数）—— **附加信息**，不判 H1。
+   */
+  readonly bucketMemberRows: number;
+}
+
+/**
+ * ★ **行读计数器**（装在库句柄上；**只读观测，不改 `src/**`**）。
+ */
+export interface RowReadCounter {
+  /** 开始计数（幂等）。 */
+  start(): void;
+  /** 停止计数（幂等）。 */
+  stop(): void;
+  /** 取**累计**快照（两次快照相减 = 窗口内读的行数）。 */
+  snapshot(): RowReadSnapshot;
+  /** 拆掉计数器（把 `db.prepare` 恢复原状）。 */
+  uninstall(): void;
+}
+
+/**
+ * ★ **给库句柄装一个行读计数器**（**H1 的「实测口径」的取数装置**）。
+ *
+ * ⚠️ ★ **为什么需要它**（2026-11-02 架构师裁决的落地）：
+ *   「H1 的口径从『命中桶成员数之和（**推算**）』改成『**实际读取的行数（实测）**』
+ *   ⇒ 对任何实现都成立（**不再模型化任何实现假设**）。」
+ * ⇒ **推算口径模型化了「桶内全量精确点积、桶内不设 LIMIT」这个实现**（§4.15.3）
+ * ⇒ ⇒ **阶段 4 一旦引入「桶内 LIMIT」或「两段式读（先读低维 sketch 再读全量）」**
+ *   ⇒ **真实读的行数会降、推算值却不会降** ⇒ ⇒ **会出现「实现降了、判据却还红」的假红**。
+ *
+ * ⚠️ ★ **怎么在不改 `src/**` 的前提下拿到「实际读了多少行」**：
+ *   本函数在 **bench 侧**替换库句柄的 `prepare` ⇒ 对**生产 SQL 实际物化出来的行**计数
+ *   ⇒ **测的是生产代码真正跑的那条 SQL**（**不是** bench 自己抄一份）
+ *   ⇒ ⇒ **对任何实现都成立**（桶内 LIMIT / 两段式读 ⇒ 物化的行数变少 ⇒ 这个数自动跟着降）。
+ *
+ * ⚠️ ★ **为什么按 SQL 分类**（口径必须写死）：
+ *   · `memories` ⇒ **候选行**（= H1 的判据量）；
+ *   · `vector_cell_members` ⇒ **桶成员行**（路由侧的行读；**附加信息**，不判 H1）。
+ *   ⇒ ⇒ ⚠️ **聚合查询不算行读**（`COUNT(*)` 之类 ⇒ 它读的是索引，**不是候选行**）。
+ *
+ * ⚠️ **纪律**：
+ *   · **计数只在 `start()` ~ `stop()` 之间累积**（⇒ 采集窗口可控）；
+ *   · **计数器的开销必须可忽略**（一次 Proxy + 一次 `rows.length` ⇒ 相对毫秒级耗时可忽略）；
+ *   · ⚠️ **本模块只提供「装置」** ⇒ **拿不到实测值时 bench 必须退回推算口径并显式标注**
+ *       （**不许假装它是实测**）。
+ *
+ * @param db 库句柄（**会被就地改造** ⇒ 用完请 `uninstall()`）
+ * @returns 计数器句柄
+ */
+export function installRowReadCounter(db: Database.Database): RowReadCounter {
+  type ReadKind = 'candidate' | 'bucketMember';
+  const counters: Record<ReadKind, number> = { candidate: 0, bucketMember: 0 };
+  let counting = false;
+
+  const handle = db as unknown as { prepare: (source: string) => unknown };
+  // ⚠️ **存「原函数对象」而不是它的 bind 产物** ⇒ `uninstall()` 能**逐位**还原
+  //   （⇒ bench 不许给生产句柄留任何残桩 ⇒ 可被逐字核对）。
+  const originalPrepare = handle.prepare;
+
+  handle.prepare = (source: string): unknown => {
+    const statement = originalPrepare.call(db, source);
+    const kind = classifyReadKind(source);
+    // ⚠️ **不是候选行 / 桶成员行的 SQL ⇒ 原样返回**（不包装 ⇒ 零开销）。
+    if (kind === null) {
+      return statement;
+    }
+    return wrapStatement(statement, kind);
+  };
+
+  function wrapStatement(statement: unknown, kind: ReadKind): unknown {
+    const target = statement as {
+      all: (...args: unknown[]) => unknown[];
+      get: (...args: unknown[]) => unknown;
+      iterate: (...args: unknown[]) => IterableIterator<unknown>;
+    };
+    return new Proxy(target, {
+      get(inner, property) {
+        if (property === 'all') {
+          return (...args: unknown[]): unknown[] => {
+            const rows = target.all(...args);
+            if (counting) {
+              counters[kind] += rows.length;
+            }
+            return rows;
+          };
+        }
+        if (property === 'get') {
+          return (...args: unknown[]): unknown => {
+            const row = target.get(...args);
+            if (counting && row !== undefined) {
+              counters[kind] += 1;
+            }
+            return row;
+          };
+        }
+        if (property === 'iterate') {
+          return (...args: unknown[]): IterableIterator<unknown> => {
+            const iterator = target.iterate(...args);
+            return (function* counted(): Generator<unknown> {
+              for (const row of iterator) {
+                if (counting) {
+                  counters[kind] += 1;
+                }
+                yield row;
+              }
+            })();
+          };
+        }
+        // ⚠️ **其余属性原样透传**（且函数**绑到真语句**上 ⇒ native 方法的 `this` 正确）。
+        const value = Reflect.get(inner, property) as unknown;
+        return typeof value === 'function' ? value.bind(inner) : value;
+      },
+    });
+  }
+
+  return {
+    start(): void {
+      counting = true;
+    },
+    stop(): void {
+      counting = false;
+    },
+    snapshot(): RowReadSnapshot {
+      return { candidateRows: counters.candidate, bucketMemberRows: counters.bucketMember };
+    },
+    uninstall(): void {
+      counting = false;
+      handle.prepare = originalPrepare;
+    },
+  };
+}
+
+/**
+ * 把一条 SQL 归到「候选行 / 桶成员行 / 不计」三类。
+ *
+ * ⚠️ **口径**：
+ *   · `FROM memories` / `JOIN memories` ⇒ **候选行**（写入路径那条 JOIN 也归这一类
+ *     ⇒ 因为它的**结果集**就是候选行）；
+ *   · `FROM vector_cell_members` / `JOIN vector_cell_members` ⇒ **桶成员行**；
+ *   · **聚合查询**（`COUNT(` / `SUM(` / `AVG(` …）⇒ **不计**（它读的是索引，不是行）。
+ *
+ * @param sql SQL 文本
+ * @returns 分类（`null` ⇒ 不计）
+ */
+function classifyReadKind(sql: string): 'candidate' | 'bucketMember' | null {
+  if (/\b(?:COUNT|SUM|AVG|TOTAL)\s*\(/i.test(sql)) {
+    return null;
+  }
+  if (/\b(?:FROM|JOIN)\s+memories\b/i.test(sql)) {
+    return 'candidate';
+  }
+  if (/\b(?:FROM|JOIN)\s+vector_cell_members\b/i.test(sql)) {
+    return 'bucketMember';
+  }
+  return null;
+}
+
 // ═══════════════════════════════ 库与训练（复用生产代码） ═══════════════════════════════
 
 /**
