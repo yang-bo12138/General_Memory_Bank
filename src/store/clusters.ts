@@ -18,6 +18,7 @@ import type Database from 'better-sqlite3';
 import { resolveNow } from '../core/clock.js';
 import { MemoryError } from '../core/errors.js';
 import type { SweepReclusterEventPayload } from '../core/events.types.js';
+import { resolveFlags } from '../core/flags.js';
 import type { Params } from '../core/params.js';
 import {
   type ClusterComputation,
@@ -245,6 +246,19 @@ export function recluster(store: ClusterStore, now?: number): ReclusterResult {
   const at = resolveNow(now);
   const db = store.db;
   const params = store.params;
+
+  // ⚠️ ★ **机制开关 `coactivation`**（§5 机制开关表）：
+  //   关 ⇒「**主题簇不计算也不使用**」
+  //   ⇒ **不读共激活图、不算簇、不写快照、不写事件** ⇒ 直接返回「没算」。
+  //   ⚠️ **为什么放在只读守卫之后**：§6 把 `recluster` 列为**三个写方法**之一
+  //   ⇒ 「在只读实例上调写方法」是**契约违规**，**与开关无关**
+  //   ⇒ §7.1 的守卫**不得随开关变化**（否则「关掉开关就绕过了只读守卫」）。
+  //   ⚠️ **`skipped` 用设计稿已有的词汇**（`'too_soon' | null`）⇒ **不新增枚举值**：
+  //   「没重算」由 `computed: false` 表达；`skipped: null` 表示「**不是**因为间隔太短」
+  //   ⇒ 结合 `computed` 就能唯一地推出「机制被关掉了」（实现里只有这两种「没重算」）。
+  if (!resolveFlags(params).coactivation) {
+    return { clusterCount: 0, largestClusterRatio: 0, computed: false, skipped: null };
+  }
 
   const previous = readSnapshotMeta(db);
 
@@ -1184,6 +1198,43 @@ function collectRepresentativeIds(stats: readonly ClusterStats[]): string[] {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
+ * ★ **「主题簇机制被关掉」时的空结果**（§5：`coactivation` 关 ⇒「主题簇不计算也不使用」）。
+ *
+ * ⚠️ **簇相关的一切都是 0 / 空**（簇数、覆盖数、成员数、两个覆盖率、两个占比）
+ *   ⇒ 因为「簇」这件事**根本不存在**（不是「存在但为空」）。
+ * ⚠️ ★ **`adoptedMemories` / `totalMemories` 仍取真值**（**这是本函数唯一需要斟酌的一处**）：
+ *   它们是**库级事实**（`access_count > 0` 的未删记忆数 / 未删记忆数），
+ *   **不是簇的事实** ⇒ §6 明写 `clusters().adoptedMemories` 与 `stats().adoptedMemories`
+ *   是「同一个数、同一口径、同一实现」⇒ **必须恒等**
+ *   ⇒ 这里填 `0` 会**直接破坏那条恒等式**（`stats()` 报真值、`clusters()` 报 0）
+ *   ⇒ ⇒ **留真值**（它们**不读簇表** ⇒ 也不违反「不计算也不使用」）。
+ *
+ * @param db 库句柄（**只读** ⇒ 只数两个库级计数，不碰簇表）
+ * @param at 注入时钟（**两条时刻都取它** ⇒ 「没有快照」时不给出假的历史时刻）
+ * @returns §6 的 `ClustersResult`（簇相关字段全 0 / 空）
+ */
+function emptyClustersResult(db: Database.Database, at: number): ClustersResult {
+  return {
+    largestClusterRatio: 0,
+    maxRawComponentRatio: 0,
+    clusters: [],
+    // ⚠️ **没有快照 ⇒ 这两个时刻都取「本次查询时刻」**（不填 0 ⇒ 0 是「假的历史时刻」）
+    asOf: at,
+    computedAt: at,
+    algoVersion: CLUSTER_ALGO_VERSION,
+    stale: false,
+    totalClusters: 0,
+    coveredMemories: 0,
+    adoptedMemories: countAdoptedMemories(db),
+    totalMemories: countLiveMemories(db),
+    totalMembers: 0,
+    seedOnlyMemories: 0,
+    coverage: 0,
+    coverageOverAdopted: 0,
+  };
+}
+
+/**
  * `clusters(options?, now?)` —— §6 的**只读导航**接口。
  *
  * ⚠️ ★ **纯读**：不写库、不写 events、不更新 `last_access`（§6 / §7.1 的「7 个允许读的方法」之一）
@@ -1214,6 +1265,16 @@ export function clusters(
 ): ClustersResult {
   const { db, params } = store;
   const at = resolveNow(now);
+
+  // ⚠️ ★ **机制开关 `coactivation`**（§5 机制开关表）：
+  //   关 ⇒「**主题簇不计算也不使用**」
+  //   ⇒ **不读簇表、不现场重算**（⇒ 连 `coacts` 都不读）⇒ 直接返回空结果。
+  //   ⚠️ **它在本方法的最前面**（本方法**纯读** ⇒ 没有只读守卫要挡）
+  //   ⇒ 「机制关着还去读簇表」= 白做功 + 给了「簇还在」的错觉。
+  if (!resolveFlags(params).coactivation) {
+    return emptyClustersResult(db, at);
+  }
+
   const meta = readSnapshotMeta(db);
   const requested = options?.minAffinity;
 

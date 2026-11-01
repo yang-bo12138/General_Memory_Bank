@@ -18,8 +18,8 @@
  *   | 开关 | 关掉后**等价于 v1.0 的哪一部分** | 逐位比对的范围 |
  *   |---|---|---|
  *   | `inhibition` | v1.0 的召回：**候选带不重排**，直接按 base 分取 topN | hits 的 id 序列 + 每条的 score + breakdown 五项 + 事件的 hitIds/scores |
- *   | `coactivation` | v1.0：**没有共激活这张表** ⇒ `coacts` 表**不被写入**、联想路**不执行** | `coacts` 表内容哈希（前后逐位相同）+ `diffused` 恒空 + 命中序列与事件 |
- *   | `writeBack` | v1.0：**「扩散唤起 → 采纳 → 回写」的联动不存在** ⇒ `touch` 只加固不写因果边 | `coacts` 表内容哈希 + `stability` 仍增长 + 事件的 `stabilityDelta` |
+ *   | `coactivation` | v1.0：**没有共激活这张表** ⇒ `coacts` 表**不被写入**、联想路**不执行**、**主题簇不计算也不使用** | `coacts` 表内容哈希（前后逐位相同）+ `diffused` 恒空 + 命中序列与事件 + **簇的三张表逐位不变 + 不记 `sweep` 事件 + `clusters()` 返回空** |
+ *   | `writeBack` | v1.0：**「扩散唤起 → 采纳 → 回写」的联动不存在** ⇒ `touch` 只加固不写因果边 | `coacts` 表内容哈希 + **无 `cause_flags` bit1 的行** + **普通共激活行（bit0）仍在** + `stability` 仍增长 + 事件的 `stabilityDelta` |
  *   | `ARCHIVAL_CACHE` | v1.0：`countArchived` 走**逐行精筛**（路径不同、结果相同） | **阶段 4 才实现 `countArchived`** ⇒ 本轮只登记「不可验」 |
  *   | `VECTOR_ROUTER='flat'` | v1.0 的向量路（**整路缺席**是阶段 1 的事实） | `fromVector` / `vectorPart` / `cos` |
  *   | `diffuseArchived` | **不是机制开关**（是 `RecallOptions` 字段）⇒ 在 v1.0 里**不存在** | `diffused` 恒空（因 `coactivation=false`）⇒ 逐位一致 |
@@ -312,36 +312,67 @@ describe('P3-T06 · 开关逐条复验 ② `coactivation`（共激活 / 联想�
     expect(recallOff.diffused).toEqual([]);
   });
 
-  it.fails(
-    '★ ⚠️ **已知缺陷（待工程师修复）**：`coactivation = false` ⇒ 主题簇**仍被计算并发布**（§5 要求「簇不计算也不使用」）',
-    () => {
-      // ⚠️ ★ **本用例是「已知缺陷的守门」**（**不是**断言当前行为正确）：
-      //   §5 机制开关表写明 `coactivation` 关 ⇒「**主题簇不计算也不使用**」
-      //   ⇒ 实测 `recluster()` **仍然计算并发布**（`theme_clusters` 有行、写了 sweep 事件），
-      //   且 `clusters()` **仍然返回簇**（coveredMemories > 0）。
-      //   ⇒ 缺陷登记在 `docs/qa/p3-t06-acceptance-report.md`（路由 = Engineer）。
-      //   ⇒ 本用例用 `it.fails` **登记缺陷**：**修好后它会反过来变红**（提醒摘掉标记）。
-      const off = makeStore({ ...BASELINE_GROUP });
-      seedAssociationWorld(off.db);
+  it('★ 关掉 ⇒ 主题簇**不计算也不使用**（三张簇表逐位不变、不记 `sweep` 事件、`clusters()` 返回空）', () => {
+    // ⚠️ §5 机制开关表写明 `coactivation` 关 ⇒「**主题簇不计算也不使用**」
+    //   ⇒ 本用例守这条：① `recluster()` **不写库、不写事件**；
+    //   ② `clusters()` **返回空**（不读簇表、不现场重算）。
+    const off = makeStore({ ...BASELINE_GROUP });
+    seedAssociationWorld(off.db);
 
-      const before = {
-        clusters: tableHash(off.db, 'theme_clusters', 'cluster_id'),
-        members: tableHash(off.db, 'theme_cluster_members', 'cluster_id, memory_id'),
-        meta: tableHash(off.db, 'cluster_snapshot_meta', 'id'),
-      };
+    const before = {
+      clusters: tableHash(off.db, 'theme_clusters', 'cluster_id'),
+      members: tableHash(off.db, 'theme_cluster_members', 'cluster_id, memory_id'),
+      meta: tableHash(off.db, 'cluster_snapshot_meta', 'id'),
+      events: off.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'sweep'").get() as {
+        n: number;
+      },
+    };
 
-      recluster(off.store, NOW);
-      expect(tableHash(off.db, 'theme_clusters', 'cluster_id')).toBe(before.clusters);
-      expect(tableHash(off.db, 'theme_cluster_members', 'cluster_id, memory_id')).toBe(
-        before.members,
-      );
-      expect(tableHash(off.db, 'cluster_snapshot_meta', 'id')).toBe(before.meta);
+    // ── 断言①：**`recluster()` 不写库**（三张簇表逐位相同）──
+    const result = recluster(off.store, NOW);
+    expect(tableHash(off.db, 'theme_clusters', 'cluster_id')).toBe(before.clusters);
+    expect(tableHash(off.db, 'theme_cluster_members', 'cluster_id, memory_id')).toBe(
+      before.members,
+    );
+    expect(tableHash(off.db, 'cluster_snapshot_meta', 'id')).toBe(before.meta);
 
-      const navigation = clusters({ db: off.db, params: off.store.params }, undefined, NOW);
-      expect(navigation.clusters).toEqual([]);
-      expect(navigation.coveredMemories).toBe(0);
-    },
-  );
+    // ── 断言②：**`recluster()` 不写事件**（一条 `sweep` 都不多）──
+    //   ⚠️ **这是「不计算也不使用」的关键一半**：只断言表不变是不够的
+    //   ⇒ 事件里若留了 `action='recluster'`，宿主仍会以为「簇刚重算过」。
+    const eventsAfter = off.db
+      .prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'sweep'")
+      .get() as { n: number };
+    expect(eventsAfter.n).toBe(before.events.n);
+
+    // ── 断言③：**`recluster()` 自报「没算」**（宿主靠 `computed` 区分）──
+    expect(result.computed).toBe(false);
+    expect(result.clusterCount).toBe(0);
+
+    // ── 断言④：**`clusters()` 返回空**（不读簇表、不现场重算）──
+    const navigation = clusters({ db: off.db, params: off.store.params }, undefined, NOW);
+    expect(navigation.clusters).toEqual([]);
+    expect(navigation.coveredMemories).toBe(0);
+    expect(navigation.totalClusters).toBe(0);
+    expect(navigation.totalMembers).toBe(0);
+    expect(navigation.coverage).toBe(0);
+    expect(navigation.coverageOverAdopted).toBe(0);
+    // ⚠️ **库级事实仍取真值**（§6：`clusters().adoptedMemories` 与 `stats().adoptedMemories`
+    //   **必须恒等** ⇒ 填 0 会破坏那条恒等式）⇒ 断言它**不是** 0。
+    expect(navigation.adoptedMemories).toBeGreaterThan(0);
+    expect(navigation.totalMemories).toBeGreaterThan(0);
+
+    // ── 断言⑤（**对照**）：开关**开着**时主题簇**确实**会被计算并发布
+    //   ⇒ 否则上面那些断言可能只是「这个种子世界本来就没有簇」的恒绿守卫。
+    const on = makeStore({ ...BASELINE_GROUP, coactivation: true });
+    seedAssociationWorld(on.db);
+    const onResult = recluster(on.store, NOW);
+    expect(onResult.computed).toBe(true);
+    expect(onResult.clusterCount).toBeGreaterThan(0);
+    const onEvents = on.db
+      .prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'sweep'")
+      .get() as { n: number };
+    expect(onEvents.n).toBe(before.events.n + 1);
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -384,32 +415,52 @@ describe('P3-T06 · 开关逐条复验 ③ `writeBack`（激活回写）', () =>
     expect(payload.stabilityDelta).toBeGreaterThan(0);
   });
 
-  it.fails(
-    '★ ⚠️ **已知缺陷（待工程师修复）**：`writeBack = false` ⇒ `coActivateWith` **仍写因果边**（§5「`touch` 的 `coActivateWith` 交叉强化不发生」）',
-    () => {
-      // ⚠️ ★ **本用例是「已知缺陷的守门」**（**不是**断言当前行为正确）：
-      //   §5 机制开关表写明 `writeBack` 关 ⇒「`touch` 的 `coActivateWith` 交叉强化**不发生**」
-      //   ⇒ 实测**仍然发生**（`coacts` 多了一行 `cause_flags = 2` 的因果边）。
-      //   ⇒ 缺陷登记在 `docs/qa/p3-t06-acceptance-report.md`（路由 = Engineer）。
-      //   ⇒ 本用例用 `it.fails` **登记缺陷**：**修好后它会反过来变红**（提醒摘掉标记）。
-      const off = makeStore({ ...BASELINE_GROUP, writeBack: false, coactivation: true });
-      seedAssociationWorld(off.db);
-      // ⚠️ **对照组**：`writeBack = true` 时**确实**写了因果边（否则「关掉没写」证明不了任何事）。
-      const on = makeStore({ ...BASELINE_GROUP, writeBack: true, coactivation: true });
-      seedAssociationWorld(on.db);
-      touch(on.store, ['v-2'], NOW, {
-        coActivateWith: [{ memoryId: 'v-2', seedIds: ['v-1'] }],
-      });
-      const rowsOn = on.db.prepare('SELECT COUNT(*) AS n FROM coacts').get() as { n: number };
-      expect(rowsOn.n).toBe(2); // ⚠️ 种子世界**预置** 1 行（簇跳燃料）+ 机制 B 写 1 行。
+  it('★ 关掉 ⇒ `coActivateWith` 的**交叉强化不发生**（无 `cause_flags` bit1 的因果边），但**普通共激活行照旧**（bit0）、`growStability` 仍加固', () => {
+    // ⚠️ §5 机制开关表写明 `writeBack` 关 ⇒「**`touch` 的 `coActivateWith` 交叉强化不发生**」
+    //   ⇒ 本用例守三件事：
+    //   ① **不写因果边**（`cause_flags` 的 bit1 = 2 那一位不置位 ⇒ 整条表逐位不变）；
+    //   ② **普通共激活行照旧**（机制 A 的 bit0 = 1 仍要写 ⇒ `writeBack` **不是**「不写 coacts」）；
+    //   ③ `growStability` 加固不受影响（由同 describe 的另一条用例守）。
+    const off = makeStore({ ...BASELINE_GROUP, writeBack: false, coactivation: true });
+    seedAssociationWorld(off.db);
+    // ⚠️ **对照组**：`writeBack = true` 时**确实**写了因果边（否则「关掉没写」证明不了任何事）。
+    const on = makeStore({ ...BASELINE_GROUP, writeBack: true, coactivation: true });
+    seedAssociationWorld(on.db);
+    touch(on.store, ['v-2'], NOW, {
+      coActivateWith: [{ memoryId: 'v-2', seedIds: ['v-1'] }],
+    });
+    const causalOn = on.db
+      .prepare('SELECT COUNT(*) AS n FROM coacts WHERE (cause_flags & 2) != 0')
+      .get() as { n: number };
+    expect(causalOn.n).toBe(1); // ⚠️ 机制 B 写的那一行（bit1 置位）。
+    const rowsOn = on.db.prepare('SELECT COUNT(*) AS n FROM coacts').get() as { n: number };
+    expect(rowsOn.n).toBe(2); // ⚠️ 种子世界**预置** 1 行（簇跳燃料）+ 机制 B 写 1 行。
 
-      const coactsBefore = tableHash(off.db, 'coacts', 'memory_a, memory_b');
-      touch(off.store, ['v-2'], NOW, {
-        coActivateWith: [{ memoryId: 'v-2', seedIds: ['v-1'] }],
-      });
-      expect(tableHash(off.db, 'coacts', 'memory_a, memory_b')).toBe(coactsBefore);
-    },
-  );
+    // ── 断言①：**关掉 ⇒ `coActivateWith` 的因果边整条不发生**（表内容逐位不变）──
+    const coactsBefore = tableHash(off.db, 'coacts', 'memory_a, memory_b');
+    touch(off.store, ['v-2'], NOW, {
+      coActivateWith: [{ memoryId: 'v-2', seedIds: ['v-1'] }],
+    });
+    expect(tableHash(off.db, 'coacts', 'memory_a, memory_b')).toBe(coactsBefore);
+    // ⚠️ **逐位比对之外再点一次名**：**没有任何一行的 `cause_flags` 置了 bit1**。
+    const causalOff = off.db
+      .prepare('SELECT COUNT(*) AS n FROM coacts WHERE (cause_flags & 2) != 0')
+      .get() as { n: number };
+    expect(causalOff.n).toBe(0);
+
+    // ── 断言②：**普通共激活行照旧**（机制 A：两条一起 touch ⇒ 写出一行 bit0）──
+    //   ⚠️ **这条是「`writeBack` ≠「不写 `coacts`」的正面证据**（§5：普通共激活由 `coactivation` 管）。
+    touch(off.store, ['v-1', 'v-2'], NOW);
+    const pairRow = off.db
+      .prepare('SELECT cause_flags FROM coacts WHERE memory_a = ? AND memory_b = ?')
+      .get('v-1', 'v-2') as { cause_flags: number } | undefined;
+    expect(pairRow).toBeDefined();
+    expect(pairRow?.cause_flags).toBe(1); // ⚠️ **只有 bit0**（机制 A）⇒ **没有 bit1**。
+
+    // ── 断言③：**事件里也没有因果回写**（`activationWrites` 恒空）──
+    const payload = readTouchPayload(off.db);
+    expect(payload.activationWrites).toEqual([]);
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════

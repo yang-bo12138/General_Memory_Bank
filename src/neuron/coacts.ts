@@ -392,8 +392,22 @@ export function writeCoactivations(store: CoactStore, input: CoactWriteInput): C
     return emptyResult();
   }
 
+  // ⚠️ ★ **机制开关 `writeBack`**（§5 机制开关表）：
+  //   关 ⇒ 关闭「**扩散唤起 → 采纳 → 回写**」的**联动**部分
+  //   ⇒ **`touch` 的 `coActivateWith` 交叉强化不发生**
+  //   ⇒ **机制 B（调用方的显式声明）整条不参与**：
+  //   **不产生因果增量**（`COACT_CAUSAL_BONUS`）、**不置 `cause_flags` 的 bit1**
+  //   （= 2，机制 B 的那位）、**不记 `activationWrites`**。
+  //   ⇒ ⚠️ **机制 A（同一批内任意两条的普通共激活）照旧**：
+  //   那是 `coactivation` 管的（`touch` 的共激活写入），**不是 `writeBack` 管的**
+  //   ⇒ **`writeBack` 关掉之后，`touch` 仍然会写普通的 `coacts` 行**（`cause_flags` 的 bit0）。
+  //   ⚠️ ★ **弱校验也一并跳过**（与上面 `coactivation` 的短路**同一纪律**）：
+  //   机制关着 ⇒ 这个入参**根本不被消费** ⇒ v1.0 里压根没有 `coActivateWith` 这个参数
+  //   ⇒ 它的校验**也不该发生** ⇒ 否则「开 / 关」会给出**不同的入参校验结果**
+  //   ⇒ ⇒ ADR-21 的「与 v1.0 逐位一致」会破（v1.0 压根不会因为这个入参报错）。
+  const declarations = resolveFlags(params).writeBack ? (input.declarations ?? []) : [];
+
   const ids = input.ids;
-  const declarations = input.declarations ?? [];
 
   // ── 弱校验 ④：条目数超 `COACT_BATCH_MAX` ⇒ **硬拒**，不是截断 ──
   // ⚠️ **为什么不静默截断**：截断会让调用方以为「全写进去了」⇒ 那些没写进去的关联**静默丢失**。
