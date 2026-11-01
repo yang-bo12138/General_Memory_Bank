@@ -23,10 +23,12 @@
  *
  * ⚠️ **流水线顺序不可换**（§4.6 首段）：
  *   路由（步骤 0，阶段 2 补）→ 三路候选（步骤 2）→ 融合打分（步骤 3）
- *   → 侧抑制后置（步骤 4.5，阶段 3 补）→ 排序截断（步骤 4）。
+ *   → 侧抑制后置（步骤 4.5）→ 联想路 / 激活扩散（步骤 4.6）→ 排序截断（步骤 4）。
  *   ⇒ **侧抑制是后置的，不进五因子公式**（§4.11.3）——这是「五项权重恒和为 1.0」得以保留的前提。
- *   ⇒ 本阶段侧抑制与激活扩散都**尚未实现**（阶段 3 / 阶段 2），
- *     因此 `suppressed` / `diffused` 恒为空数组，事件里的 `suppressedIds` / `diffusedSeeds` 恒为 `[]`。
+ *   ⇒ **激活扩散是后置的，不进五因子公式**（§4.7）：`diffusionScore` **只用于 diffused 内部排序**，
+ *     **不是 0~1 的置信度**（它的上界 = `MAX_DIFFUSED_VISITS × ACTIVATION_DECAY`）。
+ *   ⇒ **抑制不作用于 diffused**（§4.13.1 硬约束③）⇒ `diffused` 的内容与 `inhibition` 开关**无关**
+ *     （扩散的种子取的是**抑制前**的 topN）。
  *
  * ⚠️ **两条铁律**（§4.6，比任何权重都重要）：
  *   ① **三路只回答「谁可能是候选」，不回答「谁配被想起」**：
@@ -88,8 +90,9 @@ import {
 } from '../core/scoring.js';
 import { buildMatchQuery } from '../core/tokenize.js';
 import { inhibitCandidates, loadInhibitionFacts } from '../neuron/inhibit.js';
+import { type DiffusedItem, diffuse } from './diffuse.js';
 import type { EventWriter } from './events.js';
-import { type MemoryKind, type MemoryView, get } from './get.js';
+import { type MemoryView, get } from './get.js';
 import { touch } from './touch.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -197,7 +200,14 @@ export interface RecallOptions {
    *   ⇒ 本实现：**归档模式跳过强度精筛**（三路一致，铁律①）。
    */
   includeArchived?: boolean;
-  /** 扩散是否也过滤归档（默认 `true`；本阶段扩散未实现 ⇒ 恒不影响召回结果）。 */
+  /**
+   * 扩散是否也过滤归档（默认 `true`）。
+   *
+   * ⚠️ **这是 §4.7 规则 R-ARCH-DIFF 的唯一例外通道**（§7 边界约束③）：
+   *   `true` ⇒ 扩散**可以**捞出归档记忆（带 `layer: 'archived'` 标记）；
+   *   `false` ⇒ 扩散候选**同样**要过 `intensity > ARCHIVE_LINE` 的精筛，与主召回口径一致。
+   * ⚠️ **两腿共用同一套归档口径**（§4.14.5）：实体跳与簇跳**都**受这个开关约束。
+   */
   diffuseArchived?: boolean;
   /**
    * 是否同步加固本次 topN（默认 `false`）。
@@ -302,9 +312,14 @@ export interface RecallExplain {
     vector: RecallRouteInfo;
     graph: RecallRouteInfo;
   };
-  /** 激活扩散的诊断（本阶段扩散未实现 ⇒ 恒为全零 / `false`）。 */
+  /**
+   * 激活扩散的诊断（§4.7）。
+   *
+   * ⚠️ **`scanned` 是两腿合计**（§4.14.1：两条腿共享同一份 `MAX_DIFFUSED_VISITS` 预算）
+   *   ⇒ 它**恒 ≤ `MAX_DIFFUSED_VISITS`**。
+   */
   diffusion: {
-    /** 本次处理的边数。 */
+    /** 本次处理的边数（两腿合计）。 */
     scanned: number;
     /** 因 bonus < `ACTIVATION_MIN` 而未产出候选的边数。 */
     belowThreshold: number;
@@ -315,7 +330,7 @@ export interface RecallExplain {
   };
 }
 
-/** 被侧抑制挤掉、但仍可查的候选（§6；本阶段恒为空）。 */
+/** 被侧抑制挤掉、但仍可查的候选（§6）。 */
 export interface RecallSuppressed {
   id: string;
   content: string;
@@ -326,24 +341,14 @@ export interface RecallSuppressed {
   reason: 'redundant';
 }
 
-/** 扩散唤起的记忆（§6；本阶段恒为空）。 */
-export interface RecallDiffused {
-  id: string;
-  content: string;
-  diffusionScore: number;
-  layer: MemoryView['layer'];
-  viaEntity?: string;
-  viaClusterId?: string;
-  seeds?: string[];
-  kind: MemoryKind;
-  intensity: number;
-  stability: number;
-  difficulty: number;
-  confidence: number;
-  createdAt: number;
-  source: string | null;
-  hasEmbedding: boolean;
-}
+/**
+ * ⚠️ **弃用别名**：扩散唤起的记忆（§6）。
+ *
+ * ⚠️ **本类型不在本文件定义**（C36：同一件事不得有两套词）：
+ *   真正的定义在 `src/store/diffuse.ts`（`DiffusedItem`）⇒ 本文件只做**重导出**，
+ *   对外的名字 `RecallDiffused` **不变**（`src/index.ts` 的导出不破）。
+ */
+export type RecallDiffused = DiffusedItem;
 
 /** `recall` 的返回值（§6 的 `RecallResult`）。 */
 export interface RecallResult {
@@ -351,9 +356,14 @@ export interface RecallResult {
   hits: Hit[];
   /** 调用级诊断（仅 `explain` / `diagnostics` 时给出）。 */
   explain?: RecallExplain;
-  /** 被侧抑制挤掉的候选（本阶段恒为空；字段**恒在**，不省略）。 */
+  /** 被侧抑制挤掉的候选（字段**恒在**，不省略）。 */
   suppressed: RecallSuppressed[];
-  /** 扩散唤起的记忆（本阶段恒为空；字段**恒在**，不省略）。 */
+  /**
+   * 扩散唤起的记忆（字段**恒在**，不省略）。
+   *
+   * ⚠️ **默认可以包含归档记忆**（§4.7 的 R-ARCH-DIFF）⇒ 带 `layer: 'archived'` 标记。
+   * ⚠️ **不参与 hits 排序、不占 topN 名额**（§4.14）。
+   */
   diffused: RecallDiffused[];
 }
 
@@ -1086,6 +1096,22 @@ export function recall(store: RecallStore, options: RecallOptions): RecallResult
       ? ordered.slice(0, topN)
       : ordered.filter((candidate) => keptIds.has(candidate.id));
 
+  // ── 步骤 4.6：联想路 / 激活扩散（§4.7 实体跳 + §4.14 簇跳）──
+  // ⚠️ ★ **种子取「抑制前」的 topN**（§4.14.2 + §4.13.1 硬约束③）：
+  //   抑制**只作用于 hits** ⇒ 若种子取抑制后的 hits，抑制就会**间接**改变 diffused
+  //   ⇒ 「想不起名字但看到照片就想起来」这条通道（§4.7 的 R-ARCH-DIFF）会被抑制关掉。
+  //   ⇒ 攻击面 E（抑制开 / 关 ⇒ diffused 逐条相同）**因此才真正可执行**。
+  // ⚠️ **种子数 ≤ topN ≤ 8 ≤ MAX_DIFFUSED_NODES(20)**（§4.14.2 的唯一约束 ⇒ 恒满足）。
+  const diffusionSeeds = ordered.slice(0, topN).map((candidate) => candidate.id);
+  // ⚠️ **机制开关**（§5 的 `coactivation`）：关 ⇒ **联想路与簇跳都不执行**（由 `diffuse()` 内部判定）。
+  const diffusion = diffuse({
+    db,
+    params,
+    seedIds: diffusionSeeds,
+    now: at,
+    diffuseArchived,
+  });
+
   // ── 组装命中（复用 `get()` 的视图映射 ⇒ 与 §6 的 `MemoryView` 逐字一致）──
   const hits: Hit[] = [];
   for (const candidate of top) {
@@ -1180,7 +1206,9 @@ export function recall(store: RecallStore, options: RecallOptions): RecallResult
       // ⚠️ **键恒在**（不省略）：抑制挤掉的候选 id（D 桶）⇒ 事后可对账「谁被挤掉了」。
       //   ⚠️ **溢出候选不在这里**（它们根本没参与评估，§4.13.3）。
       suppressedIds: suppressed.map((item) => item.id),
-      diffusedSeeds: [],
+      // ⚠️ **恒带该键**（§4.6 步骤 4）：`diffusedSeeds` = **真正贡献了扩散结果的种子**。
+      //   ⚠️ **不是抑制后的 hits**（§4.13.1 硬约束③：抑制不作用于 diffused）。
+      diffusedSeeds: diffusion.seeds,
     };
     // ⚠️ **`memory_id` 传 `null`**（§8.4 的 recall 行：「无（涉及多条记忆，无法单值）」）。
     store.events.appendEvent('recall', null, payload, at);
@@ -1192,7 +1220,10 @@ export function recall(store: RecallStore, options: RecallOptions): RecallResult
     //   「库里只有 3 条相关」与「有 5 条但 2 条被挤掉」——这是两个不同的产品事实。
     //   ⚠️ **抑制关闭时恒为空**（机制关 ⇒ 候选带不重排，§5）。
     suppressed,
-    diffused: [],
+    // ⚠️ **扩散结果恒在**（不省略）：§7 的 R-ARCH-DIFF 规定它是**独立字段**
+    //   ⇒ 调用方可整体丢弃，不会污染 hits 的排序与 Token 预算。
+    // ⚠️ **抑制不作用于 diffused**（§4.13.1 硬约束③）⇒ 它的内容与 `inhibition` 开关无关。
+    diffused: diffusion.items,
   };
   if (withBreakdown) {
     result.explain = {
@@ -1204,12 +1235,12 @@ export function recall(store: RecallStore, options: RecallOptions): RecallResult
         // ⚠️ `ran=false` = 本次没有解析出任何实体。
         graph: { ran: contextEntityIds.length > 0, candidates: pipeline.graphCount },
       },
-      // ⚠️ 扩散本阶段未实现 ⇒ 全零 / `false`。
+      // ⚠️ **扩散诊断**（§4.7）：`scanned` = 两腿**合计**处理的边数（§4.14.1 的共享预算）。
       diffusion: {
-        scanned: 0,
-        belowThreshold: 0,
-        skippedNoEntity: 0,
-        budgetExhausted: false,
+        scanned: diffusion.scanned,
+        belowThreshold: diffusion.belowThreshold,
+        skippedNoEntity: diffusion.skippedNoEntity,
+        budgetExhausted: diffusion.budgetExhausted,
       },
     };
   }
