@@ -25,10 +25,11 @@
  *   而不是一份「bench 专用实现」。
  */
 
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdirSync, statfsSync, writeFileSync } from 'node:fs';
 import { cpus as cpus_, freemem, totalmem } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, parse as parsePath } from 'node:path';
 import { Worker } from 'node:worker_threads';
 
 import type Database from 'better-sqlite3';
@@ -412,6 +413,231 @@ export interface PeakRssMeasurement {
   readonly workerActive: boolean;
 }
 
+// ═══════════════════════════════ 存储介质（判据的介质解耦落点） ═══════════════════════════════
+
+/**
+ * ★ **存储介质类别** —— **绝对毫秒门槛的介质解耦落点**（2026-11-02 架构师裁决）。
+ *
+ * ⚠️ **为什么必须有它**（裁决原文）：
+ *   「**bench 必须把「存储介质类别」与「每行读成本」记进落盘 JSON**
+ *   （否则换一块盘，判据的含义会**静默改变**——这正是「文档与数据不一致」的另一种形态）。」
+ * ⇒ ⇒ **同一个 H1（2,000 行候选）在 SATA HDD 上是 ~16~28ms、在 NVMe SSD 上是 ~2~5ms**
+ *   ⇒ ⇒ **毫秒数必须按介质分档记录，而判据由 H1/H2（纯计数）承担**。
+ */
+export type StorageMediaClass = 'HDD' | 'SSD' | 'NVMe' | 'unknown';
+
+/**
+ * 存储介质的采集结果（**拿不到就是 `unknown`**，**不是**猜一个）。
+ */
+export interface StorageMediaInfo {
+  /** 介质类别（**`unknown` ⇒ 没测到**，不是「测到的是未知」）。 */
+  readonly mediaClass: StorageMediaClass;
+  /** 采集用的手段（`powershell:Get-PhysicalDisk` / `lsblk` / `diskutil` / `none`）。 */
+  readonly source: string;
+  /** 采集是否成功（`false` ⇒ `mediaClass` 恒为 `'unknown'`）。 */
+  readonly detected: boolean;
+  /** 补充信息（型号 / 总线类型 / 原始 `MediaType` 字符串；`null` ⇒ 没有）。 */
+  readonly detail: string | null;
+}
+
+/**
+ * 采集**存储介质类别**（**失败 ⇒ `unknown`；绝不抛错**）。
+ *
+ * ⚠️ ★ **「拿不到就记 `unknown`」是硬要求**：
+ *   bench 必须能在**任何机器**上跑（CI 容器 / Linux / macOS / 没有 PowerShell 的 Windows）
+ *   ⇒ **介质探测失败绝不能让整轮测量失败** ⇒ 所有异常都被吞掉并降级成 `'unknown'`。
+ *
+ * ⚠️ **Windows 走 PowerShell**（`Get-Partition → Get-Disk → Get-PhysicalDisk` 的 `MediaType`）：
+ *   Node **没有**直接给介质类型的 API ⇒ 只能问操作系统。
+ *   ⇒ ⚠️ **有超时**（默认 5 秒）⇒ 机器上 PowerShell 被策略禁用时**不会**把 bench 拖死。
+ *
+ * @param targetPath 要判定的路径（缺省 = 工作目录 ⇒ bench 的库都落在工作目录下的同一卷）
+ * @returns 介质信息（**永不抛错**）
+ */
+export function detectStorageMedia(targetPath: string = process.cwd()): StorageMediaInfo {
+  if (process.platform === 'win32') {
+    return detectWindowsMedia(targetPath);
+  }
+  if (process.platform === 'linux') {
+    return detectLinuxMedia(targetPath);
+  }
+  if (process.platform === 'darwin') {
+    return detectDarwinMedia(targetPath);
+  }
+  return { mediaClass: 'unknown', source: 'none', detected: false, detail: null };
+}
+
+/** Windows 的介质探测（PowerShell）；失败 ⇒ `'unknown'`。 */
+function detectWindowsMedia(targetPath: string): StorageMediaInfo {
+  const root = parsePath(targetPath).root;
+  const driveLetter = root.replace(/[:\\/]/g, '').toUpperCase();
+  if (driveLetter === '') {
+    return { mediaClass: 'unknown', source: 'none', detected: false, detail: null };
+  }
+  // ⚠️ **一条命令问完整条链**（分区 → 物理盘 → 物理盘的介质类型）。
+  //   ⚠️ 逐条问会更慢（每次 spawn 一次 PowerShell ≈ 0.5~1.5 秒）。
+  const script = [
+    `$ErrorActionPreference = 'SilentlyContinue'`,
+    `$p = Get-Partition -DriveLetter ${driveLetter}`,
+    'if ($p) {',
+    '  $d = $p | Get-Disk',
+    '  $pd = $d | Get-PhysicalDisk',
+    `  Write-Output ('MediaType=' + $pd.MediaType)`,
+    `  Write-Output ('BusType=' + $d.BusType)`,
+    `  Write-Output ('FriendlyName=' + $pd.FriendlyName)`,
+    `} else { Write-Output 'MediaType=' }`,
+  ].join('; ');
+  try {
+    const output = execFileSync(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', script],
+      { encoding: 'utf8', timeout: 5000, windowsHide: true },
+    );
+    const mediaType = readField(output, 'MediaType');
+    const busType = readField(output, 'BusType');
+    const friendlyName = readField(output, 'FriendlyName');
+    if (mediaType === null || mediaType === '') {
+      return {
+        mediaClass: 'unknown',
+        source: 'powershell:Get-PhysicalDisk',
+        detected: false,
+        detail: null,
+      };
+    }
+    return {
+      mediaClass: classifyMediaType(mediaType, busType),
+      source: 'powershell:Get-PhysicalDisk',
+      detected: true,
+      detail: [mediaType, busType, friendlyName]
+        .filter((part) => part !== null && part !== '')
+        .join(' | '),
+    };
+  } catch {
+    // ⚠️ **拿不到就记 `unknown`**（PowerShell 被禁用 / 超时 / 命令不存在）。
+    return {
+      mediaClass: 'unknown',
+      source: 'powershell:Get-PhysicalDisk',
+      detected: false,
+      detail: null,
+    };
+  }
+}
+
+/** Linux 的介质探测（`findmnt` + `lsblk`）；失败 ⇒ `'unknown'`。 */
+function detectLinuxMedia(targetPath: string): StorageMediaInfo {
+  try {
+    const device = execFileSync('findmnt', ['-no', 'SOURCE', '--target', targetPath], {
+      encoding: 'utf8',
+      timeout: 5000,
+    }).trim();
+    if (device === '') {
+      return { mediaClass: 'unknown', source: 'lsblk', detected: false, detail: null };
+    }
+    // ⚠️ **`rota` = 1 ⇒ 机械盘（HDD）；`rota` = 0 ⇒ 固态（SSD 或 NVMe）**。
+    //   ⇒ SSD 与 NVMe 的区分靠 `tran`（传输类型）。
+    const rota = execFileSync('lsblk', ['-ndo', 'rota', device], {
+      encoding: 'utf8',
+      timeout: 5000,
+    }).trim();
+    const tran = execFileSync('lsblk', ['-ndo', 'tran', device], {
+      encoding: 'utf8',
+      timeout: 5000,
+    }).trim();
+    if (rota === '') {
+      return { mediaClass: 'unknown', source: 'lsblk', detected: false, detail: null };
+    }
+    const mediaClass: StorageMediaClass = tran.toLowerCase().includes('nvme')
+      ? 'NVMe'
+      : rota === '1'
+        ? 'HDD'
+        : 'SSD';
+    return {
+      mediaClass,
+      source: 'lsblk',
+      detected: true,
+      detail: `device=${device} rota=${rota} tran=${tran}`,
+    };
+  } catch {
+    return { mediaClass: 'unknown', source: 'lsblk', detected: false, detail: null };
+  }
+}
+
+/** macOS 的介质探测（`diskutil info`）；失败 ⇒ `'unknown'`。 */
+function detectDarwinMedia(targetPath: string): StorageMediaInfo {
+  try {
+    const output = execFileSync('diskutil', ['info', targetPath], {
+      encoding: 'utf8',
+      timeout: 5000,
+    });
+    const lower = output.toLowerCase();
+    // ⚠️ **`diskutil info` 的措辞**：「Solid State」⇒ SSD；「Rotational」⇒ HDD；「NVMe」⇒ NVMe。
+    const mediaClass: StorageMediaClass = lower.includes('nvme')
+      ? 'NVMe'
+      : lower.includes('solid state')
+        ? 'SSD'
+        : lower.includes('rotational')
+          ? 'HDD'
+          : 'unknown';
+    if (mediaClass === 'unknown') {
+      return { mediaClass: 'unknown', source: 'diskutil', detected: false, detail: null };
+    }
+    return {
+      mediaClass,
+      source: 'diskutil',
+      detected: true,
+      detail: `path=${targetPath}`,
+    };
+  } catch {
+    return { mediaClass: 'unknown', source: 'diskutil', detected: false, detail: null };
+  }
+}
+
+/**
+ * 从命令输出里读一个 `Key=Value` 字段（**读不到 ⇒ `null`**）。
+ *
+ * @param output 命令输出
+ * @param key 字段名
+ * @returns 字段值（`null` ⇒ 没有这个字段）
+ */
+function readField(output: string, key: string): string | null {
+  for (const line of output.split(/\r?\n/)) {
+    const prefix = `${key}=`;
+    if (line.startsWith(prefix)) {
+      return line.slice(prefix.length).trim();
+    }
+  }
+  return null;
+}
+
+/**
+ * 把操作系统给的**原始介质字符串**归到三个类别里。
+ *
+ * ⚠️ **Windows 的 `MediaType` 取值**：`HDD` / `SSD` / `NVMe` / `Unspecified`。
+ *   `Unspecified` ⇒ **不能猜** ⇒ 归 `'unknown'`（宁可不知道，也不要给一个假的类别）。
+ *
+ * @param mediaType 原始介质字符串
+ * @param busType 总线类型（**辅助**：SATA 上的 NVMe 盘有时 `MediaType` 报 `Unspecified`）
+ * @returns 介质类别
+ */
+function classifyMediaType(mediaType: string, busType: string | null): StorageMediaClass {
+  const media = mediaType.toLowerCase();
+  if (media.includes('nvme')) {
+    return 'NVMe';
+  }
+  if (media === 'hdd' || media.includes('hard disk')) {
+    return 'HDD';
+  }
+  if (media === 'ssd' || media.includes('solid state')) {
+    return 'SSD';
+  }
+  // ⚠️ **`MediaType` 说不清、但总线说得清** ⇒ 用总线兜底（NVMe 总线 ⇒ NVMe）。
+  const bus = (busType ?? '').toLowerCase();
+  if (bus.includes('nvme')) {
+    return 'NVMe';
+  }
+  return 'unknown';
+}
+
 // ═══════════════════════════════ 库与训练（复用生产代码） ═══════════════════════════════
 
 /**
@@ -531,6 +757,16 @@ export interface MachineInfo {
    * ⚠️ **瞬时快照**（同 `freeMemoryBytes`）⇒ **不能**当机器指纹用。
    */
   readonly freeDiskBytes: number;
+  /**
+   * ★ **存储介质类别**（HDD / SSD / NVMe / `unknown`）。
+   *
+   * ⚠️ **它是「判据的介质解耦落点」**（2026-11-02 架构师裁决）：
+   *   同一个 H1（候选读取行数 ≤ 2,000）在 SATA HDD 上是 ~16~28ms、在 NVMe 上是 ~2~5ms
+   *   ⇒ **毫秒数必须按介质分档读** ⇒ **落盘 JSON 必须带上它**
+   *   ⇒ 否则「换一块盘，判据的含义会静默改变」。
+   * ⚠️ **`unknown` ⇒ 没测到**（不是「测到了未知」）⇒ 报告里要这么读。
+   */
+  readonly storageMedia: StorageMediaInfo;
 }
 
 /**
@@ -577,6 +813,8 @@ export function machineInfo(): MachineInfo {
     usedMemoryBytes: totalMemoryBytes - freeMemoryBytes,
     totalDiskBytes: disk.totalDiskBytes,
     freeDiskBytes: disk.freeDiskBytes,
+    // ⚠️ **介质探测失败不抛错**（`detectStorageMedia` 内部全吞）⇒ 这一行不会让 bench 挂掉。
+    storageMedia: detectStorageMedia(),
   };
 }
 
