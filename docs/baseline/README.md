@@ -12,14 +12,27 @@
 
 | 文件 | 内容 | 生成命令 |
 |------|------|---------|
-| `agreement-10000.json` | 吻合率（1 万条） | `pnpm exec tsx bench/agreement.ts --scale=10000 --queries=200` |
-| `perf-10000.json` | 三条 P99（1 万条） | `pnpm exec tsx bench/perf.ts --scale=10000 --queries=200 --writes=200` |
-| `baseline-flat-10000.json` | 前置测量：flat 路线的向量路占比（1 万条） | `pnpm exec tsx bench/baseline-flat.ts --scale=10000 --queries=200` |
+| `agreement-10000.json` | 吻合率（1 万条） | `pnpm exec tsx bench/agreement.ts --scale=10000 --queries=200 --allow-small-scale` |
+| `perf-10000.json` | 三条 P99（1 万条） | `pnpm exec tsx bench/perf.ts --scale=10000 --queries=200 --writes=200 --allow-small-scale` |
+| `baseline-flat-10000.json` | 前置测量：flat 路线的向量路占比（1 万条） | `pnpm exec tsx bench/baseline-flat.ts --scale=10000 --queries=200 --allow-small-scale` |
 | `agreement-1000000.json` | 吻合率（**100 万条**） | `pnpm exec tsx bench/agreement.ts --scale=1000000 --queries=200 --reuse=true --db=.tmp/bench/shared-1000000.db` |
 | `perf-1000000.json` | 三条 P99（**100 万条**） | `pnpm exec tsx bench/perf.ts --scale=1000000 --queries=200 --writes=200 --reuse=true --db=.tmp/bench/shared-1000000.db` |
 | `baseline-flat-1000000.json` | 前置测量（**100 万条**） | `pnpm exec tsx bench/baseline-flat.ts --scale=1000000 --queries=200 --reuse=true --db=.tmp/bench/shared-1000000.db` |
 | `mutation.md` | **变异实测记录**（4 处 ⇒ 断言全部变红 ⇒ `cmp` 逐字节还原） | `bash scripts/bench-mutation.sh` |
 
+> ⚠️ ★ **规模守卫（2026-11-01 补 · P2-T08 硬断言「规模写进验收行」）**：
+> `bench/` 的三个脚本**默认拒绝小规模** ⇒ `--scale < 1_000_000` ⇒
+> **抛错 + 非零退出码 + 不落盘**（⇒ 连灌库都不开始 ⇒ 不浪费时间）。
+> ⇒ **为什么**：小库**走不到分桶路径**（`ROUTER_MIN_TRAINING` = 1 万）
+> ⇒ **在小库上测得的 P99 / 吻合率什么也没验到** ⇒ **那样的数字不是验收结论**
+> ⇒ 而落盘的基线是「数字的出处」⇒ **不能让一个 1500 条的结果冒充「验收过的数字」**。
+> ⇒ ⚠️ **`--allow-small-scale` 是唯一的降级开关（默认关闭）**：上表那**三条 1 万条的命令**
+> 都带它 ⇒ **它们是「小规模参考数据」**（验证口径与工具链），**不是**「性能验收结论」。
+> ⇒ **百万级那三条不带**（规模达标 ⇒ 守卫放行）⇒ 它们才是**验收行**。
+> ⇒ 降级跑出来的**文件名带规模数字**（`perf-10000.json`）⇒ 一眼可辨。
+> ⇒ 守卫的**契约测试**在 `tests/bench/baseline-scale.test.ts`（进 CI，秒级）：
+> 断言「**文件名带 `1000000` 的基线记录的规模与训练条数必须 ≥ 100 万**」。
+>
 > ⚠️ **百万级的三个脚本共用同一份库**（`--db=... --reuse=true`）：
 > 「灌库 + 训练」在百万级要 ~5 小时 ⇒ 三个脚本各跑一次 = 15 小时，不可接受；
 > 而且**三个脚本必须测同一份语料与同一套分桶**才有可比性 ⇒ **一次准备、三次测量**。
@@ -42,6 +55,16 @@
 | `trainMs` | 训练耗时 | **生产重训序列**（`src/vector/rebuild.ts` 的 `rebuildBuckets`） |
 | `rssBeforeTrainBytes` | 训练**前**的 RSS | 与峰值对比 ⇒ 训练自身的增量 |
 | `peakRssBytes` | **进程高水位** RSS | ⚠️ **含灌库阶段的占用** ⇒ 是「训练期峰值内存」的**上界**，不是纯训练峰值 |
+| `sampledPeakRssBytes` | **采样器独立观察**到的峰值 | ⚠️ **只覆盖训练段**（不含灌库）⇒ 才是「训练段自己的峰值」；**`null` ⇒ 这次没采到**（**不是 0**） |
+| `peakRss` | 峰值内存的**完整测量口径** | `kernelPeakBytes`（上界）／`sampledPeakBytes`（训练段）／`sampleCount`（采样次数）／`workerActive`（采样器是否跑在 worker 线程上） |
+
+> ⚠️ ★ **峰值内存的两个数必须分开读**（2026-11-01 补）：
+> · **`peakRssBytes`（进程高水位）** = 进程**一生**的 RSS 峰值 ⇒ **含灌库阶段** ⇒ 是**上界**；
+> · **`sampledPeakRssBytes`（采样峰值）** = **训练段自己**的 RSS 峰值 ⇒ **独立测量值**。
+> ⇒ ⚠️ **`sampledPeakRssBytes: null` 是「没测到」**，**不是「测到了 0」**
+>   （复用旧库时，旧清单里没有这个字段 ⇒ 如实写 `null`）。
+> ⇒ 采样器跑在 **worker 线程**上 ⇒ **同步长任务（训练）期间也采得到**
+>   （Node 的定时器在主线程的同步长任务期间**一次都不会触发** ⇒ 这是历史上「采样峰值采不到数」的根因）。
 
 ### 2. `machine`（机器环境）
 
