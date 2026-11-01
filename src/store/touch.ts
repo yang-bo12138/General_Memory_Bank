@@ -30,9 +30,15 @@ import type Database from 'better-sqlite3';
 import { resolveNow } from '../core/clock.js';
 import { MemoryError } from '../core/errors.js';
 import type { TouchEventPayload } from '../core/events.types.js';
+import { resolveFlags } from '../core/flags.js';
 import { missingIds } from '../core/graph.js';
 import type { Params } from '../core/params.js';
 import { type StabilityInput, computeStabilityGrowth, difficultyBonus } from '../core/stability.js';
+import {
+  type CoactWriteResult,
+  type CoactivationDeclaration,
+  writeCoactivations,
+} from '../neuron/coacts.js';
 import type { EventWriter } from './events.js';
 import { runWriteTransaction } from './transaction.js';
 
@@ -82,6 +88,16 @@ export interface TouchOptions {
    *   `recall({ reinforce: true })` 传 `'reinforce'`。
    */
   reason?: TouchReason;
+  /**
+   * ★ **「与谁关联」的显式声明**（机制 B，§4.11.2）。
+   *
+   * ⚠️ **调用方说明「这条记忆是被哪个种子唤起的」，库据此写共激活边**——
+   *   库**不推断、不记账、不维护任何跨调用的状态**（无 ledger、无 LRU）
+   *   ⇒ **因果判断归调用方**（ADR-31，与 ADR-2「实体由调用方提供」同构）。
+   * ⚠️ **只在 `reason === 'explicit'` 时生效**：`recall({ reinforce: true })` 与
+   *   `write()` 的完全重复路径**只加固、不建共激活边**（ADR-19 / §4.11.2）。
+   */
+  coActivateWith?: CoactivationDeclaration[];
 }
 
 /** 一次 `touch` 的逐条结果。 */
@@ -89,6 +105,21 @@ export interface TouchOutcome extends GrowStabilityOutcome {
   id: string;
   /** 该记忆作为证据被强化的边数（无证据边时为 0）。 */
   edgesReinforced: number;
+  /**
+   * ★ **本次 touch 调用写入的共激活对数**（§6 `TouchResult.accepted`）。
+   *
+   * ⚠️ **这是「整次调用」的口径，不是「这一条记忆」的口径**⇒ 同一次调用的所有 outcome
+   *   取值**相同**（共激活边是「记忆对」级别的，不是「单条记忆」级别的）。
+   */
+  accepted: number;
+  /**
+   * 因 `COACT_MAX_PAIRS_PER_TOUCH` 上界被截断的对数（§6 `TouchResult.truncated`）。
+   *
+   * ⚠️ **`COACT_BATCH_MAX` 超限不进这里**——那是**硬错 `INVALID_INPUT`**，不是静默收敛点。
+   */
+  truncated: number;
+  /** 因种子无效 / 已软删被跳过的对数（§6 `TouchResult.skippedInvalidSeed`）。 */
+  skippedInvalidSeed: number;
 }
 
 /**
@@ -145,6 +176,21 @@ export function growStability(
 }
 
 /**
+ * 「不建共激活边」那条路用的空结果（`reinforce` / `exact_repeat` 两个发射点）。
+ *
+ * ⚠️ **必须是同一个对象**（不是每次新建）：它是常量级的「什么都没发生」，
+ *   每次新建只会多一次无谓的分配，不会更安全。
+ */
+const EMPTY_COACT_RESULT: CoactWriteResult = {
+  accepted: 0,
+  truncated: 0,
+  skippedInvalidSeed: 0,
+  pairs: [],
+  activationWrites: [],
+  skipped: [],
+};
+
+/**
  * `touch(ids, now?, options?)` —— §4.2 的批量加固。
  *
  * ★ **事务形状（顺序不可换）**：
@@ -155,14 +201,19 @@ export function growStability(
  *   1. **逐条 `growStability`**：难度加成**必须在循环内按各自的 `m.difficulty` 算**
  *      （在循环外算一次再复用 = 给整批套同一个倍率 = **静默算错，结果仍像正常值**）。
  *   2. **R-EDGE-TOUCH**：先统计各记忆被强化的边数，再一条 UPDATE 覆盖全部 ids。
- *   3. **记事件**（逐条；`edgesReinforced` 读第 2 步的**真实**结果，不能预估）。
+ *   3. **共激活写入**（§4.11.2）：**全库唯一的 `coacts` 写入源**——
+ *      **只在 `reason === 'explicit'` 时执行**（见下）。
+ *   4. **记事件**（逐条；`edgesReinforced` 读第 2 步的**真实**结果，不能预估）。
  *
  * ⚠️ **`recall({ reinforce: true })` 只加固、不建共激活边**（§4.11.2 裁决）：
  *   否则每次 reinforce 都把本次 top-N 焊成一个团（它们对同一 query 响应得都好 ⇒
  *   共享实体/余弦达标），触发 §0.2 明令禁止的「topN 自我强化」。
  *   ⇒ **这是预期行为，不是副作用**。
+ *   ⚠️ 同理，`write()` 的完全重复路径（`reason === 'exact_repeat'`）**也不建边**
+ *   （§4.11.2：「第三种写入源明确不实现」——一条 write 只产生一条记忆，不产生配对）。
  *
  * @throws {MemoryError} `NOT_FOUND`（`details.missingIds = 差集`；一条都不加固）
+ *   / `INVALID_INPUT`（`coActivateWith` 的四条弱校验，§6）
  */
 export function touch(
   store: TouchStore,
@@ -223,7 +274,15 @@ export function touch(
       //   在循环外算一次再复用 = 给整批套同一个倍率 ⇒ **静默算错，结果仍像正常值**。
       const bonus = difficultyBonus(m.difficulty, store.params);
       const growth = growStability(store, m, bonus, true, at);
-      outcomes.push({ id, ...growth, edgesReinforced: 0 });
+      // ⚠️ **共激活回执先置 0**：它在步骤 3 跑完之后才有值（那里才知道建了几条边）。
+      outcomes.push({
+        id,
+        ...growth,
+        edgesReinforced: 0,
+        accepted: 0,
+        truncated: 0,
+        skippedInvalidSeed: 0,
+      });
     }
 
     // ── 步骤 2：R-EDGE-TOUCH（§4.5）──
@@ -256,10 +315,36 @@ export function touch(
       now: at,
     });
 
-    // ── 步骤 3：记事件（逐条）──
+    // ── 步骤 3：共激活写入（§4.11.2）——**全库唯一的 `coacts` 写入源**──
+    // ⚠️ ★ **只有 `reason === 'explicit'` 才建边**：
+    //   · `recall({ reinforce: true })`（`reason='reinforce'`）⇒ **只加固、不建共激活边**
+    //     （ADR-19：否则每次 reinforce 都把本次 top-N 焊成一个团 ⇒ topN 自我强化）；
+    //   · `write()` 的完全重复路径（`reason='exact_repeat'`）⇒ **也不建边**
+    //     （§4.11.2：「第三种写入源明确不实现」——一条 write 只产生一条记忆，不产生配对）。
+    // ⇒ **这两条路必须与「建边」这条路分开**（§4.11.4 的「只加固，不建共激活边」裁决）。
+    // ⚠️ ★ **机制开关关 ⇒ 连那四个事件键都不带**（§5 的 `coactivation` 语义）：
+    //   「与 v1.0 逐位一致」的基线条件是「四个开关全关」⇒ v1.0 的 `touch` 事件里
+    //   **没有** `coactPairs` / `coactPairsTruncated` / `activationWrites` / `coactSkipped`
+    //   ⇒ 开关关着还带 ⇒ 基线断言红（**那正是「与 v1.0 逐位一致」这条承诺的实现**）。
+    const coactivationOn = resolveFlags(store.params).coactivation;
+    const coacts: CoactWriteResult =
+      reason === 'explicit' && coactivationOn
+        ? writeCoactivations(store, {
+            ids: requested,
+            declarations: options?.coActivateWith,
+            now: at,
+          })
+        : EMPTY_COACT_RESULT;
+
+    // ── 步骤 4：记事件（逐条）──
     for (const outcome of outcomes) {
       const edgesReinforced = edgeCounts.get(outcome.id) ?? 0;
       outcome.edgesReinforced = edgesReinforced;
+      // ⚠️ **共激活回执是「整次调用」的口径**（共激活边是「记忆对」级别的）
+      //   ⇒ 同一批的所有 outcome 取值相同。
+      outcome.accepted = coacts.accepted;
+      outcome.truncated = coacts.truncated;
+      outcome.skippedInvalidSeed = coacts.skippedInvalidSeed;
       const payload: TouchEventPayload = {
         id: outcome.id,
         reason,
@@ -271,6 +356,15 @@ export function touch(
         // ⚠️ **键恒在**（未增长时为 0）——§8.4 硬规则 5 的对账恒等式依赖它。
         stabilityDelta: outcome.stabilityDelta,
       };
+      // ⚠️ ★ **四个共激活键只在 `explicit` 发射点出现**（§8.4 硬规则 3）：
+      //   `exact_repeat` 与 `reinforce` 两个发射点**不得**带这四个键。
+      //   ⚠️ **机制开关关着也不带**（见上一步的注释：基线要求「与 v1.0 逐位一致」）。
+      if (reason === 'explicit' && coactivationOn) {
+        payload.coactPairs = coacts.pairs;
+        payload.coactPairsTruncated = coacts.truncated;
+        payload.activationWrites = coacts.activationWrites;
+        payload.coactSkipped = coacts.skipped;
+      }
       store.events.appendEvent('touch', outcome.id, payload, at);
     }
 

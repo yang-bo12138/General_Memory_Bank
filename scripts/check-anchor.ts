@@ -327,17 +327,13 @@ export const ANCHOR_PATH_BINDINGS: readonly AnchorRuleBinding[] = [
       },
       {
         label: '§0.2.2',
-        // ⚠️⚠️ **v2.1（P2 QA 第二轮 F3）**：原先落点是 `src/store/touch.ts` 的**整个文件**。
-        //   ⇒ 但那条规则的动作关键词（「不建共激活边」/ `coacts`）在 `touch.ts` 里
-        //   **一个字面量都没有**：`touch.ts` 全文**不含 `coacts`**（实测）
-        //   ⇒ 因为**共激活边本身就是阶段 3 的产物**（P3-T01「coacts 写入路径（唯一入口：touch）」）
-        //   ⇒ ⇒ 阶段 2 **无代码可守** ⇒ 标成 `pending`（**不静默跳过**：会打印在输出里）。
-        //   ⇒ **诚实优先于「假绿」**：原先那两条落点守的其实是**注释里的那句话**，
-        //   ⇒ 把实现改成「建了共激活边」只要注释还在就照样绿（QA 实测 BL-7 全绿）。
-        //   ⇒ 阶段 3 建好 `coacts` 之后，把这一行改回 `code` 落点（标签不变 ⇒ 分母不变）。
-        kind: 'pending',
-        pendingReason:
-          '共激活边是阶段 3 的产物（P3-T01）⇒ 阶段 2 的 `src/store/touch.ts` 里没有任何 `coacts` 代码 ⇒ 无可检落点；阶段 3 建好后转 `code`。',
+        // ⚠️⚠️ **v2.1（P3-T01）**：阶段 3 的 P3-T01 已落地 ⇒ 共激活边**有**了 ⇒
+        //   这条落点从 `pending` 转成 `code`（**标签不变 ⇒ 分母不变**）。
+        //   ⇒ 落点是 `src/store/touch.ts`（§0.2.2 描述的那段代码：**共激活边的建立入口**）
+        //   ⇒ 必需关键词用标识符形态 `coacts`（涂白注释与字符串后仍命中）。
+        kind: 'code',
+        file: 'src/store/touch.ts',
+        requiredKeywords: ['coacts'],
       },
       {
         label: '§0.2.3',
