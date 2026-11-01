@@ -1,7 +1,15 @@
-#!/usr/bin/env node
 /**
  * `docs/baseline/README.md` 的**档位限定一致性审计** —— 把「哪些数必须带档位、哪些数不许带档位」
  * 这条纪律做成**可复跑**的脚本，使它在每次重采基线后能被机械地重新核对一遍。
+ *
+ * ⚠️ **本文件刻意不带 `#!/usr/bin/env node` shebang**（★ 与本仓库其余脚本不同 ⇒ 记下原因）：
+ *   · Node 自己加载 `.mjs` 时**会**剥掉 shebang ⇒ 所以**直接跑**（`node scripts/audit-tier-qualifiers.mjs`）不受影响；
+ *   · 但 **vitest 不走 Node 的加载器** ⇒ 它把模块**转译后内联**（`vm.runInThisContext`）执行
+ *     ⇒ ⇒ **shebang 留在文件第一行 ⇒ `SyntaxError: Invalid or unexpected token`**（实测）
+ *     ⇒ ⇒ **后果是「连单测都 import 不了它」** ⇒ ⇒ **⇒ 本文件必须能被单测 import**（仓库「新增门禁的做法」第 1 条）。
+ *   · ⇒ ⇒ **调用方式一律写 `node scripts/audit-tier-qualifiers.mjs`**（`scripts/README.md` 里也是这么写的）
+ *     ⇒ ⇒ **仓库里没有任何地方直接执行 `./scripts/...`**（实测无此用法）⇒ ⇒ 去掉 shebang **零代价**。
+ *   · ⇒ ⇒ **★ 别把 shebang 加回来**：加了它，`tests/contracts/tier-qualifier-audit.test.ts` 会立刻红。
  *
  * ────────────────────────────────────────────────────────────────────────────
  * 【为什么需要它】
@@ -234,11 +242,18 @@ export function hasProvenance(text) {
 /**
  * 判定「本行是否是 Markdown 表格的分隔行」。
  *
+ * ⚠️ **必须同时认得 blockquote 里的表格**（`> |---|---|`）
+ *   —— README 的「现状声明」那张表**整个在引用块里**（`> | 指标 | … |`）。
+ *   ⇒ ⇒ 旧版只认 `|---|---|` ⇒ ⇒ **那张表的表头层从未生效**
+ *     ⇒ ⇒ 「表头写着『本次 · 冷盘档』」这条档位信息**被整张表忽略**。
+ *   ⇒ ⇒ **⇒ 这正是「机制自己的读法」**：读者读的是**表头**（表头说这一列是冷盘档），
+ *   不是数据格里的零散标注。
+ *
  * @param {string} line
  * @returns {boolean}
  */
 export function isTableSeparator(line) {
-  return /^\|[\s|:-]+\|$/.test(line.trim());
+  return /^(?:>\s*)*\|[\s|:-]+\|$/.test(line.trim());
 }
 
 /**

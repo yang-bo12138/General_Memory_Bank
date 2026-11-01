@@ -26,6 +26,7 @@
  *   ⇒ 而不是硬写「真缺数 > 0」（**那是对两级判定的误读** ⇒ ⇒ 会逼着人改对的东西）。
  */
 
+import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -37,6 +38,7 @@ import {
   WEAK_TIER_WORDS,
   auditTierQualifiers,
   hasTier,
+  isTableSeparator,
   renderAudit,
 } from '../../scripts/audit-tier-qualifiers.mjs';
 
@@ -163,6 +165,41 @@ describe('档位限定一致性审计（scripts/audit-tier-qualifiers.mjs）', (
     }
   });
 
+  it('★ 表头层：blockquote 里的表格（`> |---|`）也必须被认出来', () => {
+    // ★ 这是本文件抓到的一个**真 bug**：旧版只认 `|---|` ⇒ README 的「现状声明」那张表
+    //   （整个在引用块里）的**表头层从未生效** ⇒ 「表头写着冷盘档」这条信息被整张表忽略。
+    expect(isTableSeparator('|---|---|')).toBe(true);
+    expect(isTableSeparator('> |---|---|---|---|')).toBe(true);
+    expect(isTableSeparator('> > |---|---|')).toBe(true);
+    // ⇒ 而这**必须**改变判定：表头给了档位 ⇒ 只抹行内标注 ⇒ 判定不该变（仍是自带档位）
+    const lines = [
+      '> | 指标 | 100 万条实测（**本次 · 冷盘档**） | 门槛 |',
+      '> |---|---|---|---|',
+      '> | 写入 P99 | **1199.99 ms** | ≤ 5 ms |',
+      '',
+    ];
+    const before = auditTierQualifiers(lines);
+    const after = auditTierQualifiers(
+      lines.map((line, index) => (index === 2 ? line.replace('冷盘档', '档位未标') : line)),
+    );
+    expect(before.counts.missing).toBe(0);
+    // ⇒ 表头仍在 ⇒ 判定不变（自带档位的处数不变）
+    expect(selfQualifiedCount(after)).toBe(selfQualifiedCount(before));
+  });
+
+  it('★ 表头层：抹掉表头的档位 ⇒ 那张表的数必须被判成真缺（表头层真的在判定）', () => {
+    const lines = [
+      '> | 指标 | 100 万条实测（**本次 · 冷盘档**） | 门槛 |',
+      '> |---|---|---|---|',
+      '> | 写入 P99 | **1199.99 ms** | ≤ 5 ms |',
+      '',
+    ];
+    const result = auditTierQualifiers(
+      lines.map((line, index) => (index === 0 ? line.replace('冷盘档', '档位未标') : line)),
+    );
+    expect(result.counts.missing).toBeGreaterThan(0);
+  });
+
   it('★ 弱词单独不成立、强词单独成立（词表语义的直接断言）', () => {
     expect(hasTier('本次')).toBe(false);
     expect(hasTier('上一轮')).toBe(false);
@@ -225,5 +262,18 @@ describe('档位限定一致性审计（scripts/audit-tier-qualifiers.mjs）', (
     const result = auditTierQualifiers(lines);
     expect(result.counts.scanned).toBeGreaterThan(0);
     expect(result.counts.missing).toBe(0);
+  });
+
+  it('★ 负控台跑在**真实 README** 上必须 exit 0（它自己也得被守住）', () => {
+    // ★ 负控台是「脚本不是恒绿守卫」的可执行证据 ⇒ ⇒ **它自己也可能失手**
+    //   ⇒ ⇒ **这里把它跑一遍** ⇒ 它红 ⇒ 本单测就红 ⇒ **不会静默腐烂**。
+    //   ⇒ ★ 注意：负控台跑的是**仓库里真实的 README**（不是合成输入）
+    //   ⇒ ⇒ 所以它同时守住了「真实文档当前没有真缺」这条基线。
+    const result = spawnSync(
+      process.execPath,
+      [join(REPO_ROOT, 'scripts', 'audit-tier-qualifiers.negative-control.mjs')],
+      { encoding: 'utf8' },
+    );
+    expect(result.status).toBe(0);
   });
 });
