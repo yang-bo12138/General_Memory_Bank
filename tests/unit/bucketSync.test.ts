@@ -383,6 +383,16 @@ describe('P2-T03-b · 集合相等断言（§9.3.2 ③ 的三条判据）', () =
   it('★ 集合相等**不是**「条数相等」：一条漏 + 一条多 ⇒ 条数相同也必须报红', () => {
     const { db, store, params } = createBucketStore();
 
+    // ⚠️⚠️ **QA 修复（Q-01）**：本条断言的前提是「**两侧条数相同**」，
+    //   而夹具 `createTrainedBucketContext()` 落了 **40 条带向量、不入桶**的种子记忆
+    //   （`seed-000` … `seed-039`，用来模拟阶段 1 的欠账）
+    //   ⇒ 不清掉它们的话：liveCount = 40 + 1 = **41**、bucketCount = **1**
+    //   ⇒ **两侧条数根本不相等** ⇒ 本条断言会**因为错误的原因而通过**（恒绿守卫）：
+    //   把实现改成「先比条数、条数一样就认为一致」也抓不住它
+    //   （QA 实测：该变异在本场景下存活 ⇒ 见 `p2-mutation.md` 的 M3）。
+    //   ⇒ 这里先清掉种子记忆，让「条数相同」这个前提**真的成立**。
+    db.prepare("DELETE FROM memories WHERE id LIKE 'seed-%'").run();
+
     const withVector = write(store, {
       content: '甲事实',
       embedding: unitVector(params.EMBED_DIM, 1),
@@ -396,8 +406,20 @@ describe('P2-T03-b · 集合相等断言（§9.3.2 ③ 的三条判据）', () =
       withVector.id,
     );
 
-    // 性质：条数确实相同（桶表里就 1 行）
+    // 性质：**桶侧**就 1 行
     expect(countRows(db, 'vector_cell_members')).toBe(1);
+    // ⚠️ **库侧也要核对**（原实现漏了这一步 ⇒ 前提从未被验证 ⇒ 断言可恒绿）：
+    //   「库侧有向量的活记忆」必须**也是 1 条** ⇒ 两边条数**真的相同**。
+    const liveCount = (
+      db
+        .prepare(
+          'SELECT COUNT(*) AS count FROM memories WHERE embedding IS NOT NULL AND deleted = 0',
+        )
+        .get() as { count: number }
+    ).count;
+    expect(liveCount).toBe(1);
+    // 性质：条数确实相同 ⇒ **「只比条数」会判成「一致」**（这正是本条要区分的东西）
+    expect(liveCount).toBe(countRows(db, 'vector_cell_members'));
     // 性质：但**集合不等** ⇒ 缺失与脏行**都**被抓出来
     const diff = diffBucketMembership(db);
     expect(diff.missing).toContain(withVector.id);
