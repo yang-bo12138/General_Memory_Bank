@@ -28,6 +28,12 @@
  *   候选口径手工组装的**（**同样的候选集合、同样的点积、同样的排序**）
  *   ⇒ **它测的是「若把向量路按 flat 口径接进召回，会占多少」**。
  *
+ * ⚠️ ★ **规模守卫**（P2 收官 · Q-02；硬断言「规模写进验收行」）：
+ *   **规模 < 100 万 ⇒ 直接失败**（抛错 + **非零退出码** + **不落盘**）
+ *   ⇒ 「小库根本走不到分桶路径」⇒ **在小库上测得的占比什么也没验到**。
+ *   ⚠️ **降级开关 `--allow-small-scale`（默认关闭）**：只为冒烟 / 自检 / 工具链联调
+ *   留一条**合法的小规模路径**；**默认必须拒绝**。
+ *
  * 用法：
  * ```
  * pnpm exec tsx bench/baseline-flat.ts --scale=1000000 --queries=100
@@ -44,6 +50,7 @@ import { flatTopK } from './lib/flat.js';
 import {
   BENCH_NOW,
   benchWorkDir,
+  formatPeakRss,
   intArg,
   machineInfo,
   parseArgs,
@@ -52,6 +59,7 @@ import {
   summarizeLatency,
   writeJsonFile,
 } from './lib/harness.js';
+import { enforceBenchScale } from './lib/scale.js';
 
 /** 前置测量的**参考线**（§12 的原文：**证据，不是验收条件**）。 */
 export const FLAT_SHARE_REFERENCE = 0.8;
@@ -155,6 +163,17 @@ function main(): void {
   const dbPath = stringArg(args, 'db', `${benchWorkDir()}/baseline-flat-${scale}.db`);
   const outPath = stringArg(args, 'out', `docs/baseline/baseline-flat-${scale}.json`);
 
+  // ⚠️ ★ **规模守卫**（硬断言「规模写进验收行」）⇒ **在最前面**：
+  //   不达标就**别开始灌库**（百万级一次 3 小时 ⇒ 跑完再报错是浪费）。
+  //   ⇒ 不达标 ⇒ 非零退出码 ⇒ **直接 return ⇒ 绝不落盘**。
+  const scaleCheck = enforceBenchScale(args, scale);
+  if (!scaleCheck.allowed) {
+    return;
+  }
+  if (scaleCheck.downgraded) {
+    process.stdout.write(`⚠ ${scaleCheck.reason}\n`);
+  }
+
   const options: CorpusOptions = { ...DEFAULT_CORPUS_OPTIONS, size: scale, seed };
   // ⚠️ **机器信息在开始时采集**（不是结束时）：
   //   “运行开始时还有多少可用内存”才是“这个规模跑得动”的证据。
@@ -206,7 +225,7 @@ function main(): void {
       `（参考线 ≥ ${(FLAT_SHARE_REFERENCE * 100).toFixed(0)}% ⇒ ` +
       `${result.shareDelta >= 0 ? '达标' : '未达标'}）\n` +
       `  灌库 ${prepared.loadMs.toFixed(0)}ms / 训练 ${prepared.trainMs.toFixed(0)}ms / ` +
-      `峰值 RSS ${(prepared.trainPeakRssBytes / 1024 / 1024).toFixed(0)}MB\n` +
+      `${formatPeakRss(prepared.trainPeakRss)}\n` +
       `  结果已写入 ${outPath}\n`,
   );
 }

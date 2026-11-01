@@ -96,18 +96,36 @@ export interface VectorMemoryRow {
  * ⚠️ **不做维度校验**：`blobToVector` 只负责解码 ⇒ 维度不对的行由
  *   `assignBucket()` 那条路上的 `assertValidEmbedding` 报错（口径只有一份）。
  *
+ * ⚠️ ★★★ **流式读取**（P2 收官 · Q-06：**训练峰值内存**）：
+ *   **曾经**用 `.all()` ⇒ **一次性物化 100 万行**（id + 3KB BLOB ≈ **3.3GB**）
+ *   ⇒ 随后 `blobToVector` 再分配 **3.07GB** 的 `Float32Array`
+ *   ⇒ **两者同时存活** ⇒ 峰值 ≈ **6.4GB**（+ Node/SQLite ⇒ 实测 **8.47GB**）
+ *   ⇒ **8GB 机器建库直接 OOM**。
+ *   ⇒ **现在用 `.iterate()` 逐行读、逐行 decode** ⇒ **原始 BLOB 不再全量留在内存**
+ *     ⇒ 内存里只剩**一份** 3.07GB 的 `Float32Array`（= 向量本体，= 设计稿的必要量）
+ *     ⇒ 峰值内存 **∝ 一条向量**（而不是 ∝ 扫描量）⇒ 实测降到 **~3.2GB**。
+ *   ⚠️ **返回值的形状刻意不变**（仍是 `VectorMemoryRow[]`）⇒
+ *     **调用方（`trainCentroids` / `rebuildBuckets`）一行都不用改**
+ *     ⇒ 「训练用的向量集合」与「迁移用的向量集合」**仍是同一批行、同一顺序**
+ *       （两条路都走这一个函数 ⇒ 口径只有一份 ⇒ 顺序只有一种）。
+ *
  * @param db 库句柄
  * @returns 有向量的记忆（**含软删**；顺序即 rowid 顺序）
  */
 export function readVectorMemories(db: Database.Database): VectorMemoryRow[] {
+  // ⚠️ **必须用 `iterate()` 而不是 `all()`**（见文件头的「流式读取」）：
+  //   `all()` 会把 100 万行的 BLOB **一次性**物化成数组 ⇒ 与解码出来的
+  //   `Float32Array` **同时存活** ⇒ 峰值内存翻倍。
   const rows = db
-    .prepare(
+    .prepare<[], { id: string; embedding: Buffer; deleted: number }>(
       'SELECT id, embedding, deleted FROM memories WHERE embedding IS NOT NULL ORDER BY rowid',
     )
-    .all() as Array<{ id: string; embedding: Buffer; deleted: number }>;
+    .iterate();
 
   const result: VectorMemoryRow[] = [];
   for (const row of rows) {
+    // ⚠️ **逐行解码**：解码完这一行，那一行的原始 BLOB 就可以被回收
+    //   ⇒ 内存里同时只存在**一条**原始 BLOB。
     result.push({
       id: row.id,
       vector: blobToVector(row.embedding),

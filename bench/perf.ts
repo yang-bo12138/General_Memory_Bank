@@ -29,6 +29,19 @@
  *   · **首次 IO**：SQLite 的 WAL 与页缓存**由预热轮次承担** ⇒
  *     **统计里的样本不含首次 IO 的抖动**（这一点写进报告）。
  *
+ * ⚠️ ★ **规模守卫**（P2 收官 · Q-02；DEVELOPMENT-PLAN.md 行 2068~2070 的硬断言
+ *   「**规模写进验收行**」）：
+ *   · **默认 `--scale` = 1 000 000**；
+ *   · **规模 < 100 万 ⇒ 直接失败**（抛错 + **非零退出码** + **不落盘**）
+ *     ⇒ 因为「小库根本走不到分桶路径」⇒ **在小库上测得的 P99 什么也没验到**
+ *     ⇒ **那样的结果不许冒充验收结论**（落盘的基线是「数字的出处」）。
+ *   · ⚠️ **降级开关 `--allow-small-scale`（默认关闭）**：
+ *     **存在理由** = 冒烟 / 自检 / 工具链联调要在**小规模**上快速跑一遍
+ *     （否则每次自检都要 5 小时）⇒ **必须留一条合法的降级路径**。
+ *     **默认关闭的理由** = 小规模上的数字**只**能当「工具跑得通」的自检，
+ *     **不能**当「性能达标」的证据 ⇒ 默认必须拒绝。
+ *     ⇒ 降级跑出来的文件名**带规模数字**（`perf-1500.json`）⇒ 一眼可辨。
+ *
  * 用法：
  * ```
  * pnpm exec tsx bench/perf.ts --scale=1000000 --queries=200 --writes=200
@@ -47,6 +60,7 @@ import { prepareBench } from './lib/db.js';
 import {
   BENCH_NOW,
   benchWorkDir,
+  formatPeakRss,
   intArg,
   machineInfo,
   parseArgs,
@@ -56,6 +70,7 @@ import {
   summarizeLatency,
   writeJsonFile,
 } from './lib/harness.js';
+import { enforceBenchScale } from './lib/scale.js';
 
 /** 性能门槛（§7.1 的验收行，**写死在此 ⇒ 报告与断言同源**）。 */
 export const THRESHOLDS = {
@@ -332,6 +347,17 @@ function main(): void {
   const dbPath = stringArg(args, 'db', `${benchWorkDir()}/perf-${scale}.db`);
   const outPath = stringArg(args, 'out', `docs/baseline/perf-${scale}.json`);
 
+  // ⚠️ ★ **规模守卫**（硬断言「规模写进验收行」）⇒ **在最前面**：
+  //   不达标就**别开始灌库**（百万级一次 3 小时 ⇒ 跑完再报错是浪费）。
+  //   ⇒ 不达标 ⇒ 非零退出码 ⇒ **直接 return ⇒ 绝不落盘**。
+  const scaleCheck = enforceBenchScale(args, scale);
+  if (!scaleCheck.allowed) {
+    return;
+  }
+  if (scaleCheck.downgraded) {
+    process.stdout.write(`⚠ ${scaleCheck.reason}\n`);
+  }
+
   const options: CorpusOptions = { ...DEFAULT_CORPUS_OPTIONS, size: scale, seed };
   // ⚠️ **机器信息在开始时采集**（不是结束时）：
   //   “运行开始时还有多少可用内存”才是“这个规模跑得动”的证据。
@@ -382,7 +408,7 @@ function main(): void {
       `  向量路 P99 = ${result.vectorRouteP99Ms.toFixed(3)}ms（门槛 ${THRESHOLDS.vectorRouteP99Ms}ms，样本 ${result.vectorRouteSamples}）\n` +
       `  向量路占总耗时 = ${(result.vectorRouteShare * 100).toFixed(2)}%（门槛 ≤ ${(THRESHOLDS.vectorRouteShare * 100).toFixed(0)}%）\n` +
       `  灌库 ${prepared.loadMs.toFixed(0)}ms / 训练 ${prepared.trainMs.toFixed(0)}ms / ` +
-      `峰值 RSS ${(prepared.trainPeakRssBytes / 1024 / 1024).toFixed(0)}MB\n` +
+      `${formatPeakRss(prepared.trainPeakRss)}\n` +
       `  结果已写入 ${outPath}\n`,
   );
 
