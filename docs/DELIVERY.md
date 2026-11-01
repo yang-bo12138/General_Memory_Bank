@@ -24,7 +24,7 @@
 | 阶段 3（神经元交互） | ❌ 未开始 | 🟡 **已开工**：**P3-T01**（coacts 写入路径）已合并 |
 > | 门面方法 | 10 个 | **11 个**（+`rebuildVectorBuckets`，§3.1 归位表指定） |
 > | 设计裁决 | 4 份 ADR | **4 份 ADR + 1 份裁决台账索引**（`docs/design/DECISIONS.md` ⇒ 补上 Q-12「P2 裁决无落点」） |
-> | 已知边界 | 13 条 | 阶段 1 的 13 条里 **8 条已被阶段 2 消化** ⇒ 见 `docs/progress/stage0-stage1-progress.md` §七（已更新） |
+> | 已知边界 | 13 条 | 阶段 1 的 13 条里 **5 条已标闭环**（另 8 条未标 ⇒ 见 `docs/progress/stage2-progress.md` §四 4.6 的逐条对照）⇒ 原表见 `docs/progress/stage0-stage1-progress.md` §七 |
 >
 > ⇒ **阶段 2 的进度与欠账见 `docs/progress/stage2-progress.md`**（**本轮已补写** ⇒ 原先的断链已修复）。
 
