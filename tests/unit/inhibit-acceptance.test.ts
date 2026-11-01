@@ -133,6 +133,60 @@ function candidate(
   };
 }
 
+/** 造一条边（`edges` 表：实体 ↔ 实体）——**联想路实体跳的燃料**。 */
+function insertEdge(
+  db: Database.Database,
+  id: string,
+  subjectId: string,
+  predicate: string,
+  objectId: string,
+  weight: number,
+  lastActive: number = NOW,
+): void {
+  for (const entityId of [subjectId, objectId]) {
+    db.prepare(
+      `INSERT OR IGNORE INTO entities (id, name, type, created_at)
+       VALUES (@id, @id, 'concept', @at)`,
+    ).run({ id: entityId, at: NOW });
+  }
+  db.prepare(
+    `INSERT INTO edges (id, subject_id, predicate, object_id, memory_id, weight, last_active, created_at)
+     VALUES (@id, @subjectId, @predicate, @objectId, NULL, @weight, @lastActive, @lastActive)`,
+  ).run({ id, subjectId, predicate, objectId, weight, lastActive });
+}
+
+/** 造一条共激活边（**必须 a < b**，与 `coacts` 的 CHECK 一致）——**簇跳的燃料**。 */
+function insertCoact(
+  db: Database.Database,
+  left: string,
+  right: string,
+  affinity: number,
+  lastActive: number = NOW,
+): void {
+  const [a, b] = left < right ? [left, right] : [right, left];
+  db.prepare(
+    `INSERT OR REPLACE INTO coacts (memory_a, memory_b, affinity, coact_count, cause_flags, last_active)
+     VALUES (@a, @b, @affinity, 1, 1, @lastActive)`,
+  ).run({ a, b, affinity, lastActive });
+}
+
+/** 造一个主题簇（**快照的两张表**）——**簇跳的燃料**。 */
+function insertCluster(
+  db: Database.Database,
+  clusterId: string,
+  memberIds: readonly string[],
+): void {
+  db.prepare(
+    'INSERT INTO theme_clusters (cluster_id, cluster_version, computed_at, member_count) VALUES (?, 1, ?, ?)',
+  ).run(clusterId, NOW, memberIds.length);
+  for (const memberId of memberIds) {
+    db.prepare('INSERT INTO theme_cluster_members (cluster_id, memory_id) VALUES (?, ?)').run(
+      clusterId,
+      memberId,
+    );
+  }
+}
+
 /** 一组表的**内容哈希**（行数 + 主键 + 全部列的内容 ⇒ 改内容必改哈希）。 */
 function tableHash(db: Database.Database, table: string, orderBy: string): string {
   const rows = db.prepare(`SELECT * FROM ${table} ORDER BY ${orderBy}`).all() as unknown[];
@@ -171,6 +225,96 @@ function seedFiveDistinct(db: Database.Database): void {
   for (let index = 0; index < 5; index += 1) {
     seedMemory(db, `f-${index}`, { entityIds: [`u-${index}`], rank: index });
   }
+}
+
+/**
+ * ★ **攻击面 E 的夹具（P3-T04 落地 `diffused` 非空之后重建）**：
+ * **有边 + 有共激活 + 有簇** ⇒ 联想路（实体跳 + 簇跳）**真的产出东西**。
+ *
+ * ⚠️ ★ **为什么必须重建这个夹具**（QA 上一轮留在 `docs/qa/p3-t02-acceptance-report.md`
+ *   §三·3 的那笔账）：
+ *   P3-T02 写下 `E1` 时 `diffused` **恒为空数组**（联想路未实现）
+ *   ⇒ 那条断言是**恒绿守卫**（什么都能通过）⇒ **证明不了**「抑制没碰 diffused」。
+ *   ⇒ P3-T04 把 `diffused` 接成非空之后，这条断言**才真正可执行**。
+ *
+ * ⚠️ ★ **本夹具的三条腿都必须真的通**（否则「diffused 非空」这个前提仍不成立）：
+ *   ① **边**（实体跳）：`e-1 → e-4` ⇒ 从 `c-a` 的实体 `e-1` 走到 `c-d` 的实体 `e-4`。
+ *   ② **共激活 + 簇**（簇跳）：`c-a` 与 `c-d` 之间有共激活边、且同属簇 `c-1`
+ *      ⇒ 簇跳那条腿**也能**捞到 `c-d`（⇒ 两条腿都产出 ⇒ 分数取 max）。
+ *   ③ **专属路径**：`c-e` **只**能由 `c-b` 触达（`e-5 → e-6`）
+ *      ⇒ 种子口径一旦从「抑制前 topN」漂移到「抑制后 hits」，
+ *      `c-b` 被挤掉 ⇒ `c-e` 从 `diffused` 里消失 ⇒ **这条断言立刻变红**
+ *      ⇒ **它不是恒绿守卫**。
+ *
+ * ⚠️ **`c-d` / `c-e` 的正文不含「猫粮品牌」** ⇒ 它们**不进候选集**
+ *   ⇒ 不改变上面三条的分数与排序（⇒ 抑制行为仍由 `c-a` / `c-b` / `c-c` 决定）。
+ */
+function seedDiffusionWorld(db: Database.Database): void {
+  // ── 三条文本路候选：c-a / c-b 共享两个实体 ⇒ 冗余（实体路径）⇒ c-b 被挤掉；
+  //    c-c 与前两条没有共享实体 ⇒ 不冗余。
+  seedMemory(db, 'c-a', { entityIds: ['e-1', 'e-2'], rank: 0 });
+  seedMemory(db, 'c-b', { entityIds: ['e-1', 'e-2', 'e-5'], rank: 1 });
+  seedMemory(db, 'c-c', { entityIds: ['e-3', 'e-4'], rank: 2 });
+
+  // ── ① 边（实体跳）：c-a 的 e-1 ⇒ c-d 的 e-6 ──
+  //    ⚠️ ★ **正文必须显式给成「不含猫粮品牌」**（本文件的 `seedMemory` 默认正文是
+  //   「猫粮品牌偏好记录」⇒ 若不覆盖，c-d / c-e 会**进文本候选集**
+  //   ⇒ 它们就成了候选而不是「只能靠扩散捞到」⇒ 前提自检③失效）。
+  seedMemory(db, 'c-d', {
+    content: '仓库盘点清单',
+    entityIds: ['e-6'],
+    rank: 3,
+  });
+  insertEdge(db, 'ed-1', 'e-1', 'p-1', 'e-6', 0.8, NOW);
+
+  // ── ② 共激活 + 簇（簇跳）：c-a ↔ c-d 同属簇 c-1 ⇒ 簇跳那条腿也能捞到 c-d ──
+  insertCoact(db, 'c-a', 'c-d', 0.75, NOW);
+  insertCluster(db, 'c-1', ['c-a', 'c-d']);
+
+  // ── ③ 专属路径：c-e 只由 c-b 触达（e-5 → e-7）⇒ 种子口径漂移 ⇒ c-e 消失 ──
+  seedMemory(db, 'c-e', {
+    content: '货架清单',
+    entityIds: ['e-7'],
+    rank: 4,
+  });
+  insertEdge(db, 'ed-2', 'e-5', 'p-2', 'e-7', 0.8, NOW);
+}
+
+/**
+ * ★ **攻击面 E 的「深世界」夹具**：**被抑制的候选自己出现在 `diffused` 里**。
+ *
+ * ⚠️ ★ **为什么需要这一份夹具**（`seedDiffusionWorld` 抓不到的那一类变异）：
+ *   `seedDiffusionWorld` 里，被抑制的是 `c-b`，而 `diffused` 里是 `c-d` / `c-e`
+ *   ⇒ **两者不相交** ⇒ 「抑制直接过滤 diffused」这类变异**不可观测**（M-E2 打不红）。
+ *   ⇒ 本夹具构造出「**同一条记忆既在 `suppressed` 里、又在 `diffused` 里**」的世界：
+ *   ```
+ *   A（rank 0，实体 e1/e2）── 冗余源
+ *   B（rank 1，实体 e1/e2/e3）── 与 A 冗余 ⇒ **被抑制**；但它是**抑制前的种子**
+ *   C（rank 2，实体 e1/e2/e8）── 与 A 冗余 ⇒ **被抑制**；**且**与 B 同簇共激活 ⇒ 由 B 触达
+ *   D（rank 3，实体 e7）──── 与谁都不冗余 ⇒ 留在 hits
+ *   ```
+ *   · **种子取「抑制前」的 topN**（§4.14.2）⇒ `topN = 2` 时种子 = `[A, B]`
+ *     ⇒ **B 虽然被抑制，仍然是种子** ⇒ B 的簇跳路径能捞到 **C**。
+ *   ⇒ **C 同时出现在 `suppressed`（被抑制）与 `diffused`（扩散唤起）里**
+ *     ⇒ 任何「抑制影响 diffused」的变异（无论是从**种子口径**还是从**直接过滤**）
+ *     **都会立刻把这条断言打红**。
+ *
+ * ⚠️ **为什么这条比 `seedDiffusionWorld` 更强**：
+ *   §4.13.1③ 的字面要求是「抑制只作用于 hits」⇒ **被抑制的记忆不该出现在 diffused 里**
+ *   ——反过来说，**它出现了也不该被抑制机制动一下**。
+ *   ⇒ 抑制开 / 关两次的 `diffused` 必须**逐条相同**，包括那条「既被抑制又被唤起」的 C。
+ */
+function seedSuppressedAlsoDiffusedWorld(db: Database.Database): void {
+  seedMemory(db, 'w-a', { entityIds: ['e-1', 'e-2'], rank: 0 });
+  // ⚠️ **w-b 多了实体 e-3** ⇒ 它有一条**别人没有**的路径（边 e-3 → e-8）⇒ C 只能由它触达。
+  seedMemory(db, 'w-b', { entityIds: ['e-1', 'e-2', 'e-3'], rank: 1 });
+  seedMemory(db, 'w-c', { entityIds: ['e-1', 'e-2', 'e-8'], rank: 2 });
+  seedMemory(db, 'w-d', { entityIds: ['e-7'], rank: 3 });
+  // ── 边（实体跳）：只有 w-b 有 e-3 ⇒ w-c 只能由 w-b 触达 ──
+  insertEdge(db, 'ed-w1', 'e-3', 'p-w1', 'e-8', 0.8, NOW);
+  // ── 共激活 + 簇（簇跳）：w-b ↔ w-c 同簇 ⇒ 簇跳那条腿也能捞到 w-c ──
+  insertCoact(db, 'w-b', 'w-c', 0.75, NOW);
+  insertCluster(db, 'c-w', ['w-b', 'w-c']);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -472,25 +616,99 @@ describe('QA·D · 硬约束①（抑制不进 score）与②（抑制不写库�
 // ═══════════════════════════════════════════════════════════════════════
 
 describe('QA·E · 抑制不得过滤 diffused（§4.13.1③）', () => {
-  it('E1 · 抑制开 / 关两次召回的 `diffused` **逐条相同**（本阶段 diffused 恒为空 ⇒ 结构上不可能被过滤）', () => {
+  it('E1 · ★ 抑制开 / 关两次召回的 `diffused` **逐条相同**（**本轮已从恒绿守卫升级为真守卫**）', () => {
+    // ⚠️ ★ **本轮（P3-T06）的关键升级**：P3-T02 写下这条时 `diffused` **恒为空数组**
+    //   （联想路未实现）⇒ 它是一条**恒绿守卫**（什么都能通过）⇒ **证明不了**
+    //   「抑制没碰 diffused」。
+    //   ⇒ P3-T04 把 `diffused` 接成非空之后，QA 用**有边 + 有共激活 + 有簇**的
+    //   夹具（`seedDiffusionWorld`）把这条断言**重新变成真守卫**。
     const on = makeStore();
-    seedRedundantPair(on.db);
+    seedDiffusionWorld(on.db);
     const off = makeStore({ inhibition: false });
-    seedRedundantPair(off.db);
+    seedDiffusionWorld(off.db);
 
     const withInhibition = recall(on.store, { context: '猫粮品牌', now: NOW });
     const withoutInhibition = recall(off.store, { context: '猫粮品牌', now: NOW });
 
-    // ── 前提自检：抑制确实发生了（否则这条对比是空洞的）──
+    // ── 前提自检①：**抑制确实发生了**（否则这条对比是空洞的）──
     expect(withInhibition.suppressed).toHaveLength(1);
+    expect(withInhibition.suppressed[0]?.id).toBe('c-b');
+    expect(withInhibition.hits.length).toBeLessThan(withoutInhibition.hits.length);
 
-    // ── 断言 ──
+    // ── 前提自检② ★：**扩散确实产出了东西**（这正是 P3-T02 留的那笔账）──
+    //   ⚠️ **没有这一条，E1 就是恒绿守卫** ⇒ 本条是 E1 的**存在前提**。
+    expect(withInhibition.diffused.length).toBeGreaterThan(0);
+    expect(withoutInhibition.diffused.length).toBeGreaterThan(0);
+
+    // ── 前提自检③ ★：**其中有一条只由「被抑制的那条种子」（c-b）触达得到**（c-e）──
+    //   ⚠️ ★ **这是「E1 不是恒绿守卫」的决定性证据**：
+    //   种子口径一旦从「抑制前 topN」漂移到「抑制后 hits」，c-b 被挤掉
+    //   ⇒ c-e 从 `diffused` 里消失 ⇒ **这条断言立刻变红**。
+    expect(withInhibition.diffused.map((item) => item.id).sort()).toEqual(['c-d', 'c-e']);
+    expect(withoutInhibition.diffused.map((item) => item.id).sort()).toEqual(['c-d', 'c-e']);
+
+    // ── 前提自检④ ★：**两条腿都真的产出**（实体跳 + 簇跳）⇒ 夹具不是「只有一半通」──
+    //   c-d **同时**被实体跳（e-1 → e-6，bonus 0.2）与簇跳（c-a ↔ c-d 同簇，
+    //   bonus = CLUSTER_BONUS 0.4 × affinity_eff 0.75 = 0.3）捞到
+    //   ⇒ **合并取 max** ⇒ 簇跳那条腿更强 ⇒ `viaClusterId` 有值。
+    const viaDiffused = withInhibition.diffused.find((item) => item.id === 'c-d');
+    expect(viaDiffused?.viaClusterId).toBe('c-1');
+    expect(viaDiffused?.viaEntity).toBeUndefined();
+    //   ⚠️ **分数逐位核对**：合并分 = max(0.2, 0.3) = 0.3（**不是** 0.5 的相加）
+    //   ⇒ 这一条同时钉住「两腿合并取 max」（§4.14.4 约束⑥）。
+    expect(viaDiffused?.diffusionScore).toBeCloseTo(0.3, 12);
+    //   c-e 只被 c-b 的专属路径（e-5 → e-7）触达 ⇒ 它走的是**实体跳**那条腿。
+    const viaExclusive = withInhibition.diffused.find((item) => item.id === 'c-e');
+    expect(viaExclusive?.viaEntity).toBe('e-7');
+    expect(viaExclusive?.viaClusterId).toBeUndefined();
+    expect(viaExclusive?.diffusionScore).toBeCloseTo(0.2, 12);
+
+    // ── 断言：**逐条相同**（不只是条数相同）—— 抑制既不改内容，也不改顺序。──
+    expect(withInhibition.diffused.length).toBe(withoutInhibition.diffused.length);
     expect(withInhibition.diffused).toEqual(withoutInhibition.diffused);
-    // ⚠️ **本阶段的既成事实**：diffused 恒为空数组（§7 联想路未实现）。
-    //   ⇒ 这一条**恒成立**（恒绿守卫）⇒ **它不是**「抑制没碰 diffused」的**证据**，
-    //   只是「当前 diffused 里没有东西可被过滤」的记录。
-    //   ⇒ 真正的攻击面 E 必须在 **P3-T04（簇跳扩散）落地 diffused 非空之后**重测。
-    expect(withInhibition.diffused).toEqual([]);
+  });
+
+  it('E2 · ★ ★ **深世界**：一条**既被抑制、又被扩散唤起**的记忆 ⇒ 抑制开 / 关的 `diffused` 仍逐条相同', () => {
+    // ⚠️ ★ **为什么必须有这一条**（`E1` 抓不到的那一类变异）：
+    //   `E1` 的世界里被抑制的是 `c-b`，`diffused` 里是 `c-d` / `c-e` ⇒ **两者不相交**
+    //   ⇒ 「抑制**直接过滤** diffused」这类变异在 `E1` 的世界里**不可观测**。
+    //   ⇒ 本用例构造出「**同一条记忆既在 `suppressed` 里、又在 `diffused` 里**」的世界。
+    const on = makeStore();
+    seedSuppressedAlsoDiffusedWorld(on.db);
+    const off = makeStore({ inhibition: false });
+    seedSuppressedAlsoDiffusedWorld(off.db);
+
+    // ⚠️ **`topN = 2`** ⇒ 抑制前的 topN = [w-a, w-b] ⇒ **w-b 是种子**
+    //   （尽管它随后被抑制）⇒ w-c 能由 w-b 的簇跳路径捞到。
+    const withInhibition = recall(on.store, { context: '猫粮品牌', topN: 2, now: NOW });
+    const withoutInhibition = recall(off.store, { context: '猫粮品牌', topN: 2, now: NOW });
+
+    // ── 前提自检①：**抑制确实发生了**（w-b 与 w-c 都被挤掉）──
+    expect(withInhibition.suppressed.map((item) => item.id).sort()).toEqual(['w-b', 'w-c']);
+    // ── 前提自检②：**抑制关时一条都没被挤掉** ──
+    expect(withoutInhibition.suppressed).toHaveLength(0);
+
+    // ── 前提自检③ ★：**被抑制的那条记忆确实出现在 `diffused` 里** ──
+    //   ⚠️ ★ **这是本用例的存在前提**：若 w-c 不在 `diffused` 里，
+    //   则「抑制直接过滤 diffused」这类变异**打不红** ⇒ 本用例会退化成恒绿守卫。
+    const diffusedIds = withInhibition.diffused.map((item) => item.id);
+    expect(diffusedIds).toContain('w-c');
+    expect(withInhibition.suppressed.map((item) => item.id)).toContain('w-c');
+
+    // ── 前提自检④：**抑制开 / 关两次的 hits 集合确实不同**（否则「没变」证明不了任何事）──
+    expect(withInhibition.hits.map((hit) => hit.id).sort()).not.toEqual(
+      withoutInhibition.hits.map((hit) => hit.id).sort(),
+    );
+
+    // ── 断言：**逐条相同**（含那条「既被抑制又被唤起」的 w-c）──
+    expect(withInhibition.diffused).toEqual(withoutInhibition.diffused);
+    // ⚠️ **逐字段**再比一次（不只看 id 序列）：分数 / viaEntity / viaClusterId 都要一样。
+    expect(withInhibition.diffused.map((item) => item.diffusionScore)).toEqual(
+      withoutInhibition.diffused.map((item) => item.diffusionScore),
+    );
+    expect(withInhibition.diffused.map((item) => item.viaClusterId ?? null)).toEqual(
+      withoutInhibition.diffused.map((item) => item.viaClusterId ?? null),
+    );
   });
 });
 
