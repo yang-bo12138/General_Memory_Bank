@@ -642,6 +642,9 @@ describe('P3-T02 · inhibitionTrace（§6）', () => {
     expect(trace.selected.map((item) => item.baseScore)).toEqual(
       result.hits.map((hit) => hit.score),
     );
+    // ★ trace 的 `candidates` 与 `selected` 用**同一个全序**（`(score DESC, id ASC)`）
+    const traceScores = trace.candidates.map((item) => item.baseScore);
+    expect([...traceScores].sort((left, right) => right - left)).toEqual(traceScores);
   });
 
   it('★ trace 的 inhibited 只标 D 桶；溢出候选**不**被标成「被抑制」', () => {

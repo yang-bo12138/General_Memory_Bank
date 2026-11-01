@@ -19,6 +19,7 @@
 import { resolveNow } from '../core/clock.js';
 import {
   type InhibitionCandidate,
+  compareInhibitionCandidates,
   inhibitCandidates,
   loadClusterIds,
   loadInhibitionFacts,
@@ -108,22 +109,26 @@ export function inhibitionTrace(
     outcome.redundant.map((entry) => [entry.candidate.id, entry] as const),
   );
 
-  const candidates: InhibitionTraceCandidate[] = facts.map((fact) => {
-    const entry = redundantById.get(fact.id);
-    const item: InhibitionTraceCandidate = {
-      id: fact.id,
-      baseScore: fact.score,
-      clusterId: clusterIds.get(fact.id) ?? null,
-      inhibited: entry !== undefined,
-    };
-    if (entry !== undefined) {
-      item.redundantWith = entry.redundantWith;
-      if (entry.redundancySim !== null) {
-        item.redundancySim = entry.redundancySim;
+  // ⚠️ **`candidates` 与 `selected` 用同一个全序**（`(score DESC, id ASC)`）：
+  //   否则 trace 里的候选顺序与排名对不上 ⇒ 读的人得自己再排一次才能对照。
+  const candidates: InhibitionTraceCandidate[] = [...facts]
+    .sort(compareInhibitionCandidates)
+    .map((fact) => {
+      const entry = redundantById.get(fact.id);
+      const item: InhibitionTraceCandidate = {
+        id: fact.id,
+        baseScore: fact.score,
+        clusterId: clusterIds.get(fact.id) ?? null,
+        inhibited: entry !== undefined,
+      };
+      if (entry !== undefined) {
+        item.redundantWith = entry.redundantWith;
+        if (entry.redundancySim !== null) {
+          item.redundancySim = entry.redundancySim;
+        }
       }
-    }
-    return item;
-  });
+      return item;
+    });
 
   return {
     candidates,
