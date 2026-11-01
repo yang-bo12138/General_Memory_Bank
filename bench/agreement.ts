@@ -43,13 +43,14 @@ import { DEFAULT_PARAMS } from '../src/core/params.js';
 import { loadCentroidModel } from '../src/vector/centroids.js';
 import { IvfVectorBackend } from '../src/vector/ivf.js';
 import {
+  type BenchQuery,
   type CorpusOptions,
   DEFAULT_CORPUS_OPTIONS,
   generateQueries,
   querySynonymCosine,
 } from './corpus.js';
 import { prepareBench } from './lib/db.js';
-import { flatCandidateUniverse, flatTopK } from './lib/flat.js';
+import { flatCandidateUniverse, flatTopK, flatTopKMulti } from './lib/flat.js';
 import {
   BENCH_NOW,
   benchWorkDir,
@@ -165,7 +166,17 @@ export function measureAgreement(
   let bucketCandidatesOutsideUniverse = 0;
   const internalMismatches: string[] = [];
 
-  for (const query of queries) {
+  // ⚠️ ★ **flat 参照用「一遍全表」的批量版**：
+  //   百万条下本机的磁盘只有 ~2.4MB/s ⇒ 每个查询单独扫一遍 2.17GB ≈ 15 分钟
+  //   ⇒ 合成一遍扫描后，**每条查询仍是全表精确 top-20**（口径不变）。
+  const flatHitsPerQuery = flatTopKMulti(
+    db,
+    queries.map((query) => query.embedding),
+    TOP_N,
+  );
+
+  for (let queryIndex = 0; queryIndex < queries.length; queryIndex += 1) {
+    const query = queries[queryIndex] as BenchQuery;
     const start = process.hrtime.bigint();
     const bucketHits = backend.search(query.embedding, TOP_N);
     const end = process.hrtime.bigint();
@@ -182,7 +193,7 @@ export function measureAgreement(
 
     // ⚠️ **flat 参照**：同一候选宇宙上的**精确 top-N**（分桶扫的是「桶内精确点积」，
     //   flat 是「全表精确点积」⇒ 唯一的差别就是**探针覆盖**）。
-    const flatHits = flatTopK(db, query.embedding, TOP_N);
+    const flatHits = flatHitsPerQuery[queryIndex] ?? [];
     const flatIds = new Set(flatHits.map((hit) => hit.id));
     const bucketIds = new Set(bucketHits.map((hit) => hit.id));
 

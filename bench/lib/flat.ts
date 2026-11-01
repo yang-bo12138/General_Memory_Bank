@@ -121,20 +121,13 @@ export function flatTopK(
   if (k <= 0) {
     return [];
   }
-  const statement = db.prepare(
-    'SELECT id, embedding, last_access, pin_factor FROM memories ' +
-      'WHERE deleted = 0 AND embedding IS NOT NULL',
-  );
   const best: FlatHit[] = [];
-  for (const row of statement.iterate() as IterableIterator<{
-    id: string;
-    embedding: Buffer;
-    last_access: number;
-    pin_factor: number;
-  }>) {
-    if (restrict !== undefined && !restrict.has(row.id)) {
-      continue;
-    }
+  // ⚠️ **有 `restrict` 时直接按 id 取行**（不全表扫描）：
+  //   「对同一个桶集合做全量精确扫描」的**候选集合**就是那些 id
+  //   ⇒ 按 id 取行与「全表扫描后过滤」**结果完全一致**，但**不用扫 100 万行**
+  //   ⇒ 否则每个查询都要重扫一遍 4.4GB 的库（磁盘受限 ≈ 20 分钟/次）。
+  const rows = restrict === undefined ? scanAll(db) : scanByIds(db, restrict);
+  for (const row of rows) {
     const candidate: VectorCandidateRow = {
       id: row.id,
       vector: decodeInto(row.embedding),
@@ -145,6 +138,104 @@ export function flatTopK(
       continue;
     }
     insertTopK(best, { id: row.id, score: clampCos(dot(query, candidate.vector)) }, k);
+  }
+  return best;
+}
+
+/**
+ * 一行候选（与生产 `VectorCandidateRow` 同形）。
+ */
+interface CandidateRow {
+  /** 记忆 id。 */
+  readonly id: string;
+  /** 向量 BLOB。 */
+  readonly embedding: Buffer;
+  /** 最后访问时间。 */
+  readonly last_access: number;
+  /** 钉固因子。 */
+  readonly pin_factor: number;
+}
+
+/**
+ * 扫**全表**（候选集合 = 未删 且 有向量）。
+ *
+ * @param db 库句柄
+ * @returns 候选行（流式）
+ */
+function scanAll(db: Database.Database): IterableIterator<CandidateRow> {
+  const statement = db.prepare(
+    'SELECT id, embedding, last_access, pin_factor FROM memories ' +
+      'WHERE deleted = 0 AND embedding IS NOT NULL',
+  );
+  return statement.iterate() as IterableIterator<CandidateRow>;
+}
+
+/**
+ * 按 **id 白名单**取行（分块，避免参数上限）。
+ *
+ * ⚠️ **语义与「全表扫描 + 过滤」完全一致**：
+ *   同一个 `WHERE deleted = 0 AND embedding IS NOT NULL` 条件 ⇒ 同一批行。
+ *
+ * @param db 库句柄
+ * @param ids id 白名单
+ * @returns 候选行
+ */
+function scanByIds(
+  db: Database.Database,
+  ids: ReadonlySet<string>,
+): IterableIterator<CandidateRow> {
+  const rows: CandidateRow[] = [];
+  // ⚠️ ★ **一条一个 id 地请求**（**不用** `id IN (500 个值)`）：
+  //   SQLite 的估算在 `IN` 列表很长时会**改用全表扫描**（而不是主键索引）
+  //   ⇒ 桶内核对一次就能把 **2.17GB 的库整个重读一遍**。
+  //   ⇒ 改成 `id = ?`（必走主键索引）⇒ 每条只读自己那一页。
+  const statement = db.prepare(
+    'SELECT id, embedding, last_access, pin_factor FROM memories ' +
+      'WHERE id = ? AND deleted = 0 AND embedding IS NOT NULL',
+  );
+  for (const id of ids) {
+    const row = statement.get(id) as CandidateRow | undefined;
+    if (row !== undefined) {
+      rows.push(row);
+    }
+  }
+  return rows[Symbol.iterator]() as IterableIterator<CandidateRow>;
+}
+
+/**
+ * **一遍全表，同时算多条查询的精确 top-K**（flat 参照的批量版）。
+ *
+ * ⚠️ **为什么要批量版**：百万条下 flat 参照是**磁盘受限**（本机 ~2.4MB/s）
+ *   ⇒ 每个查询单独扫一遍 2.17GB 的库 ≈ **15 分钟**；
+ *   ⇒ 而「同一个候选集合」的 top-K 只依赖**候选集合**，不依赖查询的顺序
+ *   ⇒ 把 N 条查询**合成一遍扫描**时，每条查询仍是**全表精确 top-K**（**口径不变**）
+ *   ⇒ 而磁盘 I/O 从 N 遍降到 1 遍。
+ *
+ * ⚠️ **分数与顺序与单查询版逐位相同**（同一个 `dot()` + `clampCos()` + `compareHits()`）。
+ *
+ * @param db 库句柄
+ * @param queries 查询向量列表
+ * @param k 每条查询取前 K 条
+ * @returns 每条查询的精确 top-K（与查询同序）
+ */
+export function flatTopKMulti(
+  db: Database.Database,
+  queries: readonly Float32Array[],
+  k: number,
+): FlatHit[][] {
+  const best: FlatHit[][] = queries.map(() => []);
+  if (k <= 0 || queries.length === 0) {
+    return best;
+  }
+  for (const row of scanAll(db)) {
+    const vector = decodeInto(row.embedding);
+    for (let index = 0; index < queries.length; index += 1) {
+      const query = queries[index];
+      if (query === undefined) {
+        continue;
+      }
+      insertTopK(best[index] as FlatHit[], { id: row.id, score: clampCos(dot(query, vector)) }, k);
+    }
   }
   return best;
 }
