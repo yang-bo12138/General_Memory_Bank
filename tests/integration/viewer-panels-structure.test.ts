@@ -1094,3 +1094,72 @@ describe('T04 第四批(补) · 面板 3：空输入**一次都不发请求**（
     expect(shouldRunRecall(afterClick)).toBe(true);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ⑨ T04 最终 · `nextSubmitted` 的**提交语义**（每条配反例）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * ⚠️ ★ **这一节承载的是「提交语义」这一段的判别力，不是端到端点击**：
+ *   `environment: 'node'` + `renderToStaticMarkup` **不执行事件处理器**
+ *   （不装 jsdom 是 better-sqlite3 `pool: 'forks'` 的硬约束）⇒「真的点一下」跑不了。
+ *   所以链条拆成三段分别钉住：
+ *     ① `onClick → setSubmitted((prev) => nextSubmitted(prev, context))`（源码层断言，上一节）
+ *     ② `nextSubmitted` 的决策（**本节**）
+ *     ③ `submitted → recallRunner → port.recall` 收到的 `context`（上一节，真跑一次）
+ *   三段都在，唯独 React 自己的事件派发不在（框架行为，不是本仓逻辑）。
+ */
+describe('T04 最终 · `nextSubmitted`：空白不提交、非空原样提交', () => {
+  it('★ 空串 ⇒ 返回**同一个值**（`=== current`，证明没提交）', () => {
+    const current = '上一次的文本';
+    expect(nextSubmitted(current, '')).toBe(current);
+  });
+
+  it('★ 纯空白（空格 + 制表符）⇒ 同样返回**同一个值**', () => {
+    const current = '上一次的文本';
+    expect(nextSubmitted(current, ' \t  ')).toBe(current);
+  });
+
+  it('★ 首次就是空白：`null` 进、`null` 出（不存在「空串」这个中间态）', () => {
+    expect(nextSubmitted(null, '   ')).toBeNull();
+  });
+
+  it('★ 非空 ⇒ 返回 `context` **本身**（不 trim、不包装、不改写）', () => {
+    const context = ' 张三喜欢什么 ';
+    const result = nextSubmitted(null, context);
+    expect(result).toBe(context);
+    // 判别力：如果实现偷偷 trim 了，这两条会红
+    expect(result).not.toBe('张三喜欢什么');
+    expect(result?.length).toBe(context.length);
+  });
+
+  it('★ 连续两次：先空白后非空 ⇒ **只有第二次**产生新值', () => {
+    const first = nextSubmitted(null, '   ');
+    expect(first).toBeNull();
+
+    const second = nextSubmitted(first, '张三喜欢什么');
+    expect(second).toBe('张三喜欢什么');
+    expect(second).not.toBe(first);
+  });
+
+  it('★ 连续两次：先非空后空白 ⇒ 值**不被清空**（提交是「覆盖」，不是「可回退」）', () => {
+    const first = nextSubmitted(null, '第一版文本');
+    const second = nextSubmitted(first, '  ');
+    expect(second).toBe(first);
+  });
+
+  it('★ 反例（判别力）：若实现改成「总是返回 context」，第一条必须红', () => {
+    // 「总是提交」是这道题最容易被写成的错误实现（省掉 trim 判断一行）
+    const alwaysSubmit = (_current: string | null, context: string): string | null => context;
+    const current = '上一次的文本';
+
+    // 正确实现：空白 ⇒ 保留原值
+    expect(nextSubmitted(current, '   ')).toBe(current);
+    // 写坏的实现：把空白当提交 ⇒ 与正确结果**不同**（⇒ 上面那条会红）
+    expect(alwaysSubmit(current, '   ')).not.toBe(current);
+    expect(alwaysSubmit(current, '   ')).toBe('   ');
+    // 同理：首次空白，正确实现给 null，写坏的给 '   '
+    expect(nextSubmitted(null, '   ')).toBeNull();
+    expect(alwaysSubmit(null, '   ')).not.toBeNull();
+  });
+});
