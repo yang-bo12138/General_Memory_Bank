@@ -2,12 +2,13 @@
  * `docs/baseline/README.md` 的**档位限定一致性审计** —— 把「哪些数必须带档位、哪些数不许带档位」
  * 这条纪律做成**可复跑**的脚本，使它在每次重采基线后能被机械地重新核对一遍。
  *
- * ⚠️ **本文件刻意不带 `#!/usr/bin/env node` shebang**（★ 与本仓库其余脚本不同 ⇒ 记下原因）：
- *   · Node 自己加载 `.mjs` 时**会**剥掉 shebang ⇒ 所以**直接跑**（`node scripts/audit-tier-qualifiers.mjs`）不受影响；
+ * ⚠️ **本文件不带 `#!/usr/bin/env node` shebang**（★ 与本仓库其余脚本不同 ⇒ 记下原因）：
+ *   · Node 直接执行 `.ts`（`node --import tsx <file>`）时**会**剥掉 shebang；
  *   · 但 **vitest 不走 Node 的加载器** ⇒ 它把模块**转译后内联**（`vm.runInThisContext`）执行
- *     ⇒ ⇒ **shebang 留在文件第一行 ⇒ `SyntaxError: Invalid or unexpected token`**（实测）
- *     ⇒ ⇒ **后果是「连单测都 import 不了它」** ⇒ ⇒ **⇒ 本文件必须能被单测 import**（仓库「新增门禁的做法」第 1 条）。
- *   · ⇒ ⇒ **调用方式一律写 `node scripts/audit-tier-qualifiers.mjs`**（`scripts/README.md` 里也是这么写的）
+ *     ⇒ ⇒ **shebang 留在文件第一行 ⇒ `SyntaxError: Invalid or unexpected token`**（实测，且是 `.mjs`
+ *     形态时就踩过）⇒ ⇒ **后果是「连单测都 import 不了它」** ⇒ ⇒ **⇒ 本文件必须能被单测 import**
+ *     （仓库「新增门禁的做法」第 1 条）。
+ *   · ⇒ ⇒ **调用方式一律写 `pnpm run audit:tier-qualifiers`**
  *     ⇒ ⇒ **仓库里没有任何地方直接执行 `./scripts/...`**（实测无此用法）⇒ ⇒ 去掉 shebang **零代价**。
  *   · ⇒ ⇒ **★ 别把 shebang 加回来**：加了它，`tests/contracts/tier-qualifier-audit.test.ts` 会立刻红。
  *
@@ -83,22 +84,22 @@
  *   ⇒ ⇒ **如果只信它的输出，就会去改本来正确的文档** ⇒ ⇒ **这正是纪律 3「先让工具失手一次」的价值**。
  *
  * ────────────────────────────────────────────────────────────────────────────
- * 【与本仓库「新增门禁的做法」的差距】（`scripts/README.md` §「新增门禁的做法」）
+ * 【交付形态的两次变更】（★ 记下来，因为「形态」本身是判据的一部分）
  *
- *   本脚本**已做到**第 1 条（**导出纯函数**，见下方的 `auditTierQualifiers` / `renderAudit`）、
- *   第 3 条（**`tests/contracts/tier-qualifier-audit.test.ts` 的含反例单测**）与第 4 条（**已在
- *   `scripts/README.md` 登记**）。
- *   ⚠️ **尚未做到**第 2 条（串进 `package.json` 的 `ci`）—— ⇒ **故本脚本目前是
- *   「可复跑的审计 ＋ 已被单测覆盖」，但还没进 `ci` 链**
- *   ⇒ ⇒ **第 2 步要动 `package.json`（共享配置、多人改）⇒ ⇒ 等主理人定**。
+ *   · **第一版：`.mjs`**（主理人指定）—— 好处是**纯 `node` 即可跑，不依赖 `tsx`**；
+ *     代价是**不进 `tsc --noEmit`**（`tsconfig.json` 的 `include` 里 `scripts/` 只覆盖 `.ts`）
+ *     ⇒ ⇒ 类型只能靠 JSDoc 承载 ⇒ ⇒ 还被迫另配手写声明 `audit-tier-qualifiers.d.mts`
+ *     （否则单测从 `.ts` 侧 import 时会拿到 `any` ⇒ **TS7016**）。
+ *   · **第二版（当前）：`.ts`** —— 因为**它已接进 `pnpm run verify` 门禁链**，
+ *     而「新增门禁的做法」要求的第 2 条一旦落地，**类型检查就必须覆盖它**
+ *     ⇒ ⇒ **改回 `.ts` ＋ 删掉那份手写声明**（`tsc` 自己就是权威，声明成了第二个真相源）。
+ *     ⚠️ **这份手写声明被删除这件事，有单测盯着**（不许它以「影子副本」的形式回来）。
  *
- * ⚠️ **交付形态说明**：本脚本按主理人指定用 **`.mjs`**（⇒ **纯 `node` 即可跑，不依赖 `tsx`**）
- *   ⇒ ⇒ **代价**：它**不进 `tsc --noEmit` 的类型检查**（`tsconfig.json` 的 `include` 里的 `scripts/` 只覆盖 `.ts`）
- *   ⇒ ⇒ **类型信息改用 JSDoc 承载**（编辑器仍可推断）。
- *   ⇒ ⇒ **⇒ 所以本脚本另配一份手写类型声明 `scripts/audit-tier-qualifiers.d.mts`**：
- *   单测（`tests/contracts/tier-qualifier-audit.test.ts`）从 `.ts` 侧 import 它时，
- *   **没有这份声明就会拿到 `any`** ⇒ ⇒ **类型检查反而在那里断掉**（实测 TS7016）。
- *   ⇒ ⇒ **⇒ 这份声明必须与本文件一起进版本库** ⇒ ⇒ **它进版本库这件事本身就是一条硬要求**。
+ * ────────────────────────────────────────────────────────────────────────────
+ * 【它现在是不是门禁】★ 是。`pnpm run verify` 的第 12 段（`audit:tier-qualifiers`）
+ *   ⇒ 「新增门禁的做法」四条**全部到位**：① 导出纯函数 ② 串进 `verify` ③ 含反例单测
+ *   ④ 在 `scripts/README.md` 的**门禁表**里登记（不再挂在「可复跑的审计」那张表下）。
+ *   ⇒ ⇒ **判据没有变**：仍然是「真缺 > 0 ⇒ exit 1」，仍然带**自证的三个数**。
  */
 import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -109,9 +110,8 @@ const DEFAULT_TARGET = join(REPO_ROOT, 'docs', 'baseline', 'README.md');
 
 /**
  * **强档位词**：明确说明「是哪一档」⇒ **单独出现即可成立**。
- * @type {readonly string[]}
  */
-export const STRONG_TIER_WORDS = [
+export const STRONG_TIER_WORDS: readonly string[] = [
   '冷盘档',
   '部分热档',
   '部分预热档',
@@ -136,19 +136,21 @@ export const STRONG_TIER_WORDS = [
  * ⚠️ ★ **`两档` / `三档` / `跨档` 也在这一类** —— 它们说的是「**在比几个档位**」，
  * **不是**「**这个数属于哪一档**」⇒ ⇒ 若把它们算成强词，
  * 「这一段谈过档位 ⇒ 这一行的数就都算有档位限定」⇒ ⇒ **作用域被它们撑起来**。
- *
- * @type {readonly string[]}
  */
-export const WEAK_TIER_WORDS = ['本次', '上一轮', '两档', '三档', '跨档'];
+export const WEAK_TIER_WORDS: readonly string[] = ['本次', '上一轮', '两档', '三档', '跨档'];
+
+/** 一类「只属于某一档的数」。 */
+export interface TierSpecificClass {
+  readonly name: string;
+  readonly pattern: RegExp;
+}
 
 /**
  * **只属于某一档的数**（必须带档位限定）。
  *
  * ⚠️ 类目按「同一个语义量」归并 ⇒ 同一个数出现在多处时被**逐处**判定 ⇒ ⇒ 漏一处就会被抓出一处。
- *
- * @typedef {{ name: string, pattern: RegExp }} TierSpecificClass
  */
-export const TIER_SPECIFIC_CLASSES = [
+export const TIER_SPECIFIC_CLASSES: readonly TierSpecificClass[] = [
   {
     name: '① 写入毫秒拆分',
     pattern: /12\.1%|87\.9%|21\.6%|78\.4%|243\.59|161\.84|33\.44|44\.67|277\.03|206\.51/g,
@@ -174,7 +176,7 @@ export const TIER_SPECIFIC_CLASSES = [
 export const CROSS_TIER_PATTERN = /12,782|1\.2782%|12\.782/g;
 
 /** 出处陈述的标志词 ⇒ 出现它们 ⇒ 那句里的档位词是在说「出处」而非「适用范围」。 */
-const PROVENANCE_MARKERS = [
+const PROVENANCE_MARKERS: readonly string[] = [
   '实测',
   '采集',
   '出处',
@@ -187,7 +189,7 @@ const PROVENANCE_MARKERS = [
 ];
 
 /** 片段切分符：分号与句号 ⇒ ⇒ 一个「片段」= 一个分句。 */
-const FRAGMENT_DELIMITERS = ['；', ';', '。'];
+const FRAGMENT_DELIMITERS: readonly string[] = ['；', ';', '。'];
 
 /** 上下文窗口：命中行往上多少行内出现档位词即算已限定。 */
 const CONTEXT_WINDOW = 5;
@@ -195,33 +197,34 @@ const CONTEXT_WINDOW = 5;
 /** 所属小节标题的向上搜索上限。 */
 const SECTION_WINDOW = 40;
 
-/**
- * 一次审计里的一处判定。
- *
- * @typedef {{ line: number, className: string, text: string }} AuditFinding
- */
+/** 一次审计里的一处判定。 */
+export interface AuditFinding {
+  readonly line: number;
+  readonly className: string;
+  readonly text: string;
+}
 
-/**
- * 一次审计的计数（⇒ 输出里的三个数 + 提示数）。
- *
- * @typedef {{ scanned: number, adjudicated: number, missing: number, advisories: number }} AuditCounts
- */
+/** 一次审计的计数（⇒ 输出里的三个数 + 提示数）。 */
+export interface AuditCounts {
+  readonly scanned: number;
+  readonly adjudicated: number;
+  readonly missing: number;
+  readonly advisories: number;
+}
 
-/**
- * 一次审计的完整结果。
- *
- * @typedef {{ counts: AuditCounts, gaps: AuditFinding[], advisories: AuditFinding[] }} AuditResult
- */
+/** 一次审计的完整结果。 */
+export interface AuditResult {
+  readonly counts: AuditCounts;
+  readonly gaps: AuditFinding[];
+  readonly advisories: AuditFinding[];
+}
 
 /**
  * 判定「这段文本是否给出了档位」。
  *
  * ⚠️ **强词单独成立；弱词必须与强词同现**（见头注释「强档位词 vs 弱指示词」）。
- *
- * @param {string} text
- * @returns {boolean}
  */
-export function hasTier(text) {
+export function hasTier(text: string): boolean {
   if (STRONG_TIER_WORDS.some((word) => text.includes(word))) return true;
   return (
     WEAK_TIER_WORDS.some((word) => text.includes(word)) &&
@@ -229,13 +232,8 @@ export function hasTier(text) {
   );
 }
 
-/**
- * 判定「本行是否含出处陈述标志」。
- *
- * @param {string} text
- * @returns {boolean}
- */
-export function hasProvenance(text) {
+/** 判定「本行是否含出处陈述标志」。 */
+export function hasProvenance(text: string): boolean {
   return PROVENANCE_MARKERS.some((marker) => text.includes(marker));
 }
 
@@ -248,25 +246,21 @@ export function hasProvenance(text) {
  *     ⇒ ⇒ 「表头写着『本次 · 冷盘档』」这条档位信息**被整张表忽略**。
  *   ⇒ ⇒ **⇒ 这正是「机制自己的读法」**：读者读的是**表头**（表头说这一列是冷盘档），
  *   不是数据格里的零散标注。
- *
- * @param {string} line
- * @returns {boolean}
  */
-export function isTableSeparator(line) {
+export function isTableSeparator(line: string): boolean {
   return /^(?:>\s*)*\|[\s|:-]+\|$/.test(line.trim());
 }
 
 /**
  * 把一行切成**片段**（按分号 / 句号）。
  *
- * @param {string} line
- * @returns {Array<[number, number]>} 片段的 `[起, 止)` 偏移
+ * @returns 片段的 `[起, 止)` 偏移
  */
-export function fragmentsOf(line) {
-  const ranges = [];
+export function fragmentsOf(line: string): Array<[number, number]> {
+  const ranges: Array<[number, number]> = [];
   let start = 0;
   for (let i = 0; i < line.length; i += 1) {
-    if (FRAGMENT_DELIMITERS.includes(line[i])) {
+    if (FRAGMENT_DELIMITERS.includes(line.charAt(i))) {
       ranges.push([start, i]);
       start = i + 1;
     }
@@ -275,15 +269,10 @@ export function fragmentsOf(line) {
   return ranges;
 }
 
-/**
- * 找出某个偏移所在的片段。
- *
- * @param {string} line
- * @param {number} offset
- * @returns {string}
- */
-export function fragmentAt(line, offset) {
-  for (const [start, end] of fragmentsOf(line)) {
+/** 找出某个偏移所在的片段。 */
+export function fragmentAt(line: string, offset: number): string {
+  for (const range of fragmentsOf(line)) {
+    const [start, end] = range;
     if (offset >= start && offset <= end) return line.slice(start, end);
   }
   return line;
@@ -291,12 +280,8 @@ export function fragmentAt(line, offset) {
 
 /**
  * 找出该行所在表格的**表头行**（分隔行的上一行）。
- *
- * @param {readonly string[]} lines
- * @param {number} index
- * @returns {string}
  */
-export function tableHeaderOf(lines, index) {
+export function tableHeaderOf(lines: readonly string[], index: number): string {
   for (let k = index - 1; k >= 0 && k >= index - 60; k -= 1) {
     if (isTableSeparator(lines[k] ?? '')) return lines[k - 1] ?? '';
   }
@@ -308,12 +293,8 @@ export function tableHeaderOf(lines, index) {
  *
  * ⚠️ **括号要全角 `）`** —— 文档里写的是 `**（b）★ …` ⇒ 用半角 `)` 的话
  * 这条正则**永远匹配不上** ⇒ ⇒ 整节都被判成「真缺」⇒ ⇒ **见头注释里那个坑**。
- *
- * @param {readonly string[]} lines
- * @param {number} index
- * @returns {string}
  */
-export function sectionHeadingOf(lines, index) {
+export function sectionHeadingOf(lines: readonly string[], index: number): string {
   for (let k = index - 1; k >= 0 && k >= index - SECTION_WINDOW; k -= 1) {
     const candidate = lines[k] ?? '';
     if (/^#{1,6} /.test(candidate) || /^\*\*（[a-z][)）]/.test(candidate.trim())) return candidate;
@@ -326,14 +307,11 @@ export function sectionHeadingOf(lines, index) {
  *
  * ⚠️ **无随机性、无时间依赖** ⇒ ⇒ 连跑两次结果逐字相同（幂等）。
  *
- * @param {readonly string[]} lines 文档全文按行切分
- * @returns {AuditResult} 审计结果
+ * @param lines 文档全文按行切分
  */
-export function auditTierQualifiers(lines) {
-  /** @type {AuditFinding[]} */
-  const gaps = [];
-  /** @type {AuditFinding[]} */
-  const advisories = [];
+export function auditTierQualifiers(lines: readonly string[]): AuditResult {
+  const gaps: AuditFinding[] = [];
+  const advisories: AuditFinding[] = [];
   let scanned = 0;
   let adjudicated = 0;
 
@@ -341,8 +319,7 @@ export function auditTierQualifiers(lines) {
     const line = lines[index] ?? '';
     const header = tableHeaderOf(lines, index);
     const section = sectionHeadingOf(lines, index);
-    /** @type {string[]} */
-    const context = [];
+    const context: string[] = [];
     for (let k = index - 1; k >= 0 && k >= index - CONTEXT_WINDOW; k -= 1) {
       context.push(lines[k] ?? '');
     }
@@ -355,7 +332,7 @@ export function auditTierQualifiers(lines) {
         const localHasTier = hasTier(fragment) || hasTier(header);
         if (localHasTier) continue;
         const wideHasTier = context.some(hasTier) || hasTier(section);
-        const finding = {
+        const finding: AuditFinding = {
           line: index + 1,
           className: tierClass.name,
           text: fragment.trim().slice(0, 150),
@@ -394,14 +371,14 @@ export function auditTierQualifiers(lines) {
 /**
  * **纯函数**：把审计结果渲染成报告文本。
  *
- * @param {string} target 被审计的文件路径（写进报告头）
- * @param {AuditResult} result 审计结果
- * @returns {string} 报告文本（**逐字确定** ⇒ 便于比对两次运行）
+ * @param target 被审计的文件路径（写进报告头）
+ * @param result 审计结果
+ * @returns 报告文本（**逐字确定** ⇒ 便于比对两次运行）
  */
-export function renderAudit(target, result) {
+export function renderAudit(target: string, result: AuditResult): string {
   const { counts } = result;
   const local = counts.adjudicated - counts.missing - counts.advisories;
-  const out = [];
+  const out: string[] = [];
   out.push('════ 档位限定一致性审计 ════');
   out.push(`目标：${target}`);
   out.push(`扫了 ${counts.scanned} 处「只属于某一档的数」（一处 = 一个被识别的数）`);
@@ -441,7 +418,7 @@ export function renderAudit(target, result) {
 }
 
 /** CLI 薄壳（★ 逻辑都在上面的纯函数里 ⇒ 便于写单测）。 */
-function main() {
+function main(): void {
   const target = resolve(process.argv[2] ?? DEFAULT_TARGET);
   const lines = readFileSync(target, 'utf8').split(/\r?\n/);
   const result = auditTierQualifiers(lines);
@@ -450,7 +427,7 @@ function main() {
 }
 
 /**
- * ★ **只在「本文件被直接执行」时才跑 CLI** —— 被  时**只导出纯函数**。
+ * ★ **只在「本文件被直接执行」时才跑 CLI** —— 被 import 时**只导出纯函数**。
  * （仓库的「新增门禁的做法」第 1 条：「导出纯函数（便于单测），**CLI 只是薄壳**」⇒
  *   ⇒ 若 import 就跑 CLI，单测一 import 就把审计跑了一遍 ⇒ ⇒ 副作用 ⇒ ⇒ 不可测。）
  */

@@ -1,5 +1,5 @@
 /**
- * `scripts/audit-tier-qualifiers.mjs` 的单测 —— 档位限定一致性审计。
+ * `scripts/audit-tier-qualifiers.ts` 的单测 —— 档位限定一致性审计。
  *
  * ★ 本文件的断言纪律（沿用仓库惯例）：
  *   · **每条正向断言都配一条反例**：反例不是「换个输入再看一遍」，而是**故意写出那个会错的写法**
@@ -8,8 +8,9 @@
  *   · 反例一律用**合成输入**（不动仓库里的真实文件）⇒ 测试可重复、且不会污染工作树。
  *   · **不写死快照数字**：期望值写成「真缺数 > 0」「自带档位数下降」这类**性质**。
  *   · ★ **额外守一条「白名单漂移」**：档位词表若被改坏（把弱词塞回强词表）⇒ 本文件立刻红。
- *   · ★ **额外守一条「声明漂移」**：`scripts/audit-tier-qualifiers.d.mts` 若漏声明了某个导出
- *     ⇒ 本文件立刻红 ⇒ ⇒ **类型声明与实现不会各走各的**。
+ *   · ★ **额外守一条「影子副本」**：本脚本已从 `.mjs` 改回 `.ts` 接门禁
+ *     ⇒ ⇒ **仓库里不许再出现 `.mjs` / `.d.mts` 形态的它**（否则「类型真相」会有两个）
+ *     ⇒ ⇒ 见下方 `★ 影子副本守卫`。
  *   · ★ **所有变异都走 `mustReplace`** ⇒ **变异若没生效就直接抛错**
  *     ⇒ ⇒ **「变异没生效 ⇒ 断言是空的」这种假绿被从根上堵死**
  *     （★ 主理人那封里「我第一次的变异无效、第二次才有效 ⇒ 这一步不能省」⇒ ⇒ **把它固化进测试**）。
@@ -27,7 +28,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -40,12 +41,17 @@ import {
   hasTier,
   isTableSeparator,
   renderAudit,
-} from '../../scripts/audit-tier-qualifiers.mjs';
+} from '../../scripts/audit-tier-qualifiers.js';
 
 const REPO_ROOT = fileURLToPath(new URL('../..', import.meta.url));
 const README_PATH = join(REPO_ROOT, 'docs/baseline/README.md');
-const IMPL_PATH = join(REPO_ROOT, 'scripts/audit-tier-qualifiers.mjs');
-const DECL_PATH = join(REPO_ROOT, 'scripts/audit-tier-qualifiers.d.mts');
+const IMPL_PATH = join(REPO_ROOT, 'scripts/audit-tier-qualifiers.ts');
+/** ★ 已被删除的两个旧形态（`.mjs` 实现 + 手写声明）⇒ **它们不许回来**。 */
+const RETIRED_PATHS = [
+  join(REPO_ROOT, 'scripts/audit-tier-qualifiers.mjs'),
+  join(REPO_ROOT, 'scripts/audit-tier-qualifiers.d.mts'),
+  join(REPO_ROOT, 'scripts/audit-two-layer.mjs'),
+];
 
 /**
  * 替换并**断言变异真的生效**。
@@ -140,7 +146,7 @@ function selfQualifiedCount(result: {
   return result.counts.adjudicated - result.counts.missing - result.counts.advisories;
 }
 
-describe('档位限定一致性审计（scripts/audit-tier-qualifiers.mjs）', () => {
+describe('档位限定一致性审计（scripts/audit-tier-qualifiers.ts）', () => {
   it('★ 白名单自检：弱词不得进强词表（漂移守卫）', () => {
     const overlap = STRONG_TIER_WORDS.filter((word) => WEAK_TIER_WORDS.includes(word));
     expect(overlap).toEqual([]);
@@ -153,16 +159,20 @@ describe('档位限定一致性审计（scripts/audit-tier-qualifiers.mjs）', (
     }
   });
 
-  it('★ 白名单自检：`.d.mts` 的声明必须覆盖 `.mjs` 的每一个导出（防声明漂移）', () => {
-    const impl = readFileSync(IMPL_PATH, 'utf8');
-    const decl = readFileSync(DECL_PATH, 'utf8');
-    const exported = [...impl.matchAll(/^export (?:const|function) ([A-Za-z0-9_]+)/gm)].map(
-      (match) => match[1] ?? '',
-    );
-    expect(exported.length).toBeGreaterThan(0);
-    for (const name of exported) {
-      expect(decl).toContain(name);
+  it('★ 影子副本守卫：`.mjs` 实现与手写 `.d.mts` 声明**都不许回来**', () => {
+    // ★ 为什么这条现在是「文件是否存在」而不是「声明覆盖导出」：
+    //   接门禁后脚本改回 `.ts` ⇒ **`tsc` 自己就是类型真相** ⇒ 手写声明成了**第二个真相源**
+    //   ⇒ ⇒ **两个真相源一定会漂**（旧的那条「声明漂移」断言只能发现「漏写」，发现不了「写错」）。
+    //   ⇒ ⇒ 故守「它们不存在」⇒ 有人把它们加回来（比如为了「纯 node 也能跑」）⇒ 本单测立刻红。
+    for (const retired of RETIRED_PATHS) {
+      expect(existsSync(retired), `${retired} 不该存在`).toBe(false);
     }
+    // ⇒ 且实现本身必须在 `.ts` 形态下**真的存在**（否则上面的断言会「因为都找不到」而全绿）
+    expect(existsSync(IMPL_PATH)).toBe(true);
+    const impl = readFileSync(IMPL_PATH, 'utf8');
+    expect(impl.length).toBeGreaterThan(0);
+    // ⇒ ★ shebang 守卫：带 shebang 的脚本**不能被 vitest import**（实测 SyntaxError）
+    expect(impl.startsWith('#!')).toBe(false);
   });
 
   it('★ 表头层：blockquote 里的表格（`> |---|`）也必须被认出来', () => {
@@ -269,10 +279,12 @@ describe('档位限定一致性审计（scripts/audit-tier-qualifiers.mjs）', (
     //   ⇒ ⇒ **这里把它跑一遍** ⇒ 它红 ⇒ 本单测就红 ⇒ **不会静默腐烂**。
     //   ⇒ ★ 注意：负控台跑的是**仓库里真实的 README**（不是合成输入）
     //   ⇒ ⇒ 所以它同时守住了「真实文档当前没有真缺」这条基线。
+    //   ⚠️ **走的是 CLI 薄壳**（不是 import）⇒ 这条同时守住「退出码接线」：
+    //     `runNegativeControls` 算对了、但 `main()` 没把 exitCode 设上 ⇒ 这条会红。
     const result = spawnSync(
       process.execPath,
-      [join(REPO_ROOT, 'scripts', 'audit-tier-qualifiers.negative-control.mjs')],
-      { encoding: 'utf8' },
+      ['--import', 'tsx', join(REPO_ROOT, 'scripts', 'audit-tier-qualifiers.negative-control.ts')],
+      { encoding: 'utf8', cwd: REPO_ROOT },
     );
     expect(result.status).toBe(0);
   });
