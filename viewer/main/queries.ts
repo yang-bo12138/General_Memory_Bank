@@ -26,19 +26,19 @@
 import type { SqlQueryName } from '../shared/sql-names.js';
 
 /**
- * 面板 4 的**边数硬上界**（两跳各取这么多条）。
+ * ★ **两个限额常量已搬到 `viewer/shared/limits.ts`**（阶段 5 · T03 的搬动，**不是**新增第二份）。
  *
- * ⚠️ 它是 `graphTwoHop` 的 `@nodeLimit` 的**唯一来源**：调用方不许自己传一个更大的数
- *   （`db-worker.ts` 会把外部传进来的值钳到它以内）。
- */
-export const GRAPH_NODE_LIMIT = 300;
-
-/**
- * 面板 6 的**页大小**（设计 §六 T04：「50 版分页」）。
+ * ⚠️ **为什么搬**：面板（`viewer/renderer/**`）也必须知道这两个数
+ *   （面板 6 算 `offset = 页号 × 页大小`；面板 4 要显示「仅显示前 N 条边」），
+ *   而设计明写「SQL 常量不该出现在 renderer 的产物里（哪怕它只是字符串）」，
+ *   且 `renderer` 与 `main` 是**兄弟层**、不互相 import
+ *   ⇒ 数字下沉到最左层的 `shared/`，本文件改成 **re-export**。
  *
- * ⚠️ 与 `GRAPH_NODE_LIMIT` 同理：它是 `contentHistoryPage` 的 `@limit` 的唯一来源。
+ * ⚠️ **re-export 不是第二份定义**（与 `src/core/decay.ts` 里 `MS_PER_DAY` 的做法同款）：
+ *   `GRAPH_NODE_LIMIT` / `CONTENT_HISTORY_PAGE_SIZE` 的**唯一定义**在 `shared/limits.ts`，
+ *   这里只是把旧路径保住，免得 `db-worker.ts` 与既有测试的 import 同时断掉。
  */
-export const CONTENT_HISTORY_PAGE_SIZE = 50;
+export { CONTENT_HISTORY_PAGE_SIZE, GRAPH_NODE_LIMIT } from '../shared/limits.js';
 
 /**
  * ★ 三条查询的 SQL 常量。
