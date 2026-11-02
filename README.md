@@ -22,8 +22,12 @@ pnpm build       # 构建产物（tsup：CJS + ESM + d.ts）
 > 公开面 **23 个方法**（§3.1 的归位表：阶段 1~5 全挂上）。
 > 另外交付两个**不在发布产物里**的可执行形态：Electron 只读观察器（`viewer/`，七个面板）与
 > MCP Server（`mcp/`，10 个工具）—— 它们的依赖全是 `devDependencies`，`dist/` 仍只有 `index.*`。
-> ⚠️ **两条性能硬门槛仍红**（H1 = 12,782 行，是门槛的 6.39 倍）⇒ 归「**向量路接线前必须还**」，
-> 与阶段 5 的范围无关。
+> ★ **矢量路已接进 `recall()`**（2026-11-03 · PR #6）：`fromVector` / `cos` / `vectorPart` / `vectorUsed`
+> 第一次可以非零 ⇒ 阶段 2 的 §4.6 步骤 2c 欠账已清偿。
+> ⚠️ **但两条性能硬门槛仍然红**（H1 = 12,782 行 = 门槛的 6.39 倍）—— **接线不会让它们转绿**，
+> 只会让它们第一次测到真东西（该读数本来就是「带向量路的一次召回读多少行」）。
+> ⇒ 当前未还的全部清单（性能 / 功能 / 既有缺陷 / 覆盖空洞 / 环境）见
+> [`docs/progress/vector-round-progress.md`](docs/progress/vector-round-progress.md) §四。
 > ⇒ 逐任务状态、验收证据、**断言判别力审计**、遗留清单与**下一步起点**见
 > [`docs/progress/stage5-progress.md`](docs/progress/stage5-progress.md) §九（阶段 4 / 3 的账分别在
 > [`stage4-progress.md`](docs/progress/stage4-progress.md) / [`stage3-progress.md`](docs/progress/stage3-progress.md)），
