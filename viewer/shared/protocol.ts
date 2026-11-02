@@ -230,5 +230,67 @@ export type WorkerResponse =
   | { id: number; ok: true; data: unknown }
   | { id: number; ok: false; error: WorkspaceError };
 
+/**
+ * ★ **`ipc.ts` ↔ `preload/index.ts` 之间的信封**。
+ *
+ * ⚠️ **为什么 `ipcMain.handle` 必须返回信封而不是直接抛错**：
+ *   Electron 把 `handle` 里抛出的 `Error` 序列化成**一个字符串**交给渲染进程
+ *   —— `code` / `details` 全部丢失 ⇒「错误码 + details」这条硬要求（设计 §7.2）
+ *   在真实 IPC 上根本做不到。
+ *   ⇒ 主进程**不抛**，改成返回 `{ ok: false, error }`；`preload` 再把它变回一个拒绝。
+ *
+ * ⚠️ 信封的两个分支与 `WorkerResponse` 同形**不是巧合**：它们夹的是同一类信息，
+ *   只是跨的边界不同（worker_threads ↔ Electron IPC）。
+ *   ⚠️ 但**不要**把两者合并成一个类型：worker 那条带 `id`（请求配对），这条不带；
+ *     合并会让「id 从哪来」变得模糊。
+ */
+export type ReadEnvelope<T> = { ok: true; data: T } | { ok: false; error: WorkspaceError };
+
 /** 面板 5 的分页大小（`logs()` 的默认 `limit`）。 */
 export const LOG_PAGE_SIZE = 200;
+
+/**
+ * ★ 把「任意异常」还原成 `WorkspaceError`（**跨进程边界两侧共用**）。
+ *
+ * ⚠️ 为什么必须有它：`contextBridge` / `postMessage` 都会**克隆**错误对象，
+ *   `Error` 只保留 `message` / `stack` ⇒ `code` / `details` 静默消失。
+ *   ⇒ 跨边界的发送方把三者序列化进 `message`，接收方用本函数还原：
+ *     ① 先看属性（同进程、测试、假端口这几种情况下属性都在）；
+ *     ② 再看 `message` 里那串 JSON（真实 Electron 下这是唯一还活着的载体）；
+ *     ③ 都没有 ⇒ 兜底成 `DATABASE_BUSY` + `details.reason = 'unreadable_error'`
+ *        —— **排障信息不丢**（原文进 `message` / `details`），只是「码」这一层被归一。
+ *
+ * ⚠️ 面板**不该**自己 `catch` 后读 `error.code`：那在真实 Electron 下是 `undefined`。
+ *   统一走本函数（设计 §7.2：错误呈现只在一处实现）。
+ */
+export function asWorkspaceError(error: unknown): WorkspaceError {
+  const candidate = error as { code?: unknown; message?: unknown; details?: unknown } | null;
+
+  if (candidate !== null && typeof candidate === 'object' && typeof candidate.code === 'string') {
+    return {
+      code: candidate.code,
+      message: typeof candidate.message === 'string' ? candidate.message : '',
+      details:
+        candidate.details !== null && typeof candidate.details === 'object'
+          ? (candidate.details as Record<string, unknown>)
+          : {},
+    };
+  }
+
+  const message = error instanceof Error ? error.message : String(error);
+  try {
+    const parsed = JSON.parse(message) as Partial<WorkspaceError>;
+    if (typeof parsed.code === 'string') {
+      return {
+        code: parsed.code,
+        message: typeof parsed.message === 'string' ? parsed.message : message,
+        details:
+          parsed.details !== null && typeof parsed.details === 'object' ? parsed.details : {},
+      };
+    }
+  } catch {
+    // 不是那串 JSON ⇒ 落到下面的兜底
+  }
+
+  return { code: 'DATABASE_BUSY', message, details: { reason: 'unreadable_error' } };
+}

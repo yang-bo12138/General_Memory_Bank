@@ -52,3 +52,18 @@ export interface SqlQueryParams {
   /** 面板 6：聚合恒一行 ⇒ `limit` 传 `1`（见接口上的说明）。 */
   contentHistoryCount: { memoryId: string; limit: number };
 }
+
+/**
+ * ★ 类型守卫：判断一个 `unknown` 是不是合法的查询名。
+ *
+ * ⚠️ 它放在这里（而不是 `viewer/main/db-worker.ts`）的理由是**进程边界**：
+ *   `ipc.ts` 也要判它（IPC 收的是 `unknown`），而 `ipc.ts` **不能 import `db-worker.ts`**
+ *   —— 后者 import 了 `better-sqlite3` 且会在模块顶层挂 `parentPort` 监听
+ *   ⇒ 主进程顺着这个 import 把原生模块也加载进来了（「库句柄只在库线程」这条当场破功）。
+ *   ⇒ 判据跟着名字表走，跟着 SQL 文本留在 `viewer/main/` 那边。
+ *
+ * ⚠️ 它是**运行期**守卫，不是类型：IPC 没有类型，`unknown` 必须在边界上被真的检查。
+ */
+export function isSqlQueryName(value: unknown): value is SqlQueryName {
+  return typeof value === 'string' && (SQL_QUERY_NAMES as readonly string[]).includes(value);
+}
