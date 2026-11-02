@@ -1,7 +1,7 @@
 # 阶段 4（P4 · 生命周期 / 事件重放 / 可观测性）进度与交接账
 
 > 时点：2026-11-02（Asia/Shanghai）· 分支 `feat/p4-lifecycle`（基于阶段 3 收官点 `3d477d8` 之后的门禁收尾提交）
-> 门禁：`pnpm run verify` **EXIT=0**（**14 段链**）· 测试 **67 文件 / 1,193 条断言**
+> 门禁：`pnpm run verify` **EXIT=0**（**14 段链**）· 测试 **67 文件 / 1,194 条断言**
 > ⚠️ **本文件是阶段 4 的交接文档**：读完它应当能直接接手阶段 5，不需要回放对话。
 >
 > ⚠️ **分层纪律（沿用阶段 2/3）**：**实测层** = 有落盘数据 / 可复制命令支撑的数字；
@@ -107,7 +107,8 @@
 ## 七、验收结论
 
 - **门禁**：`pnpm run verify` **EXIT=0**（14 段：typecheck → lint → test → 8 条契约 → 3 条文档审计）。
-- **测试**：**67 文件 / 1,193 条断言**全绿（阶段 3 是 55 / 1,082 ⇒ 本轮 **+12 文件 / +111 断言**）。
+- **测试**：**67 文件 / 1,194 条断言**全绿（阶段 3 是 55 / 1,082 ⇒ 本轮 **+12 文件 / +112 断言**）。
+  ⚠️ 其中 **1 条**来自 #4 的「宿主无关守卫」⇒ 与 §八 的 1,193 差 1，原因见 **§九.2**（不是笔误）。
 - **构建**：`pnpm run build` 通过（ESM / CJS / d.ts）。
 - **公开面**：22 个方法（§3.1 的阶段 4 八个**全部挂上**，无空壳）。
 - **策略**：`content_history` **不裁剪**（决策记录在 `docs/decisions/`）。
@@ -122,5 +123,83 @@
   + 1 个唯一脱敏实现（`redact`）+ 1 个归档缓存模块（`archival`）+ 2 个工具（`tools/replay` / `tools/verify`）；
   ② 门面加 8 个方法（含 `close` / `rebuildArchivalSchedule`），公开面 14 → 22；
   ③ 新增 2 个运维脚本（`scripts/backup.ts` / `bench/regression/weights.ts`）与 1 份 runbook；
-  ④ 门禁 14 段全绿；测试 67 / 1,193。
+  ④ 门禁 14 段全绿；测试 67 / 1,193（**本条是当时读数**；合入 #4 后为 67 / 1,194，见 §九.2）。
   ⚠️ **未做**：`src/vector/**` 与 `bench/perf.ts` 一行未动；百万级重采未跑（见 §六）。
+
+---
+
+## 九、★★ 2026-11-02 · **交付留底**：三条分支 / 三个 PR / 复验读数
+
+> 本节是**交付侧**的账（§一~§八 记的是「代码做了什么」，本节记「它被验证到什么程度、现在挂在哪」）。
+> 全部读数来自**本轮实跑**，不是转抄前文。
+
+### 9.1 三个 PR（栈式，按顺序合）
+
+| PR | 分支 | 内容 | 去向 | CI（门禁 / 构建） |
+|---|---|---|---|---|
+| **#4** | `fix/storage-media-win-path` | 修 `main` 上**一直红**的 CI：`detectWindowsMedia()` 用宿主平台的 `path.parse` 取盘符 | `main` | ✅ success / ✅ success |
+| **#2** | `feat/p3-audit-gate` | P3 尾巴：三条文档审计接进 `verify`（第 12~14 段） | `main` | ✅ success / ✅ success |
+| **#3** | `feat/p4-lifecycle` | **本阶段**：T01~T08 全量落地 | `feat/p3-audit-gate` | ✅ success / ✅ success |
+
+**合并顺序必须是 #4 → #2 → #3**，理由不是流程洁癖：
+- #4 修的是 **`main` 上就存在**的缺陷（`main` 最近 5 次 CI 全红）⇒ 不先合它，#2/#3 的 CI 也会红，**看不清是谁的错**；
+- #2 改的是**门禁形状**（11 段 → 14 段）⇒ #3 的 `EXPECTED_GATE_COMMANDS` 断言依赖它，反过来合会让 #2 红；
+- #3 的 base 是 `feat/p3-audit-gate` ⇒ #2 合入后 GitHub 会自动把目标改成 `main`，diff 就只剩阶段 4 的改动。
+
+**祖先链已核对**（`git merge-base --is-ancestor` 三对全部 YES，且每段恰好 **+1 提交**）：
+
+```
+main ──(+1)── fix/storage-media-win-path ──(+1)── feat/p3-audit-gate ──(+1)── feat/p4-lifecycle
+```
+
+### 9.2 本地复验读数（本轮实跑，2026-11-02）
+
+| 项 | 命令 | 读数 |
+|---|---|---|
+| 门禁 | `pnpm run verify` | **EXIT=0** · **14 段链**（typecheck → lint → test → 8 条契约 → 3 条文档审计） |
+| 测试 | 同上（链内第 3 段） | **67 文件 / 1,194 断言全部通过** · 0 skip · 0 only |
+| 构建 | `pnpm run build` | **EXIT=0** · ESM 317.40 KB / CJS / `index.d.ts` 139.73 KB |
+| 档位审计 | `audit:tier-qualifiers` | 判 **121** 处 · 自带档位 **97** · 提示 **24** · **真缺 0** |
+| 两层次审计 | `audit:two-layer` | 触发 **102** 行 · 落跨档语境 **32** · **真缺 0** |
+| 负控台 | `audit:negative-control` | A/B/C 三档**全部符合预期**（B 真缺 10 / C 真缺 99 ⇒ 有分辨力） |
+
+> ⚠️ **1,194 比 §八 日志里的 1,193 多 1 条**，不是笔误：多出来的是 #4 加的
+> 「**宿主无关守卫**」（断言实现里用 `win32.parse(targetPath)`、且不出现裸 `parse(targetPath)`）。
+> 三条 PR 全合之后，`main` 上的正确读数就是 **67 / 1,194**。
+> ⇒ ⇒ **记这一笔的理由**：本仓库已经因为「抄了个会过期的数」踩过 13 次（`stage3-progress.md` §13.9），
+> 所以数字对不上时必须写清**差在哪一条**，而不是悄悄改一个数。
+
+### 9.3 环境限制（**已绕过，但下一个人该知道**）
+
+| 限制 | 现象 | 怎么绕的 |
+|---|---|---|
+| **无 `gh` CLI** | `gh --version` → not found | 从凭据管理器取 token（`git credential fill`），走 GitHub REST API 建 PR |
+| **`github.com:443` 整站不可达**，`api.github.com` 正常 | `git push` 超时；`curl https://github.com` 无响应 | 用 REST API 建 `blobs → trees → commits → refs`；**用 tree 的 sha 与本地逐值比对**证明内容一致（三个树全部相等） |
+| Windows 版 `curl` 读不到 MSYS 的 `/tmp` 路径 | `--data-binary @/tmp/x.json` 报文件不存在 | 改成 `cat file \| curl --data-binary @-` |
+
+⚠️ **因此远端 commit sha 与本地不同**（committer / 时间戳不同，**内容一致**）。
+联网恢复后跑一次对齐（不产生新提交，只移动本地指针）：
+
+```bash
+git fetch origin
+git branch -f fix/storage-media-win-path origin/fix/storage-media-win-path
+git branch -f feat/p3-audit-gate     origin/feat/p3-audit-gate
+git branch -f feat/p4-lifecycle      origin/feat/p4-lifecycle
+```
+
+### 9.4 复验入口（**别人想自己确认时，跑这三条就够**）
+
+```bash
+pnpm install
+pnpm run verify        # 期望 EXIT=0，末尾回显「14 段」与两个审计的「真缺 0」
+pnpm run build         # 期望 EXIT=0
+```
+
+⇒ 若 `verify` 红，**先看是哪一段**：第 12~14 段红是**文档措辞**问题（不是代码），第 1~3 段红才是代码 / 类型问题
+（这个区分很实用：本轮我自己写 §六 时就被第 13 段判红过一次）。
+
+### 9.5 本节**没有**改变的事实
+
+- `src/**` 一行未动（本节只写文档）；`tests/**` 一行未动。
+- §六 的「未达成清单」**一条都没变**：H1 / H2 仍红、矢量路仍未接线、缺陷①②③仍在、百万级 perf 未按实测口径重采。
+- **三个 PR 都没有合入 `main`** —— 合并是主理人的决定，本节只负责把「验证到哪一步」记录下来。

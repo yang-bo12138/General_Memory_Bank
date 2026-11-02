@@ -5,7 +5,7 @@
 
 **仓库**：https://github.com/yang-bo12138/General_Memory_Bank
 
-**★ 阶段 4 收官**（阶段 3 的收官点是 `a121951`）· `pnpm run verify` **EXIT=0**（**67 文件 / 1,193 断言**）
+**★ 阶段 4 收官**（阶段 3 的收官点是 `a121951`）· `pnpm run verify` **EXIT=0**（**67 文件 / 1,194 断言**）
 
 > ⚠️ **本文件只记「当前状态」** ⇒ 阶段 1 / 阶段 2 的完整交付总结已归档到
 > `docs/progress/stage0-stage1-progress.md` 与 `docs/progress/stage2-progress.md` ⇒
@@ -100,7 +100,7 @@ const reason = result.skipped;       // 'too_soon' | 'disabled' | null
 | **阶段** | **阶段 4 收官**（生命周期 / 事件重放 / 可观测性，8 任务） |
 | **门禁** | `pnpm run verify` **EXIT=0** —— **14 段链**：typecheck → lint → test → 8 条契约脚本 → **3 条文档审计** |
 | **构建** | `pnpm run build` 通过（ESM / CJS / d.ts 三个产物） |
-| **测试** | **67 文件 / 1,193 断言** |
+| **测试** | **67 文件 / 1,194 断言**（其中 1 条是 #4 的宿主无关守卫 ⇒ 口径见 `stage4-progress.md` §九.2） |
 | **源码 `src/`** | **60 个 `.ts` / 21,194 行**（不含测试） |
 | **测试 `tests/`** | **78 个 `.ts` / 32,930 行** |
 | **门禁与审计脚本 `scripts/`** | **16 个**（8 条契约 + **3 条文档审计（已接门禁）** + 1 个负控台 + `check-gate-entry` + `capture-golden` + **`backup.ts`** + `verify_errata_writeback.py`） |
