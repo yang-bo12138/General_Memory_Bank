@@ -22,6 +22,8 @@
  * ⚠️ **本文件在 verify 链里**（秒级 ⇒ **不执行任何真实命令** ⇒ 不 spawn PowerShell）✓
  */
 
+import { readFileSync } from 'node:fs';
+
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -112,6 +114,20 @@ describe('bench · 存储介质探测的契约（不依赖真实硬件）', () =
     expect(probe('Unspecified')).toBe('unknown');
     // ⚠️ **总线兜底**：介质说不清、但总线明确是 NVMe ⇒ 才认 NVMe。
     expect(probe('Unspecified', 'NVMe')).toBe('NVMe');
+  });
+
+  it('★ 宿主无关守卫：Windows 分支必须用 `win32.parse`（不能跟着宿主平台走）', () => {
+    // ⚠️ **这条守卫的由来**（一次真实事故，2026-11-02）：
+    //   实现里原本用 `parse(targetPath)`（= `node:path` 的**宿主平台**版本）
+    //   ⇒ 在 Ubuntu 的 CI 上 `parse('D:/probe-target').root === ''`
+    //   ⇒ `driveLetter === ''` ⇒ **直接返回 `unknown`**，那个分支**连 mock 都没被调到**
+    //   ⇒ ⇒ 本文件上面那条「Windows：MediaType 的四个取值都判对」**在 main 上红了 5 次**，
+    //     而**在开发机（Windows）上永远是绿的**。
+    // ⇒ 判据落在这里：**「平台可注入」的实现不能读宿主平台**（`platform` 注入才有意义）。
+    const source = readFileSync(new URL('../../bench/lib/harness.ts', import.meta.url), 'utf8');
+    expect(source).toContain('win32.parse(targetPath)');
+    // 反例：`parse(targetPath)`（不带 `win32.`）出现 ⇒ 又变回宿主相关 ⇒ 红
+    expect(/(?<!win32)\.parse\(targetPath\)/.test(source)).toBe(false);
   });
 
   it('★ **Linux：`rota` 判 HDD / 固态，`tran` 判 NVMe**', () => {
