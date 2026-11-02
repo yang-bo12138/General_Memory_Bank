@@ -40,7 +40,12 @@ import { clusters, recluster } from '../../src/store/clusters.js';
 import { EventWriter } from '../../src/store/events.js';
 import { recall } from '../../src/store/recall.js';
 import { touch } from '../../src/store/touch.js';
+import { resolveRecallVectorPort } from '../../src/store/vectorPort.js';
 import { MemoryLogger } from '../../src/util/log.js';
+// ⚠️ **为 D7 的正控**（`flat` + 传向量 ⇒ 必须产出）：给一条记忆真的写一个向量。
+//   用 `vectorToBlob()` 而不是手搓 Buffer —— 它就是 `memories.embedding` 的同一个编解码口径
+//   （C36：同一件事不得有两套实现）。
+import { vectorToBlob } from '../../src/vector/centroids.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 一、基线组与「等价对象」的构造
@@ -674,10 +679,37 @@ describe('P3-T06 · 开关逐条复验 ④ `ARCHIVAL_CACHE`（归档缓存）', 
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe("P3-T06 · 开关逐条复验 ⑤ `VECTOR_ROUTER='flat'`（向量路）", () => {
-  it('★ `flat` ⇒ 向量路**不产出** `fromVector` 的候选，`cos` 恒 `null`（与 v1.0 的向量路缺席口径一致）', () => {
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ★ 阶段 5 · P2-T10 按 **设计 D7** 改的是**口径**，不是断言
+  //
+  // 原口径（阶段 3 写的）：「`flat` ⇒ 向量路**不产出** `fromVector` 的候选」。
+  // 接线后的正确口径：「`flat` **且不传** `queryEmbedding` ⇒ 不产出」。
+  //
+  // ⚠️ **为什么这不是「为让测试过而改测试」**（设计 D7 的三条判别标准，逐条对照）：
+  //   ① **断言的操作对象变了没有？** 没变。仍是「这些 hit 的 `fromVector` 是否全为 `false`」
+  //      与「`cos` 是否恒 `null`、`vectorPart` 是否恒 0」——比较的量一个都没换。
+  //   ② **断言的覆盖范围变小了没有？** 没变小，**反而变大**：本 describe 里新增了一条**正控**
+  //      （`flat` + 传 ⇒ 必须产出 `fromVector` / `cos` / `vectorPart`），
+  //      于是「flat 到底产不产出」两个方向都有断言，而以前只有「不产出」一个方向。
+  //   ③ **改动的依据是测试还是设计稿？** **设计稿**：§4.6 步骤 0 明写「未命中 `ROUTER_MIN_TRAINING`
+  //      ⇒ 走 flat」、§5 对 `VECTOR_ROUTER='flat'` 的原文是「强制全表精确扫描，v1.0 做法」，
+  //      而 `ROUTER_MIN_TRAINING` 的原文写着「低于它不建分桶，**向量路走 flat**」并标注
+  //      「**设计内行为，不是故障**」⇒ 若 flat 不产出，则「1 万条以下的库**永远**拿不到那 0.25 权重」，
+  //      而「库小所以没有语义能力」这件事在设计稿里**根本不存在**（小库只是慢，不是瞎）。
+  //      ⇒ 是**断言的口径落后于设计稿**，不是设计迁就断言。
+  //
+  // ⚠️ **原断言的标题把两个独立变量混成了一个因果**：`flat`（用哪个后端）与
+  //   「有没有查询向量」（跑不跑）是**两件事**。接线后的正确口径是
+  //   「**`queryEmbedding` 是开关，`mode` 只决定用哪个后端**」。
+  // ⚠️ **本文件那条断言为什么「以前也对」**：基线语料**从不写 `embedding`**，且本调用
+  //   **不传 `queryEmbedding`**（阶段 5 之前全仓库没有任何一处传它）⇒ 接线后它**仍然成立**。
+  //   变的只是**理由**：不再是「flat 模式禁止向量路」，而是「**没人给查询向量**」。
+  // ═══════════════════════════════════════════════════════════════════════════
+  it('★ `flat` **且不传** `queryEmbedding` ⇒ 向量路**不产出** `fromVector` 的候选，`cos` 恒 `null`（与 v1.0 的向量路缺席口径一致）', () => {
     const flat = makeStore({ ...BASELINE_GROUP, VECTOR_ROUTER: 'flat' });
     seedAssociationWorld(flat.db);
 
+    // ⚠️ **刻意不传 `queryEmbedding`**：这就是「跑不跑」的那个开关（D7 / D2）。
     const result = recall(flat.store, { context: '猫粮品牌', now: NOW });
 
     // ── 断言①：**没有一条候选来自向量路** ──
@@ -689,6 +721,58 @@ describe("P3-T06 · 开关逐条复验 ⑤ `VECTOR_ROUTER='flat'`（向量路）
       expect(hit.breakdown?.cos ?? null).toBeNull();
       expect(hit.breakdown?.vectorPart ?? 0).toBe(0);
     }
+    // ── 断言③（新增）：`explain.routes.vector` 也必须是「整路缺席」那一格 ──
+    //   ⚠️ 它把**理由**钉在「这一路没跑」上，而不是「跑了但没产出」（两者在 `fromVector` 上同形，
+    //     只有 `ran` 能区分 —— 设计 D5 的 A 行 vs C 行）。
+    const explained = recall(flat.store, { context: '猫粮品牌', now: NOW, explain: true });
+    expect(explained.explain?.routes.vector).toEqual({ ran: false, candidates: 0 });
+  });
+
+  it('★ **正控**（D7 新增）：`flat` **且传** `queryEmbedding` ⇒ 必须产出 `fromVector` / `cos` / `vectorPart`', () => {
+    const flat = makeStore({ ...BASELINE_GROUP, VECTOR_ROUTER: 'flat' });
+    seedAssociationWorld(flat.db);
+
+    // ── 给一条记忆写一个与查询向量**完全相同**的向量 ⇒ 余弦恰好 1（≥ `VECTOR_MIN_COS`）──
+    //   ⚠️ **必须真的写向量**：基线词表里的记忆都没有 `embedding`
+    //     ⇒ 不写的话「向量路整路空」也是合法结果 ⇒ 这条正控会变成空气。
+    //   ⚠️ 单位向量（只有第 0 个分量是 1）⇒ 点积就是 1，不依赖归一化实现。
+    const queryEmbedding = new Array<number>(DEFAULT_PARAMS.EMBED_DIM).fill(0);
+    queryEmbedding[0] = 1;
+    flat.db
+      .prepare('UPDATE memories SET embedding = ? WHERE id = ?')
+      .run(vectorToBlob(new Float32Array(queryEmbedding)), 'v-1');
+
+    // ⚠️ **本文件手搭的 `store` 里没有 `vector` 字段**（它模拟的是「手工构造 `RecallStore` 的调用方」）
+    //   ⇒ 正向这一步必须**真的装配一个端口**，否则 `ran` 恒 `false`
+    //     （那正是接线之前的状态：`queryEmbedding` 传了也没人接）。
+    const port = resolveRecallVectorPort(flat.db, flat.store.params, {
+      centroids: () => ({ coarse: [], fine: [] }),
+      embeddedAtLeastThreshold: () => false,
+      markEmbeddedAtLeastThreshold: () => undefined,
+    });
+    expect(port, '显式 flat ⇒ 端口必然存在').not.toBeNull();
+    if (port === null) {
+      return;
+    }
+
+    const result = recall(
+      { ...flat.store, vector: port },
+      { context: '猫粮品牌', queryEmbedding, now: NOW, explain: true },
+    );
+
+    // ── 前提自检：向量路**真的跑了**（不是「跑了但零候选」）──
+    expect(result.explain?.routes.vector.ran).toBe(true);
+    expect(result.explain?.routes.vector.candidates).toBeGreaterThanOrEqual(1);
+
+    const vectorsourced = result.hits.filter((hit) => hit.fromVector);
+    expect(vectorsourced.length).toBeGreaterThanOrEqual(1);
+    // ── 那条命中的 `cos` 与 `vectorPart` 都必须**有值**（不是 `null` / 0）──
+    for (const hit of vectorsourced) {
+      expect(hit.breakdown?.cos).not.toBeNull();
+      expect(hit.breakdown?.vectorPart).toBeGreaterThan(0);
+    }
+    // ── 负控：`v-1` 必须在这批里（写了向量的就是它）──
+    expect(vectorsourced.some((hit) => hit.id === 'v-1')).toBe(true);
   });
 });
 

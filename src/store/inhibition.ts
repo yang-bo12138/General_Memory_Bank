@@ -26,10 +26,26 @@ import {
 } from '../neuron/inhibit.js';
 import { type RecallStore, clampTopN, collectScoredCandidates } from './recall.js';
 
-/** `inhibitionTrace` 的入参（§6：`options?: { now?: number }`）。 */
+/** `inhibitionTrace` 的入参（§6 的 `options?: { now?: number }` + 阶段 5 的 `queryEmbedding`）。 */
 export interface InhibitionTraceOptions {
   /** 注入时钟（C37）。 */
   now?: number;
+  /**
+   * 查询向量（**未归一化**，与 `RecallOptions.queryEmbedding` **同一个口径**）。
+   *
+   * ⚠️ ★ **必须与那一次 `recall` 传同一条**，否则本方法在 §6 的
+   *   「`baseScore` 与 `Hit.score` **逐位一致**」这条承诺下**给不出可比的数**：
+   *   trace 不含 `0.25 × vectorSim`、recall 含 ⇒ 差额 ∈ `[0, SCORE_WEIGHTS.vectorSim]`。
+   *   ⇒ 忘记传的症状是「trace 的分数普遍略低于 recall」，**不报错**（RK-8）。
+   * ⚠️ **不传 ⇒ 行为与本设计之前完全一致**（向量路整路缺席）：
+   *   这正是「既有调用方零影响」的那一层，也是它可以被默认安全忽略的原因。
+   * ⚠️ **为什么加在这里而不是让调用方「去掉向量再问一次」**：
+   *   去掉向量之后的那次打分**对不上任何一次真实召回** ⇒ 诊断输出失去意义
+   *   （那正是 §6 引入本方法时要消除的那种漂移）。
+   * ⚠️ **它不破坏公开契约**：公开面的承诺是「**23 个方法**」（方法名集合），
+   *   加一个**可选**字段既不改方法名、也不改方法数。
+   */
+  queryEmbedding?: number[];
 }
 
 /** 候选集里的一条（§6 的 `inhibitionTrace` 返回形状）。 */
@@ -75,9 +91,9 @@ export interface InhibitionTraceResult {
  * ⚠️ **名额用 `RECALL_TOP_N` 的默认值**（并经**同一个** `clampTopN()` 钳制）
  *   ⇒ `selected` 与 `recall({ context })` 的 hits **同口径**。
  *
- * @param store 库句柄 + 生效参数
+ * @param store 库句柄 + 生效参数（+ 可选的向量端口，由门面装配）
  * @param context 召回上下文（与 `recall` 完全相同的入参）
- * @param options 可选（注入时钟）
+ * @param options 可选（注入时钟 + 查询向量）
  * @returns 候选集的抑制诊断
  */
 export function inhibitionTrace(
@@ -90,12 +106,16 @@ export function inhibitionTrace(
   const topN = clampTopN(undefined, params.RECALL_TOP_N);
 
   // ⚠️ **走与 `recall` 同一段打分代码**（§6）⇒ `baseScore` 逐位相同。
+  // ⚠️ **`queryEmbedding` 原样透传**（D8）：两边传同一条 ⇒ 逐位相等；
+  //   只有 recall 传 ⇒ 差额 ∈ `[0, 0.25]`（那正是「有没有这条证据」的差）。
+  // ⚠️ **`exactOptionalPropertyTypes` ⇒ 条件展开**（显式 `undefined` 与「没这个属性」不同）。
   const pipeline = collectScoredCandidates(store, {
     context,
     entityIds: undefined,
     entityNames: undefined,
     includeArchived: false,
     now: at,
+    ...(options?.queryEmbedding === undefined ? {} : { queryEmbedding: options.queryEmbedding }),
   });
 
   const facts: InhibitionCandidate[] = loadInhibitionFacts(store.db, pipeline.scored);
