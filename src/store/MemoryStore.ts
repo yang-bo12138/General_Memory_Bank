@@ -3,7 +3,8 @@
  * （阶段 1 的 10 个方法 + 阶段 2 的 `rebuildVectorBuckets`
  *   + 阶段 3 的 `inhibitionTrace` / `recluster` / `clusters`
  *   + **阶段 4 的 8 个**：`forget` / `restore` / `updateContent` / `setParams` /
- *     `stats` / `sweep` / `close` / `rebuildArchivalSchedule`）。
+ *     `stats` / `sweep` / `close` / `rebuildArchivalSchedule`
+ *   + **阶段 5 的 1 个**：`verifyIntegrity`）。
  *
  * ⚠️ **本文件只做「委托」，一行业务逻辑都没有**（§14.3 边界原则 1：
  *   「每个承诺都要能指到唯一代码路径」）：
@@ -21,10 +22,10 @@
  *   · **阶段 3 的 3 个**：`inhibitionTrace`（§4.13 的抑制诊断；P3-T02 落地）/
  *     `recluster`（§4.12.3 的簇重算；P3-T03 落地）/
  *     `clusters`（§4.12 的簇导航；P3-T05 落地）。
- * ⇒ **不提前实现阶段 5 的 `verifyIntegrity`**（它由 `src/tools/verify.ts` 提供，
- *   但**不挂在门面上**——阶段 5 才挂）：
- *   每多一个公开方法都是一次**公开承诺**，而 §6 的 23 个方法分属阶段 1~5
- *   ⇒ 门面只承诺**已落地阶段**的那几个，其余的等各自阶段落地时再加
+ *   · **阶段 5 的 1 个**：`verifyIntegrity`（§9.4.4 的护栏①②；P5-T06 落地）——
+ *     ⚠️ ★ 它是**纯读**（不写表、不记事件）⇒ 只读实例上**必须可用**
+ *     （§7.1 的查看器要能看护栏报告）；**别把它当成写方法**（P5-T06 的常见坑）。
+ * ⇒ 门面只承诺**已落地阶段**的那几个，其余的等各自阶段落地时再加
  *   （**导出了却没实现 = 空承诺，比不导更糟**）。
  * ⇒ **「已落地阶段的方法集合 == 公开面」这条不变量由门禁守着**：
  *   `tests/contracts/export-surface.test.ts` 的「§6 方法逐阶段清单」断言
@@ -81,6 +82,8 @@ import {
   MemoryMaintainer,
   type RebuildBucketsOptions,
   type RebuildBucketsResult,
+  type VerifyIntegrityReport,
+  verifyIntegrityReport,
 } from './maintain.js';
 import { pin as pinImpl, unpin as unpinImpl } from './pin.js';
 import { type RecallOptions, type RecallResult, recall as recallImpl } from './recall.js';
@@ -197,7 +200,8 @@ function ensureSchemaForMode(db: Database.Database, readonly: boolean): void {
  * 门面 —— 库对外的唯一入口（§6）。
  *
  * ⚠️ **只暴露已落地阶段的公开方法**（阶段 1 的 10 个 + 阶段 2 的 `rebuildVectorBuckets`
- *   + 阶段 3 的 `inhibitionTrace` / `recluster` / `clusters`），
+ *   + 阶段 3 的 `inhibitionTrace` / `recluster` / `clusters`
+ *   + 阶段 4 的 8 个 + 阶段 5 的 `verifyIntegrity`），
  *   其余全是私有字段：
  *   公开面每多一个名字就是一次公开承诺（§14.3 原则 1），
  *   而 §6 的 23 个方法分属阶段 1~5 ⇒ 只承诺**已落地**的那几个。
@@ -741,6 +745,31 @@ export class MemoryStore {
       at,
     );
     return { scanned, repaired };
+  }
+
+  /**
+   * 一致性自检 —— §6 的 `verifyIntegrity(options?)`（§9.4.4 的护栏①②，P5-T06）。
+   *
+   * ⚠️ ★ **纯读**：不写任何表、不记事件 ⇒ **只读实例上必须可用**
+   *   （§7.1 的查看器要能看护栏报告；把它归成写方法是 P5-T06 的常见坑）。
+   * ⚠️ ★ **`deep` 只加检、不改口径**：五个字段的取值与 `deep` 无关
+   *   （否则「与 `stats()` 同名字段恒等」这条断言会因开关而破）；
+   *   `deep: true` 只是**额外**跑两条 PRAGMA，问题只进日志（见 `verifyIntegrityReport()`）。
+   * ⚠️ **它不修任何东西**：发现偏移后的修复动作是 `rebuildArchivalSchedule()` /
+   *   `rebuildVectorBuckets()`（护栏③）—— 自检与修复**分开**，才能「先看再修」。
+   *
+   * @param options `deep`（是否做额外的库级深检）
+   * @returns §6 的五个字段（归档两项 / 桶覆盖率 / 簇快照新鲜度 / 可扩散边数）
+   */
+  verifyIntegrity(options?: { deep?: boolean }): VerifyIntegrityReport {
+    // ⚠️ **只读上下文刻意不含 `events`**（`readContext` 只有 `db` + `params`）
+    //   ⇒ **结构上**杜绝了「顺手记一条事件」的写法（§6：自检不记事件）。
+    // ⚠️ **日志器从 `#writeContext` 取**：它的唯一来源在构造期（只读实例上也有，
+    //   只是事件流短路）；自检自己不写库，只借它落 `deep` 那条告警。
+    return verifyIntegrityReport(this.#readContext.db, this.#readContext.params, {
+      ...options,
+      logger: this.#writeContext.logger,
+    });
   }
 
   /**

@@ -199,6 +199,9 @@ export type {
   RebuildBucketsOptions,
   RebuildBucketsResult,
   RebuildOnceOutcome,
+  // ⚠️ **阶段 5 的 `verifyIntegrity()` 只导返回类型**（理由同上：唯一公开入口是门面方法
+  //   `MemoryStore.verifyIntegrity`）⇒ **不导** `verifyIntegrityReport` 这个实现函数。
+  VerifyIntegrityReport,
 } from './store/maintain.js';
 export type {
   MediaType,
@@ -262,7 +265,12 @@ export type { MemoryStats, VectorBackendStats } from './store/stats.js';
 export type { SweepOptions, SweepResult } from './store/sweep.js';
 // ── 阶段 4（P4-T07）的**工具**：重放与对账 ──
 // ⚠️ 这两个模块是**离线工具**（运维 / 排障用），不是门面方法：
-//   `verifyIntegrity` 属阶段 5 才挂门面（§3.1 的归位表），重放器则**永远**是工具。
+//   ⚠️ ★ **它与 §6 的 `MemoryStore.verifyIntegrity()`（阶段 5）同名但不同签名**，
+//     是**两个用途、两个入口**（刻意如此，不是重复实现）：
+//     · 本处这个 `verifyIntegrity(db, params)` = **恢复 runbook 的全量深检**
+//       （`PRAGMA` + 桶覆盖率对象 + 归档三项 + **整个事件流**的稳定性对账）；
+//     · 门面那个 `verifyIntegrity({deep?})` = **常设护栏**（§9.4.4 护栏①②，五个 number，纯读、快）。
+//   ⇒ 因此门面的方法**不额外具名导出**（否则导出面上会出现两个 `verifyIntegrity`）。
 export { replayEvents, replayFromDb, readEvents } from './tools/replay.js';
 export type { ReplayEvent, ReplayMemoryState, ReplayState } from './tools/replay.js';
 export { checkStabilityBalance, verifyIntegrity } from './tools/verify.js';
