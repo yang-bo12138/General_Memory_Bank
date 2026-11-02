@@ -188,7 +188,7 @@ verifyIntegrity(options?: { deep?: boolean }): {
 |---|---|---|---|
 | **Q-P5-01** | **`rebuildArchivalSchedule` 的签名与 §6 不一致** | §6 写 `rebuildArchivalSchedule(options?: {...batchSize...})`；实现是 `rebuildArchivalSchedule(now?: number)`（阶段 4 落地，已合入 main） | 这是**设计稿与已合入代码的口径冲突**，不是实现细节。改哪一边都会动公开 API：改实现 = 破坏性变更（宿主已可调用）；改文档 = 修改已裁定的 §6。**需要设计方裁**，我不动 |
 | **Q-P5-02** | **C37 的钟表豁免清单是否应收 `verifyIntegrity`** | 它需要在「当前时刻」判定边是否过期与快照新鲜度 ⇒ 读了时钟；`check:clock` 当前**绿**（实测），说明它未被判成裸读时钟 | 收进豁免清单 = 改 `CLOCK_EXEMPT_METHODS` 与 §11.1 的名单（两份要对得上）；📌 也可能是「`resolveNow()` 本身就是**被许可的唯一入口**，根本不需要逐方法豁免」。**两种读法都自洽，我不猜** |
-| **Q-P5-03** | **T01~T05 的依赖引入要不要单开一个「依赖轮」** | 现在仓库运行时依赖只有 `better-sqlite3`；一笔加进 react/electron/MCP SDK 会同时改 `package.json` 与锁文件 | 依赖策略（尤其 Electron 是**打包期**依赖还是**运行时**依赖）属架构决策 ⇒ 归架构师 |
+| **Q-P5-03** | **T01~T05 的依赖引入要不要单开一个「依赖轮」** | **✅ 已裁**（见 `docs/design/p5-t01-t05-design.md` §2.6 的裁决 D-P5-Q03）。原文保留：现在仓库运行时依赖只有 `better-sqlite3`；一笔加进 react/electron/MCP SDK 会同时改 `package.json` 与锁文件 | 依赖策略（尤其 Electron 是**打包期**依赖还是**运行时**依赖）属架构决策 ⇒ 归架构师（⇒ 已由架构师裁：6 个包全部 `devDependencies`，`dependencies` 仍只有 `better-sqlite3`） |
 
 ---
 
@@ -222,6 +222,41 @@ verifyIntegrity(options?: { deep?: boolean }): {
   ④ 新增 `tests/integration/verifyIntegrity.test.ts`（19 条断言）；门禁 14 段全绿；
   ⑤ 测试 **67 文件 / 1,194 断言 → 68 / 1,213**（实测）；`src/` **60 个 `.ts` / 21,472 行**（实测，不含测试）。
   ⚠️ **未做**：T01~T05（查看器与 MCP，见 §二）；阶段 4 §六 的八条（见 §六）。
+
+- **2026-11-02（阶段 5 · T05：MCP Server 最小集）**：
+  ① 新增 `mcp/tools.ts`：`TOOL_DEFINITIONS`（**10 个工具 = 最小集 6 + 维护类 4**）+ 纯函数
+     `dispatchTool()` + 入参校验器（JSON Schema 的执行层，`additionalProperties: false` **真的会拒未知键**）。
+     ★ **不 import MCP 官方 SDK**：`mcp/server.ts` 是**唯一**一处（由 `mcp/tools.test.ts` 扫
+     `src/**` + `mcp/**` 全树断言「命中文件恰好只有 `mcp/server.ts`」）。
+  ② 新增 `mcp/server.ts`（薄适配）：低层 `Server` + `tools/list` / `tools/call` 两个处理器。
+     **异步只在这一层**（库仍是全同步 API，`dispatchTool()` 返回值不是 Promise，有断言钉住）；
+     错误以 `{ code, message, details }` 的 `isError: true` 内容返回（§11.2，不是裸文本）。
+  ③ 三个**阻塞 1~3 分钟**的维护方法（`rebuildArchivalSchedule` / `rebuildVectorBuckets` / `recluster`）
+     **不暴露**；且 `assertNoBlockedMaintenance()` 在**模块初始化时就跑**
+     ⇒ 谁把它加回工具表，`import` 那一刻就抛错（不是「跑起来才发现」）。
+  ④ `sweep` 按终裁（设计 §9.2 的 **N-07**）**暴露**，且 `purgeDeletedDays` 与 `vacuum` 两个键**都进 `required`**
+     （本层不给任何默认值）；`clusters` **不暴露**（它是读方法，但首调会现场重算几百毫秒 ⇒ 归查看器面板 7）。
+     五个维护类方法的逐个裁决与理由写在 `mcp/tools.ts` 顶部的决策块。
+  ⑤ 三条默认值纪律都配了「正向 + 反向」成对断言：`recall.explain` 默认关（不写 `recall` 事件，
+     显式 `true` 恰好 +1 条）；`forget.hard` 默认 `false`（软删：`deleted=1`、`deleted_at` 非空、**行仍在**，
+     `hard:true` 才删行）；`recall` **没有** `source` 过滤。
+  ⑥ `touch.coActivateWith` 超 `COACT_BATCH_MAX`（256）⇒ `INVALID_INPUT`，且 `details.reason` 是**库**写的
+     `coact_batch_max` ⇒ 证明 MCP 层没吞错、没截断（边界 256 条不抛，成对）。
+  ⑦ 新增 `mcp/tools.test.ts`（**37 条断言**；`vitest.config.ts` 的 `include` 已含 `mcp/**/*.test.ts`，
+     本文件同时断言这条 glob 在场 ⇒ 不是「没被收集还不报错」）。
+     其中 7 条做过**变异验证**：把 `explain` 默认改成开 / 把 `hard` 默认改成真 / 去掉一条
+     `additionalProperties: false` / 把阻塞守卫改成空实现 / 把 `coActivateWith` 截断成 100 条
+     ⇒ **各自都会把断言打红**（判别力已实测，不是恒绿守卫）。
+  ⑧ 门禁读数（实测）：`typecheck` 绿；`biome check .` 下 **`mcp/` 三个文件零告警**；
+     10 个 `check:*` 与 `audit:*` 段全绿；`mcp/tools.test.ts` **37 passed**。
+     ⚠️ **全链 `pnpm run verify` 此刻不是 EXIT=0**，红点在**并行的 T03/T04 在途文件**上
+     （`viewer/renderer/panels/LogViewer.tsx` / `GraphView.tsx` 的 biome 格式与导入顺序，
+     以及 `tests/integration/viewer-panels-structure.test.ts` 的 1 条断言），
+     与本轮 T05 的改动无关（已当场告知 T03/T04 的工程师修）。
+  ⚠️ **未做**：`stats` / `get` / `inhibitionTrace` 等读工具的暴露、HTTP/SSE 传输、
+     `sweep` 之外的维护面（理由逐个写在 `mcp/tools.ts` 的决策块 ③）。
+  ⚠️ 本文件**头部**那句「68 文件 / 1,213 条断言」是上一轮的读数，本轮**没有改**
+     （避免与并行任务抢同一行；以本条与 §八 的复验入口为准）。
 
 ---
 
