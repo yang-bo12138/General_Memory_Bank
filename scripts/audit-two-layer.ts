@@ -1,6 +1,10 @@
-#!/usr/bin/env node
 /**
  * 「两个层次必须分开列」的**可复跑审计** —— 防止一句「逐位相同」把两个层次糊在一起。
+ *
+ * ⚠️ **本文件不带 `#!/usr/bin/env node` shebang**（★ 与它的 `.mjs` 前身不同 ⇒ 记下原因）：
+ *   接进 `pnpm run verify` 之后，它**必须能被 `tests/contracts/two-layer-audit.test.ts` import**
+ *   ⇒ ⇒ 而 vitest **不走 Node 的加载器**（转译后内联执行）⇒ ⇒ **shebang 会让 `import` 直接抛
+ *   `SyntaxError: Invalid or unexpected token`** ⇒ ⇒ **故去掉** ⇒ ⇒ 调用方式写 `pnpm run audit:two-layer`。
  *
  * ────────────────────────────────────────────────────────────────────────────
  * 【它守的是哪条纪律】
@@ -15,7 +19,7 @@
  * ⇒ ⇒ **实测两档是 12.1% vs 21.6%** ⇒ ⇒ **行数（不变量）被当成了毫秒占比（变量）**。
  *
  * ────────────────────────────────────────────────────────────────────────────
- * 【它第一版踩过的坑】（留给后人 —— ★ 与 `audit-tier-qualifiers.mjs` 的同名小节同一用途）
+ * 【它第一版踩过的坑】（留给后人 —— ★ 与 `audit-tier-qualifiers.ts` 的同名小节同一用途）
  *
  * · **坑①：判定范围太宽 ⇒ 假阳性泛滥**
  *   第一版规格是「**凡是**出现『逐位相同』就要求点名量」
@@ -42,22 +46,22 @@
  *
  * ```bash
  * # 审计默认目标（仓库根 docs/ 下的全部 .md，排除 docs/qa/）
- * node scripts/audit-two-layer.mjs
- * #   （也可用 pnpm exec tsx scripts/audit-two-layer.mjs —— 两者等价）
+ * pnpm run audit:two-layer
  *
- * # 审计指定文件或目录
- * node scripts/audit-two-layer.mjs docs/design/DEVELOPMENT-PLAN.md docs/baseline
+ * # 审计指定文件或目录（CLI 仍接受的参数形式）
+ * node --import tsx scripts/audit-two-layer.ts docs/design/DEVELOPMENT-PLAN.md docs/baseline
  * ```
  *
- * **退出码**：`0` = 无真缺；`1` = 有真缺（⇒ 可直接当门禁用）。
+ * **退出码**：`0` = 无真缺；`1` = 有真缺（⇒ **可直接当门禁用**）。
  *
- * ⚠️ **距离「门禁」还差两步**（按 `scripts/README.md` §「新增门禁的做法」）：
- * **第 2 步**（串进 `package.json` 的 `ci`）与**第 3 步**（`tests/contracts/` 里**含反例**的单测）
- * ⇒ ⇒ **第 3 步要动 `tests/contracts/**`（⇒ 不在架构师-3 的边界内）⇒ ⇒ 两步都待主理人指定。**
+ * ────────────────────────────────────────────────────────────────────────────
+ * 【它现在是不是门禁】★ 是。`pnpm run verify` 的第 13 段（`audit:two-layer`）
+ *   ⇒ 「新增门禁的做法」四条全部到位：① 导出纯函数（`auditTwoLayers` / `renderAudit`）
+ *   ② 串进 `verify` ③ `tests/contracts/two-layer-audit.test.ts` 的**含反例单测** ④ 门禁表登记。
+ *   ⇒ ⇒ 交付形态随之从 `.mjs` 改回 `.ts`（⇒ **进 `tsc --noEmit`**）。
  *
- * ⚠️ **交付形态**：按主理人指定用 **`.mjs`**（⇒ **纯 `node` 即可跑，不依赖 `tsx`**）
- * ⇒ ⇒ **代价**：它**不进 `tsc --noEmit` 的类型检查** ⇒ ⇒ **类型错误只能靠运行发现**
- * ⇒ ⇒ **⇒ 所以它的「自证」（三个数 ＋ 退出码）必须守住**。
+ * ⚠️ **它仍然只判「跨档语境」里的「逐位相同」** ⇒ 这条收窄**不是妥协，是判据的一部分**
+ *   （⇒ 放宽会产出 ~76 个假阳性 ⇒ 假阳性泛滥的检查会被绕过 ⇒ **等于没有检查**）。
  */
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
@@ -74,7 +78,11 @@ const DEFAULT_SCAN_ROOT = join(REPO_ROOT, 'docs');
  * `docs/qa/` 是**历史验收报告** ⇒ 它**按当时的口径记录**旧措辞是它的本职
  * ⇒ ⇒ **把它算进「真缺」⇒ 会把历史记录误判成现行违规** ⇒ ⇒ **故排除**。
  */
-const EXCLUDED_DIRS = ['docs/qa'];
+const EXCLUDED_DIRS: readonly string[] = ['docs/qa'];
+
+/** **上下文窗口**（写死 ⇒ 纪律 1）：触发行**及其前后各 1 行**。 */
+const CONTEXT_LINES_BEFORE = 1;
+const CONTEXT_LINES_AFTER = 1;
 
 /** 触发词：**「逐位相同」类**必须点名量**的说法。 */
 const TRIGGER_PATTERN = /逐位相同|逐位完全相同/;
@@ -93,7 +101,11 @@ const TIER_PATTERN =
  *
  * ⇒ 每一项都必须逐个出现在 `bench/perf.ts` 里 ⇒ ⇒ **白名单漂移 ⇒ 判红**。
  */
-export const CODE_FIELD_NAMES = ['candidateReadRows', 'hitFineBuckets', 'vectorCandidateRows'];
+export const CODE_FIELD_NAMES: readonly string[] = [
+  'candidateReadRows',
+  'hitFineBuckets',
+  'vectorCandidateRows',
+];
 
 /**
  * **白名单 · 文档中文写法部分**（⚠️ **不可机器核** —— 中文别名没有单一权威出处）。
@@ -103,7 +115,7 @@ export const CODE_FIELD_NAMES = ['candidateReadRows', 'hitFineBuckets', 'vectorC
  * ⚠️ ★ **「行数」是本仓库这个量的规范中文写法** ⇒ ⇒ **它必须在白名单里**
  * ⚠️ ★ **（第一版漏了它 ⇒ 产出 4 个假阳性 ⇒ ⇒ 见上面「坑②」）**
  */
-export const DOC_QUANTITY_NAMES = [
+export const DOC_QUANTITY_NAMES: readonly string[] = [
   '行数',
   '候选读取行数',
   '写入侧候选扫描行数',
@@ -118,29 +130,53 @@ export const DOC_QUANTITY_NAMES = [
 ];
 
 /** **白名单的并集**（判定用）。 */
-export const QUANTITY_NAMES = [...CODE_FIELD_NAMES, ...DOC_QUANTITY_NAMES];
+export const QUANTITY_NAMES: readonly string[] = [...CODE_FIELD_NAMES, ...DOC_QUANTITY_NAMES];
 
 /** 一处「真缺」的定位信息。 */
-export function makeGap(path, line, text, reason) {
+export interface LayerGap {
+  readonly path: string;
+  readonly line: number;
+  readonly text: string;
+  readonly reason: string;
+}
+
+/** 一个被审计的文件。 */
+export interface AuditedFile {
+  readonly path: string;
+  readonly content: string;
+}
+
+/** 一次审计的完整结果。 */
+export interface TwoLayerAudit {
+  readonly triggerLines: number;
+  readonly judgedLines: number;
+  readonly realGaps: number;
+  readonly gaps: LayerGap[];
+  readonly whitelistSelfCheck: string[];
+}
+
+/** 构造一处「真缺」。 */
+export function makeGap(path: string, line: number, text: string, reason: string): LayerGap {
   return { path, line, text, reason };
 }
 
 /** 取「本行 + 相邻句」作为语境（**读者读 Markdown 的方式**）。 */
-export function contextOf(lines, index) {
+export function contextOf(lines: readonly string[], index: number): string {
   const from = Math.max(0, index - CONTEXT_LINES_BEFORE);
   const to = Math.min(lines.length, index + CONTEXT_LINES_AFTER + 1);
   return lines.slice(from, to).join('\n');
 }
 
 /**
- * 审计一批文件。
+ * **纯函数**：审计一批文件。
  *
- * ⚠️ **纯函数**（⇒ **无 IO、无随机、无时间依赖** ⇒ ⇒ 连跑两次输出逐字相同）。
+ * ⚠️ **无 IO、无随机、无时间依赖** ⇒ ⇒ 连跑两次输出逐字相同。
  *
- * @param {readonly {path: string, content: string}[]} files
+ * @param files 待审计的文件（路径 + 全文）
+ * @param auditSource 可选的 `bench/perf.ts` 源码覆盖（**只给单测做漂移反例用**）
  */
-export function auditTwoLayers(files) {
-  const gaps = [];
+export function auditTwoLayers(files: readonly AuditedFile[], auditSource?: string): TwoLayerAudit {
+  const gaps: LayerGap[] = [];
   let triggerLines = 0;
   let judgedLines = 0;
 
@@ -179,7 +215,7 @@ export function auditTwoLayers(files) {
     judgedLines,
     realGaps: gaps.length,
     gaps,
-    whitelistSelfCheck: checkWhitelistAgainstCode(),
+    whitelistSelfCheck: checkWhitelistAgainstCode(auditSource),
   };
 }
 
@@ -187,14 +223,20 @@ export function auditTwoLayers(files) {
  * **白名单自检**：**代码字段名必须逐个出现在代码里** ⇒ ⇒ 白名单不可靠印象填。
  *
  * ⚠️ **这是纪律 4 的实例 ⑨ 的教训**：白名单若靠印象填 ⇒ 它自己就是一个「无效的检查」。
+ *
+ * @param source 可选的源码覆盖（**单测用它注入「已漂移」的源码** ⇒ 证明这条自检能打红）
  */
-export function checkWhitelistAgainstCode() {
-  const problems = [];
+export function checkWhitelistAgainstCode(source?: string): string[] {
+  const problems: string[] = [];
   let bench = '';
-  try {
-    bench = readFileSync(join(REPO_ROOT, 'bench', 'perf.ts'), 'utf8');
-  } catch {
-    return ['✗ 读不到 bench/perf.ts ⇒ 白名单自检无法进行（⇒ 检查项自己失效了 ⇒ 判红）'];
+  if (source !== undefined) {
+    bench = source;
+  } else {
+    try {
+      bench = readFileSync(join(REPO_ROOT, 'bench', 'perf.ts'), 'utf8');
+    } catch {
+      return ['✗ 读不到 bench/perf.ts ⇒ 白名单自检无法进行（⇒ 检查项自己失效了 ⇒ 判红）'];
+    }
   }
   for (const field of CODE_FIELD_NAMES) {
     if (!bench.includes(field)) {
@@ -205,8 +247,8 @@ export function checkWhitelistAgainstCode() {
 }
 
 /** 渲染审计报告（**纯函数** ⇒ 且**不含时间戳** ⇒ 幂等）。 */
-export function renderAudit(audit) {
-  const lines = [];
+export function renderAudit(audit: TwoLayerAudit): string {
+  const lines: string[] = [];
   lines.push('两层次分离审计（§2.4 纪律 4 的写法要求）');
   lines.push('');
   lines.push(`  触发行数（凡「逐位相同」）：${audit.triggerLines}`);
@@ -235,10 +277,10 @@ export function renderAudit(audit) {
 }
 
 /** 递归收集目标文件（**按路径排序** ⇒ 幂等）。 */
-export function collectFiles(target) {
-  const out = [];
-  const walk = (p) => {
-    let st;
+export function collectFiles(target: string): AuditedFile[] {
+  const out: AuditedFile[] = [];
+  const walk = (p: string): void => {
+    let st: ReturnType<typeof statSync>;
     try {
       st = statSync(p);
     } catch {
@@ -259,7 +301,7 @@ export function collectFiles(target) {
 }
 
 /** CLI 薄壳。 */
-function main() {
+function main(): void {
   const args = process.argv.slice(2);
   const targets = args.length > 0 ? args : [DEFAULT_SCAN_ROOT];
   const files = targets.flatMap((t) => collectFiles(resolve(REPO_ROOT, t)));
@@ -269,10 +311,9 @@ function main() {
   process.exitCode = audit.realGaps > 0 || selfCheckFailed ? 1 : 0;
 }
 
-/** **上下文窗口**（写死 ⇒ 纪律 1）：触发行**及其前后各 1 行**。 */
-const CONTEXT_LINES_BEFORE = 1;
-const CONTEXT_LINES_AFTER = 1;
-
-if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {
+const invokedDirectly =
+  process.argv[1] !== undefined &&
+  resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
+if (invokedDirectly) {
   main();
 }

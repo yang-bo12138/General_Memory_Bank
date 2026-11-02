@@ -1,10 +1,10 @@
 /**
- * `scripts/audit-tier-qualifiers.mjs` 的**负控台** —— 证明那个审计脚本**不是恒绿守卫**。
+ * `scripts/audit-tier-qualifiers.ts` 的**负控台** —— 证明那个审计脚本**不是恒绿守卫**。
  *
- * ⚠️ **本文件刻意不带 `#!/usr/bin/env node` shebang**（原因与被测脚本**完全一样**）：
+ * ⚠️ **本文件不带 `#!/usr/bin/env node` shebang**（原因与被测脚本**完全一样**）：
  *   vitest 把模块**转译后内联**执行（不走 Node 的加载器）⇒ ⇒ shebang 会让 `import` 直接抛
- *   `SyntaxError: Invalid or unexpected token` ⇒ ⇒ **凡是「要被单测 import 的 `.mjs`」都不能带 shebang**。
- *   ⇒ ⇒ 调用方式一律写 `node scripts/audit-tier-qualifiers.negative-control.mjs`。
+ *   `SyntaxError: Invalid or unexpected token` ⇒ ⇒ **凡是「要被单测 import 的脚本」都不能带 shebang**。
+ *   ⇒ ⇒ 调用方式一律写 `pnpm run audit:negative-control`。
  *
  * ────────────────────────────────────────────────────────────────────────────
  * 【为什么需要它】
@@ -32,7 +32,7 @@
  *     ⇒ ⇒ 而「跨档 / 三档 / 两档」**恰恰是「在比几个档位」、不是「这个数属于哪一档」**
  *     ⇒ ⇒ **第一版负控是在给「弱词撑作用域」这个 bug 背书** ⇒ ⇒ **它测的不是它声称测的东西**
  *       （★ 实测证据：把「两档 / 三档 / 跨档」降为弱词后，同一处变异立刻变成「真缺 10」⇒
- *         **同一个变异、两个版本、两个结论** ⇒ ⇒ **旧负控的「通过」是偶然的，不是判据**）。
+ *         **同一个变异、两个版本、两个结论** ⇒ ⇒ 旧负控的「通过」是偶然的，不是判据）。
  *
  * ⇒ ⇒ **所以本版改成内容锚定**：**按内容找那张表**（找表头里写着「100 万条实测（」的那一行），
  *   再**按内容**圈出它的数据行 ⇒ ⇒ **README 怎么改行号都不影响它**。
@@ -56,10 +56,18 @@
  *   ⇒ ⇒ **只留一个 ⇒ 就只是「脚本没反应」或「脚本乱反应」，分不出来**。
  *
  * ────────────────────────────────────────────────────────────────────────────
+ * 【它自己怎么被反证】★ 2026-11-02 接门禁时补的一条
+ *
+ *   「负控台全绿」也可能是**负控台自己坏了**（比如它把所有异常都吞掉、只打印不累加）。
+ *   ⇒ ⇒ 故本文件把**执行体抽成纯函数** `runNegativeControls(lines, audit, controls)`
+ *   ⇒ ⇒ 单测可以**注入一个「恒绿审计」（永远说 missing = 0）**
+ *     ⇒ ⇒ **此时负控台必须报失败** ⇒ ⇒ **它是能被反证的**（不是恒绿守卫的第二层）。
+ *
+ * ────────────────────────────────────────────────────────────────────────────
  * 【怎么用】
  *
  * ```bash
- * node scripts/audit-tier-qualifiers.negative-control.mjs
+ * pnpm run audit:negative-control
  * ```
  *
  * **退出码**：`0` = 全部负控符合预期；`1` = 有负控不符合预期（⇒ **审计脚本失去判别力或出现假阳性**）。
@@ -70,7 +78,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { auditTierQualifiers } from './audit-tier-qualifiers.mjs';
+import { type AuditResult, auditTierQualifiers } from './audit-tier-qualifiers.js';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const TARGET = join(REPO_ROOT, 'docs', 'baseline', 'README.md');
@@ -81,15 +89,39 @@ const ALL_TIER_WORDS = /冷盘档|部分热档|部分预热档|热盘档|全热�
 /** 目标表的内容锚点：那张「现状声明」表的表头里写着这几个字。 */
 const TARGET_TABLE_HEADER_NEEDLE = '100 万条实测（';
 
+/** 一次变异的结果：变异后的文档 + 被变异的行下标。 */
+export interface Mutation {
+  readonly lines: string[];
+  readonly indexes: ReadonlySet<number>;
+}
+
+/** 一个负控用例。 */
+export interface NegativeControl {
+  readonly name: string;
+  readonly mutate: (lines: readonly string[]) => Mutation;
+  /**
+   * @param result 变异后的审计结果
+   * @param baseline 基线（无变异）的审计结果
+   * @param baselineSelfQualified 基线的「自带档位」处数
+   * @param mutatedIndexes 被变异的行下标
+   */
+  readonly expect: (
+    result: AuditResult,
+    baseline: AuditResult,
+    baselineSelfQualified: number,
+    mutatedIndexes: ReadonlySet<number>,
+  ) => boolean;
+  readonly why: string;
+  /** 该用例是否**本来就不带变异**（基线用例 ⇒ 不要求「变异生效」）。 */
+  readonly expectApplied?: boolean;
+}
+
 /**
  * 判定某一行是不是 Markdown 表格的**分隔行**（`|---|---|`）。
  *
  * ⚠️ **必须同时认得 blockquote 里的表格**（`> |---|---|`）—— README 的「现状声明」表就在引用块里。
- *
- * @param {string} line 原始行
- * @returns {boolean} 是不是分隔行
  */
-function isSeparatorRow(line) {
+function isSeparatorRow(line: string): boolean {
   return /^(?:>\s*)*\|[\s|:-]+\|$/.test(line.trim());
 }
 
@@ -99,11 +131,10 @@ function isSeparatorRow(line) {
  * ⚠️ **为什么单独算它**：它是「**这一处自带档位限定**」的真正读数
  *   ⇒ ⇒ 局部变异若生效 ⇒ **它必须减少**（那些数不再自带档位了）
  *   ⇒ ⇒ **这是「变异确实打在判据真正在读的那一层」的证据**。
- *
- * @param {{ counts: { adjudicated: number, missing: number, advisories: number } }} r 审计结果
- * @returns {number} 自带档位的处数
  */
-function selfQualifiedCount(r) {
+export function selfQualifiedCount(r: {
+  counts: { adjudicated: number; missing: number; advisories: number };
+}): number {
   return r.counts.adjudicated - r.counts.missing - r.counts.advisories;
 }
 
@@ -112,24 +143,21 @@ function selfQualifiedCount(r) {
  *
  * ⚠️ **为什么必须按内容**：行号会随 README 的任何改动漂移 ⇒ ⇒ 负控会打空 ⇒ ⇒ 恒绿。
  *
- * @param {readonly string[]} lines 文档按行切分
- * @returns {{ headerIndex: number, rowIndexes: number[] }} 表头行下标 + 数据行下标
- * @throws {Error} 找不到目标表时抛出（⇒ **绝不允许「打空」变成「通过」**）
+ * @throws 找不到目标表时抛出（⇒ **绝不允许「打空」变成「通过」**）
  */
-function findTargetTable(lines) {
+function findTargetTable(lines: readonly string[]): { headerIndex: number; rowIndexes: number[] } {
   const headerIndex = lines.findIndex(
     (line) =>
-      (line ?? '').includes(TARGET_TABLE_HEADER_NEEDLE) &&
-      /^\s*>?\s*\|/.test(line ?? '') &&
-      !isSeparatorRow(line ?? ''),
+      line.includes(TARGET_TABLE_HEADER_NEEDLE) &&
+      /^\s*>?\s*\|/.test(line) &&
+      !isSeparatorRow(line),
   );
   if (headerIndex < 0) {
     throw new Error(
       `★ 负控定位失败：找不到表头含「${TARGET_TABLE_HEADER_NEEDLE}」的表格 ⇒ ⇒ **拒绝在「变异打空」的情况下判通过**`,
     );
   }
-  /** @type {number[]} */
-  const rowIndexes = [];
+  const rowIndexes: number[] = [];
   for (let i = headerIndex + 1; i < lines.length; i += 1) {
     const line = lines[i] ?? '';
     if (!/^\s*>?\s*\|/.test(line)) break;
@@ -144,12 +172,8 @@ function findTargetTable(lines) {
 
 /**
  * 把指定行里的所有档位词抹掉（模拟「档位真丢了」）。
- *
- * @param {readonly string[]} lines 文档按行切分
- * @param {readonly number[]} indexes 要抹的行下标
- * @returns {{ lines: string[], indexes: Set<number> }} 变异后的文档 + 被变异的行下标
  */
-function stripTierAt(lines, indexes) {
+function stripTierAt(lines: readonly string[], indexes: readonly number[]): Mutation {
   const out = lines.slice();
   for (const index of indexes) {
     out[index] = (out[index] ?? '').replace(ALL_TIER_WORDS, '档位未标');
@@ -157,31 +181,11 @@ function stripTierAt(lines, indexes) {
   return { lines: out, indexes: new Set(indexes) };
 }
 
-/**
- * 一个负控用例。
- *
- * @typedef {{
- *   name: string,
- *   mutate: (lines: readonly string[]) => string[],
- *   expect: (
- *     r: {
- *       counts: { adjudicated: number, missing: number, advisories: number },
- *       gaps: readonly { line: number }[],
- *     },
- *     baseline: { counts: { adjudicated: number, missing: number, advisories: number } },
- *     baselineSelfQualified: number,
- *     mutatedIndexes: ReadonlySet<number>,
- *   ) => boolean,
- *   why: string,
- *   expectApplied?: boolean,
- * }} NegativeControl
- */
-
-/** @type {readonly NegativeControl[]} */
-const CONTROLS = [
+/** 负控用例表（**写死为常量** ⇒ 纪律 1「分母写死」）。 */
+export const CONTROLS: readonly NegativeControl[] = [
   {
     name: '原始（无变异）',
-    mutate: (lines) => ({ lines: lines.slice(), indexes: new Set() }),
+    mutate: (lines) => ({ lines: lines.slice(), indexes: new Set<number>() }),
     expect: (r) => r.counts.missing === 0,
     why: '基线：当前文档没有「档位真丢了」的数 ⇒ 真缺必须是 0',
     // ★ 基线用例**本来就不带变异** ⇒ 不要求「变异生效」
@@ -222,7 +226,7 @@ const CONTROLS = [
   {
     name: '负控 C：全文件抹掉所有档位词',
     mutate: (lines) => ({
-      lines: lines.map((line) => (line ?? '').replace(ALL_TIER_WORDS, '档位未标')),
+      lines: lines.map((line) => line.replace(ALL_TIER_WORDS, '档位未标')),
       indexes: new Set(lines.map((_line, index) => index)),
     }),
     expect: (r, baseline) => r.counts.missing > baseline.counts.missing,
@@ -232,52 +236,118 @@ const CONTROLS = [
   },
 ];
 
-/** CLI 薄壳。 */
-function main() {
-  const base = readFileSync(TARGET, 'utf8').split(/\r?\n/);
-  const baseline = auditTierQualifiers(base);
+/** 单个负控用例的执行结果。 */
+export interface ControlOutcome {
+  readonly name: string;
+  readonly ok: boolean;
+  readonly applied: boolean;
+  /** 该用例失败时的原因（定位失败 ⇒ 带异常文本）；成功时为 `null`。 */
+  readonly failureReason: string | null;
+  /** 变异后的读数（一行，供人核对）。 */
+  readonly observed: string;
+  readonly why: string;
+}
+
+/** 一次负控台执行的完整结果（**纯数据** ⇒ 便于单测断言）。 */
+export interface NegativeControlReport {
+  readonly target: string;
+  readonly baselineLine: string;
+  readonly outcomes: readonly ControlOutcome[];
+  readonly failures: number;
+}
+
+/**
+ * **纯函数**：跑一遍全部负控用例。
+ *
+ * ⚠️ **审计函数与用例表都可注入** —— 单测用「恒绿审计」注入 ⇒ 证明**负控台自己能打红**。
+ *
+ * @param lines 目标文档按行切分
+ * @param audit 被测审计函数
+ * @param controls 负控用例表
+ * @param target 目标路径（只用于报告）
+ */
+export function runNegativeControls(
+  lines: readonly string[],
+  audit: (lines: readonly string[]) => AuditResult = auditTierQualifiers,
+  controls: readonly NegativeControl[] = CONTROLS,
+  target: string = TARGET,
+): NegativeControlReport {
+  const base = lines.slice();
+  const baseline = audit(base);
   const baselineSelfQualified = selfQualifiedCount(baseline);
+  const outcomes: ControlOutcome[] = [];
 
-  console.log('════ 档位限定审计脚本 · 负控台 ════');
-  console.log(`目标：${TARGET}`);
-  console.log(
-    `基线：扫 ${baseline.counts.scanned} · 自带档位 ${baselineSelfQualified} · 真缺 ${baseline.counts.missing} · 提示 ${baseline.counts.advisories}`,
-  );
-  console.log('');
-
-  let failures = 0;
-  for (const control of CONTROLS) {
-    let mutated;
-    let mutatedIndexes;
+  for (const control of controls) {
+    let mutated: Mutation;
     try {
-      const result = control.mutate(base);
-      mutated = result.lines;
-      mutatedIndexes = result.indexes;
+      mutated = control.mutate(base);
     } catch (error) {
-      failures += 1;
-      console.log(`❌ ${control.name}`);
-      console.log(`   ★ 变异定位失败：${error instanceof Error ? error.message : String(error)}`);
+      outcomes.push({
+        name: control.name,
+        ok: false,
+        applied: false,
+        failureReason: `★ 变异定位失败：${error instanceof Error ? error.message : String(error)}`,
+        observed: '——（变异未执行）',
+        why: control.why,
+      });
       continue;
     }
-    const applied = mutated.join('\n') !== base.join('\n');
-    const result = auditTierQualifiers(mutated);
+    const applied = mutated.lines.join('\n') !== base.join('\n');
+    const result = audit(mutated.lines);
     const appliedOk = control.expectApplied === false ? true : applied;
-    const ok = appliedOk && control.expect(result, baseline, baselineSelfQualified, mutatedIndexes);
-    if (!ok) failures += 1;
-    console.log(`${ok ? '✅' : '❌'} ${control.name}`);
-    console.log(
-      `   变异生效=${applied ? '是' : '★否'} · 扫 ${result.counts.scanned} · 自带档位 ${selfQualifiedCount(result)} · 真缺 ${result.counts.missing} · 提示 ${result.counts.advisories} · 退出码 ${result.counts.missing === 0 ? 0 : 1}`,
-    );
-    console.log(`   预期：${control.why}`);
+    const ok =
+      appliedOk && control.expect(result, baseline, baselineSelfQualified, mutated.indexes);
+    outcomes.push({
+      name: control.name,
+      ok,
+      applied,
+      failureReason: ok ? null : appliedOk ? '断言不符合预期' : '★ 变异未生效（断言等于空跑）',
+      observed:
+        `变异生效=${applied ? '是' : '★否'} · 扫 ${result.counts.scanned}` +
+        ` · 自带档位 ${selfQualifiedCount(result)} · 真缺 ${result.counts.missing}` +
+        ` · 提示 ${result.counts.advisories} · 退出码 ${result.counts.missing === 0 ? 0 : 1}`,
+      why: control.why,
+    });
   }
 
-  console.log('');
-  console.log(
-    failures === 0
+  return {
+    target,
+    baselineLine:
+      `基线：扫 ${baseline.counts.scanned} · 自带档位 ${baselineSelfQualified}` +
+      ` · 真缺 ${baseline.counts.missing} · 提示 ${baseline.counts.advisories}`,
+    outcomes,
+    failures: outcomes.filter((outcome) => !outcome.ok).length,
+  };
+}
+
+/** **纯函数**：把负控台结果渲染成报告文本（**不含时间戳** ⇒ 幂等）。 */
+export function renderNegativeControlReport(report: NegativeControlReport): string {
+  const out: string[] = [];
+  out.push('════ 档位限定审计脚本 · 负控台 ════');
+  out.push(`目标：${report.target}`);
+  out.push(report.baselineLine);
+  out.push('');
+  for (const outcome of report.outcomes) {
+    out.push(`${outcome.ok ? '✅' : '❌'} ${outcome.name}`);
+    out.push(`   ${outcome.observed}`);
+    if (outcome.failureReason !== null) out.push(`   ${outcome.failureReason}`);
+    out.push(`   预期：${outcome.why}`);
+  }
+  out.push('');
+  out.push(
+    report.failures === 0
       ? '✅ 全部负控符合预期 ⇒ 审计脚本**有判别力**（不是恒绿守卫）'
-      : `❌ ${failures} 个负控不符合预期 ⇒ ⇒ **审计脚本失去判别力或出现假阳性 ⇒ 不可当证据用**`,
+      : `❌ ${report.failures} 个负控不符合预期 ⇒ ⇒ **审计脚本失去判别力或出现假阳性 ⇒ 不可当证据用**`,
   );
-  process.exitCode = failures === 0 ? 0 : 1;
+  return out.join('\n');
+}
+
+/** CLI 薄壳。 */
+function main(): void {
+  const lines = readFileSync(TARGET, 'utf8').split(/\r?\n/);
+  const report = runNegativeControls(lines, auditTierQualifiers, CONTROLS, TARGET);
+  process.stdout.write(`${renderNegativeControlReport(report)}\n`);
+  process.exitCode = report.failures === 0 ? 0 : 1;
 }
 
 const invokedDirectly =

@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ── 门禁：8 条子命令串成一条链，任一失败 ⇒ 退出码非 0 ──
+  # ── 门禁：14 条子命令串成一条链（11 条契约 + 3 条文档审计），任一失败 ⇒ 退出码非 0 ──
   verify:
     name: 门禁（verify）
     runs-on: ubuntu-latest

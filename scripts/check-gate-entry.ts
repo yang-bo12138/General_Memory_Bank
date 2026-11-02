@@ -28,11 +28,21 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 /**
- * ★ **写死的期望值**：门禁必须串起的 **11 条子命令**（C31 的分母）。
+ * ★ **写死的期望值**：门禁必须串起的 **14 条子命令**（C31 的分母）。
  *
- * ⚠️ 这 11 条是「阶段 0 的全部验收门禁 + F-08 ③ 的静态守卫 + P2 的两个新门禁」：
- *   类型检查 → 代码风格 → 单元测试 → 8 条契约脚本。
+ * ⚠️ 这 14 条是「阶段 0 的全部验收门禁 + F-08 ③ 的静态守卫 + P2 的两个新门禁
+ *   + **阶段 3 收官的 3 条文档审计**（`audit:*` ⇒ 2026-11-02 接门禁）」：
+ *   类型检查 → 代码风格 → 单元测试 → 8 条契约脚本 → 3 条文档审计。
  *   改这个数组等于改「门禁是什么」，必须是一次**显式**的改动。
+ *
+ * ⚠️ **3 条 `audit:*` 为什么也算门禁**（它们判的不是代码，是**文档里的数**）：
+ *   · `audit:tier-qualifiers` ⇒ 「只属于某一档的数」必须带档位限定词（真缺 ⇒ exit 1）；
+ *   · `audit:two-layer` ⇒ 「逐位相同」必须点名被比较的量（真缺 ⇒ exit 1）；
+ *   · `audit:negative-control` ⇒ **前两条自己的负控**（证明它们不是恒绿守卫）。
+ *   ⇒ ⇒ **三条一旦红了，说明「文档里的数字被写成了会误导人的样子」** ⇒
+ *     而这正是本仓库反复踩过的坑（`stage3-progress.md` §十三.9）⇒ ⇒ **所以它们必须挡在门口**。
+ *   ⚠️ **代价**：门禁从 11 段变成 14 段，`README.md` / `scripts/README.md` 里写死的段数
+ *     必须同步 ⇒ ⇒ 那些数字**也是分母**（改了链不改字 ⇒ 文档与门禁不一致）。
  *
  * ⚠️ **加一条门禁就必须同步改这个数组**（否则 `check:contract-ids` 内联调用本模块时
  *   会以「多出 / 缺少」的形式把门禁链卡红）⇒ 这是 C31「分母写死」的必然代价，
@@ -50,6 +60,9 @@ export const EXPECTED_GATE_COMMANDS: readonly string[] = [
   'check:contract-ids',
   'check:doc-counts',
   'check:clamp',
+  'audit:tier-qualifiers',
+  'audit:two-layer',
+  'audit:negative-control',
 ];
 
 /**
