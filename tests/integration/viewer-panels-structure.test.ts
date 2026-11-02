@@ -395,21 +395,54 @@ describe('T03 · 面板无任何写入口（三层钉）', () => {
 // ⑤ 七个面板共用同一套状态组件
 // ═══════════════════════════════════════════════════════════════════════════
 
+/**
+ * ★ **七个面板文件的写死清单**（设计 §7.2 的七个编号）。
+ *
+ * ⚠️ 为什么要写死而不是「`panels/*.tsx` 全都要满足」：
+ *   `panels/` 下还有一个**子组件** `ClusterBubble.tsx`（气泡本体，不是面板），
+ *   它没有自己的取数，自然不 import 那个 hook。
+ *   ⇒ 判据必须区分「面板」与「面板里的部件」，而**唯一可靠的区分方式是把七个面板写死**。
+ *   ⚠️ T03 时后四个还不存在 ⇒ 断言写成「存在的那几个必须满足」，
+ *     并在 T04 的测试里补一条「七个全都存在」。
+ */
+const EXPECTED_PANEL_FILES = [
+  'viewer/renderer/panels/Overview.tsx',
+  'viewer/renderer/panels/MemoryList.tsx',
+  'viewer/renderer/panels/RecallSimulator.tsx',
+  'viewer/renderer/panels/GraphView.tsx',
+  'viewer/renderer/panels/LogViewer.tsx',
+  'viewer/renderer/panels/VersionHistory.tsx',
+  'viewer/renderer/panels/ClusterMap.tsx',
+] as const;
+
+/** `panels/` 下**允许存在**的非面板文件（面板里的部件）。 */
+const PANEL_PARTS = ['viewer/renderer/panels/ClusterBubble.tsx'] as const;
+
+/** 当前仓库里**已存在**的面板文件（T03 时是前三个）。 */
+function existingPanelFiles(): string[] {
+  const all = new Set(listSourceFiles('viewer/renderer/panels'));
+  return EXPECTED_PANEL_FILES.filter((file) => all.has(file));
+}
+
 describe('T03 · 面板共用同一套状态组件（不各写一套）', () => {
-  it('★ `panels/*.tsx` 里 `catch (` 出现次数为 0（错误只在 `state/` 里处理）', () => {
-    const panels = listSourceFiles('viewer/renderer/panels').filter((file) =>
-      file.endsWith('.tsx'),
-    );
+  it('★ `panels/` 下的文件只有「七个面板 + 已登记部件」这几类（没有第 9 个来路不明的文件）', () => {
+    const all = listSourceFiles('viewer/renderer/panels');
+    expect(all.length).toBeGreaterThanOrEqual(3);
+    const known = new Set<string>([...EXPECTED_PANEL_FILES, ...PANEL_PARTS]);
+    const unknown = all.filter((file) => !known.has(file));
+    expect(unknown).toEqual([]);
+  });
+
+  it('★ 每个已存在的面板文件里 `catch (` 出现次数为 0（错误只在 `state/` 里处理）', () => {
+    const panels = existingPanelFiles();
     expect(panels.length).toBeGreaterThanOrEqual(3);
     for (const file of panels) {
       expect(/catch\s*\(/.test(readCode(file)), `${file} 里出现了 catch (`).toBe(false);
     }
   });
 
-  it('★ 每个面板文件都 import `useReadCall` 与 `StatusBlock`', () => {
-    const panels = listSourceFiles('viewer/renderer/panels').filter((file) =>
-      file.endsWith('.tsx'),
-    );
+  it('★ 每个已存在的面板文件都 import `useReadCall` 与 `StatusBlock`', () => {
+    const panels = existingPanelFiles();
     expect(panels.length).toBeGreaterThanOrEqual(3);
     for (const file of panels) {
       const code = readCode(file);

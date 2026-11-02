@@ -1,5 +1,5 @@
 /**
- * 查看器根组件 —— 阶段 5 · T03（设计 §7.2 / §7.3）。
+ * 查看器根组件 —— 阶段 5 · T03/T04（设计 §7.2 / §7.3）。
  *
  * ★ 本文件承担两件「全局」的事，因此七个面板不必各做一遍：
  *   ① **只读徽标顶部常驻**（§7.3「只读模式」一行）：它是这个应用**是什么**的声明，
@@ -13,10 +13,15 @@
 
 import type { ReactElement } from 'react';
 
-import type { ReadPort } from '../shared/protocol.js';
+import type { ClustersResult } from '../../src/store/clusters.js';
+import type { LogQuery, ReadPort } from '../shared/protocol.js';
+import { ClusterMap } from './panels/ClusterMap.js';
+import { GraphView } from './panels/GraphView.js';
+import { LogViewer } from './panels/LogViewer.js';
 import { MemoryList } from './panels/MemoryList.js';
 import { Overview } from './panels/Overview.js';
 import { RecallSimulator } from './panels/RecallSimulator.js';
+import { VersionHistory } from './panels/VersionHistory.js';
 import { ReadonlyBadge } from './state/StatusBlock.js';
 import { APP_TITLE, PANEL_ORDER, PANEL_TITLES } from './texts.js';
 import type { PanelId } from './texts.js';
@@ -24,11 +29,11 @@ import type { PanelId } from './texts.js';
 /**
  * ★ **已接线**的面板（顺序即导航顺序）。
  *
- * ⚠️ 它必须与 `PANEL_ORDER` 的前缀一致（T03 接上前三个，T04 补齐后四个）——
- *   由 `viewer-panels-structure.test.ts` 断言「它是 `PANEL_ORDER` 的前缀」：
+ * ⚠️ 它必须与 `PANEL_ORDER` **逐条相等**（T03 时是它的前三个，T04 补齐后四个）。
+ *   由 `viewer-panels-structure.test.ts` 断言「它是 `PANEL_ORDER` 的前缀」——
  *   写成乱序或跳过中间某个面板，都会让「七个面板」这句话在界面上不成立。
  */
-export const WIRED_PANELS: readonly PanelId[] = PANEL_ORDER.slice(0, 3);
+export const WIRED_PANELS: readonly PanelId[] = PANEL_ORDER;
 
 /** 当前选中项（面板 + 该面板需要的参数）。 */
 export interface AppSelection {
@@ -38,6 +43,12 @@ export interface AppSelection {
   readonly memoryId: string;
   /** 面板 3 的模拟对话文本。 */
   readonly recallContext: string;
+  /** 面板 5 的查询条件（缺省 ⇒ 按 `now` 所在的年月）。 */
+  readonly logQuery?: LogQuery;
+  /** 面板 6 的页号（缺省 0）。 */
+  readonly historyPage?: number;
+  /** 面板 7 的「上次快照」（缺省 `null` ⇒ 没有基准）。 */
+  readonly previousClusters?: ClustersResult | null;
 }
 
 /** 缺省选中项（打开查看器时的第一屏）。 */
@@ -46,6 +57,17 @@ export const DEFAULT_SELECTION: AppSelection = {
   memoryId: '',
   recallContext: '',
 };
+
+/**
+ * 面板 5 的缺省查询：`now` 所在的年 / 月。
+ *
+ * ⚠️ **从 `now` 推**（不是 `new Date()`）：`now` 是注入的
+ *   ⇒ 同一个 `now` 渲染两次得到同一份 markup，快照不会因为「今天是几号」而变。
+ */
+export function defaultLogQuery(now: number): LogQuery {
+  const iso = new Date(now).toISOString();
+  return { year: Number(iso.slice(0, 4)), month: Number(iso.slice(5, 7)) };
+}
 
 /** `App` 的入参。 */
 export interface AppProps {
@@ -66,10 +88,21 @@ function renderPanel(selection: AppSelection, port: ReadPort | null, now: number
       return <MemoryList port={port} now={now} memoryId={selection.memoryId} />;
     case 'recallSimulator':
       return <RecallSimulator port={port} now={now} context={selection.recallContext} />;
-    default:
-      // ⚠️ T04 之前的四个面板还没接线 ⇒ 这里刻意返回 `null` 而不是「尚未实现」的占位：
-      //   占位文案会活到 T04 之后（因为没人会记得删），而 `null` 一眼就能看出少东西。
-      return <></>;
+    case 'graphView':
+      return <GraphView port={port} now={now} memoryId={selection.memoryId} />;
+    case 'logViewer':
+      return <LogViewer port={port} now={now} query={selection.logQuery ?? defaultLogQuery(now)} />;
+    case 'versionHistory':
+      return (
+        <VersionHistory
+          port={port}
+          now={now}
+          memoryId={selection.memoryId}
+          page={selection.historyPage ?? 0}
+        />
+      );
+    case 'clusterMap':
+      return <ClusterMap port={port} now={now} previous={selection.previousClusters ?? null} />;
   }
 }
 
