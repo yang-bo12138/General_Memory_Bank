@@ -26,7 +26,11 @@ T01~T04（Electron 只读查看器的 7 个面板）与 T05（MCP Server）**一
 |---|---|---|
 | 1 | 三条阶段 3/4 分支的 PR **合并到 main** | ✅ #4 → #2 → #3 依次合入，每个合并点的 CI 均 `success`（见 §1.1） |
 | 2 | **P5-T06** 落地（`verifyIntegrity()` 挂门面） | ✅ 新增 19 条断言，门禁全绿（见 §三） |
-| 3 | 提交**推送**到远端 | ❌ **未完成** —— 运行时 `github.com:443` 不可达（只 `api.github.com` / `codeload` 通），见 §1.2 |
+| 3 | 两个可交付点提交并**推送** | ✅ 分支 `feat/p5-verify-integrity` 已推送，**PR #5** 已开，CI 全绿（见 §1.4） |
+
+> ⚠️ **推送中途有过一段失败**（`github.com:443` 一度不可达，只 `api.github.com` / `codeload` 通），
+> 后来网络自行恢复 ⇒ 推送与开 PR 都完成了。**这一段的过程留在 §1.2**（不是「没发生」，
+> 而是「发生过、已绕回」）—— 因为它解释了为什么本地曾经重建过 main。
 
 ### 1.1 三个 PR 的合并（实测，GitHub REST API 逐个核对）
 
@@ -44,7 +48,7 @@ T01~T04（Electron 只读查看器的 7 个面板）与 T05（MCP Server）**一
 - **每个合并点都等 CI**：合 #4 后等 `a08c69d` 的「门禁（verify）」`success` 才合 #2；
   合 #2 后等同理才合 #3。**没有任何一步是「绿着猜」过去的。**
 
-### 1.2 ⚠️ 本地 main 是**重建**的，不是 fetch 下来的（下次接手必读）
+### 1.2 ⚠️ 本地 main 曾经是**重建**的、不是 fetch 下来的（**已消除，留作教训**）
 
 本轮 `git fetch` / `git push` 对 `github.com:443` **持续失败**（`Recv failure: Connection was reset`
 → 后续 `Failed to connect ... after 21s`），但 `api.github.com` 与 `codeload.github.com` 正常
@@ -63,9 +67,21 @@ T01~T04（Electron 只读查看器的 7 个面板）与 T05（MCP Server）**一
 （实测，两边都取 `git/commits/<sha>.tree.sha` / `git rev-parse HEAD^{tree}`）。
 ⇒ §1.3 的读数是在**与 main 内容完全一致**的树上跑出来的。
 
-⇒ ⇒ **⚠️ 下一件事**：等网络恢复后，**不要**直接 `git push main`（本地 main 是重建的，
-会与远端分叉）。正确做法是 `git fetch origin && git reset --hard origin/main`（丢掉本地那三个
-重建 merge commit），再在新 main 上继续。
+⇒ ⇒ **⚠️ 这条分叉已经消除**（2026-11-02 同一轮内网络恢复后处理完毕）：
+`git fetch origin` 拿到真实的 `origin/main = 774e9b8` ⇒ 把阶段 5 的两个提交
+**cherry-pick 到真实 main 上**，`main` 分支 `reset` 回 `origin/main`
+⇒ 现在本地 `main` == `origin/main`，**那三个重建的 merge commit 已不在任何分支上**。
+⚠️ 证据：重建态与新历史的 `HEAD^{tree}` **逐字相同**（`91ea83f…`）⇒ 搬运**没有改变任何内容**。
+⚠️ 搬运时对 `feat/p5-verify-integrity` 用了 `--force-with-lease`（**只覆盖本分支自己刚推的那一版**，
+PR 尚未创建、没有别人的提交）⇒ 不违反「不 force push 覆盖他人提交」。
+
+### 1.4 阶段 5 的交付点（实测）
+
+| 项 | 值 |
+|---|---|
+| 分支 | `feat/p5-verify-integrity`（基于真实 `main` 的 `774e9b8`，**2 个提交**） |
+| PR | **#5** https://github.com/yang-bo12138/General_Memory_Bank/pull/5 （base `main`） |
+| PR head 的 CI | `7774c6b` 的「门禁（verify）」+「构建（tsup）」**4 个 check-run 全 `success`**（实测） |
 
 ### 1.3 main 上的复验读数（实测，2026-11-02 本轮复跑）
 
