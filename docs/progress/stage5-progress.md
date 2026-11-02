@@ -247,12 +247,14 @@ verifyIntegrity(options?: { deep?: boolean }): {
      其中 7 条做过**变异验证**：把 `explain` 默认改成开 / 把 `hard` 默认改成真 / 去掉一条
      `additionalProperties: false` / 把阻塞守卫改成空实现 / 把 `coActivateWith` 截断成 100 条
      ⇒ **各自都会把断言打红**（判别力已实测，不是恒绿守卫）。
-  ⑧ 门禁读数（实测）：`typecheck` 绿；`biome check .` 下 **`mcp/` 三个文件零告警**；
-     10 个 `check:*` 与 `audit:*` 段全绿；`mcp/tools.test.ts` **37 passed**。
-     ⚠️ **全链 `pnpm run verify` 此刻不是 EXIT=0**，红点在**并行的 T03/T04 在途文件**上
-     （`viewer/renderer/panels/LogViewer.tsx` / `GraphView.tsx` 的 biome 格式与导入顺序，
-     以及 `tests/integration/viewer-panels-structure.test.ts` 的 1 条断言），
-     与本轮 T05 的改动无关（已当场告知 T03/T04 的工程师修）。
+  ⑧ 门禁读数（实测，本块收尾时复跑）：`pnpm run verify` **EXIT=0**（14 段链）
+     ⇒ **77 文件 / 1,507 条断言**（基线 72 / 1,330；本轮 T05 自己贡献 **1 文件 / 37 条**）。
+     其中 `mcp/` 三个文件 `biome check` 零告警；`mcp/tools.test.ts` **37 passed**。
+     ⚠️ **过程留痕**（不是「一路绿」）：本轮中途 `verify` 曾两次为红 ——
+     一次红在**并行的 T03/T04 在途文件**上（`viewer/renderer/panels/*` 的 biome 格式/导入顺序、
+     `tests/integration/viewer-panels-*.test.ts` 的 1 条断言），与本轮 T05 改动无关；
+     另一次是 `node_modules` 被清空（隔离验证时误删，已按设计 §2.2 的命令用
+     `--frozen-lockfile` + 干净 store 重装恢复，锁文件未变）。⇒ 最终读数以上面这句为准。
   ⚠️ **未做**：`stats` / `get` / `inhibitionTrace` 等读工具的暴露、HTTP/SSE 传输、
      `sweep` 之外的维护面（理由逐个写在 `mcp/tools.ts` 的决策块 ③）。
   ⚠️ 本文件**头部**那句「68 文件 / 1,213 条断言」是上一轮的读数，本轮**没有改**
