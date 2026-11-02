@@ -10,6 +10,24 @@ allowBuilds:
   esbuild: true
   '@biomejs/biome': true
 
+# ⚠️★ **关掉「未放行的构建脚本 ⇒ 整次安装失败」**（阶段 5 收官时补）。
+#
+#   为什么必须有这一节：pnpm 12 在**有包带构建脚本却没被 allowBuilds 放行**时，
+#   会让整次 `pnpm install` 以 `ERR_PNPM_IGNORED_BUILDS` **失败**（不是警告）。
+#   本地一度用 `--config.strict-dep-builds=false` 绕过 ⇒ **CI 没有那个 flag，
+#   于是 CI 在「安装依赖」这一步就死了**（实测：run 41461815627，第 5 步 failure）
+#   ⇒ ⇒ **「本地绕过」不是修复，只是把问题推给 CI**。
+#
+#   ⇒ 正确的做法是把**意图**写进配置：需要跑的三个已在上面 `allowBuilds` 里逐条放行，
+#     其余的（当前就是 electron）**本就不该跑**——我们要的只是 `electron.d.ts`，
+#     它随 npm tarball 发布，不跑 `install.js` 也有。
+#     ⇒ `strictDepBuilds: false` 的语义正是「**未放行的就跳过，不要因此让安装失败**」。
+#   ⚠️ 它不是「关掉安全策略」：`allowBuilds` 仍是**白名单**（不写就不跑），
+#     这一项只决定「跳过要不要报错」。将来新增依赖若也需要构建，仍须显式加进 `allowBuilds`。
+strictDepBuilds: false
+
+
+
 # ⚠️★ **electron 不得加进 allowBuilds**（阶段 5 · p5-t01-t05-design.md §2.2）。
 #
 #   Electron 的 `install.js` 会下载 ~100MB 的平台二进制并写 `path.txt`。
