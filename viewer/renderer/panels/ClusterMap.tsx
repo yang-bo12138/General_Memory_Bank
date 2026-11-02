@@ -15,22 +15,31 @@
  *      ⇒ 拿 key 做对比，得到的是「这两个 key 一不一样」，与「是不是同一个簇」无关。
  *      本文件里**根本不出现**簇的 `key` 字段（只用 `clusterId` 做 DOM key，它也不是持久标识）。
  *
- * ⚠️ ★ **「上次结果」的基准说明常驻**（`LAST_SNAPSHOT_BASELINE`）：
- *   跨快照比较**只在进程内做**（§3）⇒ 这里的「上次」是
- *   **本次会话内上次打开面板时的结果**，**不是**「上一版已发布快照」。
- *   不说清楚，用户会拿它去跟一个它并不是的东西比。
+ * ★ **本文件含交互层**（阶段 5 · T04 补遗）：
+ *   「本次会话内上一次结果」由本面板的 `useState` 持有 —— **不是** localStorage、
+ *   **不是**已发布快照表（§3：跨快照比较只在进程内做）。
+ *   每次拿到**新的** `computedAt` 就把上一份快照存进 `previous`，供「对比上次」使用。
+ *   ⚠️ 存的是**快照对象本身**，不是 `computedAt`：对比要算**成员集合**的重叠度，
+ *     光有时间戳算不出任何东西。
+ *
+ * ⚠️ **「上次结果」的基准说明常驻**（`LAST_SNAPSHOT_BASELINE`）：
+ *   这里的「上次」是**本次会话内上次打开面板时的结果**，
+ *   **不是**「上一版已发布快照」。不说清楚，用户会拿它去跟一个它并不是的东西比。
  *
  * ⚠️ 本文件不 import `electron` / `better-sqlite3` / `viewer/main/**`，也不写 `try/catch`。
  */
 
 import type { ReactElement } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 import type { ClustersResult } from '../../../src/store/clusters.js';
 import type { ReadPort } from '../../shared/protocol.js';
 import { StatusBlock } from '../state/StatusBlock.js';
+import { overlapRatio } from '../state/navigation.js';
 import type { ReadState } from '../state/useReadCall.js';
 import { useReadCall } from '../state/useReadCall.js';
 import {
+  BUTTON_COMPARE_PREVIOUS,
   CLUSTER_COMPARISON_HEADING,
   CLUSTER_COVERAGE_LABEL,
   CLUSTER_EMPTY_TEXT,
@@ -46,42 +55,18 @@ import {
 } from '../texts.js';
 import { ClusterBubble } from './ClusterBubble.js';
 
+/**
+ * ★ 成员重叠度 —— **唯一实现在 `state/navigation.ts`**，这里只做**别名再导出**。
+ *
+ * ⚠️ 为什么保留这个别名：既有测试与 `compareSnapshots` 都在用 `memberOverlapRatio` 这个名字
+ *   （它是面板 7 的术语）。别名不是第二份定义（与 `decay.ts` 里 `MS_PER_DAY` 的做法同款），
+ *   值恒等于 `navigation.ts` 里那一份。
+ */
+export { overlapRatio as memberOverlapRatio } from '../state/navigation.js';
+
 /** 面板 7 的读调用。 */
 export async function loadClusters(port: ReadPort, now: number): Promise<ClustersResult> {
   return port.clusters(now);
-}
-
-/**
- * ★ **两个成员集合的重叠度**（Jaccard 的「按较小集合归一」变体）。
- *
- * ⚠️ 为什么按 `min(|A|,|B|)` 而不是并集：
- *   簇会长大（今天 10 条、明天 60 条且包含原来那 10 条）——
- *   用并集归一会让「完全包含」只得到 0.17，看起来像「几乎不是同一个簇」；
- *   而它其实是**同一个簇变大了**。按较小集合归一后，完全包含 = 1.0。
- *
- * ⚠️ 这是**纯函数**（不读 `now`、不读库）⇒ 单测可以逐值断言，
- *   也是「快照对比不用 `key`」那条的**判别力所在**：
- *   两次快照里同名簇的 `key` 相同但成员不同 ⇒ 重叠度 != 1。
- *
- * @param previous 上次快照的成员 id
- * @param next 本次快照的成员 id（**顺序不参与计算**，只做集合语义）
- * @returns `[0, 1]`；任一侧为空 ⇒ 0
- */
-export function memberOverlapRatio(
-  previous: ReadonlyArray<string>,
-  next: ReadonlyArray<string>,
-): number {
-  if (previous.length === 0 || next.length === 0) {
-    return 0;
-  }
-  const previousSet = new Set(previous);
-  let shared = 0;
-  for (const id of next) {
-    if (previousSet.has(id)) {
-      shared += 1;
-    }
-  }
-  return shared / Math.min(previous.length, next.length);
 }
 
 /** 一次「本次簇 → 上次最相似的簇」的对照行。 */
@@ -113,7 +98,7 @@ export function compareSnapshots(
     let bestId: string | null = null;
     let bestOverlap = 0;
     for (const candidate of previous.clusters) {
-      const overlap = memberOverlapRatio(candidate.memberIds, cluster.memberIds);
+      const overlap = overlapRatio(candidate.memberIds, cluster.memberIds);
       if (overlap > bestOverlap) {
         bestOverlap = overlap;
         bestId = candidate.clusterId;
@@ -131,10 +116,25 @@ export interface ClusterMapViewProps {
   readonly previous: ClustersResult | null;
   /** 注入的当前时刻（新鲜度文案要用它）。 */
   readonly now: number;
+  /** 「对比上次」—— 不传 ⇒ 按钮 disabled（没有可对比的基准）。 */
+  readonly onComparePrevious?: (() => void) | undefined;
+  /** 用户是否**显式**按过「对比上次」（对比区据此标注来源）。 */
+  readonly comparisonRequested?: boolean | undefined;
+}
+
+/** 一个什么都不做的回调（只读渲染时的缺省值）。 */
+function noop(): void {
+  /* 对比算式在被单测的纯函数（`overlapRatio` / `compareSnapshots`）里 */
 }
 
 /** 面板 7 的**纯展示层**。 */
-export function ClusterMapView({ state, previous, now }: ClusterMapViewProps): ReactElement {
+export function ClusterMapView({
+  state,
+  previous,
+  now,
+  onComparePrevious,
+  comparisonRequested = false,
+}: ClusterMapViewProps): ReactElement {
   return (
     <StatusBlock state={state} what={PANEL_TITLES.clusterMap}>
       {(snapshot: ClustersResult) => {
@@ -183,12 +183,25 @@ export function ClusterMapView({ state, previous, now }: ClusterMapViewProps): R
 
             <section className="cluster-map__comparison" data-chart="cluster-comparison">
               <h3 className="memory__heading">{CLUSTER_COMPARISON_HEADING}</h3>
+              <button
+                type="button"
+                data-action="compare-previous"
+                disabled={previous === null}
+                onClick={() => {
+                  (onComparePrevious ?? noop)();
+                }}
+              >
+                {BUTTON_COMPARE_PREVIOUS}
+              </button>
               {previous === null ? (
                 <p className="panel__empty" data-comparison-empty="">
                   {CLUSTER_NO_PREVIOUS_TEXT}
                 </p>
               ) : (
-                <ul className="cluster-map__comparison-list">
+                <ul
+                  className="cluster-map__comparison-list"
+                  data-comparison-source={comparisonRequested ? 'explicit' : 'auto'}
+                >
                   {overlaps.map((row) => (
                     <li key={row.clusterId} data-overlap-cluster={row.clusterId}>
                       <span data-field="overlap-cluster">{row.clusterId}</span>
@@ -216,14 +229,65 @@ export interface ClusterMapProps {
   readonly port: ReadPort | null;
   /** 注入的当前时刻。 */
   readonly now: number;
-  /** 本次会话内上一次的快照。 */
+  /** **初始**的「上次快照」（一般传 `null`；会话内由本面板自己累积）。 */
   readonly previous: ClustersResult | null;
 }
 
-/** 面板 7（取数 + 展示）。 */
-export function ClusterMap({ port, now, previous }: ClusterMapProps): ReactElement {
+/**
+ * 面板 7（取数 + 展示 + 交互）。
+ *
+ * ⚠️ ★ **「上次结果」只在进程内**（`useState` / `useRef`），**不落盘**：
+ *   设计要求是「本次会话内上次打开面板时的结果」，落盘会把它变成
+ *   「上一版已发布快照」—— 那是另一件事，也正是基准说明要防的误解。
+ *
+ * ⚠️ 判定「是不是新快照」用的是 `computedAt`（**不是 `asOf`**）：
+ *   `asOf` 是图的时间点，同一张图重算两次 `asOf` 可能相同，但 `computedAt` 一定变
+ *   ⇒ 用 `asOf` 判断会漏掉「同一张图的新一次计算」。
+ */
+export function ClusterMap({
+  port,
+  now,
+  previous: initialPrevious,
+}: ClusterMapProps): ReactElement {
+  const [previous, setPrevious] = useState<ClustersResult | null>(initialPrevious);
+  const [comparisonRequested, setComparisonRequested] = useState<boolean>(false);
+  /** 上一份**快照对象**（不是时间戳：对比要算成员集合的重叠度）。 */
+  const lastSnapshotRef = useRef<ClustersResult | null>(initialPrevious);
+  /** 已经吸收过的 `computedAt`（防止同一份快照被 effect 反复搬进 `previous`）。 */
+  const absorbedAtRef = useRef<number | null>(initialPrevious?.computedAt ?? null);
+
   const state = useReadCall<ClustersResult>(port, `clusters:${now}`, (activePort) =>
     loadClusters(activePort, now),
   );
-  return <ClusterMapView state={state} previous={previous} now={now} />;
+
+  const readySnapshot = state.status === 'ready' ? state.data : null;
+
+  useEffect(() => {
+    if (readySnapshot === null) {
+      return;
+    }
+    if (absorbedAtRef.current === readySnapshot.computedAt) {
+      return;
+    }
+    // 这一次是**新的**快照 ⇒ 把上一份存成「上次结果」，再把自己变成新的「上一份」。
+    const last = lastSnapshotRef.current;
+    if (last !== null) {
+      setPrevious(last);
+      setComparisonRequested(false);
+    }
+    absorbedAtRef.current = readySnapshot.computedAt;
+    lastSnapshotRef.current = readySnapshot;
+  }, [readySnapshot]);
+
+  return (
+    <ClusterMapView
+      state={state}
+      previous={previous}
+      now={now}
+      comparisonRequested={comparisonRequested}
+      onComparePrevious={() => {
+        setComparisonRequested(true);
+      }}
+    />
+  );
 }

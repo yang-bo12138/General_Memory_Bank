@@ -304,6 +304,35 @@ export function logTotalText(total: number, offset: number, count: number): stri
 /** 日志面板的只读提示（§8.2：日志从不写正文 ⇒ 面板不需要做脱敏）。 */
 export const LOG_READONLY_HINT = '日志正文永不包含记忆原文（§8.2），此处不需要脱敏。';
 
+/** 年 / 月 / 日三级选择的标签（面板 5）。 */
+export const LOG_YEAR_LABEL = '年';
+/** 月份标签。 */
+export const LOG_MONTH_LABEL = '月';
+/** 日标签。 */
+export const LOG_DAY_LABEL = '日';
+/** 「整月」（未选日期）。 */
+export const LOG_ALL_DAYS = '整月';
+/** 关键字输入框标签。 */
+export const LOG_KEYWORD_LABEL = '关键字';
+
+/**
+ * 月份清单（`1~12`，渲染 `<option>` 用）。
+ *
+ * ⚠️ 生成而不是手写 12 个字面量：手写的那份必然有人漏掉 7 月。
+ */
+export const MONTH_OPTIONS: readonly number[] = Array.from({ length: 12 }, (_, index) => index + 1);
+
+/** 日期清单（`1~31`；不按月份算大小月 —— 后端对不存在的日期返回空页，这比在界面上算闰年可靠）。 */
+export const DAY_OPTIONS: readonly number[] = Array.from({ length: 31 }, (_, index) => index + 1);
+
+/** 面板 6：已加载全部版本时的提示（此时「加载更早的版本」不再渲染）。 */
+export const HISTORY_LOADED_ALL = '已加载全部版本';
+
+/** 面板 6：「加载更早的版本」按钮旁边的进度说明。 */
+export function historyLoadedText(loaded: number, total: number): string {
+  return `已加载 ${loaded} / ${total} 版`;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // 八、面板 6：版本历史
 // ═══════════════════════════════════════════════════════════════════════════
@@ -430,6 +459,10 @@ export const BUTTON_NEXT = '下一页';
 export const BUTTON_RUN_RECALL = '模拟召回';
 /** 「刷新快照」（**读**动作：重新调 `clusters()`）。 */
 export const BUTTON_REFRESH = '刷新快照';
+/** 「加载更早的版本」（面板 6：**读**动作，`select` 的更早一页；不是「回滚」）。 */
+export const BUTTON_LOAD_OLDER = '加载更早的版本';
+/** 「对比上次」（面板 7：**纯前端**动作，只是把本次会话内记下的上一份快照算一次重叠度）。 */
+export const BUTTON_COMPARE_PREVIOUS = '对比上次';
 
 /**
  * ★ **渲染树里允许出现的 `<button>` 文案白名单**。
@@ -445,7 +478,14 @@ export const BUTTON_REFRESH = '刷新快照';
  *     「白名单里不含回滚/恢复/删除/加固」，以及一条**负控**
  *     （拿一段含 `<button>回滚</button>` 的假 markup 过同一个判据，必须命中）。
  */
-export const BUTTON_LABELS = [BUTTON_PREV, BUTTON_NEXT, BUTTON_RUN_RECALL, BUTTON_REFRESH] as const;
+export const BUTTON_LABELS = [
+  BUTTON_PREV,
+  BUTTON_NEXT,
+  BUTTON_RUN_RECALL,
+  BUTTON_REFRESH,
+  BUTTON_LOAD_OLDER,
+  BUTTON_COMPARE_PREVIOUS,
+] as const;
 
 /** 按钮文案是不是白名单里的一个（运行期守卫，测试与面板共用同一份判据）。 */
 export function isButtonLabelAllowed(text: string): boolean {

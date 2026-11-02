@@ -440,7 +440,7 @@ describe('T04 · 面板 7：「上次结果」的基准说明常驻', () => {
 
 describe('T04 · 面板 7：无写入口 + 错误呈现', () => {
   it('★ 渲染树里的 `<button>` 文案 ⊆ 白名单（本面板一个按钮都不需要）', () => {
-    const whitelist = ['上一页', '下一页', '模拟召回', '刷新快照'];
+    const whitelist = ['上一页', '下一页', '模拟召回', '刷新快照', '加载更早的版本', '对比上次'];
     const html = renderClusters(makeClustersResult());
     const labels = [...html.matchAll(/<button[^>]*>([\s\S]*?)<\/button>/g)].map((match) =>
       (match[1] ?? '').replace(/<[^>]*>/g, '').trim(),
@@ -514,5 +514,130 @@ describe('T04 · 七个面板文件全部存在，且共用同一套状态组件
     for (const file of SEVEN) {
       expect(readCode(file), `${file} 没有 View 组件`).toMatch(/export function \w+View\(/);
     }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 四、T04 补遗 · 面板 5 的三级选择、面板 7 的「对比上次」
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('T04 补遗 · 面板 5：年 / 月 / 日三级选择真的在界面上', () => {
+  const page = makeLogPage();
+
+  it('★ 三个选择控件 + 关键字输入都在场（`data-filter` 四个锚点）', () => {
+    const html = renderToStaticMarkup(
+      createElement(LogViewerView, { state: readyState(page), query: LOG_QUERY, now: FIXED_NOW }),
+    );
+    for (const filter of ['year', 'month', 'day', 'keyword']) {
+      expect(html, `缺少 ${filter} 选择控件`).toContain(`data-filter="${filter}"`);
+    }
+    expect(html).toContain('data-chart="log-filters"');
+  });
+
+  it('★ 月份是 `<select>`（`1~12` 全给，不手写 12 个漏一个）', () => {
+    const html = renderToStaticMarkup(
+      createElement(LogViewerView, { state: readyState(page), query: LOG_QUERY, now: FIXED_NOW }),
+    );
+    expect(html).toContain('<select');
+    for (const month of ['1', '7', '12']) {
+      expect(html).toContain(`value="${month}"`);
+    }
+  });
+
+  it('★ 页码与「最后一页」都挂在 markup 上（翻页后有可断言的痕迹）', () => {
+    // 400 行 / 每页 200 ⇒ 最后一页 = 1（第 0、1 两页）
+    const html = renderToStaticMarkup(
+      createElement(LogViewerView, {
+        state: readyState(makeLogPage([{ no: 1, raw: 'x', level: 'info' }], 400)),
+        query: LOG_QUERY,
+        now: FIXED_NOW,
+        page: 0,
+        pageSize: 200,
+      }),
+    );
+    expect(html).toContain('data-page="0"');
+    expect(html).toContain('data-last-page="1"');
+  });
+
+  it('★ 第 0 页「上一页」disabled、最后一页「下一页」disabled（夹紧在界面上也成立）', () => {
+    const first = renderToStaticMarkup(
+      createElement(LogViewerView, { state: readyState(page), query: LOG_QUERY, now: FIXED_NOW }),
+    );
+    expect(first).toMatch(/data-pager="prev"[^>]*disabled/);
+
+    const lastPageHtml = renderToStaticMarkup(
+      createElement(LogViewerView, {
+        state: readyState(makeLogPage([{ no: 1, raw: 'x', level: 'info' }], 400)),
+        query: LOG_QUERY,
+        now: FIXED_NOW,
+        page: 1,
+        pageSize: 200,
+      }),
+    );
+    expect(lastPageHtml).toMatch(/data-pager="next"[^>]*disabled/);
+  });
+
+  it('反例：中间页两个按钮都**不** disabled（否则上面那条是恒绿）', () => {
+    // 1000 行 / 每页 200 ⇒ 最后一页 = 4；停在第 2 页 ⇒ 两向都可走
+    const html = renderToStaticMarkup(
+      createElement(LogViewerView, {
+        state: readyState(makeLogPage([{ no: 1, raw: 'x', level: 'info' }], 1000)),
+        query: LOG_QUERY,
+        now: FIXED_NOW,
+        page: 2,
+        pageSize: 200,
+      }),
+    );
+    expect(html).not.toMatch(/data-pager="prev"[^>]*disabled/);
+    expect(html).not.toMatch(/data-pager="next"[^>]*disabled/);
+  });
+
+  it('★ 源码层：翻页与查询走 navigation 的纯函数（组件里没有第二套算式）', () => {
+    const code = readCode('viewer/renderer/panels/LogViewer.tsx');
+    expect(code).toContain('buildLogQuery');
+    expect(code).toContain('nextPage');
+    expect(code).toContain('prevPage');
+    expect(code).toContain('maxPage');
+  });
+});
+
+describe('T04 补遗 · 面板 7：「对比上次」动作', () => {
+  it('★ 按钮在场；没有上次结果时 **disabled**（不给一个点了没用的按钮）', () => {
+    const html = renderClusters(makeClustersResult(), null);
+    expect(html).toContain('对比上次');
+    expect(html).toMatch(/data-action="compare-previous"[^>]*disabled/);
+  });
+
+  it('★ 有上次结果 ⇒ 按钮可点（不再 disabled）', () => {
+    const html = renderClusters(makeClustersResult(), makeClustersResult());
+    expect(html).not.toMatch(/data-action="compare-previous"[^>]*disabled/);
+  });
+
+  it('★ 对比区标注来源：未按过 ⇒ `auto`，按过 ⇒ `explicit`（动作有可断言的效果）', () => {
+    const autoHtml = renderClusters(makeClustersResult(), makeClustersResult());
+    expect(autoHtml).toContain('data-comparison-source="auto"');
+
+    const explicitHtml = renderToStaticMarkup(
+      createElement(ClusterMapView, {
+        state: readyState(makeClustersResult()),
+        previous: makeClustersResult(),
+        now: FIXED_NOW,
+        comparisonRequested: true,
+      }),
+    );
+    expect(explicitHtml).toContain('data-comparison-source="explicit"');
+  });
+
+  it('★ 源码层：上次快照放 `useState`（进程内），不是 localStorage / 快照表', () => {
+    const code = readCode('viewer/renderer/panels/ClusterMap.tsx');
+    expect(code).toContain('useState');
+    expect(code).not.toContain('localStorage');
+    expect(code).not.toContain('sessionStorage');
+    expect(code).not.toContain('theme_cluster');
+  });
+
+  it('★ 基准说明仍在场（补交互不许删那句「本次会话内」）', () => {
+    const html = renderClusters(makeClustersResult(), null);
+    expect(html).toContain('本次会话内');
   });
 });

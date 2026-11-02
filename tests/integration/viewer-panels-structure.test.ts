@@ -344,7 +344,7 @@ function allAllowed(labels: readonly string[], whitelist: readonly string[]): bo
 
 describe('T03 · 面板无任何写入口（三层钉）', () => {
   /** ★ 白名单的**测试侧副本**（不从 `texts.ts` import ⇒ 加白名单条目也要走审查）。 */
-  const WHITELIST = ['上一页', '下一页', '模拟召回', '刷新快照'];
+  const WHITELIST = ['上一页', '下一页', '模拟召回', '刷新快照', '加载更早的版本', '对比上次'];
 
   it('① `WRITE_CHANNELS` 是空数组且长度断言（通道层）', () => {
     expect(WRITE_CHANNELS).toEqual([]);
@@ -470,6 +470,64 @@ describe('T03 · 面板共用同一套状态组件（不各写一套）', () => 
     const readyHtml = renderMemoryList(readyState(makeMemoryDetail()));
     expect(readyHtml).not.toContain('计算中');
     expect(readyHtml).not.toContain('data-status="loading"');
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ⑤bis 交互层（T04 补遗）：按钮在场 ≠ 按钮有用
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * ★ 为什么需要这一节：`renderToStaticMarkup` **不序列化事件处理器**，
+ *   所以「按钮在场」的断言**证明不了**它能用 —— 上一轮正是这样漏掉的
+ *   （`LogViewer` 渲染了上一页/下一页却没有 `onClick`）。
+ *   ⇒ 判据换成**源码扫描**：带交互的面板里必须出现 `useState` 与 `onClick`/`onChange`，
+ *     且页码 / 查询 / 累积必须走 `state/navigation.ts` 的纯函数（那些函数有逐值单测）。
+ */
+describe('T04 补遗 · 交互层：handler 真的接上了（源码层判据）', () => {
+  /** 三个需要交互的面板（面板 1~4 是纯展示/导航由 `App` 的 props 驱动，不需要本地 state）。 */
+  const INTERACTIVE_PANELS = [
+    'viewer/renderer/panels/LogViewer.tsx',
+    'viewer/renderer/panels/VersionHistory.tsx',
+    'viewer/renderer/panels/ClusterMap.tsx',
+  ];
+
+  it('★ 每个带交互的面板源码里都出现 `useState` 与 `onClick=`/`onChange=`', () => {
+    expect(INTERACTIVE_PANELS.length).toBe(3);
+    for (const file of INTERACTIVE_PANELS) {
+      const code = readCode(file);
+      expect(code, `${file} 没有 useState`).toContain('useState');
+      expect(/onClick=|onChange=/.test(code), `${file} 一个 handler 都没有`).toBe(true);
+    }
+  });
+
+  it('★ 反例（判别力）：纯展示面板的源码**不该**出现 handler（否则上面的判据是恒绿）', () => {
+    const code = readCode('viewer/renderer/panels/Overview.tsx');
+    expect(/onClick=|onChange=/.test(code)).toBe(false);
+    expect(code).not.toContain('useState');
+  });
+
+  it('★ 面板 5 的页码 / 查询**不许自己写**：必须调用 navigation 的纯函数', () => {
+    const code = readCode('viewer/renderer/panels/LogViewer.tsx');
+    expect(code).toContain('buildLogQuery');
+    expect(code).toMatch(/nextPage\(/);
+    expect(code).toMatch(/prevPage\(/);
+    // 反例：组件里不许出现 `page + 1` / `page - 1` 这类自写夹紧
+    expect(/page\s*[+-]\s*1/.test(code)).toBe(false);
+  });
+
+  it('★ 面板 6 的累积加载走 `appendPage`（不在组件里拼数组）', () => {
+    const code = readCode('viewer/renderer/panels/VersionHistory.tsx');
+    expect(code).toMatch(/appendPage\(/);
+    expect(code).toContain('nextPage');
+    expect(code).toContain('prevPage');
+  });
+
+  it('★ 面板 7 的重叠度来自 navigation（唯一实现），组件里没有第二份', () => {
+    const code = readCode('viewer/renderer/panels/ClusterMap.tsx');
+    expect(code).toContain('overlapRatio');
+    // 反例：「就地算重叠度」会留下这个除法痕迹
+    expect(code).not.toContain('/ Math.min(');
   });
 });
 

@@ -561,3 +561,35 @@ body {
   padding-left: 18px;
   font-size: 12px;
 }
+
+/* ── 面板 5 的三级选择（T04 补遗：交互层） ───────────────────────────── */
+
+.log__filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-soft);
+}
+
+.log__filter {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.log__filter-input {
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  font-family: inherit;
+  font-size: 12px;
+}
+
+.log__filter-input[type="number"] {
+  width: 72px;
+}

@@ -48,7 +48,7 @@ import {
   makeMemoryError,
   makeMemoryView,
 } from '../helpers/panelFixtures.js';
-import { listSourceFiles } from '../helpers/sourceScan.js';
+import { listSourceFiles, readCode } from '../helpers/sourceScan.js';
 import { allTableNames, tableFingerprints } from '../helpers/tableHashes.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -262,7 +262,7 @@ describe('T04 · 面板 6 分页：一次只取 50 版', () => {
 
 describe('T04 · 面板 6 没有「回滚」控件', () => {
   it('★ 渲染树里的 `<button>` 文案 ⊆ 白名单，且白名单里没有「回滚」', () => {
-    const whitelist = ['上一页', '下一页', '模拟召回', '刷新快照'];
+    const whitelist = ['上一页', '下一页', '模拟召回', '刷新快照', '加载更早的版本', '对比上次'];
     const html = renderHistory([makeHistoryRow('h-1', 'x', 'merge', FIXED_NOW)], 137);
     const labels = [...html.matchAll(/<button[^>]*>([\s\S]*?)<\/button>/g)].map((match) =>
       (match[1] ?? '').replace(/<[^>]*>/g, '').trim(),
@@ -487,5 +487,51 @@ describe('T04 · 面板 4 / 6 的错误呈现：错误码 + `details`', () => {
     expect(html).toContain('contentHistoryPage');
     expect(html).toContain('m-404');
     expect(html).not.toContain('加载失败');
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ⑦ T04 补遗 ·「更早的按需加载」：按钮在场 **且** 到了就不再渲染
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('T04 补遗 · 面板 6：「加载更早的版本」是**按需加载**，不是装饰', () => {
+  const threeRows: ReadonlyArray<SqlRow> = [
+    makeHistoryRow('h-3', 'C', 'merge', FIXED_NOW - 3_600_000),
+    makeHistoryRow('h-2', 'B', 'manual_fix', FIXED_NOW - 7_200_000),
+    makeHistoryRow('h-1', 'A', 'merge', FIXED_NOW - 10_800_000),
+  ];
+
+  it('★ 已加载 < total ⇒ 按钮在场（可继续往更早加载）', () => {
+    const html = renderHistory([threeRows[0] as SqlRow], 137);
+    expect(html).toContain('加载更早的版本');
+    expect(html).toContain('data-pager="older"');
+    expect(html).toContain('已加载 1 / 137 版');
+  });
+
+  it('★ 已加载 >= total ⇒ 按钮**不渲染**（不是渲染一个 disabled 的死按钮）', () => {
+    const html = renderHistory(threeRows, 3);
+    expect(html).not.toContain('加载更早的版本');
+    expect(html).not.toContain('data-pager="older"');
+    expect(html).toContain('已加载全部版本');
+  });
+
+  it('负控：`total` 比已加载多 1 条时按钮**又出现**（边界是 `loaded >= total`，不是「差不多」）', () => {
+    const html = renderHistory(threeRows, 4);
+    expect(html).toContain('加载更早的版本');
+  });
+
+  it('★ 累积语义由 `appendPage` 单测钉住（本面板只负责把回调接上）', () => {
+    // ⚠️ 这条断言的意义是把「累积 = 追加而非替换」这件事指向那个**有单测的纯函数**，
+    //   而不是在组件层再做一遍（组件层做就会有两套语义）。
+    const source = readCode('viewer/renderer/panels/VersionHistory.tsx');
+    expect(source).toContain('appendPage');
+    expect(source).toContain("modeRef.current = 'append'");
+  });
+
+  it('「更早」不是写动作：文案里没有回滚 / 恢复 / 删除字样', () => {
+    const html = renderHistory([threeRows[0] as SqlRow], 137);
+    for (const forbidden of ['回滚', '恢复', '删除', '加固']) {
+      expect(html).not.toContain(forbidden);
+    }
   });
 });
