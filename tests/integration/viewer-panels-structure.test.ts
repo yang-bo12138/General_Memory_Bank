@@ -19,7 +19,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 
 import { MemoryError } from '../../src/core/errors.js';
-import { App, WIRED_PANELS } from '../../viewer/renderer/App.js';
+import { App, DEFAULT_SELECTION, WIRED_PANELS } from '../../viewer/renderer/App.js';
 import { ClusterMapView } from '../../viewer/renderer/panels/ClusterMap.js';
 import { GraphViewView } from '../../viewer/renderer/panels/GraphView.js';
 import { LogViewerView } from '../../viewer/renderer/panels/LogViewer.js';
@@ -768,13 +768,14 @@ describe('T04 补强 · ⑥ 七个面板各自的**加载态**都由同一个 `S
 describe('T04 补遗 · 交互层：handler 真的接上了（源码层判据）', () => {
   /** 三个需要交互的面板（面板 1~4 是纯展示/导航由 `App` 的 props 驱动，不需要本地 state）。 */
   const INTERACTIVE_PANELS = [
+    'viewer/renderer/panels/RecallSimulator.tsx',
     'viewer/renderer/panels/LogViewer.tsx',
     'viewer/renderer/panels/VersionHistory.tsx',
     'viewer/renderer/panels/ClusterMap.tsx',
   ];
 
   it('★ 每个带交互的面板源码里都出现 `useState` 与 `onClick=`/`onChange=`', () => {
-    expect(INTERACTIVE_PANELS.length).toBe(3);
+    expect(INTERACTIVE_PANELS.length).toBe(4);
     for (const file of INTERACTIVE_PANELS) {
       const code = readCode(file);
       expect(code, `${file} 没有 useState`).toContain('useState');
@@ -842,5 +843,127 @@ describe('T03 · App：只读徽标常驻、导航标题来自唯一一份 `PANE
     const { port, calls } = makeThrowingPort();
     renderToStaticMarkup(createElement(App, { port, now: FIXED_NOW }));
     expect(calls).toEqual([]);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ⑦ T04 第四批 · 可用性：面板 3 真的能跑一次召回、七个面板真的都能打开
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('T04 第四批 · 面板 3 真的能跑一次召回（不再是「海报」）', () => {
+  it('★ 源码层：`useState` + `onChange=` + `onClick=` 三者都在', () => {
+    const code = readCode('viewer/renderer/panels/RecallSimulator.tsx');
+    expect(code).toContain('useState');
+    expect(/onChange=/.test(code), '输入框没有 onChange').toBe(true);
+    expect(/onClick=/.test(code), '「模拟召回」没有 onClick').toBe(true);
+  });
+
+  it('★ 空态（还没提交）：有输入框与「模拟召回」，但**不画状态块、不画结果**', () => {
+    // ⚠️ 这条是「不发请求」的可断言形式：空态若拿 `loading` 冒充，就会渲染出 `data-status="loading"`。
+    const html = renderToStaticMarkup(
+      createElement(RecallSimulatorView, {
+        state: { status: 'loading' },
+        now: FIXED_NOW,
+        context: '',
+        idle: true,
+      }),
+    );
+    expect(html).toContain('data-recall-idle="true"');
+    expect(html).toContain('data-field="context-input"');
+    expect(html).toContain('模拟召回');
+    expect(html).toContain('reinforce 恒为 false');
+    expect(html).not.toContain('data-status="loading"');
+    expect(html).not.toContain('data-suppressed-count');
+  });
+
+  it('反例：非空态才画被抑制栏与结果（否则上一条的 `not.toContain` 是恒真）', () => {
+    const html = renderRecall(readyState(makeRecallSimResult()));
+    expect(html).toContain('data-recall-idle="false"');
+    expect(html).toContain('data-suppressed-count');
+  });
+
+  it('★ 输入框是**受控**的：渲染出的文本就是传进来的 `context`', () => {
+    const html = renderToStaticMarkup(
+      createElement(RecallSimulatorView, {
+        state: { status: 'loading' },
+        now: FIXED_NOW,
+        context: '张三喜欢什么',
+        idle: true,
+      }),
+    );
+    expect(html).toContain('张三喜欢什么');
+    expect(html).toContain('data-field="context-input"');
+  });
+
+  it('★ 把面板切到面板 3 且文本为空时是**空态**（不会拿空串去查一次）', () => {
+    const { port } = makeThrowingPort();
+    const html = renderToStaticMarkup(
+      createElement(App, {
+        port,
+        now: FIXED_NOW,
+        selection: { ...DEFAULT_SELECTION, panel: 'recallSimulator' },
+      }),
+    );
+    expect(html).toContain('data-recall-idle="true"');
+    expect(html).not.toContain('data-status="loading"');
+  });
+});
+
+describe('T04 第四批 · 七个面板都能从导航打开', () => {
+  it('★ 导航里恰好 `PANEL_ORDER.length` 个**可点**元素，且顺序逐条相同', () => {
+    const { port } = makeThrowingPort();
+    const html = renderToStaticMarkup(createElement(App, { port, now: FIXED_NOW }));
+
+    const navIds = [...html.matchAll(/data-nav-panel="([^"]+)"/g)].map((match) => match[1] ?? '');
+    expect(navIds).toEqual([...PANEL_ORDER]);
+    expect(navIds.length).toBe(7);
+
+    // ★「可点」的判据：每个 nav 元素都是 `<button>`（改之前是 `<span>` ⇒ 一个也点不了）
+    const buttons = [...html.matchAll(/<button[^>]*data-nav-panel="[^"]+"/g)];
+    expect(buttons.length).toBe(PANEL_ORDER.length);
+  });
+
+  it('★ 七块**各自都真的渲染出来**（逐块把 selection 指过去，面板体必须在场）', () => {
+    const { port } = makeThrowingPort();
+    for (const panelId of PANEL_ORDER) {
+      const html = renderToStaticMarkup(
+        createElement(App, {
+          port,
+          now: FIXED_NOW,
+          selection: { ...DEFAULT_SELECTION, panel: panelId, memoryId: 'm-1' },
+        }),
+      );
+      expect(html, `${panelId} 没有切换过去`).toContain(`data-selected-panel="${panelId}"`);
+      // 面板体在场：加载态下是 `data-panel="<标题>"`，空态/就绪态下是 `data-panel-body="<id>"`
+      const rendered =
+        html.includes(`data-panel="${PANEL_TITLES[panelId]}"`) ||
+        html.includes(`data-panel-body="${panelId}"`);
+      expect(rendered, `${panelId} 的面板体没有被渲染`).toBe(true);
+    }
+  });
+
+  it('★ 源码层：nav 不再是不可点的 `<span>`，且由 `useState` 驱动', () => {
+    const code = readCode('viewer/renderer/App.tsx');
+    expect(code).toContain('useState');
+    expect(/onClick=/.test(code), 'nav 没有 onClick').toBe(true);
+    expect(code).toContain('data-nav-panel');
+    // 反例：本文件里不该再出现「nav-item 的 span」
+    expect(/<span[^>]*app__nav-item/.test(code)).toBe(false);
+  });
+
+  it('★ 导航文案里没有任何写动作字样（回滚 / 删除 / 遗忘 / 恢复 / 加固）', () => {
+    const { port } = makeThrowingPort();
+    const html = renderToStaticMarkup(createElement(App, { port, now: FIXED_NOW }));
+    for (const forbidden of ['回滚', '删除', '遗忘', '恢复', '加固']) {
+      expect(html, `界面上出现了写动作字样：${forbidden}`).not.toContain(forbidden);
+    }
+  });
+
+  it('★ 七个 nav 的文案逐条等于 `PANEL_TITLES`（不是另写一套短名）', () => {
+    const { port } = makeThrowingPort();
+    const html = renderToStaticMarkup(createElement(App, { port, now: FIXED_NOW }));
+    for (const panelId of PANEL_ORDER) {
+      expect(html).toContain(`>${PANEL_TITLES[panelId]}</button>`);
+    }
   });
 });
