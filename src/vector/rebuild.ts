@@ -72,6 +72,18 @@ export interface BucketRebuildOptions {
   coarseCenters: number;
   /** 细中心总数（§5 `ROUTER_FINE_CENTERS`）。 */
   fineCenters: number;
+  /**
+   * 每层 k-means 的**最大迭代轮数**（缺省 `DEFAULT_MAX_ITERATIONS` = 25）。
+   *
+   * ⚠️★ **这是一个逃生阀，不是一个调参项**（2026-11-02 性能轮补上）：
+   *   `buildCentroidModel` 一直支持它，但本接口此前**没有**这个字段
+   *   ⇒ 调用方只能吃默认值 ⇒ **百万级重训没法用「降迭代」换内存/时间 ⇒ 只能被 OOM 打断**
+   *   （`docs/progress/stage3-progress.md` §3.1 缺陷① 的原始描述）。
+   *   ⇒ 现在可以显式压低（例如百万级冒烟跑 `1~3` 轮）换更小的峰值内存与更短耗时。
+   *   ⚠️ **压低会改变中心质量**（可能没收敛）⇒ 它**不进 Params**（§5 的参数表不认它）：
+   *     它是「这一次重训怎么跑」，不是「这个库怎么算」 ⇒ 只能是**调用期**入参。
+   */
+  maxIterations?: number;
   /** 归属规则用的粗层探针数（缺省 `ROUTER_NPROBE_COARSE`）。 */
   nprobeCoarse?: number;
   /** 落库时间戳（毫秒）——写进 `vector_*_cells.updated_at`。 */
@@ -180,6 +192,9 @@ export function rebuildBuckets(
   const model = buildCentroidModel(trainingVectors, {
     coarseCenters: options.coarseCenters,
     fineCenters: options.fineCenters,
+    // ⚠️ **条件展开**（`exactOptionalPropertyTypes`）：不传时保持「字段缺省」的语义，
+    //   而不是显式塞 `undefined`（后者在严格可选下是不同的类型）。
+    ...(options.maxIterations === undefined ? {} : { maxIterations: options.maxIterations }),
   });
 
   // ⚠️ **归属上下文指向「新模型」**（不是缓存里的旧模型）：

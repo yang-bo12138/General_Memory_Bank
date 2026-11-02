@@ -25,6 +25,7 @@ import {
   buildCentroidModel,
   trainCentroids,
 } from '../../src/vector/ivf.js';
+import { sphericalKmeans } from '../../src/vector/kmeans.js';
 import { EMBED_DIM, createTestDb, insertMemories, pseudoUnitVector } from '../fixtures/vector.js';
 
 /** 一个固定的时间基准。 */
@@ -500,5 +501,118 @@ describe('P2-T02 · 两级 k-means 分桶后端（IVF）', () => {
         expect(fixture.fineBucketIds[index]).toBe(assignFineBucket(fixture.model, vector, 2));
       });
     });
+  });
+});
+
+/**
+ * ★ **性能轮（2026-11-02）**：`buildCentroidModel` 的两处改动。
+ *
+ * 背景（缺陷②/①，见 `docs/progress/stage3-progress.md` §3.1）：
+ *   · 旧实现「**每个粗桶都从头遍历一遍全部向量**」再按归属过滤 ⇒ `O(粗桶数 × N)`
+ *     （默认 200 × 100 万 = 2 亿次比较），而这件事本身只需要 `O(N)`；
+ *   · `BucketRebuildOptions` 没有 `maxIterations` 字段 ⇒ 百万级重训没法降迭代换内存。
+ *
+ * ★ **本组断言的判别力从哪来**（这类「性能改写」最容易写成恒绿）：
+ *   ① 不复用被测实现的分堆逻辑 —— 上面 `referenceFineCentroids()` 把**旧的 O(K×N) 写法**
+ *      原样重写一遍当参照 ⇒ 两边中心**逐位相同**才通过；
+ *   ② 再配一条**负控**：把参照里的成员顺序**故意打乱**，必须**不再相等**
+ *      ⇒ 证明「逐位相同」这个判据真的对顺序敏感（否则它只是「两边都跑了同一个函数」）；
+ *   ③ `maxIterations` 的透传**不靠「结果不同」**（这份夹具在 1 轮就收敛，结果本来就相同），
+ *      而是靠 **`sphericalKmeans` 对非法值的守卫**：值只有真的到达了 kmeans 才会抛
+ *      `maxIterations 必须是 ≥ 1 的整数`。这是一条不会因数据而飘的判据。
+ */
+describe('性能轮 · 单遍分堆必须与旧双层扫描逐位等价', () => {
+  /** 旧的 O(粗桶数 × N) 写法（**参照实现**，刻意不用被测代码的分堆）。 */
+  function referenceFineCentroids(
+    vectors: readonly Float32Array[],
+    coarseCenters: number,
+    fineCenters: number,
+  ): Float32Array[] {
+    const coarseResult = sphericalKmeans(vectors, coarseCenters, {});
+    const finePerCoarse = Math.max(1, Math.floor(fineCenters / coarseCenters));
+    const fine: Float32Array[] = [];
+    for (let coarseIndex = 0; coarseIndex < coarseResult.centers.length; coarseIndex += 1) {
+      const bucketVectors: Float32Array[] = [];
+      for (let index = 0; index < vectors.length; index += 1) {
+        const vector = vectors[index];
+        if (vector === undefined) {
+          continue;
+        }
+        if (coarseResult.assignments[index] === coarseIndex) {
+          bucketVectors.push(vector);
+        }
+      }
+      for (const centroid of sphericalKmeans(bucketVectors, finePerCoarse, {}).centers) {
+        fine.push(centroid);
+      }
+    }
+    return fine;
+  }
+
+  it('细中心逐位相同（顺序也相同）⇒ 分堆方式的改写没有改变训练结果', () => {
+    const vectors = Array.from({ length: 60 }, (_, index) => pseudoUnitVector(index + 1));
+    const model = buildCentroidModel(vectors, { coarseCenters: 4, fineCenters: 40 });
+    const reference = referenceFineCentroids(vectors, 4, 40);
+
+    expect(model.fine.length).toBe(reference.length);
+    for (let index = 0; index < reference.length; index += 1) {
+      const actual = model.fine[index]?.centroid;
+      const expected = reference[index];
+      expect(actual).toBeDefined();
+      expect(expected).toBeDefined();
+      if (actual === undefined || expected === undefined) {
+        continue;
+      }
+      // ⚠️ **逐位比较**（不是 `toBeCloseTo`）：分堆顺序一变，细层的初始中心就变
+      //   ⇒ 浮点结果会有差异 ⇒ 这正是本用例要抓的东西。
+      expect(Array.from(actual)).toEqual(Array.from(expected));
+    }
+  });
+
+  it('★ 负控：把参照里的成员顺序打乱 ⇒ 中心必须不再相同（证明上一条对顺序敏感）', () => {
+    const vectors = Array.from({ length: 60 }, (_, index) => pseudoUnitVector(index + 1));
+    const balanced = referenceFineCentroids(vectors, 4, 40);
+    // 打乱输入顺序（同一批向量，只是顺序不同）⇒ 初始中心取自「前 K 条」⇒ 结果应当不同
+    const shuffled = [...vectors].reverse();
+    const shuffledCentroids = referenceFineCentroids(shuffled, 4, 40);
+    const identical =
+      balanced.length === shuffledCentroids.length &&
+      balanced.every((centroid, index) => {
+        const other = shuffledCentroids[index];
+        return (
+          other !== undefined && Array.from(centroid).join(',') === Array.from(other).join(',')
+        );
+      });
+    expect(identical).toBe(false);
+  });
+});
+
+describe('性能轮 · `maxIterations` 真的到达了 k-means', () => {
+  const vectors = Array.from({ length: 30 }, (_, index) => pseudoUnitVector(index + 1));
+
+  it('非法值（0）⇒ 抛 k-means 的守卫错误（值没传到就不会抛）', () => {
+    // ⚠️ 这条是**透传的判据**：`buildCentroidModel` 只是把 `maxIterations` 交给
+    //   `sphericalKmeans` ⇒ 只有真的交过去了，这个守卫才会响。
+    expect(() =>
+      buildCentroidModel(vectors, { coarseCenters: 2, fineCenters: 2, maxIterations: 0 }),
+    ).toThrowError(/maxIterations 必须是 ≥ 1 的整数/);
+  });
+
+  it('★ 负控：不传 `maxIterations` 时**不应该**抛（默认值 25 是合法值）', () => {
+    // 与上一条成对 —— 否则「抛错」可能只是「这个函数本来就会抛」。
+    expect(() => buildCentroidModel(vectors, { coarseCenters: 2, fineCenters: 2 })).not.toThrow();
+  });
+
+  it('合法值（3）⇒ 能跑通，且与默认值的结果一致（这份夹具 1 轮就收敛 ⇒ 结果本就相同）', () => {
+    const withThree = buildCentroidModel(vectors, {
+      coarseCenters: 4,
+      fineCenters: 40,
+      maxIterations: 3,
+    });
+    const withDefault = buildCentroidModel(vectors, { coarseCenters: 4, fineCenters: 40 });
+    expect(withThree.fine.map((cell) => cell.fineId)).toEqual(
+      withDefault.fine.map((cell) => cell.fineId),
+    );
+    expect(withThree.fine.length).toBe(withDefault.fine.length);
   });
 });

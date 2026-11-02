@@ -226,23 +226,39 @@ export function buildCentroidModel(
   // ⚠️ **细中心数按公式算**（别硬写 50）：每个粗桶分到 floor(细 / 粗) 个。
   const finePerCoarse = Math.max(1, Math.floor(options.fineCenters / options.coarseCenters));
 
+  // ⚠️★ **一次遍历分堆**（2026-11-02 性能轮改）—— 旧写法是双层循环：
+  //   外层遍历粗桶、内层**每次都从 0 遍历全部 `vectors`** 再按归属过滤
+  //   ⇒ 复杂度 `O(粗桶数 × N)`。默认 200 个粗桶 × 100 万条 ⇒ **2 亿次比较**，
+  //     而这件事本身只是「把向量按归属分成几堆」⇒ 本来 `O(N)` 就够。
+  //   ⇒ 现在先一次性分堆（`O(N)`），再按粗桶顺序训练细层。
+  //   ⚠️ **结果必须与旧写法完全相同**：每个桶内仍然是**按输入顺序**收集的
+  //     （细层的初始中心 = 该桶前 `finePerCoarse` 条 ⇒ 顺序变了结果就变）。
+  //     这条由 `tests/unit/ivf.test.ts` 的「单遍分堆 ≡ 双层扫描」用例钉住。
+  const bucketMembers: Float32Array[][] = coarse.map(() => []);
+  for (let index = 0; index < vectors.length; index += 1) {
+    const vector = vectors[index];
+    const assigned = coarseResult.assignments[index];
+    if (vector === undefined || assigned === undefined) {
+      continue;
+    }
+    const member = bucketMembers[assigned];
+    // ⚠️ 归属越界只可能来自「`assignments` 与 `coarse` 不同长」这种内部不一致
+    //   （`coarse` 会跳过取值 `undefined` 的中心）⇒ 跳过该向量，与旧写法一致
+    //   （旧写法里 `assignments[index] === coarseIndex` 同样选不中它）。
+    if (member === undefined) {
+      continue;
+    }
+    member.push(vector);
+  }
+
   const fine: IvfCentroidModel['fine'][number][] = [];
   for (let coarseIndex = 0; coarseIndex < coarse.length; coarseIndex += 1) {
     const coarseCell = coarse[coarseIndex];
     if (coarseCell === undefined) {
       continue;
     }
-    // ⚠️ **按输入顺序**收集该粗桶的向量 ⇒ 细层的初始中心也是确定的。
-    const bucketVectors: Float32Array[] = [];
-    for (let index = 0; index < vectors.length; index += 1) {
-      const vector = vectors[index];
-      if (vector === undefined) {
-        continue;
-      }
-      if (coarseResult.assignments[index] === coarseIndex) {
-        bucketVectors.push(vector);
-      }
-    }
+    // ⚠️ **按输入顺序**的成员（分堆时逐条 push ⇒ 顺序即输入顺序）⇒ 细层初始中心是确定的。
+    const bucketVectors = bucketMembers[coarseIndex] ?? [];
     const fineResult = sphericalKmeans(bucketVectors, finePerCoarse, {
       maxIterations: options.maxIterations,
     });

@@ -115,6 +115,17 @@ export interface RebuildBucketsOptions {
    *   （`scripts/check-payload-keys.ts` 会红）。
    */
   reason?: string;
+  /**
+   * 每层 k-means 的最大迭代轮数（缺省 `DEFAULT_MAX_ITERATIONS` = 25）。
+   *
+   * ⚠️★ **逃生阀，不是调参项**：百万级重训的峰值内存与耗时随迭代轮数线性上升
+   *   ⇒ 冒烟 / 受限内存的环境里可以显式压低（例如 `1~3`），代价是**中心可能没收敛**。
+   *   ⚠️ **它刻意不进 `Params`**（§5 的参数表不认它）：`Params` 描述「这个库怎么算」，
+   *     而它是「**这一次**重训怎么跑」⇒ 只能是调用期入参（改了它不该影响历史数据的解读方式）。
+   *   ⚠️ **不进事件 payload**：§8.4 硬规则 4 写死 `action='rebuildBuckets'` 的字段集
+   *     只有 `cells, members` ⇒ 多塞一个键会被 `scripts/check-payload-keys.ts` 判红。
+   */
+  maxIterations?: number;
 }
 
 /** 「只重训一次」闸门的结果。 */
@@ -185,6 +196,9 @@ export class MemoryMaintainer {
   rebuildVectorBuckets(options?: RebuildBucketsOptions): RebuildBucketsResult {
     const context = this.#context;
     const reason = options?.reason ?? 'explicit';
+    // ⚠️ **先归一化再进闭包**：`options` 是可选参数，直接在闭包里写 `options.maxIterations`
+    //   会踩 `TS18048`（possibly undefined）；而且归一化一次比每处都写 `?.` 更不容易漏。
+    const maxIterations = options?.maxIterations;
 
     // ⚠️ **`inRetrain` 必须在整段重训期间为 true** ⇒ 用 `try/finally` 保证
     //   **异常路径也会复位**（漏复位 ⇒ 面板永远说「正在重训」⇒ 状态永久失真）。
@@ -205,6 +219,8 @@ export class MemoryMaintainer {
           // ⚠️ **条件展开**（`exactOptionalPropertyTypes`）：显式写 `hooks: undefined`
           //   与「不传」是**两件事** ⇒ 钩子不存在时**根本不带上这个键**。
           ...(context.hooks === undefined ? {} : { hooks: context.hooks }),
+          // ⚠️ 同款条件展开：`maxIterations` 不传时保持「字段缺省」⇒ 向量层用默认 25 轮。
+          ...(maxIterations === undefined ? {} : { maxIterations }),
         },
       );
 
