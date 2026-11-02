@@ -625,7 +625,7 @@ function listTsFiles(dir: string): string[] {
 }
 
 describe('T05 · 架构约束', () => {
-  it('★ `mcp/tools.ts` 不 import SDK；`src/**` 与 `mcp/**` 里命中该包名的文件**只有** `mcp/server.ts`', () => {
+  it('★ `mcp/tools.ts` 不 import SDK；**产品代码**里命中该包名的文件只有 `mcp/server.ts`', () => {
     const scanned = [
       ...listTsFiles(join(REPO_ROOT, 'src')),
       ...listTsFiles(join(REPO_ROOT, 'mcp')),
@@ -635,7 +635,23 @@ describe('T05 · 架构约束', () => {
       .map((file) => relative(REPO_ROOT, file).split(sep).join('/'));
 
     expect(scanned.length).toBeGreaterThan(50); // 分母非空（别让空目录给出假绿）
-    expect(hits, 'SDK 的耦合面被扩散了：升级 SDK 就得改多处').toEqual(['mcp/server.ts']);
+
+    // ① **产品代码**（非 `*.test.ts`）：只许 `mcp/server.ts` 一处。
+    const productHits = hits.filter((file) => !file.endsWith('.test.ts'));
+    expect(productHits, 'SDK 的耦合面被扩散了：升级 SDK 就得改多处').toEqual(['mcp/server.ts']);
+
+    // ② ★ **测试侧**：命中该包名的测试文件必须**恰好**是 `mcp/server.test.ts`。
+    //   ⚠️ 这半条不是凑数：它证明「排除 `*.test.ts`」不是一块遮羞布 ——
+    //     若有人把 SDK 悄悄 import 进**别的**测试文件当捷径，这里会红；
+    //     若 `server.test.ts` 被删/改名，这里也会红（那时 ① 依然绿，说明半条断言各有分工）。
+    const testHits = hits.filter((file) => file.endsWith('.test.ts'));
+    expect(
+      testHits,
+      '测试侧 import SDK 的文件集合变了（协议层覆盖的入口只有 server.test.ts）',
+    ).toEqual(['mcp/server.test.ts']);
+
+    // ③ 再钉一次最核心的那句：`mcp/tools.ts` 自己不含这个包名（它是 SDK 免疫的纯函数层）。
+    expect(hits).not.toContain('mcp/tools.ts');
   });
 
   it('★ vitest 的 `include` 含 `mcp/**/*.test.ts`（否则本文件根本不跑，而且**不报错**）', () => {
