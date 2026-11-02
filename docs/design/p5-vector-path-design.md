@@ -946,3 +946,56 @@ graph LR
 **现改为做**（D8）—— 因为不做就等于把 §6 的「`baseScore` 与 `Hit.score` 逐位一致」
 在**最有用的场景**下变成一句假话，而那条承诺正是 `inhibitionTrace` 存在的**唯一理由**。
 代价是 `InhibitionTraceOptions` 多一个**可选**字段（不改方法数、不改方法名）。
+
+---
+
+## 11. 实现后读数（**实测**，2026-11-03）
+
+> 本节是**交付侧**的账：设计里承诺的东西最终落在哪、被验证到什么程度。
+> 全部读数来自本轮实跑，不转抄计划值。
+
+### 11.1 落地提交
+
+| 任务 | 提交 | 内容 |
+|---|---|---|
+| **T01 · P2-T09** | `77b1e2d` | `src/vector/query.ts`（`normalizeQueryEmbedding`）· `src/store/vectorPort.ts`（`resolveRecallVectorPort` / `RecallVectorPort`）· `src/store/stats.ts` 加可选 `known` |
+| **T02 · P2-T10** | `96568eb` | `src/store/recall.ts` 步骤 2c + 三路合并 + 四处取值来源 · `MemoryStore.ts` 装配 · `inhibition.ts` 加可选 `queryEmbedding` |
+| **T03 · P2-T11** | `399d1ee` | 五个验收测试文件（flat-vs-ivf / 四态矩阵 / 零影响回归 / **ivf 端到端**）＋ `tests/fixtures/qaVectorWorld.ts` |
+| **T04 · P2-T12** | 本次提交 | `DECISIONS.md` 的 ADR-P5-VEC · `DESIGN-v2-errata.md` §11（六条勘误）· 本文件本节 |
+| **T05 · P2-T13** | — | ⬜ **未做**（bench 变体 + 独立重采轮） |
+
+### 11.2 门禁与规模
+
+| 项 | 读数 |
+|---|---|
+| `pnpm run verify` | **EXIT=0** · **90 文件 / 1,832 断言** |
+| 相对基线（83 / 1,757） | **+7 文件 / +75 断言**，零删除、零放宽 |
+| `pnpm run build` | 待最终确认（`tsup` entry 仍只 `src/index.ts`） |
+| 两条文档审计 | 真缺 0 |
+
+### 11.3 关键实测数字
+
+| 项 | 实测 |
+|---|---|
+| **零影响的成本维度** | 不传 `queryEmbedding`：**3 条 SQL，`embedding IS NOT NULL` 的全表 COUNT 0 次**；传了：6 条，COUNT 1 次（原文 `SELECT count(*) AS n FROM memories WHERE deleted = 0 AND embedding IS NOT NULL`） |
+| **ivf 端到端**（门面级，40 条带向量记忆） | `mode==='ivf'` · `coarseCells=20` · `fineCells=26` · `members=40` · `ran=true` · `candidates=20` · 每条 `fromVector=true` · `cos` 与自算点积逐位一致 · `vectorPart === 0.25 × cos` |
+| **`reload()` 失效可观测** | 库外重训且不 `reload()` ⇒ 同一查询 `cos=0.8740`（不是最像那条）；新实例（缓存为空）⇒ `cos=0.8821`（正是最像那条）⇒ **静默变差被观测到，不是报错** |
+| **ivf ≡ flat（探针吃满）** | id 序列、每条 `cos`、`score` **逐位相同**；反向对照：探 1/1 时两者**必须不同**（证明前一条不是「ivf 压根没分桶」） |
+| **吻合率 vs 探针** | 一次实测（3,200 条簇状语料 · 16 簇×200 · 粗 16/细 64 · 6 条查询，每档 120 点）：满探针 16/64 = 120/120；2/8 = 120/120；2/4 = **0.958**；1/2 = 0.725 |
+| **时间窗可观测性** | 只有「>60 条窗内但已归档的旧记忆 + 1 条窗外的新记忆」这个形状能把它与强度精筛分开：正确实现 `candidates=1`，绕过时间窗则 `candidates=0` |
+
+⚠️ **两条必须这么读**（细节见 `DESIGN-v2-errata.md` §11.4 / §11.5）：
+- 「吻合率 ≥ 0.98」是**数据 + 探针配置**的特定值；能当实现性质断言的是**探针吃满 ⇒ 必须 1.0**。
+- **时间窗与 `ARCHIVE_LINE` 在当前默认参数下是同一个边界**（窗口宽 = `MAX_STABILITY × ln(1/ARCHIVE_LINE)`）⇒ 它单独**不可观测**，是个索引友好的预筛而非独立语义闸门。
+
+### 11.4 与设计的偏差（三条，全部已在 errata 或注释里留痕）
+
+1. **端口只在传了 `queryEmbedding` 时才装配**（D1 的字面是「每次 recall 时」）。理由：无条件装配会给每个既有宿主每次召回加一次全表 COUNT，直接违反 D2 的**成本**维度。已由 COUNT 计数断言钉住，并记为 `DECISIONS.md` 的 **D1-a**。
+2. **`VECTOR_ENRICH_SQL` 的「不含 `last_access`」按「WHERE 段不含时间窗判定」实现**：`SELECT` 列表必须有 `last_access`（强度精筛要用），字面理解做不到。
+3. **`src/vector/flat.ts` 的 `assertBackendConfig` 硬比 `DEFAULT_PARAMS.EMBED_DIM`**（而非 `params.EMBED_DIM`）⇒ 覆盖 `EMBED_DIM` 的宿主传向量会**响亮抛错**。既有问题，未修，已登记 errata §11.6。
+
+### 11.5 本轮**明确没做**的
+
+- **T05**：`bench/perf.ts` / `bench/baseline-flat.ts` 的 `queryEmbedding` 变体、以及**百万级重采**（26 分钟 + ≥5GB 内存）。⇒ **H1 / H2 的读数本轮未重采**，且按 RK-10 的结论：**接线不会让它转绿**。
+- `MemoryConfig.embedder` 现算查询向量（§10 第 1 条）。
+- `stats()` / `flags` 两套 mode 词的收敛（errata §11.6(a)）。
