@@ -20,8 +20,14 @@ import { describe, expect, it } from 'vitest';
 
 import { MemoryError } from '../../src/core/errors.js';
 import { App, WIRED_PANELS } from '../../viewer/renderer/App.js';
+import { ClusterMapView } from '../../viewer/renderer/panels/ClusterMap.js';
+import { GraphViewView } from '../../viewer/renderer/panels/GraphView.js';
+import { LogViewerView } from '../../viewer/renderer/panels/LogViewer.js';
 import { MemoryListView } from '../../viewer/renderer/panels/MemoryList.js';
+import { OverviewView } from '../../viewer/renderer/panels/Overview.js';
 import { RecallSimulatorView } from '../../viewer/renderer/panels/RecallSimulator.js';
+import { loadRecallSim } from '../../viewer/renderer/panels/RecallSimulator.js';
+import { VersionHistoryView } from '../../viewer/renderer/panels/VersionHistory.js';
 import { errorState, readyState } from '../../viewer/renderer/state/useReadCall.js';
 import { PANEL_ORDER, PANEL_TITLES } from '../../viewer/renderer/texts.js';
 import { WRITE_CHANNELS } from '../../viewer/shared/channels.js';
@@ -34,10 +40,15 @@ import {
   FIXED_NOW,
   breakdownSum,
   makeBreakdown,
+  makeClustersResult,
+  makeGraphRow,
+  makeHistoryRow,
+  makeLogPage,
   makeMemoryDetail,
   makeMemoryError,
   makeRecallHit,
   makeRecallSimResult,
+  makeStats,
   makeSuppressed,
   scoreBarMemoryIds,
   scoreBarRows,
@@ -68,6 +79,13 @@ function renderRecall(state: Parameters<typeof RecallSimulatorView>[0]['state'])
   );
 }
 
+/** 渲染面板 1（就绪态）。 */
+function renderOverview(stats: Parameters<typeof makeStats>[0] & object): string {
+  return renderToStaticMarkup(
+    createElement(OverviewView, { state: readyState(makeStats(stats)), now: FIXED_NOW }),
+  );
+}
+
 /** 一个「一调用就抛」的假端口（SSR 里 `useEffect` 不跑 ⇒ 它不该被调用一次）。 */
 function makeThrowingPort(): { port: ReadPort; calls: string[] } {
   const calls: string[] = [];
@@ -93,9 +111,14 @@ function makeThrowingPort(): { port: ReadPort; calls: string[] } {
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe('T03 · 面板 3：无 embedder 时必须显式标注「本次未执行向量路」', () => {
-  it('★ 标注出现，且**不出现**「向量索引损坏」', () => {
+  it('★ 标注出现（后半句「不出现向量索引损坏」的判别力**不在**这里，见下）', () => {
     const html = renderRecall(readyState(makeRecallSimResult({ hasEmbedder: false })));
     expect(html).toContain('本次未执行向量路');
+    // ⚠️ ★ **这半条本身不是守卫**（如实记）：同一文件的「渲染层没有『向量索引损坏』
+    //   这句措辞」一节已断言该词在 `viewer/renderer/**` **源码里一次都不出现**
+    //   ⇒ 渲染结果**永远**不可能含有它，这条 `not.toContain` 因此**恒真**。
+    //   留着它只是因为「面板 3 的输出里没有这句话」读起来直观；
+    //   **真正的守卫是那条源码扫描**（有人把这句写进面板时它会变红）。
     expect(html).not.toContain('向量索引损坏');
   });
 
@@ -470,6 +493,183 @@ describe('T03 · 面板共用同一套状态组件（不各写一套）', () => 
     const readyHtml = renderMemoryList(readyState(makeMemoryDetail()));
     expect(readyHtml).not.toContain('计算中');
     expect(readyHtml).not.toContain('data-status="loading"');
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ④bis T03 断言补强：让「不咬人」的断言真的能变红
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('T03 补强 · 面板 2 的 τ：**不一致**夹具才能区分「读字段」与「自己算」', () => {
+  /**
+   * ⚠️ ★ 为什么必须造「不一致」夹具：
+   *   原夹具里 `effectiveStability` **恒等于** `stability × pinFactor`（25 = 10 × 2.5）
+   *   ⇒ 把实现从「读 `view.effectiveStability`」改成「自己算 `stability * pinFactor`」，
+   *     原来的三条断言**全绿**。`src/core/scoring.ts` 确认两者当前代数相等，
+   *     所以这是**未来漂移**风险：哪天上游给「有效 τ」再加一个系数，渲染层会悄悄显示错值。
+   *   ⇒ 造一个 `30 ≠ 10 × 2.5 = 25` 的夹具：读到 30 才算真读了字段。
+   */
+  it('★ `stability=10, pinFactor=2.5, effectiveStability=30` ⇒ `data-tau-days="30"`（不是 25）', () => {
+    const base = makeMemoryDetail();
+    const detail = {
+      ...base,
+      view: { ...base.view, stability: 10, pinFactor: 2.5, effectiveStability: 30 },
+    };
+    const html = renderMemoryList(readyState(detail));
+    expect(html).toContain('data-tau-days="30"');
+    // 判别力：自己算 `stability × pinFactor` 的实现会渲染 25
+    expect(html).not.toContain('data-tau-days="25"');
+  });
+
+  it('★ 另一方向：`effectiveStability=7.5` < `stability × pinFactor` 也要如实显示', () => {
+    const base = makeMemoryDetail();
+    const detail = {
+      ...base,
+      view: { ...base.view, stability: 10, pinFactor: 2.5, effectiveStability: 7.5 },
+    };
+    const html = renderMemoryList(readyState(detail));
+    expect(html).toContain('data-tau-days="7.5"');
+    expect(html).not.toContain('data-tau-days="25"');
+  });
+
+  it('★ 源码层：renderer **不做时间计算** —— 不出现 `pinFactor` 这个标识符', () => {
+    const files = listSourceFiles('viewer/renderer');
+    expect(files.length).toBeGreaterThanOrEqual(16);
+    // 摘掉注释后扫（注释里解释「pin_factor 在分母内」是允许的，代码里算它不允许）
+    const offenders = files.filter((file) => readCode(file).includes('pinFactor'));
+    expect(offenders).toEqual([]);
+    // 负控：同一判据能在「自己算」的写法上命中
+    expect('const tau = view.stability * view.pinFactor;'.includes('pinFactor')).toBe(true);
+  });
+});
+
+describe('T03 补强 · ① `embeddedRatio` 的标签与数值**绑在一起**（两条独立 toContain 会脱钩）', () => {
+  it('★ `data-embedded-ratio-text` 的**取值**就是 `43.1%`', () => {
+    const html = renderOverview(makeStats({ embeddedRatio: 0.4312 }));
+    expect(html).toContain('data-embedded-ratio-text="">43.1%</p>');
+  });
+
+  it('判别力：换比例 ⇒ 该属性的取值跟着变（不是别处的 43.1% 满足了断言）', () => {
+    const html = renderOverview(makeStats({ embeddedRatio: 0.0875 }));
+    expect(html).toContain('data-embedded-ratio-text="">8.8%</p>');
+    expect(html).not.toContain('data-embedded-ratio-text="">43.1%</p>');
+  });
+});
+
+describe('T03 补强 · ⑨(a) 七个面板的 `<button>` 文案一次性收齐并 ⊆ 白名单', () => {
+  /** ★ 白名单的测试侧副本（不从 `texts.ts` import）。 */
+  const WHITELIST = ['上一页', '下一页', '模拟召回', '刷新快照', '加载更早的版本', '对比上次'];
+
+  /** 把七个面板各渲一遍（都喂就绪态），返回全部 markup。 */
+  function renderAllSevenPanels(): string[] {
+    return [
+      renderToStaticMarkup(
+        createElement(OverviewView, { state: readyState(makeStats()), now: FIXED_NOW }),
+      ),
+      renderMemoryList(readyState(makeMemoryDetail())),
+      renderRecall(readyState(makeRecallSimResult())),
+      renderToStaticMarkup(
+        createElement(GraphViewView, {
+          state: readyState([makeGraphRow(1, '张三', '养', '猫')]),
+          now: FIXED_NOW,
+        }),
+      ),
+      renderToStaticMarkup(
+        createElement(LogViewerView, {
+          state: readyState(makeLogPage()),
+          query: { year: 2024, month: 1 },
+          now: FIXED_NOW,
+        }),
+      ),
+      // 面板 6：`loaded < total` ⇒ 「加载更早的版本」也在场（三个按钮都要被检查到）
+      renderToStaticMarkup(
+        createElement(VersionHistoryView, {
+          state: readyState({
+            rows: [makeHistoryRow('h-1', 'x', 'merge', FIXED_NOW)],
+            total: 137,
+            page: 0,
+          }),
+          current: makeMemoryDetail().view,
+          now: FIXED_NOW,
+        }),
+      ),
+      renderToStaticMarkup(
+        createElement(ClusterMapView, {
+          state: readyState(makeClustersResult()),
+          previous: makeClustersResult(),
+          now: FIXED_NOW,
+        }),
+      ),
+    ];
+  }
+
+  it('★ 收齐后**每条**文案都在白名单里（含面板 5 的上/下页这 2 个按钮）', () => {
+    const htmls = renderAllSevenPanels();
+    expect(htmls.length).toBe(7);
+    const labels = htmls.flatMap((html) => buttonLabels(html));
+
+    // ⚠️ 分母：面板 3 有 1 个、面板 5 有 2 个、面板 6 有 3 个、面板 7 有 1 个 ⇒ 至少 7 条
+    expect(labels.length).toBeGreaterThanOrEqual(7);
+    // 面板 5 的那两个按钮必须真的被收进来（这正是原先漏掉的那一处）
+    expect(labels).toContain('上一页');
+    expect(labels).toContain('下一页');
+
+    for (const label of labels) {
+      expect(WHITELIST, `面板里出现了白名单外的按钮文案：${label}`).toContain(label);
+    }
+  });
+
+  it('★ 这个 helper **真的能看见**面板 5 的按钮（否则上面的「收齐」是空转）', () => {
+    const logHtml = renderToStaticMarkup(
+      createElement(LogViewerView, {
+        state: readyState(makeLogPage()),
+        query: { year: 2024, month: 1 },
+        now: FIXED_NOW,
+      }),
+    );
+    expect(buttonLabels(logHtml)).toEqual(['上一页', '下一页']);
+  });
+
+  it('负控：混进一个「回滚」按钮 ⇒ 同一判据立刻红', () => {
+    const polluted = renderToStaticMarkup(
+      createElement(LogViewerView, {
+        state: readyState(makeLogPage()),
+        query: { year: 2024, month: 1 },
+        now: FIXED_NOW,
+      }),
+    ).replace('</button>', '</button><button type="button">回滚</button>');
+    const labels = buttonLabels(polluted);
+    expect(labels).toContain('回滚');
+    expect(labels.every((label) => WHITELIST.includes(label))).toBe(false);
+  });
+});
+
+describe('T03 补强 · ⑨(b) 面板侧的 `reinforce: false`（原先只有 IPC 层断言）', () => {
+  it('★ 面板发起召回时传给 `port.recall` 的 input 里 `reinforce === false`（且键存在）', async () => {
+    const captured: unknown[] = [];
+    const port = {
+      stats: () => Promise.reject(new Error('不该调用')),
+      get: () => Promise.reject(new Error('不该调用')),
+      recall: (input: unknown) => {
+        captured.push(input);
+        return Promise.resolve(makeRecallSimResult());
+      },
+      clusters: () => Promise.reject(new Error('不该调用')),
+      inhibitionTrace: () => Promise.reject(new Error('不该调用')),
+      verifyIntegrity: () => Promise.reject(new Error('不该调用')),
+      select: () => Promise.reject(new Error('不该调用')),
+      logs: () => Promise.reject(new Error('不该调用')),
+    } as unknown as ReadPort;
+
+    await loadRecallSim(port, '张三喜欢什么');
+
+    expect(captured.length).toBe(1);
+    const input = captured[0] as { context?: unknown; reinforce?: unknown };
+    expect(input.context).toBe('张三喜欢什么');
+    // ★ 三条一起断：「键存在」+「值是 false」+「不是靠缺省糊过去」
+    expect(Object.hasOwn(input, 'reinforce')).toBe(true);
+    expect(input.reinforce).toBe(false);
+    expect(input.reinforce).not.toBe(true);
   });
 });
 

@@ -115,6 +115,40 @@ describe('T03 · 面板 1 的向量路块：五条措辞逐字匹配设计 §7.2
   });
 });
 
+describe('T03 补强 · 五条措辞逐条**取值**绑定（「整句出现过」≠「这个字段就是这句」）', () => {
+  /**
+   * ⚠️ ★ 为什么原来的写法不咬人：
+   *   上面那五条用的是 `toContain(整句)` ⇒ 只要页面上**任何地方**出现过这句话就算过。
+   *   极端反例：实现把五句**同时**渲染出来，五条断言**全绿**（而且用户看到五条互相矛盾的结论）。
+   *   ⇒ 这里改成绑定 `data-vector-route-text` 那**一个节点**的**完整取值**：
+   *     它必须**恰好**是这一句 —— 多一个字、少一个字、换成别的分支都算红。
+   */
+  const CASES: ReadonlyArray<
+    readonly ['flat_explicit' | 'flat_auto' | 'ivf' | 'absent', boolean, string]
+  > = [
+    ['flat_explicit', false, EXPECTED_VECTOR_TEXTS.flat_explicit],
+    ['flat_auto', false, EXPECTED_VECTOR_TEXTS.flat_auto],
+    ['ivf', false, EXPECTED_VECTOR_TEXTS.ivf],
+    ['absent', false, EXPECTED_VECTOR_TEXTS.absent_not_retraining],
+    ['absent', true, EXPECTED_VECTOR_TEXTS.absent_retraining],
+  ];
+
+  for (const [mode, inRetrain, expected] of CASES) {
+    it(`★ ${mode}（inRetrain=${String(inRetrain)}）⇒ 该节点的取值恰好是那一句`, () => {
+      const html = renderWithVectorBackend(mode, inRetrain);
+      expect(html).toContain(`data-vector-route-text="">${escapeHtml(expected)}</p>`);
+
+      // 反向：另外四句**一句都不许**落在这个节点里（防止「五句同时渲染」那种假绿）
+      for (const other of Object.values(EXPECTED_VECTOR_TEXTS)) {
+        if (other === expected) {
+          continue;
+        }
+        expect(html).not.toContain(`data-vector-route-text="">${escapeHtml(other)}</p>`);
+      }
+    });
+  }
+});
+
 describe('T03 · 面板 1：`flat_auto` 不得被标成「正在重训」', () => {
   it('★ 注入 `flat_auto` + `inRetrain=true`（不合法的组合）⇒ 仍不出现「重训」', () => {
     // ⚠️ 设计说 `flat_auto` 时 `inRetrain` **恒为 false**（flat 不建桶 ⇒ 没有重训这件事）。
