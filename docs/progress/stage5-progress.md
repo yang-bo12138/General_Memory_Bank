@@ -370,6 +370,12 @@ H1（12,782 行 = 门槛 6.39 倍，**沿用阶段 3 读数、本轮未复测**�
 | `D:\.pnpm-store` 文件损坏（`os error 1392`） | 文件系统层面，早于本轮所有工程师 | 换干净 store 重装（`--store-dir`）；**未修根因** ⇒ 建议对 D 盘跑一次 `chkdsk /f` |
 | `npx biome` 报 46 条假错 | npm 上有个**同名无关包** `biome@0.3.3` | 只用 `pnpm run lint` 或 `./node_modules/.bin/biome` |
 | `pnpm run <script>` 触发依赖预检 | 见上第 2 条 | 跑脚本前缀 `npm_config_verify_deps_before_run=false` |
+| **CI 一直红在「安装依赖」第 5 步**（`ERR_PNPM_IGNORED_BUILDS`），本地却全绿 | pnpm 12 在「有包带构建脚本、却没被 `allowBuilds` 放行」时让**整次安装失败**；electron 被刻意排除在 `allowBuilds` 外 ⇒ 必失败。而本地一直用 `--config.strict-dep-builds=false` 绕过 | 把意图写进仓库配置：`pnpm-workspace.yaml` 的 **`strictDepBuilds: false`**（`264ff3e`）。⚠️ 这**不是**关掉安全策略：`allowBuilds` 仍是白名单；该开关只决定「跳过要不要报错」 |
+
+★ **这一行是本轮最值得传下去的教训**：**「本地绕过」不是修复，只是把问题推给 CI。**
+我们三次用 `--config.strict-dep-builds=false` 让本地跑通，代价是 CI 从头到尾都没跑过一次绿的门禁
+（`c8d846c`、`7b1a7c6` 两次 run 全部 failure，且都死在测试之前的安装步骤）。
+**判据应当是「CI 上那条原样的命令能不能过」，不是「我本地能不能过」。**
 
 ### 9.8 复验入口（定稿读数，2026-11-02 实跑）
 
