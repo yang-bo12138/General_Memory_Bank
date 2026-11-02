@@ -227,7 +227,7 @@ const reason = result.skipped;       // 'too_soon' | 'disabled' | null
 | `docs/progress/stage3-progress.md` | **阶段 3 进度与交接账**（§一~§十三.16：交付清单 / 裁决记录 / 产品级缺陷 / 已达成未达成 / 待办 / **阶段 4 接手须知** / 通用工程纪律 4 与 5 的完整推导） |
 | `docs/design/DEVELOPMENT-PLAN.md` §2.4 | **通用工程纪律（5 条 · 永久落点）** |
 | `docs/baseline/perf-1000000.json` | 百万级基线（顶层 = 冷盘档 ＋ `_priorWarmRun` 全热档 ＋ `_priorPartialWarmRun` 部分热档 ＋ `_note` ①~⑩ ＋ `_measurementLayers` ＋ `_runs_index`） |
-| `docs/baseline/README.md` | **对外基线说明（已定版 · 81 处档位标注经脚本审计）** |
+| `docs/baseline/README.md` | **对外基线说明（已定版 · 审计脚本实测：121 处档位标注 · 97 处自带档位 · 24 处「标得不够近」· 0 处真缺）** |
 | `docs/qa/p3-t02-acceptance-report.md` · `p3-t06-acceptance-report.md` | 两轮对抗式验收报告 |
 | `docs/design/DECISIONS.md` | 裁决台账（索引，不复制正文） |
 | `scripts/` | 13 个脚本（8 条契约检查 + 3 个可复跑审计 + 1 个负控台） |
