@@ -70,6 +70,39 @@ export async function loadRecallSim(port: ReadPort, context: string): Promise<Re
   return port.recall(input);
 }
 
+/**
+ * ★ **提交语义**（纯函数）：点「模拟召回」时，`submitted` 该变成什么。
+ *
+ * ⚠️ 抽成纯函数不是为了好看：`renderToStaticMarkup` **不执行事件处理器**
+ *   ⇒ 「点一下到底提交了什么」在无 DOM 环境里**测不到**。
+ *   把这一跳的决策拿出来之后，就能逐值断言「空输入不提交 / 非空原样提交 / 再点一次覆盖」。
+ *
+ * @param current 上一次提交的文本（`null` = 还没提交过）
+ * @param context 输入框里的当前文本
+ * @returns 非空 ⇒ 用新文本；空白 ⇒ **保持原样**（不提交）
+ */
+export function nextSubmitted(current: string | null, context: string): string | null {
+  return context.trim() === '' ? current : context;
+}
+
+/**
+ * ★ **把 `submitted` 变成一次真实的 `port.recall` 调用**（纯函数工厂）。
+ *
+ * ⚠️ 这是「接线」的可断言形式：`RecallSimulator` 把本函数交给 `useReadCall` 当 `run`，
+ *   测试里直接拿同一个函数 + 假端口跑一次 ⇒ 断「假端口收到的 `context` 就是那一份」。
+ *   ⇒ 三段链条里唯一没被自动化覆盖的只剩 React 自己的事件派发（框架行为，不是本仓逻辑）。
+ */
+export function shouldRunRecall(submitted: string | null): boolean {
+  return submitted !== null && submitted.trim() !== '';
+}
+
+/**
+ * ★ **把 `submitted` 变成一次真实的 `port.recall` 调用**（纯函数工厂）。
+ */
+export function recallRunner(submitted: string): (port: ReadPort) => Promise<RecallSimResult> {
+  return (port: ReadPort) => loadRecallSim(port, submitted);
+}
+
 /** `RecallSimulatorView`（纯展示）的入参。 */
 export interface RecallSimulatorViewProps {
   /** 本次召回的读状态（`idle` 时不渲染它）。 */
@@ -128,6 +161,8 @@ export function RecallSimulatorView({
         className="panel__action"
         type="button"
         data-action="run-recall"
+        // ★ 空输入 ⇒ **disabled**（不是「点了没反应」）：用户看得见「现在还不能点」
+        disabled={context.trim() === ''}
         onClick={() => {
           (onSubmit ?? noop)();
         }}
@@ -305,11 +340,13 @@ export function RecallSimulator({
 
   // ⚠️ 未提交时把 `port` 传 `null`：`useReadCall` 因此**不调用**（而不是发一次空查询）。
   //   那个 `loading` 状态不会被渲染（见 `idle` 分支）。
-  const activePort = submitted === null ? null : port;
+  const activePort = shouldRunRecall(submitted) ? port : null;
   const state = useReadCall<RecallSimResult>(
     activePort,
     `recall:${submitted ?? '__idle__'}`,
-    (active) => loadRecallSim(active, submitted ?? ''),
+    // ★ 复用的就是 `recallRunner(submitted)` —— 测试里拿**同一个函数** + 假端口跑一次，
+    //   所以「假端口收到的 `context` 就是输入框那一份」是被断言过的，不是推断的。
+    recallRunner(submitted ?? ''),
   );
 
   return (
@@ -320,11 +357,8 @@ export function RecallSimulator({
       idle={submitted === null}
       onContextChange={setContext}
       onSubmit={() => {
-        // 空文本不提交（`recall()` 会以 INVALID_INPUT 拒绝，那是噪音不是信息）
-        if (context.trim() === '') {
-          return;
-        }
-        setSubmitted(context);
+        // ★ 提交语义收在纯函数里（空文本不提交 / 非空原样提交）
+        setSubmitted((current) => nextSubmitted(current, context));
       }}
     />
   );

@@ -26,7 +26,12 @@ import { LogViewerView } from '../../viewer/renderer/panels/LogViewer.js';
 import { MemoryListView } from '../../viewer/renderer/panels/MemoryList.js';
 import { OverviewView } from '../../viewer/renderer/panels/Overview.js';
 import { RecallSimulatorView } from '../../viewer/renderer/panels/RecallSimulator.js';
-import { loadRecallSim } from '../../viewer/renderer/panels/RecallSimulator.js';
+import {
+  loadRecallSim,
+  nextSubmitted,
+  recallRunner,
+  shouldRunRecall,
+} from '../../viewer/renderer/panels/RecallSimulator.js';
 import { VersionHistoryView } from '../../viewer/renderer/panels/VersionHistory.js';
 import { errorState, readyState } from '../../viewer/renderer/state/useReadCall.js';
 import { PANEL_ORDER, PANEL_TITLES } from '../../viewer/renderer/texts.js';
@@ -965,5 +970,127 @@ describe('T04 第四批 · 七个面板都能从导航打开', () => {
     for (const panelId of PANEL_ORDER) {
       expect(html).toContain(`>${PANEL_TITLES[panelId]}</button>`);
     }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ⑧ T04 第四批(补) · 面板 3 的「接线」证据：点一次 ⇒ 假端口收到的 context 就是输入框的值
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('T04 第四批(补) · 面板 3：提交语义是纯函数，接线可被直接跑一次', () => {
+  it('★ `nextSubmitted`：空白输入**不提交**（保持原值）', () => {
+    expect(nextSubmitted(null, '')).toBeNull();
+    expect(nextSubmitted(null, '   ')).toBeNull();
+    // 已有值也不会被空白清掉
+    expect(nextSubmitted('旧文本', '  ')).toBe('旧文本');
+  });
+
+  it('★ `nextSubmitted`：非空输入**原样提交**（不 trim，交给库侧归一）', () => {
+    expect(nextSubmitted(null, '张三喜欢什么')).toBe('张三喜欢什么');
+    expect(nextSubmitted('旧文本', '新文本')).toBe('新文本');
+  });
+
+  it('★★ 接线证据：`recallRunner(输入框的值)` 交给假端口 ⇒ 收到的 `context` 就是那一份', () => {
+    // ⚠️ 这条才是「接上了」的证据。只断 `reinforce === false` 证明不了接线
+    //   （那个常量跟输入框无关）。
+    const captured: Array<{ context?: unknown; reinforce?: unknown }> = [];
+    const port = {
+      recall: (input: unknown) => {
+        captured.push(input as { context?: unknown; reinforce?: unknown });
+        return Promise.resolve(makeRecallSimResult());
+      },
+    } as unknown as ReadPort;
+
+    // 用的是 `RecallSimulator` 交给 `useReadCall` 的**同一个** runner
+    const run = recallRunner('张三喜欢什么');
+
+    return run(port).then(() => {
+      expect(captured.length).toBe(1);
+      expect(captured[0]?.context).toBe('张三喜欢什么');
+      expect(captured[0]?.reinforce).toBe(false);
+    });
+  });
+
+  it('★ 换一份输入 ⇒ 送出去的也跟着换（不是写死的一句）', async () => {
+    const captured: unknown[] = [];
+    const port = {
+      recall: (input: unknown) => {
+        captured.push(input);
+        return Promise.resolve(makeRecallSimResult());
+      },
+    } as unknown as ReadPort;
+
+    await recallRunner('第二次的文本')(port);
+    expect((captured[0] as { context?: unknown }).context).toBe('第二次的文本');
+  });
+});
+
+describe('T04 第四批(补) · 面板 3：空输入时按钮 disabled（不是「点了没反应」）', () => {
+  /** 渲染空态面板 3。 */
+  function renderIdle(context: string): string {
+    return renderToStaticMarkup(
+      createElement(RecallSimulatorView, {
+        state: { status: 'loading' },
+        now: FIXED_NOW,
+        context,
+        idle: true,
+      }),
+    );
+  }
+
+  it('★ 空输入 ⇒ `data-action="run-recall"` 按钮带 `disabled`', () => {
+    expect(renderIdle('')).toMatch(/data-action="run-recall"[^>]*disabled/);
+  });
+
+  it('★ 只有空白 ⇒ 仍然 disabled（不是「非空字符就算」）', () => {
+    expect(renderIdle('   ')).toMatch(/data-action="run-recall"[^>]*disabled/);
+  });
+
+  it('反例：有内容 ⇒ **不** disabled（否则上面两条对任何输入都成立）', () => {
+    expect(renderIdle('张三喜欢什么')).not.toMatch(/data-action="run-recall"[^>]*disabled/);
+  });
+});
+
+describe('T04 第四批(补) · 导航：给定 activePanel 时**只渲染那一块**', () => {
+  it('★ 七块逐一验证：main 里恰好一个面板体（不多渲）', () => {
+    const { port } = makeThrowingPort();
+    for (const panelId of PANEL_ORDER) {
+      const html = renderToStaticMarkup(
+        createElement(App, {
+          port,
+          now: FIXED_NOW,
+          selection: { ...DEFAULT_SELECTION, panel: panelId, memoryId: 'm-1' },
+        }),
+      );
+      // 面板体只有两种形态：loading/error 的 `data-panel="<标题>"`、空态/就绪态的 `data-panel-body="<id>"`
+      const bodies =
+        (html.match(/data-panel-body="/g) ?? []).length +
+        (html.match(/data-panel="/g) ?? []).length;
+      expect(bodies, `${panelId} 渲染出的面板体数量不是 1`).toBe(1);
+    }
+  });
+});
+
+describe('T04 第四批(补) · 面板 3：空输入**一次都不发请求**（可断言的推导）', () => {
+  it('★ `shouldRunRecall(null)` false、`shouldRunRecall("")` false ⇒ 容器不会调端口', () => {
+    expect(shouldRunRecall(null)).toBe(false);
+    expect(shouldRunRecall('')).toBe(false);
+    expect(shouldRunRecall('   ')).toBe(false);
+  });
+
+  it('反例：有内容才允许发（否则上面三条是恒绿）', () => {
+    expect(shouldRunRecall('张三喜欢什么')).toBe(true);
+  });
+
+  it('★ 串联：空输入点提交 ⇒ `submitted` 仍是 null ⇒ 仍然不发', () => {
+    const afterClick = nextSubmitted(null, '   ');
+    expect(afterClick).toBeNull();
+    expect(shouldRunRecall(afterClick)).toBe(false);
+  });
+
+  it('★ 串联：有输入点提交 ⇒ `submitted` 是那份文本 ⇒ 允许发', () => {
+    const afterClick = nextSubmitted(null, '张三喜欢什么');
+    expect(afterClick).toBe('张三喜欢什么');
+    expect(shouldRunRecall(afterClick)).toBe(true);
   });
 });
