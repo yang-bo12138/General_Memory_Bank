@@ -51,7 +51,12 @@ import {
   type WorkspaceError,
 } from '../shared/protocol.js';
 import { type SqlQueryName, isSqlQueryName } from '../shared/sql-names.js';
-import { CONTENT_HISTORY_PAGE_SIZE, GRAPH_NODE_LIMIT, SQL_QUERIES } from './queries.js';
+import {
+  CONTENT_HISTORY_PAGE_SIZE,
+  GRAPH_NODE_LIMIT,
+  RECENT_MEMORY_LIMIT,
+  SQL_QUERIES,
+} from './queries.js';
 import { guard } from './sql-guard.js';
 
 /**
@@ -325,28 +330,40 @@ function requireString(value: unknown, key: string): string {
  * 按查询名绑定命名参数（**参数上界一律来自常量，不信调用方**）。
  *
  * ⚠️ `nodeLimit` / `limit` 都**钳**在常量以内：即使 renderer 传 `1e9`，
- *   真正执行的 SQL 也只会取 `GRAPH_NODE_LIMIT` / `CONTENT_HISTORY_PAGE_SIZE` 条
- *   ⇒ 「按 LIMIT 抽样」这件事不是靠调用方守规矩。
+ *   真正执行的 SQL 也只会取 `GRAPH_NODE_LIMIT` / `CONTENT_HISTORY_PAGE_SIZE` /
+ *   `RECENT_MEMORY_LIMIT` 条 ⇒ 「按 LIMIT 抽样」这件事不是靠调用方守规矩。
+ *
+ * ⚠️ ★ **`memoryId` 的校验下沉进各分支**（P5-T04）：
+ *   原先它在 `switch` **之前**无条件执行，而新增的 `recentMemories` **根本没有**
+ *   `memoryId`（它的语义是「库里最近的若干条」，不是「某一条的历史」）
+ *   ⇒ 那条前置校验会把它一律判成 `INVALID_INPUT`。
+ *   现在按 `name` 分派后再各自校验：**该有 `memoryId` 的三条照旧缺一不可**，
+ *   `recentMemories` 只要 `limit`。`switch` 覆盖了 `SqlQueryName` 的全部取值
+ *   ⇒ 将来再加查询名，**这里编译期就会红**（不会静默走到「什么都不绑」）。
  */
 function bindQueryParams(name: SqlQueryName, params: unknown): Record<string, unknown> {
   const source = (params ?? {}) as Record<string, unknown>;
-  const memoryId = requireString(source.memoryId, 'memoryId');
 
   switch (name) {
+    case 'recentMemories':
+      // ⚠️ 没有 `memoryId`：列表的语义是「库里最近的若干条」（见 `sql-names.ts`）
+      return {
+        limit: clampNumber(source.limit, RECENT_MEMORY_LIMIT, 1, RECENT_MEMORY_LIMIT),
+      };
     case 'graphTwoHop':
       return {
-        memoryId,
+        memoryId: requireString(source.memoryId, 'memoryId'),
         nodeLimit: clampNumber(source.nodeLimit, GRAPH_NODE_LIMIT, 1, GRAPH_NODE_LIMIT),
       };
     case 'contentHistoryPage':
       return {
-        memoryId,
+        memoryId: requireString(source.memoryId, 'memoryId'),
         limit: clampNumber(source.limit, CONTENT_HISTORY_PAGE_SIZE, 1, CONTENT_HISTORY_PAGE_SIZE),
         offset: clampNumber(source.offset, 0, 0, Number.MAX_SAFE_INTEGER),
       };
     case 'contentHistoryCount':
       // 聚合恒定一行 ⇒ `limit` 恒 1（见 `queries.ts` 文件头的说明）
-      return { memoryId, limit: 1 };
+      return { memoryId: requireString(source.memoryId, 'memoryId'), limit: 1 };
   }
 }
 

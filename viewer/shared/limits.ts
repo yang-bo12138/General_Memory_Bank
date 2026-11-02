@@ -38,13 +38,31 @@ export const GRAPH_NODE_LIMIT = 300;
 export const CONTENT_HISTORY_PAGE_SIZE = 50;
 
 /**
+ * ★ 面板 2 的**「最近记忆」列表条数**（`recentMemories` 的 `@limit` 的唯一来源）。
+ *
+ * ⚠️ **为什么必须有这个常量**（P5-T04 的可用性修复）：
+ *   在它之前，renderer 里**没有任何入口**能决定「看哪一条记忆」——
+ *   `AppSelection.memoryId` 恒为 `''`，而 `memoryId` 是面板 2 / 4 / 6 的**唯一取数键**
+ *   ⇒ 面板 6 永远是一张空表、两个翻页按钮永远点不动（`total = 0`）。
+ *   有了列表才有「选一条」这个动作，而列表本身同样**必须带 `LIMIT`**：
+ *   `memories` 的行数不受控（它随库规模增长）⇒ 「最近记忆」不能是「全表」。
+ *
+ * ⚠️ 它与 `CONTENT_HISTORY_PAGE_SIZE`（面板 6 的页大小）**不是同一个量**，
+ *   数值相同只是巧合（一个是「列表看多少条」，一个是「一页多少版」）
+ *   ⇒ 拆成两个常量，谁将来被调都不会牵动另一个。
+ * ⚠️ 库线程的 `bindQueryParams` 会把外来值**钳**在本值以内（不信调用方）。
+ */
+export const RECENT_MEMORY_LIMIT = 50;
+
+/**
  * 面板 7 的**簇成员样本上限** —— 与 §4.12.4 的枚举上限一致。
  *
  * ⚠️ ★ 这是一条**派生别名**，不是第二份定义（与 `src/core/decay.ts` 里 `MS_PER_DAY` 的
  *   re-export 同款理由）：数字的唯一出处是 `DEFAULT_PARAMS.CLUSTER_MEMBER_SAMPLE_MAX`
  *   ⇒ 有人调参数时本值自动跟随，**不可能漂移**。
- *   ⚠️ 这里**不写 `50` 字面量**：仓库里「50」只允许出现在两处定义点
- *   （`src/core/params.ts` 的那一项、以及上面的 `CONTENT_HISTORY_PAGE_SIZE`），
- *   面板源码里出现第三份就会被 `viewer-panels-*.test.ts` 的扫描判红。
+ *   ⚠️ 这里**不写 `50` 字面量**：`50` 的定义点只允许 `src/core/params.ts` 的那一项、
+ *   上面的 `CONTENT_HISTORY_PAGE_SIZE`、以及新增的 `RECENT_MEMORY_LIMIT`
+ *   （三个语义不同的量）⇒ **面板源码里出现任何一份 `50` 都会被
+ *   `viewer-panels-text.test.ts` 的扫描判红**（面板只能 import 常量）。
  */
 export const CLUSTER_MEMBER_SAMPLE_MAX: number = DEFAULT_PARAMS.CLUSTER_MEMBER_SAMPLE_MAX;

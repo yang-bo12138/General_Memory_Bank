@@ -381,14 +381,20 @@ describe('T01 · 通道白名单（只读保证的「通道层」）', () => {
 });
 
 describe('T01 · 查询名表（renderer 只能拿名字，拿不到 SQL 文本）', () => {
-  it('`SQL_QUERY_NAMES` 恰好 3 条，且逐字写死', () => {
+  it('`SQL_QUERY_NAMES` 恰好 4 条，且逐字写死', () => {
     // ⚠️ 期望值**独立写死**在测试里（不从 `sql-names.ts` 的常量反推）：
     //   import 同一个常量来当期望值，会让断言退化成 `expect(x).toBe(x)`
+    // ⚠️ ★ **P5-T04 同步（3 → 4）**：第 4 条 `recentMemories` 是「选哪一条记忆」的取数口
+    //   （`memoryId` 是面板 2 / 4 / 6 的唯一取数键，而原先 renderer 里没有入口能设它）。
+    //   ⇒ 这里改的是**期望值**（跟着新增的具名查询走），断言的**判据**没变：
+    //     仍然要求「清单与这里逐字相等」——多一条、少一条、换个顺序都红。
     expect([...SQL_QUERY_NAMES]).toEqual([
       'graphTwoHop',
       'contentHistoryPage',
       'contentHistoryCount',
+      'recentMemories',
     ]);
+    expect([...SQL_QUERY_NAMES]).toHaveLength(4);
   });
 
   it('`sql-names.ts` 里没有任何 SQL 文本（只有名字与参数形状）', () => {

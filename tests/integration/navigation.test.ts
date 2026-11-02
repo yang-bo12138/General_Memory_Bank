@@ -16,7 +16,9 @@ import { describe, expect, it } from 'vitest';
 import {
   appendPage,
   buildLogQuery,
+  isMemorySelected,
   maxPage,
+  nextMemoryId,
   nextPage,
   overlapRatio,
   prevPage,
@@ -227,5 +229,91 @@ describe('导航纯函数 · `overlapRatio` 用成员集合，不用簇的 key',
     const after = ['m-1', 'm-7'];
     expect(overlapRatio(before, after)).toBe(0.5);
     expect(overlapRatio(before, after)).not.toBe(1);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 五、nextMemoryId / isMemorySelected：「选哪一条记忆」的语义（P5-T04）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * ⚠️ ★ **为什么这一节是那道缺陷的判据**：
+ *   改之前 `selection.memoryId` 恒为 `''`，而 renderer 里**没有入口**能改它
+ *   ⇒ 面板 2 / 4 / 6（唯一取数键就是 `memoryId`）全是死页面：
+ *   面板 6 的 `total` 恒 0 ⇒ 上一页 / 下一页**永久 disabled**。
+ *   现在「选中」是一次 `setState(nextMemoryId(current, picked))`，
+ *   而事件处理器在 `environment: 'node'` 里跑不了 ⇒ 语义抽在这个纯函数里逐值钉住。
+ */
+describe('导航纯函数 · `nextMemoryId` 选中语义', () => {
+  it('★ 非空 ⇒ 返回 **trim 后**的 id（粘贴来的 id 常带首尾空白）', () => {
+    expect(nextMemoryId('', '  m-1  ')).toBe('m-1');
+    expect(nextMemoryId('m-9', '\tm-1\n')).toBe('m-1');
+  });
+
+  it('★ 空 `picked` ⇒ 返回**同一引用**（`toBe`，不是 `toEqual`）—— 不误清空当前选中项', () => {
+    const current = 'm-1';
+    const next = nextMemoryId(current, '');
+    // ⚠️ `toBe` 断言的是「同一个值/引用」：这里必须是「没变」，
+    //   否则用户点空一下就会让面板 6 退回「尚未选择记忆」。
+    expect(next).toBe(current);
+  });
+
+  it('★ 纯空白（空格 + 制表符 + 换行）同样**不清空**', () => {
+    const current = 'm-1';
+    expect(nextMemoryId(current, '   ')).toBe(current);
+    expect(nextMemoryId(current, ' \t\n ')).toBe(current);
+  });
+
+  it('★ 重复点同一条 ⇒ 返回**同一引用**（避免多余重渲染）', () => {
+    const current = 'm-1';
+    expect(nextMemoryId(current, 'm-1')).toBe(current);
+    // 带空白地重复点同一条，也必须收敛到「没变」
+    expect(nextMemoryId(current, '  m-1 ')).toBe(current);
+  });
+
+  it('★ 反例（判别力）：换一条 id ⇒ 一定**不是**同一引用，且值是 trim 后的新 id', () => {
+    const current = 'm-1';
+    const next = nextMemoryId(current, 'm-2');
+    expect(next).not.toBe(current);
+    expect(next).toBe('m-2');
+  });
+
+  it('★ 反例：若实现「总是返回 picked」，空白输入那条必须红', () => {
+    // 「总是 setMemoryId(picked)」是这道题最容易被写成的错误实现（省掉 trim 判断一行）
+    const alwaysTake = (_current: string, picked: string): string => picked;
+    const current = 'm-1';
+    expect(nextMemoryId(current, '   ')).toBe(current);
+    expect(alwaysTake(current, '   ')).not.toBe(current);
+  });
+
+  it('★ 反例：若实现「不 trim」，带空白的输入那条必须红', () => {
+    const noTrim = (_current: string, picked: string): string => picked;
+    expect(nextMemoryId('', '  m-1  ')).toBe('m-1');
+    expect(noTrim('', '  m-1  ')).not.toBe('m-1');
+  });
+
+  it('首次选择（`current` 是空串）⇒ 拿到 picked 的值', () => {
+    expect(nextMemoryId('', 'm-7')).toBe('m-7');
+  });
+});
+
+describe('导航纯函数 · `isMemorySelected`：空串是「还没选」，不是「查不到」', () => {
+  it('★ 空串 / 纯空白 ⇒ false（面板要走「尚未选择记忆」的引导）', () => {
+    expect(isMemorySelected('')).toBe(false);
+    expect(isMemorySelected('   ')).toBe(false);
+    expect(isMemorySelected('\t\n')).toBe(false);
+  });
+
+  it('★ 反例：真实 id ⇒ true（否则上面两条对任何输入都成立）', () => {
+    expect(isMemorySelected('m-1')).toBe(true);
+    expect(isMemorySelected(' m-1 ')).toBe(true);
+  });
+
+  it('★ 两条判据**自洽**：`false` 的输入喂给 `nextMemoryId` 不会把选中项改掉', () => {
+    const current = 'm-1';
+    for (const blank of ['', '   ', '\n']) {
+      expect(isMemorySelected(blank)).toBe(false);
+      expect(nextMemoryId(current, blank)).toBe(current);
+    }
   });
 });

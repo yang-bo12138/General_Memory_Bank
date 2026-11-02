@@ -25,6 +25,16 @@ export const SQL_QUERY_NAMES = [
   'contentHistoryPage',
   /** 面板 6：一条记忆的正文历史**总版本数**（分页控件要分母）。 */
   'contentHistoryCount',
+  /**
+   * ★ 面板 2：**最近访问过的记忆**（`last_access` 逆序，`LIMIT` 抽样）—— P5-T04 新增。
+   *
+   * ⚠️ **它是「选择记忆」这件事的取数口**：在它之前 renderer 里没有任何东西能决定
+   *   「看哪一条」，而 `memoryId` 是面板 2 / 4 / 6 的唯一取数键
+   *   ⇒ 面板 6 永远空表、翻页按钮永久 disabled。
+   * ⚠️ 它**不带 `memoryId` 参数**（列表就是「所有未软删记忆」的头部）——
+   *   所以库线程的 `bindQueryParams` 对它是**先于** `memoryId` 校验处理的（见那里）。
+   */
+  'recentMemories',
 ] as const;
 
 /** 一条原始查询的名字。 */
@@ -51,6 +61,15 @@ export interface SqlQueryParams {
   contentHistoryPage: { memoryId: string; limit: number; offset: number };
   /** 面板 6：聚合恒一行 ⇒ `limit` 传 `1`（见接口上的说明）。 */
   contentHistoryCount: { memoryId: string; limit: number };
+  /**
+   * ★ 面板 2：`limit` 是**列表条数**的硬上界（唯一来源 `RECENT_MEMORY_LIMIT`）。
+   *
+   * ⚠️ 与面板 6 的两条不同，它**没有 `memoryId`**：列表的语义是「库里最近的若干条」，
+   *   不是「某一条的历史」⇒ 参数形状不同是**语义不同**，不是遗漏。
+   * ⚠️ 它照样带 `limit` —— 「`SQL_QUERIES` 里每一条 SQL 都带 `LIMIT`」这条不变量
+   *   **没有例外名单**（见上面的接口说明）。
+   */
+  recentMemories: { limit: number };
 }
 
 /**

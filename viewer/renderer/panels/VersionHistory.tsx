@@ -37,8 +37,9 @@ import { useEffect, useRef, useState } from 'react';
 import type { MemoryView } from '../../../src/store/get.js';
 import { CONTENT_HISTORY_PAGE_SIZE } from '../../shared/limits.js';
 import type { MemoryDetail, ReadPort, SqlRow } from '../../shared/protocol.js';
+import { NoSelectionPanel } from '../state/Selection.js';
 import { StatusBlock } from '../state/StatusBlock.js';
-import { appendPage, nextPage, prevPage } from '../state/navigation.js';
+import { appendPage, isMemorySelected, nextPage, prevPage } from '../state/navigation.js';
 import type { ReadState } from '../state/useReadCall.js';
 import { useReadCall } from '../state/useReadCall.js';
 import {
@@ -122,6 +123,14 @@ export interface VersionHistoryViewProps {
   readonly onPrev?: (() => void) | undefined;
   /** 下一页（移窗口）。 */
   readonly onNext?: (() => void) | undefined;
+  /**
+   * ★ **尚未选择记忆**（P5-T04）—— 不传 ⇒ 照旧渲染历史（既有调用点全部不受影响）。
+   *
+   * ⚠️ 为什么它必须是一个**独立开关**而不是「`memoryId` 为空就切换」：
+   *   `*View` 是纯展示层，它拿不到也不该拿「选中项」这个概念（那是 `App` 的状态）；
+   *   由容器算好 `isMemorySelected(memoryId)` 再传下来，这一层的入参就只有布尔。
+   */
+  readonly noSelection?: boolean | undefined;
 }
 
 /** 一个什么都不做的回调（只读渲染时的缺省值）。 */
@@ -137,7 +146,17 @@ export function VersionHistoryView({
   onLoadOlder,
   onPrev,
   onNext,
+  noSelection,
 }: VersionHistoryViewProps): ReactElement {
+  // ★ 「还没选记忆」在这里就短路掉（不进 `StatusBlock`）：
+  //   此时 `state` 只会是 `loading`（容器把 `port` 换成了 `null`，一次都不发），
+  //   渲染「计算中」等于告诉用户「马上就有一条历史了」—— 而其实一条都没选过。
+  if (noSelection === true) {
+    return (
+      <NoSelectionPanel title={PANEL_TITLES.versionHistory} bodyId="versionHistory" inertPager />
+    );
+  }
+
   return (
     <StatusBlock state={state} what={PANEL_TITLES.versionHistory}>
       {(history: HistoryPage) => {
@@ -262,7 +281,7 @@ export interface VersionHistoryProps {
   readonly port: ReadPort | null;
   /** 注入的当前时刻。 */
   readonly now: number;
-  /** 要看的记忆 id。 */
+  /** 要看的记忆 id（`''` ⇒ **尚未选择记忆**）。 */
   readonly memoryId: string;
   /** **初始**页号（之后的翻页由本面板自己的 `useState` 持有）。 */
   readonly page: number;
@@ -297,13 +316,25 @@ export function VersionHistory({
   /** 已经吸收过的页号，避免同一次结果被 effect 追加两遍。 */
   const absorbedRef = useRef<number | null>(null);
 
+  /**
+   * ★ **是否已经选了一条记忆**（P5-T04）。
+   *
+   * ⚠️ 未选中时把 `port` 换成 `null` ⇒ `useReadCall` **一次都不发**：
+   *   改之前两个读调用（`get` 与 `contentHistory*`）无条件用 `memoryId=''` 发出去，
+   *   `contentHistoryCount` 恒 0 ⇒ 「上一页 / 下一页」**永久 disabled**，
+   *   而界面上看起来只是「这条记忆没有历史版本」（一句假结论）。
+   */
+  const selected = isMemorySelected(memoryId);
+
   const detailState = useReadCall<MemoryDetail | null>(
-    port,
+    selected ? port : null,
     `get:${memoryId}:${now}`,
     (activePort) => activePort.get(memoryId, now),
   );
-  const state = useReadCall<HistoryPage>(port, `history:${memoryId}:${page}`, (activePort) =>
-    loadHistoryPage(activePort, memoryId, page),
+  const state = useReadCall<HistoryPage>(
+    selected ? port : null,
+    `history:${memoryId}:${page}`,
+    (activePort) => loadHistoryPage(activePort, memoryId, page),
   );
 
   const readyPage = state.status === 'ready' ? state.data : null;
@@ -336,6 +367,7 @@ export function VersionHistory({
       state={viewState}
       current={current}
       now={now}
+      noSelection={!selected}
       onPrev={() => {
         modeRef.current = 'window';
         setPage((currentPage) => prevPage(currentPage, total, CONTENT_HISTORY_PAGE_SIZE));

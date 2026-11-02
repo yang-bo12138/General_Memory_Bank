@@ -371,8 +371,23 @@ function allAllowed(labels: readonly string[], whitelist: readonly string[]): bo
 }
 
 describe('T03 · 面板无任何写入口（三层钉）', () => {
-  /** ★ 白名单的**测试侧副本**（不从 `texts.ts` import ⇒ 加白名单条目也要走审查）。 */
-  const WHITELIST = ['上一页', '下一页', '模拟召回', '刷新快照', '加载更早的版本', '对比上次'];
+  /**
+   * ★ 白名单的**测试侧副本**（不从 `texts.ts` import ⇒ 加白名单条目也要走审查）。
+   *
+   * ⚠️ **P5-T04 新增「按 id 查看」**：它是「选哪一条记忆」的第二个入口
+   *   （列表空了还得有兜底），语义是**读**动作 —— 只改本地选中项，不碰库
+   *   （「不碰库」由本文件第 ③ 层「16 个写方法名在 renderer 里一个都不出现」
+   *   与 `WRITE_CHANNELS` 为空共同钉住）。**其余条目一个都没删**。
+   */
+  const WHITELIST = [
+    '上一页',
+    '下一页',
+    '模拟召回',
+    '刷新快照',
+    '加载更早的版本',
+    '对比上次',
+    '按 id 查看',
+  ];
 
   it('① `WRITE_CHANNELS` 是空数组且长度断言（通道层）', () => {
     expect(WRITE_CHANNELS).toEqual([]);
@@ -562,8 +577,21 @@ describe('T03 补强 · ① `embeddedRatio` 的标签与数值**绑在一起**�
 });
 
 describe('T03 补强 · ⑨(a) 七个面板的 `<button>` 文案一次性收齐并 ⊆ 白名单', () => {
-  /** ★ 白名单的测试侧副本（不从 `texts.ts` import）。 */
-  const WHITELIST = ['上一页', '下一页', '模拟召回', '刷新快照', '加载更早的版本', '对比上次'];
+  /**
+   * ★ 白名单的测试侧副本（不从 `texts.ts` import）。
+   *
+   * ⚠️ **P5-T04 新增「按 id 查看」**（面板 2 的「按 id 查看」提交按钮）——
+   *   与上一节同一条理由，且**没有删掉任何既有条目**。
+   */
+  const WHITELIST = [
+    '上一页',
+    '下一页',
+    '模拟召回',
+    '刷新快照',
+    '加载更早的版本',
+    '对比上次',
+    '按 id 查看',
+  ];
 
   /** 把七个面板各渲一遍（都喂就绪态），返回全部 markup。 */
   function renderAllSevenPanels(): string[] {

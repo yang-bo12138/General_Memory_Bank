@@ -218,6 +218,52 @@ export function archiveText(remainingMs: number): string {
 export const MISSING_MEMORY_TEXT = '库里没有这条记忆';
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 四bis 面板 2 / 4 / 6：**选哪一条记忆来看**（P5-T04 的可用性修复）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * ★ 「尚未选择记忆」—— 面板 2 / 4 / 6 在 `memoryId` 为空时的**引导**文案。
+ *
+ * ⚠️ ★ **它与 `MISSING_MEMORY_TEXT` 是两件事**（这是本次修复的核心）：
+ *   · 「尚未选择记忆」= **还没有人做选择** ⇒ 下方必须告诉用户**去哪选**（列表 / 输入框）；
+ *   · 「库里没有这条记忆」= **已经选了一条，但库里没有** ⇒ 那才是一条「查不到」的结果。
+ *   原先两者共用同一句话 ⇒ 面板一打开就是「库里没有这条记忆」，
+ *   看起来像**报错**，而真相是「这个应用没有任何入口能让你选」。
+ */
+export const NO_MEMORY_SELECTED_TEXT = '尚未选择记忆';
+
+/** 「尚未选择记忆」时**告诉用户去哪选**（不是让用户自己猜）。 */
+export const SELECT_MEMORY_GUIDE_TEXT =
+  '在下面的「最近记忆」列表里点一条，或把记忆 id 粘贴到「按 id 查看」输入框后回车。';
+
+/** 「最近记忆」列表的标题。 */
+export const RECENT_MEMORY_HEADING = '最近记忆（按最近访问排序）';
+
+/** 列表为空时的**明确空态**（不是一块空白）。 */
+export const RECENT_MEMORY_EMPTY_TEXT =
+  '库里还没有可查看的记忆：先用宿主写一条，或直接在下面粘贴 id。';
+
+/** 列表取数失败时的说明（**带错误码**：面板不许把错误翻译成一句「出错了」）。 */
+export const RECENT_MEMORY_ERROR_TEXT = '最近记忆取数失败';
+
+/** 「按 id 查看」输入框的标签（同时也是提交按钮的文案，见 `BUTTON_VIEW_ID`）。 */
+export const MEMORY_ID_INPUT_LABEL = '按 id 查看';
+
+/** 输入框的占位文字。 */
+export const MEMORY_ID_INPUT_PLACEHOLDER = '粘贴记忆 id';
+
+/**
+ * 「最近记忆」一行里 `last_access` 的标签。
+ *
+ * ⚠️ 它与面板 2 的 `STABILITY_LABEL` 一起显示：列表是在**选**一条，
+ *   而「多久没被用过 / 记多牢」正是选的时候要看的两个数。
+ */
+export const RECENT_LAST_ACCESS_LABEL = '最近访问';
+
+/** 列表一行里 `stability` 的标签（短标签：列表列宽有限）。 */
+export const RECENT_STABILITY_LABEL = 'τ（天）';
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 五、面板 3：召回模拟器
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -474,6 +520,8 @@ export const BUTTON_REFRESH = '刷新快照';
 export const BUTTON_LOAD_OLDER = '加载更早的版本';
 /** 「对比上次」（面板 7：**纯前端**动作，只是把本次会话内记下的上一份快照算一次重叠度）。 */
 export const BUTTON_COMPARE_PREVIOUS = '对比上次';
+/** 「按 id 查看」（面板 2：**读**动作 —— 只把选中项换成输入框里的那个 id，不碰库）。 */
+export const BUTTON_VIEW_ID = MEMORY_ID_INPUT_LABEL;
 
 /**
  * ★ **渲染树里允许出现的 `<button>` 文案白名单**。
@@ -483,6 +531,13 @@ export const BUTTON_COMPARE_PREVIOUS = '对比上次';
  *   与「恢复」（`restore()` 是写方法）。
  *   ⇒ 白名单里**没有**「回滚」「恢复」「删除」「加固」任何一个；
  *     任何新按钮的文案不在这四个里，断言就红。
+ *
+ * ⚠️ **P5-T04 新增一条 `BUTTON_VIEW_ID`（「按 id 查看」）**：它是「选哪一条记忆」的
+ *   第二个入口（列表空了还得有兜底）。语义上是**读**动作 —— 只改本地的选中项
+ *   （`memoryId`），不碰库、不发任何写请求。
+ *   ⚠️ 它不写库的证据不在文案上：`WRITE_CHANNELS` 是空数组、
+ *     renderer 里没有任何 `port.<写方法>(` 调用点（两条都在
+ *     `viewer-panels-structure.test.ts` 里被断言）—— 那才是它**不可能**写库的原因。
  *
  * ⚠️ 白名单本身是**可腐化**的（下一个人往数组里加一条就过了）
  *   ⇒ `viewer-panels-structure.test.ts` 里另有一条**写死的反向断言**：
@@ -496,6 +551,7 @@ export const BUTTON_LABELS = [
   BUTTON_REFRESH,
   BUTTON_LOAD_OLDER,
   BUTTON_COMPARE_PREVIOUS,
+  BUTTON_VIEW_ID,
 ] as const;
 
 /** 按钮文案是不是白名单里的一个（运行期守卫，测试与面板共用同一份判据）。 */

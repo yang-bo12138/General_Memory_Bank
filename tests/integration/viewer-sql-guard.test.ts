@@ -242,4 +242,43 @@ describe('T02 · 面板 4/6 的 SQL 常量自证清白', () => {
     expect(hasLimit(SQL_QUERIES.graphTwoHop)).toBe(true);
     expect(hasLimit(SQL_QUERIES.graphTwoHop.replace(/LIMIT @nodeLimit/g, ''))).toBe(false);
   });
+
+  /**
+   * ★ **P5-T04 新增的 `recentMemories` 也在这条不变量的覆盖面里**。
+   *
+   * ⚠️ 上面那条 `for (const [name, sql] of Object.entries(SQL_QUERIES))` 已经把它**自动**
+   *   纳进来了（这正是「不维护例外名单」的收益）⇒ 本节**不另写一套**判据，
+   *   只把「这一条也真的被看到了」与「它的两条语义」逐条钉死：
+   *   ① 带 `LIMIT`（行数随库规模增长 ⇒ 没有 LIMIT 会把 worker 钉住）；
+   *   ② `WHERE deleted = 0`（软删的记忆不进列表 —— 但它**仍可按 id 直查**，
+   *      面板 6 会如实标注「已遗忘」）。
+   */
+  it('★ `recentMemories` 在「每条 SQL 都带 LIMIT」的覆盖面里，且只取未软删的记忆', () => {
+    const names = Object.keys(SQL_QUERIES);
+    // 分母：它真的在表里（否则下面关于它的断言全是空气）
+    expect(names).toContain('recentMemories');
+
+    const sql = SQL_QUERIES.recentMemories.replace(/\s+/g, ' ');
+    expect(sql).toMatch(/\bLIMIT @limit\b/i);
+    // ⚠️ 反例方向：把 LIMIT 摘掉必须被同一条判据抓到（不是「这句话恒真」）
+    expect(/\bLIMIT\b/i.test(sql.replace(/LIMIT @limit/g, ''))).toBe(false);
+
+    expect(sql).toContain('FROM memories');
+    expect(sql).toContain('WHERE deleted = 0');
+    // 列表要显示的四列（少一列面板就会静默显示空值）
+    for (const column of ['id', 'content', 'last_access', 'stability']) {
+      expect(sql, `recentMemories 没有选 ${column}`).toContain(column);
+    }
+    // 「最近」= 最近被用过；`id` 只是给同毫秒的行一个全序
+    expect(sql).toContain('ORDER BY last_access DESC');
+
+    // 只读：防护层放行，且不含任何写关键字
+    expect(guard(SQL_QUERIES.recentMemories).ok).toBe(true);
+    expect(sql).not.toMatch(/\b(INSERT|UPDATE|DELETE|DROP|ALTER)\b/i);
+  });
+
+  it('反例：把 `deleted = 0` 去掉 ⇒ 上面那条判据会红（判据有判别力）', () => {
+    const broken = SQL_QUERIES.recentMemories.replace('WHERE deleted = 0', 'WHERE 1 = 1');
+    expect(broken).not.toContain('WHERE deleted = 0');
+  });
 });

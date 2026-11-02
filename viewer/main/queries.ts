@@ -38,7 +38,11 @@ import type { SqlQueryName } from '../shared/sql-names.js';
  *   `GRAPH_NODE_LIMIT` / `CONTENT_HISTORY_PAGE_SIZE` 的**唯一定义**在 `shared/limits.ts`，
  *   这里只是把旧路径保住，免得 `db-worker.ts` 与既有测试的 import 同时断掉。
  */
-export { CONTENT_HISTORY_PAGE_SIZE, GRAPH_NODE_LIMIT } from '../shared/limits.js';
+export {
+  CONTENT_HISTORY_PAGE_SIZE,
+  GRAPH_NODE_LIMIT,
+  RECENT_MEMORY_LIMIT,
+} from '../shared/limits.js';
 
 /**
  * ★ 三条查询的 SQL 常量。
@@ -135,6 +139,36 @@ LIMIT @limit OFFSET @offset
 SELECT count(*) AS total
 FROM content_history
 WHERE memory_id = @memoryId
+LIMIT @limit
+`,
+
+  /**
+   * ★ 面板 2 的**「最近记忆」列表**（P5-T04 新增）—— 「选哪一条记忆来看」的唯一取数口。
+   *
+   * 为什么需要它：`memoryId` 是面板 2 / 4 / 6 的**唯一取数键**，而 renderer 里原先
+   * **没有任何入口**能设它（`AppSelection.memoryId` 恒为 `''`）
+   * ⇒ 面板 6 的 `total` 恒为 0、两个翻页按钮永久 disabled。
+   * 列表是那条通路的入口 ⇒ 它必须真的从库里来（不能靠上层假数据渲染）。
+   *
+   * 三条硬约束：
+   *   · **`WHERE deleted = 0`**：软删的记忆不进列表（§8.2：软删 = 不参与任何召回与扩散，
+   *     用户也不该被引导去看它；要按 id 直接看仍可以，面板 6 会如实标注「已遗忘」）；
+   *   · **`ORDER BY last_access DESC`**：「最近」= 最近被用过（§4.4 的 `last_access`），
+   *     第二排序键 `id ASC` 只是给同毫秒的行一个**全序**（否则同一次查询两次执行可能换序，
+   *     而在界面上表现为「列表莫名其妙跳了一下」）；
+   *   · **`LIMIT @limit`**：行数随库规模增长 ⇒ 没有 LIMIT 的列表查询会把 worker 钉住
+   *     （本文件的不变量，`viewer-sql-guard.test.ts` 逐条断言，**没有例外名单**）。
+   *
+   * ⚠️ **选进结果集的列 = 面板列表要显示的四样东西**
+   *   （`id` / 正文摘要 / `last_access` / `stability`），一个都不多：
+   *   `embedding` 之类的 BLOB 列不选（`SqlRow` 只允许 `string | number | null`），
+   *   `content` 本身就是要显示的正文摘要来源（面板负责截断，SQL 不做字符串手术）。
+   */
+  recentMemories: `
+SELECT id, content, last_access, stability
+FROM memories
+WHERE deleted = 0
+ORDER BY last_access DESC, id ASC
 LIMIT @limit
 `,
 } as const satisfies Record<SqlQueryName, string>;

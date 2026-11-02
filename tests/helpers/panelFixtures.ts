@@ -292,6 +292,23 @@ export function makeHistoryRow(
   return { id, memory_id: 'm-1', content, reason, replaced_at: replacedAt };
 }
 
+/**
+ * ★ 造一条 `recentMemories` 的行（面板 2 的「最近记忆」列表 / P5-T04）。
+ *
+ * ⚠️ 列与 `viewer/main/queries.ts` 的 `recentMemories` **逐个对应**
+ *   （`id` / `content` / `last_access` / `stability`）：夹具多造一列会掩盖
+ *   「SQL 少选了一列」这类缺陷（面板只会静默显示空值）。
+ * ⚠️ `lastAccess` **显式传入**（不取 `FIXED_NOW`）：列表的顺序断言要能控制先后。
+ */
+export function makeRecentMemoryRow(
+  id: string,
+  content: string,
+  lastAccess: number = FIXED_NOW - DAY,
+  stability = 10,
+): SqlRow {
+  return { id, content, last_access: lastAccess, stability };
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // 六、面板 5：LogPage
 // ═══════════════════════════════════════════════════════════════════════════

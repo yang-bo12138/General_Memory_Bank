@@ -20,7 +20,9 @@ import { GRAPH_NODE_LIMIT } from '../../shared/limits.js';
 import type { ReadPort, SqlRow } from '../../shared/protocol.js';
 import { ForceGraph } from '../charts/ForceGraph.js';
 import type { ForceGraphEdge, ForceGraphNode } from '../charts/ForceGraph.js';
+import { NoSelectionPanel } from '../state/Selection.js';
 import { StatusBlock } from '../state/StatusBlock.js';
+import { isMemorySelected } from '../state/navigation.js';
 import type { ReadState } from '../state/useReadCall.js';
 import { useReadCall } from '../state/useReadCall.js';
 import {
@@ -169,14 +171,31 @@ export interface GraphViewProps {
   readonly port: ReadPort | null;
   /** 注入的当前时刻。 */
   readonly now: number;
-  /** 种子记忆 id。 */
+  /** 种子记忆 id（`''` ⇒ **尚未选择记忆**）。 */
   readonly memoryId: string;
 }
 
-/** 面板 4（取数 + 展示）。 */
+/**
+ * 面板 4（取数 + 展示）。
+ *
+ * ★ **P5-T04 的修复**：`memoryId` 为空时**不再发那条查询** ——
+ *   改之前它无条件发 `select('graphTwoHop', { memoryId: '' })`：
+ *   种子实体集恒空 ⇒ 图恒空，而界面显示的是「这条记忆没有关联实体」
+ *   （一句**看起来像结论、其实什么都没查**的话）。
+ *   ⇒ 现在空 id 走「尚未选择记忆 + 去哪选」的引导，
+ *   并且把 `port` 换成 `null`：**一次查询都不发**（`useReadCall` 对 `null` 端口不调用任何方法）。
+ */
 export function GraphView({ port, now, memoryId }: GraphViewProps): ReactElement {
-  const state = useReadCall<ReadonlyArray<SqlRow>>(port, `graph:${memoryId}`, (activePort) =>
-    loadGraph(activePort, memoryId),
+  const selected = isMemorySelected(memoryId);
+  const state = useReadCall<ReadonlyArray<SqlRow>>(
+    selected ? port : null,
+    `graph:${memoryId}`,
+    (activePort) => loadGraph(activePort, memoryId),
   );
+
+  if (!selected) {
+    return <NoSelectionPanel title={PANEL_TITLES.graphView} bodyId="graphView" />;
+  }
+
   return <GraphViewView state={state} now={now} />;
 }
