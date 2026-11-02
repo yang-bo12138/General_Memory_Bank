@@ -5,6 +5,11 @@
  * ⚠️ **本文件是 §6 公开方法 `rebuildVectorBuckets` 的落点**（DEVELOPMENT-PLAN.md §3.1
  *   的方法归位表：阶段 2 新增的**唯一**公开方法就是它）。
  *
+ * ⚠️ ★ **本文件也是 §6 `verifyIntegrity()` 的落点**（P5-T06）：它是**纯读**
+ *   ⇒ **不属于**下面那三个「阻塞写方法」之列 ⇒ 只读实例上**必须可用**（§7.1 的查看器要能看护栏报告）。
+ *   它的 `bucketCoverage` 复用同文件的 `computeBucketCoverage()`、归档两项复用
+ *   `archival.ts` 的 `checkArchivalSchedule()` ⇒ **口径只有一份**（P5-T06 的常见坑）。
+ *
  * ⚠️ **重训的三步序列在 `src/vector/rebuild.ts`**（向量层）：
  *   本文件只做**存储层该做的事**——取参数、记事件、管 `inRetrain`、失效中心缓存。
  *   ⇒ 桶表名**不出现**在本文件里（§4.6 步骤 2c：流水线不得引用桶表名）。
@@ -30,6 +35,7 @@
 import type Database from 'better-sqlite3';
 
 import { resolveNow } from '../core/clock.js';
+import { type DecayEdgeInput, edgeWeight } from '../core/decay.js';
 import type { Params } from '../core/params.js';
 import { LOG_ACTIONS, type Logger } from '../util/log.js';
 import type { BucketAssignContext } from '../vector/bucketAssign.js';
@@ -39,6 +45,7 @@ import {
   type ReconcileOutcome,
   reconcileBuckets,
 } from '../vector/reconcile.js';
+import { checkArchivalSchedule } from './archival.js';
 import type { EventWriter } from './events.js';
 import { runWriteTransaction } from './transaction.js';
 
@@ -367,4 +374,238 @@ export function computeBucketCoverage(db: Database.Database): number {
   return reconcileBuckets(db, <T>(body: () => T): T => runWriteTransaction(db, body), {
     detectOnly: true,
   }).report.coverage;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 一致性自检 —— §6 的 `verifyIntegrity()`（P5-T06）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * `verifyIntegrity()` 的返回（§6 的**五个字段**，顺序与 §6 逐字一致）。
+ *
+ * ⚠️ ★ **五个字段必须与 `stats()` 的同名口径共用实现**（§9.4.4「三道护栏」：
+ *   ① 可观测 `stats().archivalOrphans`、② 自检、③ 重建）：
+ *   · `archivalOrphans` / `archivalMismatch` ⇒ `archival.ts` 的 `checkArchivalSchedule()`；
+ *   · `bucketCoverage` ⇒ 本文件的 `computeBucketCoverage()`（= 对账的 `report.coverage`）。
+ *   ⇒ **两处各算一遍 = 迟早一个说 0 一个说 3，而没人知道该信哪个**（P5-T06 的常见坑）。
+ */
+export interface VerifyIntegrityReport {
+  /** 归档缓存里的**孤儿**（缓存有、主表没有或已软删）——与 `stats().archivalOrphans` 恒等。 */
+  archivalOrphans: number;
+  /** 归档缓存的**不一致**（`archive_at` 与按当前参数重算的值差 > 1ms）——与 `stats()` 恒等。 */
+  archivalMismatch: number;
+  /** **已有向量且已入桶**的记忆占比（`0`~`1`；库里没有向量时取 `1` = 没有欠账）。 */
+  bucketCoverage: number;
+  /**
+   * **距上次簇发布过了多久**（毫秒）。
+   *
+   * ⚠️ ★ **`-1` = 从未发布过快照**（**不是** `0`）——
+   *   `0` 表示「刚刚发布」，两者语义相反；用一个不可能是「时长」的负数当哨兵，
+   *   调用方（面板）不必再额外查一张表就知道「还没有快照这件事」。
+   *   ⚠️ **待定（本次裁决，2026-11-02）**：§6 只说「距上次簇发布过了多久」，
+   *     没规定「从未发布」怎么表示 ⇒ 本次定为 **`-1` 哨兵**（而不是 `null`：
+   *     五个字段在 §6 里**全是 `number`**，返回 `null` 会把这个字段的类型撬开）。
+   *   ⇒ 推论（调用方必读）：**判「有没有快照」用 `< 0`，判「有多旧」用具体值**；
+   *     「快照很旧」与「从来没有快照」是两件事，处置也不同
+   *     （前者 `recluster()` 会因间隔闸门跳过，后者会真的重算）。
+   */
+  clusterSnapshotFreshness: number;
+  /** **联想路健康度（库级）**：当前 `bonus ≥ ACTIVATION_MIN` 的边数（见 `countDiffusableEdges()`）。 */
+  edgesDiffusable: number;
+}
+
+/**
+ * `verifyIntegrity()` 的入参。
+ *
+ * ⚠️ **公开签名是 `{ deep?: boolean }`**（§6 逐字）⇒ `now` 与 `logger` 是**内部接线**用的：
+ *   · `now`：注入时钟（C37）——`clusterSnapshotFreshness` 与 `edgesDiffusable` 都要「现在」；
+ *   · `logger`：`deep` 发现问题时那条告警的落点（门面把自己的日志器接进来）。
+ *   ⇒ 门面**不把这两个键暴露给调用方**（§6 只承诺 `deep`；多开一个键就是多一次公开承诺）。
+ */
+export interface VerifyIntegrityOptions {
+  /** 是否做**额外**的库级深检（见 `verifyIntegrityReport()`）。 */
+  deep?: boolean;
+  /** 注入时钟（C37）；缺省取真实时钟。 */
+  now?: number;
+  /** 日志器（`deep` 深检不通过时记一条 warn）。 */
+  logger?: Logger;
+}
+
+/**
+ * 一致性自检 —— §6 的 `verifyIntegrity(options?)`（§9.4.4 的护栏①②）。
+ *
+ * ★ **纯读**：不写任何表、不记事件 ⇒ 只读实例上也**必须**可用（§7.1：查看器要能看护栏报告）。
+ *   ⚠️ 这条不是「顺便」：把自检归类成写方法 ⇒ 只读查看器调不了护栏报告
+ *   ⇒ 护栏①（可观测）就退化成「只有宿主主动想起来才看得见」（P5-T06 的常见坑）。
+ *
+ * ⚠️ ★ **`deep` 只加检、不改口径**：
+ *   · `deep: false`（缺省）⇒ 只算五个字段；
+ *   · `deep: true` ⇒ 在**算完五个字段之后**额外跑 `PRAGMA integrity_check` 与
+ *     `PRAGMA foreign_key_check`，不通过时记一条 warn 日志。
+ *   ⇒ **五个字段的取值与 `deep` 无关**（否则「与 `stats()` 恒等」这条断言会因开关而破）。
+ *   ⚠️ **待定（本次裁决，2026-11-02）**：§6 只写了 `options.deep?: boolean` 却没说它检什么；
+ *     本次定为「额外两条 PRAGMA，结果只进日志、不进返回值」——
+ *     理由：返回值是**五个 number**（§6 逐字），塞进布尔就会改签名；
+ *     而深检的价值在「留痕可查」，不在「多一个字段」。
+ *
+ * ⚠️ **深检可能很慢**（`integrity_check` 是整库逐页校验），但**不阻塞写**：
+ *   本库全同步、单线程 ⇒ 慢的是**调用方自己那一次调用**，不是库级锁
+ *   （只读路径不持写锁，WAL 下其它连接的写照常进行）。
+ *
+ * @param db 库句柄
+ * @param params 生效参数（归档线 / 边权衰减 / 激活阈值都从它来）
+ * @param options `deep` + 内部接线（`now` / `logger`）；全可选
+ * @returns §6 的五个字段
+ */
+export function verifyIntegrityReport(
+  db: Database.Database,
+  params: Params,
+  options?: VerifyIntegrityOptions,
+): VerifyIntegrityReport {
+  const now = resolveNow(options?.now);
+
+  // ── ① 归档自检（**与 `stats()` 同一个实现**，口径不得分叉）──
+  // ⚠️ ★ **不抽样、直接全表比对**：`ARCHIVAL_ORPHAN_CHECK`（§5，默认 1000）是
+  //   「宿主调度的抽样条数上限」，而 `checkArchivalSchedule()` 做的是**全表** JOIN + 逐行重算
+  //   ⇒ 全表是抽样的**超集** ⇒「抽样能命中那条脏数据」这条验收标准自动成立，
+  //     而且不存在「这一轮恰好没抽到」的假绿。
+  //   ⇒ 代价是 O(未删记忆数) 次重算；护栏本来就是低频调用，不在这条路径上省。
+  const archival = checkArchivalSchedule(db, params);
+
+  // ── ② 桶覆盖率（**复用 `computeBucketCoverage()`**，不另写第二份）──
+  // ⚠️ 它内部走 `reconcileBuckets({ detectOnly: true })` 的 `report.coverage`
+  //   ⇒「已有向量且已入桶的占比」只有一处实现。
+  // ⚠️ 那层 `runWriteTransaction()` 在**只读检测**里其实不做事，但它是合法的：
+  //   实测 better-sqlite3 在 `readonly: true` 的连接上 `BEGIN`/`COMMIT` 正常
+  //   （只有**真正写**才抛 SQLITE_READONLY）⇒ 只读实例上照常可用。
+  //   ⇒ 所以这里**不**为了「绕过事务」去写第二份覆盖率 —— 那才是真正的口径分叉。
+  const bucketCoverage = computeBucketCoverage(db);
+
+  // ── ③ 簇快照新鲜度（**直接读 `cluster_snapshot_meta`**，绝不调 `clusters()`）──
+  const clusterSnapshotFreshness = readClusterSnapshotFreshness(db, now);
+
+  // ── ④ 联想路健康度（库级存量，**与 `clusters().explain.diffusion` 不同源**）──
+  const edgesDiffusable = countDiffusableEdges(db, params, now);
+
+  // ── ⑤ 可选深检（**只加检、不改上面五个字段**）──
+  if (options?.deep === true) {
+    checkDatabaseConsistency(db, options.logger);
+  }
+
+  return {
+    archivalOrphans: archival.orphans,
+    archivalMismatch: archival.mismatch,
+    bucketCoverage,
+    clusterSnapshotFreshness,
+    edgesDiffusable,
+  };
+}
+
+/**
+ * 读「距上次簇发布过了多久」—— **唯一实现**（`verifyIntegrity().clusterSnapshotFreshness`）。
+ *
+ * ⚠️ ★ **只 `SELECT computed_at`，绝不调 `clusters()`**：
+ *   后者会**写快照**、会触发重算（距上次发布足够久时）——那是写操作
+ *   ⇒ 在只读句柄上直接违规，而且「自检」这个动作本身会把被检的那张表改掉（观察者效应）。
+ *
+ * ⚠️ **`computed_at` 是快照落表时刻**（§3 的列名，与 `publishSnapshot()` 的 INSERT 一致）
+ *   ⇒ 它是**已发布快照**的时间戳，不是「本次重算开始的时间」。
+ *
+ * @param db 库句柄
+ * @param now 判定基准（C37）
+ * @returns 毫秒差；**从未发布 ⇒ `-1`**（哨兵值，不是 `0`：`0` = 刚刚发布）
+ */
+function readClusterSnapshotFreshness(db: Database.Database, now: number): number {
+  const row = db
+    .prepare('SELECT computed_at AS computedAt FROM cluster_snapshot_meta WHERE id = 1')
+    .get() as { computedAt: number } | undefined;
+  if (row === undefined) {
+    // ⚠️ 单行表**没有行** = 从未发布过任何快照（不是「版本 0 的快照」）。
+    return -1;
+  }
+  // ⚠️ **下界夹到 0**（不是让它变负）：`-1` 被「从未发布」占用了
+  //   ⇒ 注入的「现在」早于快照时刻（时钟回拨 / 测试注入过去时刻）不得伪装成 ‑1。
+  return Math.max(0, now - row.computedAt);
+}
+
+/**
+ * 数「当前仍可扩散的边」—— **唯一实现**（`verifyIntegrity().edgesDiffusable`）。
+ *
+ * ★ **口径**（§6）：`bonus ≥ ACTIVATION_MIN` 的**库级存量**边数，其中 `bonus` 与扩散路径
+ *   **逐字同一个公式**：`bonus = ACTIVATION_DECAY × edgeWeight(e, params, now) / INITIAL_EDGE_WEIGHT`
+ *   （`src/store/diffuse.ts` 的实体腿就是这么算的）。
+ *
+ * ⚠️ ★ **必须复用 `edgeWeight()`，不在 SQL 里重写指数**：
+ *   衰减公式 `w × e^(−Δt/(EDGE_STABILITY×86400000))` 一旦有第二份实现，
+ *   两边就会在**参数调整**时漂移（`EDGE_STABILITY` 一改，SQL 那份不跟着变，还不报错）
+ *   ⇒ 表现为「召回里一条边都不激活，自检却说边很健康」——**两个口径各有各的真相**。
+ *   ⇒ 所以这里**扫边、在 JS 里用那个唯一实现判**（`SELECT weight, last_active FROM edges`）。
+ *
+ * ⚠️ **它与 `clusters().explain.diffusion.*` 不同源**：一个是**库级存量**、
+ *   一个是**本次调用遇到的增量**（`belowThreshold`）⇒ **不能相减**（§6 原文）。
+ *   两者的用法是**对照**：边总数够、但本次遇到的都过期了 ⇒ 该重新 `link()` / `touch()` 保鲜。
+ *
+ * ⚠️ **默认参数下的窗口 ≈ 8.6 天**：`0.2 × 0.8 / 0.8 ≥ 0.15` 要求 `exp(−Δt/30d) ≥ 0.75`
+ *   ⇒ `Δt ≤ 30 × ln(1/0.75) ≈ 8.63 天`（§0.2 说的就是这条窗口）。
+ *   ⇒ 断言里**不写死 8.6**：窗口随参数走，测试只断言「构造一条远超窗口的旧边 ⇒ 计数下降」。
+ *
+ * ⚠️ **分母 `INITIAL_EDGE_WEIGHT` 不做零值兜底**：`diffuse.ts` 的实体腿同样直接除
+ *   ⇒ 这里加个 ε 兜底就会让两处**在退化参数下的行为分叉**（一处 Infinity、一处有限值）。
+ *   保持一致比「看起来更稳」重要。
+ *
+ * @param db 库句柄
+ * @param params 生效参数（`EDGE_STABILITY` / `ACTIVATION_DECAY` / `INITIAL_EDGE_WEIGHT` / `ACTIVATION_MIN`）
+ * @param now 判定基准（C37）
+ * @returns 仍可扩散的边数
+ */
+function countDiffusableEdges(db: Database.Database, params: Params, now: number): number {
+  // ⚠️ 只在**边**上扫：`edges` 是实体↔实体的语义关系（§3），也就是扩散实体腿走的那张表。
+  //   `coacts` 是**另一件事**（记忆↔记忆的共现，簇跳用它）⇒ 不混进来。
+  const rows = db.prepare('SELECT weight, last_active FROM edges').all() as DecayEdgeInput[];
+  let diffusable = 0;
+  for (const row of rows) {
+    const weight = edgeWeight(row, params, now);
+    const bonus = params.ACTIVATION_DECAY * (weight / params.INITIAL_EDGE_WEIGHT);
+    if (bonus >= params.ACTIVATION_MIN) diffusable += 1;
+  }
+  return diffusable;
+}
+
+/**
+ * `deep: true` 的**额外**深检：`PRAGMA integrity_check` + `PRAGMA foreign_key_check`。
+ *
+ * ⚠️ **结果只进日志、不进返回值**（见 `verifyIntegrityReport()` 的「待定」说明）：
+ *   返回值是 §6 逐字钉住的五个 number ⇒ 塞布尔就会改签名。
+ *
+ * ⚠️ **不调 `src/tools/verify.ts` 的 `verifyIntegrity()`**：那个是**阶段 4 的离线工具**
+ *   （`IntegrityReport` 里还有稳定性对账 —— 它要把**整个事件流**读进内存，
+ *   比这里的两条 PRAGMA 贵一到两个量级）⇒ 自检要的是「快而常设」，
+ *   恢复 runbook 要的是「全而深」，**两个用途、两个入口**（同名不同签名是刻意的）。
+ *
+ * @param db 库句柄
+ * @param logger 日志器（缺省不记 —— 自检**不得**因为「没人接收日志」而失败）
+ */
+function checkDatabaseConsistency(db: Database.Database, logger?: Logger): void {
+  // ⚠️ **两条 PRAGMA 都是纯读**（SQLite 侧不写任何页）。
+  const integrity = db.pragma('integrity_check') as Array<{ integrity_check: string }>;
+  const integrityOk = integrity.length === 1 && integrity[0]?.integrity_check === 'ok';
+  const foreignKeyViolations = (db.pragma('foreign_key_check') as unknown[]).length;
+
+  if (integrityOk && foreignKeyViolations === 0) {
+    return;
+  }
+
+  // ⚠️ **动作名挑 `LOG_ACTIONS.error`**：§8.1 的动作枚举是**闭合的 14 项**
+  //   （每个对应 §8.4 的一种 `events.type` + 1 项「错误」）⇒
+  //   为了这条告警**新增一个动作常量**会同时改动枚举与 §8.1 的表（那是文档+契约变更）；
+  //   而这里的语义正是「库不干净」⇒「错误」是既有选项里最贴切的一个。
+  //   ⚠️ **级别用 warn 不用 error**：`error` 级会**同步写盘并 flush**（§8.3）——
+  //   自检发现库脏是**需要人看一眼**的事，不是「进程要挂了」。
+  logger?.warn(LOG_ACTIONS.error, {
+    reason: 'integrity-deep-check-failed',
+    integrityOk,
+    foreignKeyViolations,
+    detail:
+      'deep 自检未通过：PRAGMA integrity_check / foreign_key_check 报出问题（§11.3.1 恢复 runbook）',
+  });
 }

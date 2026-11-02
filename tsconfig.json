@@ -1,7 +1,16 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "lib": ["ES2023"],
+    /* ⚠️ `DOM` 是 `@types/react` 与 `createRoot` 需要的（阶段 5 的 `viewer/renderer/**`）。
+     * 代价（诚实记）：`src/**` 从此**也能**编译 `document` / `window` / `fetch` 之类的名字
+     * ⇒ 「服务端库不该摸 DOM」这条**从编译期约束退化为纪律**。
+     * 为什么还是选「一个 tsconfig」而不是拆 `viewer/tsconfig.json`：
+     * `tests` 会 import 面板组件 ⇒ TS 会把 `viewer` 下的 `.tsx` 拉进 program（与是否在 `include` 里无关）
+     * ⇒ 根项目无论如何都得有 `jsx` 和 `DOM` ⇒ 拆项目只多两个配置文件，**一条约束也保不住**。 */
+    "lib": ["ES2023", "DOM"],
+    /* ⚠️ 必须与 `vitest.config.ts` 的 `esbuild.jsx` **同批**保持一致（都是 automatic / react-jsx）：
+     * 一个 react-jsx、一个 classic ⇒ 测试里报 `React is not defined`（见 p5-t01-t05-design.md §8 R3）。 */
+    "jsx": "react-jsx",
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "moduleDetection": "force",
@@ -29,6 +38,20 @@
   /* ⚠️ `bench` 进 include（**类型检查要覆盖它**），
    * 但 `tsconfig.build.json` 的 include 只有 `src` ⇒ **构建产物里不含 bench**。
    * ⇒ 理由：bench 是**仓库内的一等代码**（它 import 生产模块、也被冒烟测试 import）
-   *   ⇒ 不该脱离类型检查；又它是**测量工具**⇒ 不该进 npm 产物（`files: ["dist"]`）。 */
-  "include": ["src", "tests", "scripts", "bench", "vitest.config.ts", "tsup.config.ts"]
+   *   ⇒ 不该脱离类型检查；又它是**测量工具**⇒ 不该进 npm 产物（`files: ["dist"]`）。
+   *
+   * ⚠️ **阶段 5 的 `viewer` / `mcp` 同理进 include**（同一先例）：
+   *   · 不进 include ⇒ 1000+ 行新代码**脱离类型检查**（而它们正是「只读保证」的落点）；
+   *   · 进 include 也**不会**被 `tsup` 带进产物：`tsup.config.ts` 的 entry 只有 `src/index.ts`，
+   *     且 `tsconfig.build.json` 的 `include: ["src"]` / `rootDir: "src"` ⇒ 两条路都进不去。 */
+  "include": [
+    "src",
+    "tests",
+    "scripts",
+    "bench",
+    "viewer",
+    "mcp",
+    "vitest.config.ts",
+    "tsup.config.ts"
+  ]
 }

@@ -1,0 +1,630 @@
+/**
+ * 查看器面板的样式表 —— 阶段 5 · T03。
+ *
+ * ⚠️ **本文件是纯 CSS，没有 `@import`、没有预处理器**：
+ *   面板走 Electron 的本地 `file://` 加载，任何构建期的 CSS 变换都会让
+ *   「打开查看器」多一条与门禁无关的失败路径。
+ *
+ * ⚠️ **颜色一律用 `var(--…)` 并给了兜底值**：没有主题变量表时也能看清
+ *   （查看器是排障工具，排障时最不该出现的就是「白底白字」）。
+ */
+
+:root {
+  --fg: #1f2328;
+  --fg-muted: #57606a;
+  --bg: #ffffff;
+  --bg-soft: #f6f8fa;
+  --border: #d0d7de;
+  --accent: #0969da;
+  --warn: #9a6700;
+  --danger: #cf222e;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  color: var(--fg);
+  background: var(--bg);
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+.app__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-soft);
+}
+
+.app__title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.badge--readonly {
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: var(--accent);
+  color: #ffffff;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.app__nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.app__nav-item {
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--fg-muted);
+  font-size: 13px;
+}
+
+.app__nav-item[data-active="true"] {
+  border-color: var(--accent);
+  background: var(--bg-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.app__main {
+  flex: 1;
+  padding: 16px;
+}
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.panel__title {
+  margin: 0;
+  font-size: 18px;
+}
+
+.panel__empty {
+  color: var(--fg-muted);
+  font-size: 13px;
+}
+
+.panel__action {
+  align-self: flex-start;
+  padding: 6px 14px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--accent);
+  cursor: pointer;
+}
+
+/* ── 共用状态块（§7.3） ─────────────────────────────────────────────── */
+
+.status__skeleton {
+  height: 80px;
+  border-radius: 6px;
+  background: linear-gradient(90deg, var(--bg-soft), var(--border), var(--bg-soft));
+  background-size: 200% 100%;
+  animation: status-skeleton 1.2s ease-in-out infinite;
+}
+
+@keyframes status-skeleton {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+
+.status__text {
+  color: var(--fg-muted);
+  font-size: 13px;
+}
+
+.status--error {
+  padding: 12px;
+  border: 1px solid var(--danger);
+  border-radius: 6px;
+  background: #fff5f5;
+}
+
+.status__title {
+  margin: 0 0 8px;
+  color: var(--danger);
+  font-size: 15px;
+}
+
+.status__label {
+  display: inline-block;
+  min-width: 64px;
+  color: var(--fg-muted);
+  font-size: 12px;
+}
+
+.status__code-value {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-weight: 700;
+  color: var(--danger);
+}
+
+.status__details {
+  margin: 8px 0 0;
+  padding: 8px;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+
+/* ── 向量路块 ─────────────────────────────────────────────────────── */
+
+.vector-route {
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-soft);
+}
+
+.vector-route__heading {
+  margin: 0 0 6px;
+  font-size: 14px;
+}
+
+.vector-route__text {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.vector-route[data-vector-mode="absent"] .vector-route__text {
+  color: var(--warn);
+}
+
+.vector-route__bytes {
+  margin: 6px 0 0;
+  color: var(--fg-muted);
+  font-size: 12px;
+}
+
+/* ── 面板 1 ───────────────────────────────────────────────────────── */
+
+.overview__layer-list {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.overview__layer {
+  font-size: 14px;
+}
+
+.overview__hint {
+  margin: 6px 0 0;
+  color: var(--fg-muted);
+  font-size: 12px;
+}
+
+.overview__total,
+.overview__now {
+  color: var(--fg-muted);
+  font-size: 12px;
+}
+
+/* ── 面板 2 ───────────────────────────────────────────────────────── */
+
+.memory__content {
+  margin: 0;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-soft);
+  white-space: pre-wrap;
+}
+
+.memory__facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 12px;
+  margin: 0;
+  font-size: 13px;
+}
+
+.memory__facts dt {
+  color: var(--fg-muted);
+}
+
+.memory__facts dd {
+  margin: 0;
+}
+
+.decay__plot {
+  fill: var(--bg-soft);
+}
+
+.decay__line {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+.decay__mark {
+  stroke: var(--border);
+  stroke-dasharray: 4 3;
+}
+
+.decay__mark--archived {
+  stroke: var(--danger);
+}
+
+.decay__mark-label {
+  font-size: 10px;
+  fill: var(--fg-muted);
+}
+
+.decay__legend {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+
+/* ── 面板 3 ───────────────────────────────────────────────────────── */
+
+.recall__input {
+  width: 100%;
+  min-height: 64px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: inherit;
+}
+
+.recall__vector-note {
+  padding: 8px 12px;
+  border-left: 3px solid var(--warn);
+  background: #fffbeb;
+}
+
+.recall__vector-note-title {
+  margin: 0;
+  font-weight: 600;
+  color: var(--warn);
+}
+
+.recall__vector-note-hint {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+
+.recall__hits {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.recall__hit {
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.recall__hit-title {
+  margin: 0 0 6px;
+  font-size: 14px;
+}
+
+.recall__hit-content {
+  margin: 0 0 6px;
+  font-size: 13px;
+}
+
+.recall__hit-sources {
+  margin: 0 0 8px;
+  color: var(--fg-muted);
+  font-size: 12px;
+}
+
+.score-bars__list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.score-bars__row {
+  display: grid;
+  grid-template-columns: 56px 1fr 64px;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.score-bars__track {
+  height: 8px;
+  border-radius: 4px;
+  background: var(--bg-soft);
+}
+
+.score-bars__bar {
+  display: block;
+  height: 8px;
+  border-radius: 4px;
+  background: var(--accent);
+}
+
+.score-bars__value {
+  text-align: right;
+  font-family: "Cascadia Mono", Consolas, monospace;
+}
+
+.score-bars__evidence {
+  margin: 6px 0 0;
+  display: flex;
+  gap: 16px;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+
+.suppressed__table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.suppressed__table th,
+.suppressed__table td {
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+}
+
+.suppressed__table th {
+  color: var(--fg-muted);
+  font-weight: 600;
+}
+
+/* ── 面板 4 ~ 7（T04） ─────────────────────────────────────────────── */
+
+.graph__svg {
+  display: block;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-soft);
+}
+
+.graph__edge {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+
+.graph__node {
+  fill: var(--accent);
+}
+
+.graph__node--hop2 {
+  fill: var(--fg-muted);
+}
+
+.graph__node-label {
+  font-size: 9px;
+  fill: var(--fg);
+}
+
+.graph__table,
+.history__table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.graph__table th,
+.graph__table td,
+.history__table th,
+.history__table td {
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.log__line {
+  margin: 0;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+
+.log__line[data-level="warn"] mark {
+  background: #fff1c2;
+}
+
+.log__line[data-level="error"] {
+  color: var(--danger);
+}
+
+.log__line[data-level="error"] mark {
+  background: #ffe0e0;
+}
+
+.panel__pager {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+
+.panel__pager button {
+  padding: 4px 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  cursor: pointer;
+}
+
+.history__current,
+.history__version-content {
+  margin: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-soft);
+  white-space: pre-wrap;
+}
+
+.history__deleted-notice {
+  padding: 8px 12px;
+  border-left: 3px solid var(--warn);
+  background: #fffbeb;
+  font-weight: 600;
+  color: var(--warn);
+}
+
+.cluster-map__bubbles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.cluster-bubble {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-soft);
+}
+
+.cluster-bubble__heading {
+  margin: 0 0 4px;
+  font-size: 14px;
+}
+
+.cluster-bubble__meta {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: 12px;
+}
+
+.cluster-bubble__members {
+  margin-top: 6px;
+  font-size: 12px;
+}
+
+.cluster-bubble__member-list {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  font-family: "Cascadia Mono", Consolas, monospace;
+}
+
+.cluster-map__baseline {
+  padding: 8px 12px;
+  border-left: 3px solid var(--accent);
+  background: var(--bg-soft);
+  font-size: 12px;
+}
+
+.cluster-map__ratios {
+  display: flex;
+  gap: 24px;
+  font-size: 13px;
+}
+
+.cluster-map__comparison-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+}
+
+/* ── 面板 5 的三级选择（T04 补遗：交互层） ───────────────────────────── */
+
+.log__filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-soft);
+}
+
+.log__filter {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.log__filter-input {
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  font-family: inherit;
+  font-size: 12px;
+}
+
+.log__filter-input[type="number"] {
+  width: 72px;
+}
+
+/* ── 导航按钮（T04 第四批：从不可点的 span 改成可点的 tab） ───────────── */
+
+button.app__nav-item {
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.4;
+  background: var(--bg);
+  cursor: pointer;
+}
+
+button.app__nav-item:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+button.app__nav-item[data-active="true"] {
+  border-color: var(--accent);
+  background: var(--bg-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* ── 面板 3 的空态提示 ─────────────────────────────────────────────── */
+
+.recall__form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.recall__label {
+  font-size: 12px;
+  color: var(--fg-muted);
+}

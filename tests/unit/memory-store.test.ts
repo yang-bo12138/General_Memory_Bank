@@ -340,11 +340,11 @@ describe('P1-T10 · 门面的 10 个公开方法（§6）', () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 二、边界：公开面恰好 14 个方法 / 错误原样透出 / 只读拒绝
+// 二、边界：公开面恰好 23 个方法 / 错误原样透出 / 只读拒绝
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe('P1-T10 · 门面的边界（公开面 / 错误透出 / 只读）', () => {
-  it('★ 公开方法恰好是那 22 个（阶段 1 的 10 + 阶段 2 的 1 + 阶段 3 的 3 + 阶段 4 的 8）', () => {
+  it('★ 公开方法恰好是那 23 个（阶段 1 的 10 + 阶段 2 的 1 + 阶段 3 的 3 + 阶段 4 的 8 + 阶段 5 的 1）', () => {
     const methods = Object.getOwnPropertyNames(MemoryStore.prototype)
       .filter((name) => name !== 'constructor')
       .filter((name) => {
@@ -361,6 +361,8 @@ describe('P1-T10 · 门面的边界（公开面 / 错误透出 / 只读）', () 
     // ⚠️ **阶段 4 新增八个**（§3.1 的归位表，P4-T02 ~ P4-T06）：
     //   `forget` / `restore` / `updateContent` / `setParams` / `stats` / `sweep` /
     //   `close` / `rebuildArchivalSchedule` ⇒ 公开面从 14 个长到 **22 个**。
+    // ⚠️ **阶段 5 新增一个**（§3.1 的归位表，P5-T06）：
+    //   `verifyIntegrity`（**纯读**的自检）⇒ 公开面从 22 个长到 **23 个**（§6 的 23 个到齐）。
     expect(methods).toEqual([
       'close',
       'clusters',
@@ -383,6 +385,7 @@ describe('P1-T10 · 门面的边界（公开面 / 错误透出 / 只读）', () 
       'touch',
       'unpin',
       'updateContent',
+      'verifyIntegrity',
       'write',
     ]);
   });

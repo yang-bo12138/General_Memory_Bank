@@ -1,0 +1,226 @@
+/**
+ * 查看器根组件 —— 阶段 5 · T03/T04（设计 §7.2 / §7.3）。
+ *
+ * ★ 本文件承担两件「全局」的事，因此七个面板不必各做一遍：
+ *   ① **只读徽标顶部常驻**（§7.3「只读模式」一行）：它是这个应用**是什么**的声明，
+ *      不是某个面板的状态 ⇒ 放在 `<header>` 里，七个面板共用同一个 `ReadonlyBadge`；
+ *   ② **面板导航**：七个标题一律来自 `texts.ts` 的 `PANEL_TITLES`
+ *      （只此一份，免得导航与面板正文写出两个名字）。
+ *
+ * ★ **本文件含交互层**（阶段 5 · T04 第四批）：导航从不可点的 `<span>` 改成
+ *   `<button role="tab">` + `useState<PanelId>`。
+ *   ⚠️ 这不是装饰问题：改之前**七个面板里六个打不开**（只能看总览），
+ *     交付物对用户来说等于「打开就是一张海报」。
+ *   ⚠️ ★ **用 `role="tab"` 的 `<button>` 而不是把它塞进 `BUTTON_LABELS` 白名单**：
+ *     `BUTTON_LABELS` 的语义是「**面板内的动作**白名单」（上一页 / 模拟召回 / 加载更早 …），
+ *     把七个**面板标题**塞进去会让「动作白名单」失去意义（标题不是动作）。
+ *     导航的可点元素由**它自己的**断言守住：`data-nav-panel` 元素数量 === `PANEL_ORDER.length`、
+ *     文案逐条 === `PANEL_TITLES`、且**不得**含「回滚 / 删除 / 遗忘 / 恢复」这类写动作字样。
+ *
+/**
+ * ★ ★ **本文件还承担「选哪一条记忆」这件事的**持有权**（P5-T04 的可用性修复）。
+ *
+ * ⚠️ ★ 改之前这里把 `selection.memoryId` **写死为空串**，而全 renderer
+ *   **没有任何入口**能改它 —— 而 `memoryId` 是面板 2 / 4 / 6 的**唯一取数键**：
+ *     · 面板 2 ⇒ 永远渲染「库里没有这条记忆」，零控件可救；
+ *     · 面板 4 ⇒ `graphTwoHop { memoryId: '' }` ⇒ 图恒空；
+ *     · 面板 6 ⇒ `contentHistoryCount` 恒 0 ⇒ **上一页 / 下一页永久 disabled**。
+ *   ⇒ 现在 `memoryId` 是 `useState` 持有的一等状态，入口有两个（都在面板 2 顶部）：
+ *     ① 「最近记忆」列表（`select('recentMemories')`）；
+ *     ② 「按 id 查看」输入框（列表空了还得有兜底）。
+ *   ⚠️ 两个入口的语义都收敛到 `state/navigation.ts` 的 `nextMemoryId()`
+ *     （空输入不清空、重复点同一条返回同一引用 ⇒ 不多余重渲染）。
+ *   ⚠️ **它仍然只是「读什么」的选择**：`write` 系列的 16 个方法一个都不在这里，
+ *     也没有任何通道能把它们带进来（`WRITE_CHANNELS` 是空数组）。
+ *
+ * ⚠️ **本文件不 import `electron`**：端口由 `main.tsx` 从 `globalThis` 取（preload 注入），
+ *   以 prop 传下来。这也是面板能在 vitest（`environment: 'node'`）里直测的原因。
+ */
+
+import type { ReactElement } from 'react';
+import { useState } from 'react';
+
+import type { ClustersResult } from '../../src/store/clusters.js';
+import type { LogQuery, ReadPort } from '../shared/protocol.js';
+import { ClusterMap } from './panels/ClusterMap.js';
+import { GraphView } from './panels/GraphView.js';
+import { LogViewer } from './panels/LogViewer.js';
+import { MemoryList } from './panels/MemoryList.js';
+import { Overview } from './panels/Overview.js';
+import { RecallSimulator } from './panels/RecallSimulator.js';
+import { VersionHistory } from './panels/VersionHistory.js';
+import { ReadonlyBadge } from './state/StatusBlock.js';
+import { nextMemoryId } from './state/navigation.js';
+import { APP_TITLE, PANEL_ORDER, PANEL_TITLES } from './texts.js';
+import type { PanelId } from './texts.js';
+
+/**
+ * ★ **已接线**的面板（顺序即导航顺序）。
+ *
+ * ⚠️ 它必须与 `PANEL_ORDER` **逐条相等**。由 `viewer-panels-structure.test.ts` 断言
+ *   「它是 `PANEL_ORDER` 的前缀」—— 写成乱序或跳过中间某个面板，
+ *   都会让「七个面板」这句话在界面上不成立。
+ */
+export const WIRED_PANELS: readonly PanelId[] = PANEL_ORDER;
+
+/** 当前选中项（面板 + 该面板需要的参数）。 */
+export interface AppSelection {
+  /** 当前面板（**初始**面板；打开后由 `useState` 接管）。 */
+  readonly panel: PanelId;
+  /**
+   * 面板 2 / 4 / 6 要看的记忆 id（**初始**值；打开后由 `useState` 接管）。
+   *
+   * ⚠️ `''` 的语义是「**还没选**」，不是「查不到」——
+   *   面板会据此显示「尚未选择记忆 + 去哪选」，而不是「库里没有这条记忆」。
+   */
+  readonly memoryId: string;
+  /** 面板 3 的模拟对话文本（**初始**值；之后的编辑由面板自己持有）。 */
+  readonly recallContext: string;
+  /** 面板 5 的查询条件（缺省 ⇒ 按 `now` 所在的年月）。 */
+  readonly logQuery?: LogQuery;
+  /** 面板 6 的页号（缺省 0）。 */
+  readonly historyPage?: number;
+  /** 面板 7 的「上次快照」（缺省 `null` ⇒ 没有基准）。 */
+  readonly previousClusters?: ClustersResult | null;
+}
+
+/**
+ * 缺省选中项（打开查看器时的第一屏）。
+ *
+ * ⚠️ `memoryId: ''` 是**刻意的**：查看器不替用户猜「你想看哪一条」
+ *   （猜错就会在打开瞬间展示一条无关记忆的正文）。第一屏是总览，
+ *   用户从面板 2 的「最近记忆」列表里选一条之后，面板 2 / 4 / 6 才有内容。
+ *   ⚠️ 真正让它**不再是死路**的是面板 2 顶部的两个入口（P5-T04）。
+ */
+export const DEFAULT_SELECTION: AppSelection = {
+  panel: 'overview',
+  memoryId: '',
+  recallContext: '',
+};
+
+/**
+ * 面板 5 的缺省查询：`now` 所在的年 / 月。
+ *
+ * ⚠️ **从 `now` 推**（不是 `new Date()`）：`now` 是注入的
+ *   ⇒ 同一个 `now` 渲染两次得到同一份 markup，快照不会因为「今天是几号」而变。
+ */
+export function defaultLogQuery(now: number): LogQuery {
+  const iso = new Date(now).toISOString();
+  return { year: Number(iso.slice(0, 4)), month: Number(iso.slice(5, 7)) };
+}
+
+/** `App` 的入参。 */
+export interface AppProps {
+  /** 读端口（`null` ⇒ 所有面板停在加载中）。 */
+  readonly port: ReadPort | null;
+  /** 注入的当前时刻（面板的全部时间文案都以它为基准）。 */
+  readonly now: number;
+  /** **初始**选中项（打开后由 `useState` 接管）。 */
+  readonly selection?: AppSelection;
+}
+
+/**
+ * 按选中项渲染对应面板。
+ *
+ * ⚠️ `onSelectMemory` **只传给面板 2**（「最近记忆」列表与「按 id 查看」都在那里）：
+ *   面板 4 / 6 只**消费**选中项，不提供入口 —— 选择这件事只有一个地方能做，
+ *   否则三个面板各有一套「选中」就会各说各话。
+ */
+function renderPanel(
+  selection: AppSelection,
+  port: ReadPort | null,
+  now: number,
+  onSelectMemory: (picked: string) => void,
+): ReactElement {
+  switch (selection.panel) {
+    case 'overview':
+      return <Overview port={port} now={now} />;
+    case 'memoryList':
+      return (
+        <MemoryList
+          port={port}
+          now={now}
+          memoryId={selection.memoryId}
+          onSelectMemory={onSelectMemory}
+        />
+      );
+    case 'recallSimulator':
+      return <RecallSimulator port={port} now={now} context={selection.recallContext} />;
+    case 'graphView':
+      return <GraphView port={port} now={now} memoryId={selection.memoryId} />;
+    case 'logViewer':
+      return <LogViewer port={port} now={now} query={selection.logQuery ?? defaultLogQuery(now)} />;
+    case 'versionHistory':
+      return (
+        <VersionHistory
+          port={port}
+          now={now}
+          memoryId={selection.memoryId}
+          page={selection.historyPage ?? 0}
+        />
+      );
+    case 'clusterMap':
+      return <ClusterMap port={port} now={now} previous={selection.previousClusters ?? null} />;
+  }
+}
+
+/** 查看器根组件。 */
+export function App({ port, now, selection = DEFAULT_SELECTION }: AppProps): ReactElement {
+  /** ★ 当前面板：由导航按钮驱动（改之前它只是 prop ⇒ 六个面板打不开）。 */
+  const [activePanel, setActivePanel] = useState<PanelId>(selection.panel);
+  /**
+   * ★ 当前选中的记忆 id：**一等状态**（改之前它被写死成 `''` 且没有入口）。
+   *
+   * ⚠️ 初值来自 `selection.memoryId`（`AppProps.selection` 只是**初始**值，
+   *   打开后由本状态接管 —— 与 `activePanel` 同款）。
+   */
+  const [memoryId, setMemoryId] = useState<string>(selection.memoryId);
+  const current: AppSelection = { ...selection, panel: activePanel, memoryId };
+
+  /**
+   * 「选中一条记忆」的**唯一入口**。
+   *
+   * ⚠️ 用 `nextMemoryId()` 而不是直接 `setMemoryId(picked)`：
+   *   空输入**不清空**当前选中项、重复点同一条返回同一引用（React 因此不重渲染）。
+   *   那两条都是 `state/navigation.ts` 里有单测的语义，组件里不重写一遍。
+   */
+  const selectMemory = (picked: string): void => {
+    setMemoryId((previous) => nextMemoryId(previous, picked));
+  };
+
+  return (
+    <div className="app" data-app="memory-viewer">
+      <header className="app__header" data-header="readonly">
+        <h1 className="app__title">{APP_TITLE}</h1>
+        <ReadonlyBadge />
+      </header>
+      <nav className="app__nav" data-nav-panels={WIRED_PANELS.length}>
+        {WIRED_PANELS.map((panelId) => (
+          <button
+            key={panelId}
+            type="button"
+            role="tab"
+            className="app__nav-item"
+            data-panel-id={panelId}
+            data-nav-panel={panelId}
+            data-active={panelId === activePanel ? 'true' : 'false'}
+            aria-selected={panelId === activePanel}
+            onClick={() => {
+              setActivePanel(panelId);
+            }}
+          >
+            {PANEL_TITLES[panelId]}
+          </button>
+        ))}
+      </nav>
+      <main
+        className="app__main"
+        data-selected-panel={activePanel}
+        data-selected-memory={memoryId}
+        data-now={now}
+      >
+        {renderPanel(current, port, now, selectMemory)}
+      </main>
+    </div>
+  );
+}

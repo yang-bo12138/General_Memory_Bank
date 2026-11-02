@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <!--
+      ★ 内容安全策略（CSP）—— 阶段 5 · T03（设计 §7.1 第 1、2 条的渲染侧落点）。
+
+      ⚠️ `default-src 'none'` 是**刻意的**：查看器不需要任何网络能力
+        （ADR-10：库内不接模型、不读环境变量、不发网络请求）。
+        面板只画自己算出来的 SVG / 表格 ⇒ `img-src` / `connect-src` 一律不放行。
+      ⚠️ `script-src 'self'` 而不是 `'unsafe-inline'`：
+        「只读观察器」一旦能执行内联脚本，它的所有只读保证就只剩代码审查了。
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; base-uri 'none'; form-action 'none'"
+    />
+    <title>记忆库只读观察器</title>
+    <link rel="stylesheet" href="./panels/panels.css" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./main.tsx"></script>
+  </body>
+</html>
