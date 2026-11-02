@@ -225,6 +225,12 @@ describe('T05 · 工具表：最小集齐、阻塞方法不在、参数语义显
 
   it('★ 三个阻塞维护方法**不在**工具名集合里（且反例：沾污名单必须抛）', () => {
     expect(BLOCKED_MAINTENANCE_METHODS.length).toBe(3);
+    // ★ 三个名字**逐个写死**：只断 `length === 3` 时，把 `recluster` 换成别的阻塞方法也绿。
+    expect([...BLOCKED_MAINTENANCE_METHODS].sort()).toEqual([
+      'rebuildArchivalSchedule',
+      'rebuildVectorBuckets',
+      'recluster',
+    ]);
     const exposed = TOOL_NAMES.filter((name) => BLOCKED_MAINTENANCE_METHODS.includes(name));
     expect(exposed, '阻塞维护方法被暴露了（一次调用会阻塞 1~3 分钟）').toEqual([]);
 
@@ -491,15 +497,45 @@ describe('T05 · `touch.coActivateWith` 校验在 MCP 层同样生效', () => {
     expect(error.details.count).toBe(DEFAULT_PARAMS.COACT_BATCH_MAX + 1);
   });
 
-  it('恰好 `COACT_BATCH_MAX` 条 ⇒ 不抛（边界是 `>` 而不是 `>=`，与上一条成对）', () => {
-    const written = run<WriteResult>('write', { content: '共激活边界内的陪跑数据' });
-    const justEnough = Array.from({ length: DEFAULT_PARAMS.COACT_BATCH_MAX }, () => ({
-      memoryId: written.id,
-      seedIds: [] as string[],
-    }));
-    expect(() =>
-      dispatchTool(fixture.store, 'touch', { ids: [written.id], coActivateWith: justEnough }),
-    ).not.toThrow();
+  it('★ 恰好 `COACT_BATCH_MAX` 条 ⇒ 不抛，且 256 条声明**全部被消费**（不是静默丢弃）', () => {
+    // ⚠️ 为什么不能只断 `not.toThrow()`：在 `MAX-1` 处静默截断同样不抛 ⇒ 恒绿。
+    //   ⇒ 这里造 **256 个互不相同**的 (seed, memoryId) 对，再按库自己的记账核对：
+    //     accepted（真的写成边）+ truncated（明确的截断）+ skippedInvalidSeed（无效种子）
+    //     **必须恰好等于 256** ⇒ 少一条就说明被悄悄丢了。
+    const anchors = [
+      run<WriteResult>('write', { content: '共激活锚点 A' }).id,
+      run<WriteResult>('write', { content: '共激活锚点 B' }).id,
+    ];
+    const seeds: string[] = [];
+    // 2 个锚点 × 128 个种子 = 256 个互不相同的对（`COACT_BATCH_MAX` 恰好 256）
+    const seedCount = DEFAULT_PARAMS.COACT_BATCH_MAX / anchors.length;
+    for (let i = 0; i < seedCount; i += 1) {
+      seeds.push(run<WriteResult>('write', { content: `共激活种子 ${i}` }).id);
+    }
+
+    const declarations: Array<{ memoryId: string; seedIds: string[] }> = [];
+    for (const seed of seeds) {
+      for (const anchor of anchors) {
+        if (declarations.length >= DEFAULT_PARAMS.COACT_BATCH_MAX) break;
+        declarations.push({ memoryId: anchor, seedIds: [seed] });
+      }
+    }
+    expect(declarations.length).toBe(DEFAULT_PARAMS.COACT_BATCH_MAX);
+
+    const outcomes = run<TouchOutcome[]>('touch', { ids: anchors, coActivateWith: declarations });
+    const outcome = outcomes[0];
+    expect(outcome?.skippedInvalidSeed, '有声明被当成无效种子丢掉 —— 那不是「消费」').toBe(0);
+    expect(
+      (outcome?.accepted ?? -1) + (outcome?.truncated ?? -1),
+      'accepted + truncated != 声明的条数 ⇒ 有声明被静默丢弃（在 MAX-1 处截断就会这样）',
+    ).toBe(DEFAULT_PARAMS.COACT_BATCH_MAX);
+    // 上限是 `COACT_MAX_PAIRS_PER_TOUCH`（每对上限），**不是** `COACT_BATCH_MAX`：
+    // 前者限制「一次写多少对边」，后者限制「一次收多少条声明」，两者各管一件事。
+    expect(outcome?.accepted).toBe(DEFAULT_PARAMS.COACT_MAX_PAIRS_PER_TOUCH);
+    // 后果：`accepted` 那么多行真的进了 `coacts`
+    expect(coactCount(), 'accepted 说有边，但 coacts 表里没有').toBe(
+      DEFAULT_PARAMS.COACT_MAX_PAIRS_PER_TOUCH,
+    );
   });
 });
 
@@ -667,5 +703,357 @@ describe('T05 · 架构约束', () => {
   it('工具表的顺序稳定（最小集在前、维护类在后）⇒ 快照与断言可复现', () => {
     expect(TOOL_NAMES.slice(0, 6)).toEqual(MINIMAL_TOOL_NAMES);
     expect(TOOL_NAMES.slice(6)).toEqual(EXPOSED_MAINTENANCE_NAMES);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 八、后果层：**回库查状态**，不只断库方法的返回值
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// ⚠️ 这一节的存在理由（复核指出的病根）：上一版的 5 条断言「改坏实现也不会红」——
+//   它们只读**返回值**（`purged === 0`、`typeof stabilityDelta === 'number'`、
+//   `movedMemories` 是数字……），而一个**空实现**（什么都不做、只编排一个漂亮的返回对象）
+//   完全满足这些条件。⇒ 本节每条都是：**先用旁路只读连接看到后果，再与返回值对照**。
+//
+// ⚠️ 「摆夹具」用可写旁路连接或门面自己的 `now` 注入（**只用于造过去的时间**），
+//   因为 MCP 层刻意不转发时钟（见 `mcp/tools.ts` 决策块④）。
+//   ⇒ 每一步都注明「这是摆夹具，不是被测对象」。
+
+/** 可写旁路连接（**只用于摆夹具**：把 `last_access` 拨到过去，让同日守卫不再吞掉增长）。 */
+function withWritableDb<T>(dbPath: string, run: (db: Database.Database) => T): T {
+  const db = new Database(dbPath);
+  try {
+    return run(db);
+  } finally {
+    db.close();
+  }
+}
+
+/** 一条记忆的**后果列**（加固 / 置信度 / 软删状态都从这里读）。 */
+interface MemoryStateRow {
+  stability: number;
+  access_count: number;
+  last_access: number;
+  confidence: number;
+  deleted: number;
+  deleted_at: number | null;
+}
+
+/** 读一条记忆的后果列（不存在 ⇒ `undefined`）。 */
+function memoryState(id: string): MemoryStateRow | undefined {
+  return withDb(
+    fixture.dbPath,
+    (db) =>
+      db
+        .prepare(
+          'SELECT stability, access_count, last_access, confidence, deleted, deleted_at FROM memories WHERE id = ?',
+        )
+        .get(id) as MemoryStateRow | undefined,
+  );
+}
+
+/** 某个实体还在不在（`mergeEntities` 的后果：源实体必须消失）。 */
+function entityExists(entityId: string): boolean {
+  return withDb(fixture.dbPath, (db) => {
+    const row = db.prepare('SELECT count(*) AS n FROM entities WHERE id = ?').get(entityId) as {
+      n: number;
+    };
+    return row.n > 0;
+  });
+}
+
+/** 某条记忆挂在某个实体上的关联条数。 */
+function entityLinkCount(memoryId: string, entityId: string): number {
+  return withDb(fixture.dbPath, (db) => {
+    const row = db
+      .prepare('SELECT count(*) AS n FROM memory_entities WHERE memory_id = ? AND entity_id = ?')
+      .get(memoryId, entityId) as { n: number };
+    return row.n;
+  });
+}
+
+/** 一条边的落库形态（`link` 的后果：`memory_id` 与权重都必须真的写进去）。 */
+interface EdgeRow {
+  subject_id: string;
+  object_id: string;
+  memory_id: string | null;
+  weight: number;
+}
+
+/** 按谓词取一条边（每个用例用互不相同的谓词，避免撞 `idx_edge_spo` 唯一索引）。 */
+function edgeByPredicate(predicate: string): EdgeRow | undefined {
+  return withDb(
+    fixture.dbPath,
+    (db) =>
+      db
+        .prepare('SELECT subject_id, object_id, memory_id, weight FROM edges WHERE predicate = ?')
+        .get(predicate) as EdgeRow | undefined,
+  );
+}
+
+/** 边表总行数（`createMissing:false` 的「零写入」判据）。 */
+function edgeCount(): number {
+  return withDb(fixture.dbPath, (db) => {
+    const row = db.prepare('SELECT count(*) AS n FROM edges').get() as { n: number };
+    return row.n;
+  });
+}
+
+/** 共激活边总数（`touch` 的后果：声明被真的消费成边）。 */
+function coactCount(): number {
+  return withDb(fixture.dbPath, (db) => {
+    const row = db.prepare('SELECT count(*) AS n FROM coacts').get() as { n: number };
+    return row.n;
+  });
+}
+
+/** 一天多少毫秒（摆夹具用）。 */
+const ONE_DAY_MS = 86_400_000;
+
+describe('T05 · 后果层 ①：`sweep` 真的物理删了行（PLAN P0）', () => {
+  it('★ `purgeDeletedDays: 30` ⇒ 40 天前的软删行**已消失**；1 天前的那条还在（成对）', () => {
+    const stale = run<WriteResult>('write', { content: '40 天前被软删的那条' });
+    const fresh = run<WriteResult>('write', { content: '1 天前被软删的那条' });
+
+    // 摆夹具：用门面自己的 `now` 注入把 `deleted_at` 拨到过去（MCP 不转发时钟）
+    const now = Date.now();
+    fixture.store.forget(stale.id, {}, now - 40 * ONE_DAY_MS);
+    fixture.store.forget(fresh.id, {}, now - 1 * ONE_DAY_MS);
+    expect(memoryRow(stale.id)?.deleted).toBe(1);
+    expect(memoryRow(stale.id)?.deleted_at).toBe(now - 40 * ONE_DAY_MS);
+
+    // ① `purgeDeletedDays: 0` = 「一条都不清」（不是「清 0 天前的」）
+    const zero = run<SweepResult>('sweep', { purgeDeletedDays: 0, vacuum: false });
+    expect(zero.purged).toBe(0);
+    expect(memoryRow(stale.id), 'purgeDeletedDays:0 把 40 天前的旧行删了').toBeDefined();
+    expect(memoryRow(fresh.id)).toBeDefined();
+
+    // ② `purgeDeletedDays: 30` ⇒ 只清 40 天前那条
+    const swept = run<SweepResult>('sweep', { purgeDeletedDays: 30, vacuum: false });
+    expect(swept.purged).toBe(1);
+    expect(
+      memoryRow(stale.id),
+      '返回值说 purged=1，但行还在（空实现也能满足旧断言）',
+    ).toBeUndefined();
+    expect(memoryRow(fresh.id), '1 天前的软删行被误删（阈值方向反了）').toBeDefined();
+  });
+});
+
+describe('T05 · 后果层 ②：`touch` 真的改了 stability / access_count（PLAN P0）', () => {
+  it('★ 加固之后 `stability` 与 `access_count` 在库里真的变了', () => {
+    const written = run<WriteResult>('write', { content: '要被加固的那条' });
+
+    // 摆夹具：把 `last_access` 拨回 3 天前。
+    // ⚠️ 不拨会踩**同日守卫**（`intervalDays < 1` ⇒ 不增长）⇒ `stabilityDelta` 恒为 0
+    //   ⇒ 那条断言就退化成恒真（这正是复核说的「改坏实现也不会红」）。
+    withWritableDb(fixture.dbPath, (db) => {
+      db.prepare('UPDATE memories SET last_access = ? WHERE id = ?').run(
+        Date.now() - 3 * ONE_DAY_MS,
+        written.id,
+      );
+    });
+
+    const before = memoryState(written.id);
+    expect(before?.stability).toBeGreaterThan(0);
+    const accessCountBefore = before?.access_count ?? -1;
+
+    const outcomes = run<TouchOutcome[]>('touch', { ids: [written.id] });
+
+    const after = memoryState(written.id);
+    expect(
+      after?.stability,
+      'stability 在库里没涨（touch 只返回了一个好看的数字）',
+    ).toBeGreaterThan(before?.stability ?? 0);
+    expect(after?.access_count).toBe(accessCountBefore + 1);
+    expect(after?.last_access).toBeGreaterThan(before?.last_access ?? 0);
+    // 返回值与后果**对得上**（不是各说各话）
+    expect(outcomes[0]?.stabilityDelta).toBeCloseTo(
+      (after?.stability ?? 0) - (before?.stability ?? 0),
+      6,
+    );
+  });
+});
+
+describe('T05 · 后果层 ③：`link` 真的把 memory_id 与权重写进 edges（PLAN P0）', () => {
+  it('★ `memory_id` 被整个丢掉也会让旧断言全绿 ⇒ 这里回库查四列', () => {
+    const written = run<WriteResult>('write', {
+      content: '钱七在乙公司的同事是孙八',
+      entities: ['钱七', '孙八'],
+    });
+    const result = run<LinkResult>('link', {
+      subject: '钱七',
+      predicate: '同事乙公司',
+      object: '孙八',
+      memoryId: written.id,
+    });
+
+    const edge = edgeByPredicate('同事乙公司');
+    expect(edge, '`edges` 里没有这条边（link 只返回了一个对象）').toBeDefined();
+    expect(edge?.subject_id).toBe(entityIdByName('钱七'));
+    expect(edge?.object_id).toBe(entityIdByName('孙八'));
+    expect(edge?.memory_id, 'memoryId 被吞了：返回值仍然好看，但证据链断了').toBe(written.id);
+    expect(edge?.weight, '落库权重与返回值不一致').toBeCloseTo(result.weightAfter, 6);
+    expect(edge?.weight).toBeGreaterThan(0);
+  });
+});
+
+describe('T05 · 后果层 ④：`mergeEntities` 的后果（源实体消失 / 关联迁移）（PLAN P0）', () => {
+  it('★ 合并之后 `entities` 里没有源实体，`memory_entities` 指向 target', () => {
+    const written = run<WriteResult>('write', {
+      content: '丙和丁是同一个人',
+      entities: ['丙', '丁'],
+    });
+    const sourceId = entityIdByName('丁');
+    const targetId = entityIdByName('丙');
+
+    // 分母非空：合并前，这条记忆在源、目标两侧各有一条关联
+    expect(entityLinkCount(written.id, sourceId), '夹具里源实体没挂上这条记忆').toBe(1);
+    expect(entityLinkCount(written.id, targetId)).toBe(1);
+
+    const result = run<MergeEntitiesResult>('mergeEntities', { sourceId, targetId });
+
+    expect(entityExists(sourceId), '源实体还在（movedMemories 只是个数字）').toBe(false);
+    expect(entityLinkCount(written.id, targetId), '关联没有迁到 target').toBe(1);
+    expect(result.movedMemories).toBeGreaterThanOrEqual(0);
+    // 源实体成了 target 的别名（§4.9.2 的后果：主名降级为别名）
+    const aliases = withDb(fixture.dbPath, (db) =>
+      db.prepare('SELECT alias FROM entity_aliases WHERE entity_id = ?').all(targetId),
+    ) as Array<{ alias: string }>;
+    expect(aliases.map((row) => row.alias)).toContain('丁');
+  });
+});
+
+describe('T05 · 后果层 ⑤：六个「参数只在 schema 里描述」的项', () => {
+  it('★ `link{createMissing:false}` ⇒ `NOT_FOUND` 且 **`edges` 一行都没写**（零写入）', () => {
+    const before = edgeCount();
+    const error = expectMemoryError(
+      () =>
+        dispatchTool(fixture.store, 'link', {
+          subject: '从未存在的实体甲',
+          predicate: '自造关系',
+          object: '从未存在的实体乙',
+          createMissing: false,
+        }),
+      'NOT_FOUND',
+    );
+    expect(error.details.missingEntityNames).toBeDefined();
+    expect(edgeCount(), '抛错前已经写了一半（§4.5 禁止「一边自动建、一边抛错」）').toBe(before);
+    // 反例配对：同一对实体，`createMissing` 缺省（true）时**会**建出来
+    const ok = run<LinkResult>('link', {
+      subject: '从未存在的实体甲',
+      predicate: '自造关系',
+      object: '从未存在的实体乙',
+    });
+    expect(ok.weightAfter).toBeGreaterThan(0);
+    expect(edgeByPredicate('自造关系')).toBeDefined();
+    expect(edgeCount()).toBe(before + 1);
+  });
+
+  it('★ `restore{mergeInto}`：先 `CONFLICT`（带 conflictingId），合并后源行**消失**', () => {
+    const first = run<WriteResult>('write', { content: '同一条事实（会撞 hash）' });
+    run<{ ok: true }>('forget', { id: first.id });
+    const second = run<WriteResult>('write', { content: '同一条事实（会撞 hash）' });
+    expect(second.id).not.toBe(first.id);
+    expect(second.merged).toBe(false);
+
+    // ① 不传 mergeInto ⇒ CONFLICT 且**不改任何东西**
+    const conflict = expectMemoryError(
+      () => dispatchTool(fixture.store, 'restore', { id: first.id }),
+      'CONFLICT',
+    );
+    expect(conflict.details.conflictingId).toBe(second.id);
+    expect(memoryRow(first.id)?.deleted, '抛 CONFLICT 之后待恢复行被动了').toBe(1);
+
+    // ② 传 mergeInto ⇒ 源行被合并掉（后果，不是返回值）
+    run<{ ok: true }>('restore', { id: first.id, mergeInto: second.id });
+    expect(memoryRow(first.id), 'mergeInto 之后源行还在（它只是被 undelete 了？）').toBeUndefined();
+    expect(memoryRow(second.id)?.deleted).toBe(0);
+  });
+
+  it('★ `recall{includeArchived}`：归档记忆**只有在显式要的时候**才回来', () => {
+    const written = run<WriteResult>('write', { content: '很久以前的一条归档记忆' });
+    // 摆夹具：把 last_access 拨到 900 天前 ⇒ intensity 跌破归档线（不改任何阈值）
+    withWritableDb(fixture.dbPath, (db) => {
+      db.prepare('UPDATE memories SET last_access = ? WHERE id = ?').run(
+        Date.now() - 900 * ONE_DAY_MS,
+        written.id,
+      );
+    });
+
+    const plain = run<RecallResult>('recall', { context: '很久以前的一条归档记忆' });
+    expect(
+      plain.hits.map((hit) => hit.id),
+      '归档记忆出现在默认召回里',
+    ).not.toContain(written.id);
+    const withArchived = run<RecallResult>('recall', {
+      context: '很久以前的一条归档记忆',
+      includeArchived: true,
+    });
+    // 反例配对：开启之后必须**真的**回来（否则「默认不含」可以靠「永远不返回」通过）
+    expect(withArchived.hits.map((hit) => hit.id)).toContain(written.id);
+  });
+
+  it('★ `write{mediaRef}` 只给一半 ⇒ `INVALID_INPUT`（互斥约束在库层，schema 管不到）', () => {
+    expectMemoryError(
+      () =>
+        dispatchTool(fixture.store, 'write', { content: '多模态只给一半', mediaRef: '/tmp/a.png' }),
+      'INVALID_INPUT',
+    );
+    // 反例配对：两个都给 ⇒ 过，且 `media_ref` / `media_type` 都落库
+    const written = run<WriteResult>('write', {
+      content: '多模态两个都给',
+      mediaRef: '/tmp/b.png',
+      mediaType: 'image',
+    });
+    const row = withDb(fixture.dbPath, (db) =>
+      db
+        .prepare('SELECT media_ref AS mediaRef, media_type AS mediaType FROM memories WHERE id = ?')
+        .get(written.id),
+    ) as { mediaRef: string | null; mediaType: string | null } | undefined;
+    expect(row?.mediaRef).toBe('/tmp/b.png');
+    expect(row?.mediaType).toBe('image');
+  });
+
+  it('★ `write{entityAliases}` ⇒ `entity_aliases` 里真的有那两条别名', () => {
+    run<WriteResult>('write', {
+      content: '别名写入测试',
+      entityAliases: [{ name: '老周', aliases: ['周先生', '周总'] }],
+    });
+    const aliases = withDb(fixture.dbPath, (db) =>
+      db.prepare('SELECT alias FROM entity_aliases ORDER BY alias').all(),
+    ) as Array<{ alias: string }>;
+    expect(aliases.map((row) => row.alias)).toEqual(['周先生', '周总']);
+  });
+
+  it('★ `write{confidence}` 是**真的落库**（不是只回一条 `warnings`）', () => {
+    const written = run<WriteResult>('write', { content: '置信度 0.5', confidence: 0.5 });
+    expect(memoryState(written.id)?.confidence).toBe(0.5);
+    // 反例配对：缺省时库里是 0.7（§3 的默认值），说明这条断言读的是真列
+    const defaulted = run<WriteResult>('write', { content: '置信度缺省' });
+    expect(memoryState(defaulted.id)?.confidence).toBe(0.7);
+    // 越界值在 MCP 层就被 schema 拦掉（0~1），不会走到库的 INVALID_INPUT
+    const error = expectMemoryError(
+      () => dispatchTool(fixture.store, 'write', { content: '置信度越界', confidence: 5 }),
+      'INVALID_INPUT',
+    );
+    expect(error.details.path).toBe('$.confidence');
+  });
+
+  it('★ `write{emotion}`：越界被 schema 拒、合法值能写进去（**不**复算库的 difficulty 公式）', () => {
+    // ⚠️ 为什么只到这一步：`emotion` **不是** `memories` 的列（它只参与算 `initialDifficulty`）
+    //   ⇒ 想断言它的后果就得在测试里**重抄一遍库的公式**，那恰恰是会漂移的第二种实现。
+    //   ⇒ 这里只验两件**可判**的事：越界被拒（`$.emotion`）、合法值不报错且难度落进合法区间。
+    const outOfRange = expectMemoryError(
+      () => dispatchTool(fixture.store, 'write', { content: '情绪越界', emotion: 2 }),
+      'INVALID_INPUT',
+    );
+    expect(outOfRange.details.path).toBe('$.emotion');
+
+    const written = run<WriteResult>('write', { content: '情绪 0.5', emotion: 0.5 });
+    const difficulty = withDb(fixture.dbPath, (db) =>
+      db.prepare('SELECT difficulty FROM memories WHERE id = ?').get(written.id),
+    ) as { difficulty: number } | undefined;
+    expect(difficulty?.difficulty).toBeGreaterThanOrEqual(0);
+    expect(difficulty?.difficulty).toBeLessThanOrEqual(1);
   });
 });
