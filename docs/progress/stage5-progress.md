@@ -1,7 +1,7 @@
 # 阶段 5（P5 · 只读查看器与服务集成）进度与交接账
 
 > 时点：2026-11-02（Asia/Shanghai）· 分支 `feat/p5-verify-integrity`（基于 main 的合并点）
-> 门禁：`pnpm run verify` **EXIT=0**（**14 段链**）· 测试 **80 文件 / 1,636 条断言**（2026-11-02 收官定稿读数，见 **§九.8**）
+> 门禁：`pnpm run verify` **EXIT=0**（**14 段链**）· 测试 **82 文件 / 1,738 条断言**（2026-11-02 定稿读数，见 **§九.8**；数字为何变过三次见 §9.8 的「读数沿革」）
 > ⚠️ 本文件的 §〇~§二 写于「只有 T06 落地」时，**已被 §九 取代**（§九 记 T01~T05 全量落地与断言判别力审计）。
 > ⚠️ **本文件是阶段 5 的交接文档**：读完它应当能直接接手阶段 5 剩下的 T01~T05，不需要回放对话。
 >
@@ -375,10 +375,52 @@ H1（12,782 行 = 门槛 6.39 倍，**沿用阶段 3 读数、本轮未复测**�
 
 ```bash
 cd gmb
-npm_config_verify_deps_before_run=false pnpm run verify   # 期望 EXIT=0 · 80 文件 / 1,636 断言 · 14 段链
+npm_config_verify_deps_before_run=false pnpm run verify   # 期望 EXIT=0 · 82 文件 / 1,738 断言 · 14 段链
 npm_config_verify_deps_before_run=false pnpm run build    # 期望 EXIT=0（dist 只有 index.*）
 npx vitest run mcp/                                        # 期望 2 文件 / 63 条（tools 48 + server 15）
 ```
 
-**规模（实测）**：`src/` 60 个 `.ts` / 21,472 行 · `viewer/` ＋ `mcp/` 33 个文件 / 8,530 行 · `tests/` 92 个 `.ts` / 39,258 行。
+**规模（实测）**：`src/` 60 个 `.ts` / 21,472 行 · `viewer/` ＋ `mcp/` 34 个文件 / 9,303 行 · `tests/` 95 个 `.ts` / 40,713 行。
 **两条文档审计**：档位审计判 121 处 / **真缺 0**；两层次审计**真缺 0**。
+
+### 9.9 ★ QA 独立验收（判 **Engineer**：找到 1 个真缺陷，已修）
+
+**验收方式**：不采信任何既有测试，自己写 46 条探针从外部进攻，并亲手改坏两次实现验证判别力。
+
+**六条证伪实验**（全部通过）：
+
+| 实验 | 结果 |
+|---|---|
+| 只读架构 | 自建 16 方法表（**不拿被测常量当分母**）⇒ 16/16 抛的**恰好**是 `READONLY_VIOLATION`；`.db` sha256 前后一致 |
+| SQL 防护层 | 我方 8 条 ＋ QA 另加 8 条对抗：`PRAGMA journal_mode(WAL)`（括号形态的写）、`PRAGMA main.user_version = 7`（schema 前缀）、`WITH … DELETE`、行注释里藏 DML、`EXPLAIN DELETE` **全部拒**；`WITH RECURSIVE … SELECT`、`SELECT 'a; DROP TABLE x'`、小写 `pragma` **放行未误拒** |
+| worker 隔离 | 子进程钩 `Module._load`，**正控先跑**（导入 `db-worker.ts` 必须检出 better-sqlite3 的原生 `.node`），renderer / worker-host / preload 三者 `loaded: []` |
+| 面板无写入口 | 自渲七面板：6 个面板内按钮 ＋ 7 个 `role="tab"`，**零 `<a>`、零内联 `onclick`**，动作名全在读白名单内 |
+| MCP | 真 `Client` ＋ 内存传输：10 工具、三个阻塞方法不在、10/10 `additionalProperties === false` |
+| 改坏会红 | 删 `sql-guard` 的 `INSERT` ⇒ 3 红；把 `events.ts` 的 `get readonly()` 改成 `return false` ⇒ **44 红**。两次均还原，`git status` 为空 |
+
+**★ 找到的真缺陷（判 `Engineer` 的唯一理由）**：`AppSelection.memoryId` 在渲染层**没有任何输入入口**
+（`App.tsx:68` 写死 `''`），而它是面板 2 / 4 / 6 的**唯一取数键** ⇒ 面板 2 永远 `MISSING_MEMORY_TEXT`、
+面板 4 图恒空、面板 6 的上一页/下一页**永久 disabled**（PLAN 第一条硬断言「面板 6 存在且可用」实际不成立）。
+**修法**（`8b475b3`）：加一条带 `LIMIT` 的具名查询 `recentMemories`（`select` 通道只收**查询名**、不收 SQL 文本
+⇒ **不开新通道**），面板 2 顶部给可点的「最近记忆」列表 ＋ 按 id 查看的兜底输入，空态改为明确引导。
+
+**一个复现细节值得记**：只读连接**一打开**就会补出 `-shm`(32KB) 与一个 **0 字节** `-wal`，且只读连接关不掉
+（实测）⇒「库没被改」的口径不能是「目录内文件不变」，必须落在 **`.db` 的 sha256 ＋ `-wal` 必须 0 字节**
+（有帧就说明有提交）。
+
+**QA 明确没验证的**（如实登记，别当成已验证）：真 Electron 窗口没起过（本机无显示器）⇒
+`contextIsolation`/`nodeIntegration`/`sandbox` 只做了源码读取；真实 DOM 里没点过任何控件（`environment:'node'`
+无 jsdom）；面板 4/6 的 SQL **语义正确性**没逐条核对（只验了 guard 放行 ＋ 参数化 ＋ 只读）；
+面板 7 的「两次快照对比」是否只用成员重叠度没查；worker 在 Electron 下的超时/崩溃分支只读了代码。
+
+### 9.10 读数沿革（**为什么同一个指标有三个数**，别再被误读成「有人偷改测试」）
+
+| 读数 | 对应提交 | 差在哪 |
+|---|---|---|
+| 80 文件 / 1,636 断言 | `99df145` | 阶段 5 主体交付完成的读数 |
+| 80 文件 / 1,643 断言 | `2956574` | 该提交在 `viewer-panels-structure.test.ts` 加了 **7 个** `it`（`nextSubmitted` 那批） |
+| 81 文件 / 1,689 断言 | QA 探针入库前 | QA 的两个探针文件（工作区 untracked 但被 vitest 收集） |
+| **82 文件 / 1,738 断言** | **`f3956fe`（定稿）** | 探针正式入库 ＋ `8b475b3` 的记忆选择入口（+49） |
+
+⇒ ★ **教训**：文档里的读数一旦写成「定稿」，就必须在**最后一次提交之后**重取一次；
+本轮就是先写了 1,636、后面又落了两个提交 ⇒ 差点变成「照文档复跑会看到不同的数」。
