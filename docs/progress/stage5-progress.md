@@ -250,6 +250,9 @@ verifyIntegrity(options?: { deep?: boolean }): {
   ⑧ 门禁读数（实测，本块收尾时复跑）：`pnpm run verify` **EXIT=0**（14 段链）
      ⇒ **77 文件 / 1,507 条断言**（基线 72 / 1,330；本轮 T05 自己贡献 **1 文件 / 37 条**）。
      这个 77 / 1,507 是**三个已落地块之和**：T03 = `28f7da1`、T04 = `2a11d2d`、T05 = `2a08417`（+ `21a32e9`）。
+     ⚠️ **「谁落的」只能按提交正文核，不能按 git 身份**：本仓库的所有提交是**同一个 git 身份**
+     ⇒ 作者名分不出来。可复核的判据是正文：`2a11d2d`（T04）的正文含「环境留痕 / strict-dep-builds /
+     os error 1392」三段 ⇒ 由 software-engineer-2 落；T03 的正文没有这类标记 ⇒ **不要在日志里替它归人**。
      其中 `mcp/` 三个文件 `biome check` 零告警；`mcp/tools.test.ts` **37 passed**。
      ⚠️ **过程留痕**（不是「一路绿」）：本轮中途 `verify` 曾两次为红 ——
      一次红在**并行的 T03/T04 在途文件**上（`viewer/renderer/panels/*` 的 biome 格式/导入顺序、
@@ -262,6 +265,8 @@ verifyIntegrity(options?: { deep?: boolean }): {
      ⇒ 与别人的 gate 互相把 `.bin` 清掉。处置：加 `--config.strict-dep-builds=false` 重装
      （**不要** `pnpm approve-builds`：那会开始下载 ~100MB 的 Chromium，见设计 §2.2），
      装完以 `node_modules/.modules.yaml` 存在为「真的装好了」的判据。
+     ⚠️ 同理，判断依赖是否干净**不要用 `npx biome`**：`node_modules` 为空时 npx 会去 registry
+     拉一个同名的无关包（`biome@0.3.3`）并「成功」返回 ⇒ 一律用 `node_modules/.bin/biome check .`。
   ⚠️ **未做**：`stats` / `get` / `inhibitionTrace` 等读工具的暴露、HTTP/SSE 传输、
      `sweep` 之外的维护面（理由逐个写在 `mcp/tools.ts` 的决策块 ③）。
   ⚠️ 本文件**头部**那句「68 文件 / 1,213 条断言」是上一轮的读数，本轮**没有改**
