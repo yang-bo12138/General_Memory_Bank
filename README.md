@@ -15,13 +15,15 @@ pnpm run verify  # 门禁：类型检查 → 代码风格 → 单元测试 → 8
 pnpm build       # 构建产物（tsup：CJS + ESM + d.ts）
 ```
 
-> 📌 **当前实现范围**（阶段 3 已收官，基线 `a121951`）：
+> 📌 **当前实现范围**（**阶段 4 已收官**）：
 > 阶段 0（骨架与不变量）、阶段 1（存储与基础运算）、阶段 2（向量分桶与路由，8 任务）、
-> **阶段 3（神经元交互，6 任务 T01~T06）** —— **均已完成并通过对抗式验收**；
-> **阶段 4（向量桶内 LIMIT）尚未开始** ⇒ 两条性能硬门槛仍红（H1 = 12,782 行，是门槛的 6.39 倍）。
+> 阶段 3（神经元交互，6 任务 T01~T06）、**阶段 4（生命周期 / 事件重放 / 可观测性，8 任务 T01~T08）**
+> —— **均已完成**；公开面 **22 个方法**（§3.1 的归位表：阶段 1~4 全挂上）。
+> ⚠️ **两条性能硬门槛仍红**（H1 = 12,782 行，是门槛的 6.39 倍）⇒ 归「**向量路接线前必须还**」，
+> 与阶段 4 的范围无关。
 > ⇒ 逐任务状态、验收证据、遗留清单与**下一步起点**见
-> [`docs/progress/stage3-progress.md`](docs/progress/stage3-progress.md)，
-> 交付总览见 [`docs/DELIVERY.md`](docs/DELIVERY.md)。
+> [`docs/progress/stage4-progress.md`](docs/progress/stage4-progress.md)（阶段 3 的账在
+> [`stage3-progress.md`](docs/progress/stage3-progress.md)），交付总览见 [`docs/DELIVERY.md`](docs/DELIVERY.md)。
 
 > 📌 **★ 写代码前请先读 [`docs/design/DEVELOPMENT-PLAN.md` §2.4](docs/design/DEVELOPMENT-PLAN.md)「通用工程纪律」**
 > —— 5 条跨阶段长期有效的纪律，每条都有真实事故支撑（**13 个实例 · 4 个人各撞至少一次**）：

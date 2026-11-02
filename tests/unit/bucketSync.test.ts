@@ -270,21 +270,25 @@ describe('P2-T03-b · 路径 3（§4.9 步骤 4 · 全新事实创建）', () =>
 });
 
 describe('P2-T03-b · 路径 4（§4.9.1 步骤 4 · updateContent 显式改正文）', () => {
-  it('★ 本轮**不建** `updateContent.ts`（阶段 4 才建）——但 TODO 锚点必须在', () => {
-    // ⚠️ **空壳 = 死函数 = 假绿**（同 P1-T07 对空壳 `assignBucket` 的处理）：
-    //   造一个只写 `memories` 不写桶的 `updateContent` ⇒ 那就是「阶段 1 不入桶」的翻版
-    //   ⇒ 而静态断言会**假通过**（「四条路径都调了 assignBucket」）。
-    // ⇒ 本轮只留**明确的 TODO 锚点**，让阶段 4 不会漏。
+  it('★ 路径 4 实现后：`updateContent.ts` 存在，且**两条桶归属分支都在**（入桶 / 退桶）', () => {
+    // ⚠️ **本用例的历史**：阶段 2 时它断言的是「文件**不存在**」——
+    //   那时的理由是「**空壳 = 死函数 = 假绿**」：造一个只写 `memories`、不写桶的
+    //   `updateContent` ⇒ 静态断言会假通过（「四条路径都调了 assignBucket」）。
+    // ⇒ **阶段 4 把它真做出来了** ⇒ 本条也跟着升级成「**它必须两条分支都在**」：
+    //   · 传了向量 ⇒ `assignBucket`（换桶）；
+    //   · 没传向量 ⇒ `unassignBucket`（**退桶**——桶里留一条无向量的行会让桶计数偏大）。
+    //   ⚠️ 运行期行为由 `tests/unit/updateContent.test.ts` 覆盖，这里只守「结构上两分支都在」
+    //     （**不是**「调过就算」：调用点必须与 `memories` 的 UPDATE 同事务，见下方断言）。
     const here = fileURLToPath(new URL('.', import.meta.url));
     const srcRoot = resolve(here, '../../src');
+    const path = join(srcRoot, 'store', 'updateContent.ts');
 
-    // 性质：文件**不存在**（本轮不建）
-    expect(existsSync(join(srcRoot, 'store', 'updateContent.ts'))).toBe(false);
-
-    // 性质：TODO 锚点在 `src/store/write.ts` 里（阶段 4 的接手点）
-    const writeSource = readFileSync(join(srcRoot, 'store', 'write.ts'), 'utf8');
-    expect(writeSource).toContain('updateContent');
-    expect(writeSource).toContain('TODO');
+    expect(existsSync(path)).toBe(true);
+    const source = readFileSync(path, 'utf8');
+    expect(source).toContain('assignBucket');
+    expect(source).toContain('unassignBucket');
+    // ★ **同事务**：`runWriteTransaction` 必须在场（§9.3.2 ①）
+    expect(source).toContain('runWriteTransaction');
   });
 });
 

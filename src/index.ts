@@ -253,6 +253,26 @@ export type {
   ClusterSplitInfo,
   ClusterView,
 } from './store/clusters.js';
+// ── 阶段 4（P4-T02 ~ P4-T06）的门面方法用到的公共类型 ──
+// ⚠️ 同样**只导类型，不导实现函数**：唯一公开入口是门面方法（§6 / C36）。
+export type { ForgetOptions } from './store/forget.js';
+export type { RestoreOptions } from './store/restore.js';
+export type { SetParamsResult } from './store/setParams.js';
+export type { MemoryStats, VectorBackendStats } from './store/stats.js';
+export type { SweepOptions, SweepResult } from './store/sweep.js';
+// ── 阶段 4（P4-T07）的**工具**：重放与对账 ──
+// ⚠️ 这两个模块是**离线工具**（运维 / 排障用），不是门面方法：
+//   `verifyIntegrity` 属阶段 5 才挂门面（§3.1 的归位表），重放器则**永远**是工具。
+export { replayEvents, replayFromDb, readEvents } from './tools/replay.js';
+export type { ReplayEvent, ReplayMemoryState, ReplayState } from './tools/replay.js';
+export { checkStabilityBalance, verifyIntegrity } from './tools/verify.js';
+export type {
+  BucketCoverage,
+  IntegrityReport,
+  StabilityBalance,
+  StabilityMismatch,
+} from './tools/verify.js';
+
 export {
   FileLogger,
   flattenField,

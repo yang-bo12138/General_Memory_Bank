@@ -1,0 +1,32 @@
+[
+  {
+    "corpus": "corpus-a",
+    "ratio": 50,
+    "query": "张三住在上海",
+    "ids": ["c0", "c5", "c3", "c1", "c2"]
+  },
+  {
+    "corpus": "corpus-a",
+    "ratio": 50,
+    "query": "她不喜欢猫粮",
+    "ids": ["c10", "c1", "c7"]
+  },
+  {
+    "corpus": "corpus-a",
+    "ratio": 50,
+    "query": "北京今天刮风",
+    "ids": ["c6", "c5", "c3"]
+  },
+  {
+    "corpus": "corpus-a",
+    "ratio": 50,
+    "query": "腾讯的总部在深圳",
+    "ids": ["c9", "c2"]
+  },
+  {
+    "corpus": "corpus-a",
+    "ratio": 50,
+    "query": "狗需要每天遛",
+    "ids": ["c8", "c11"]
+  }
+]
