@@ -249,12 +249,19 @@ verifyIntegrity(options?: { deep?: boolean }): {
      ⇒ **各自都会把断言打红**（判别力已实测，不是恒绿守卫）。
   ⑧ 门禁读数（实测，本块收尾时复跑）：`pnpm run verify` **EXIT=0**（14 段链）
      ⇒ **77 文件 / 1,507 条断言**（基线 72 / 1,330；本轮 T05 自己贡献 **1 文件 / 37 条**）。
+     这个 77 / 1,507 是**三个已落地块之和**：T03 = `28f7da1`、T04 = `2a11d2d`、T05 = `2a08417`（+ `21a32e9`）。
      其中 `mcp/` 三个文件 `biome check` 零告警；`mcp/tools.test.ts` **37 passed**。
      ⚠️ **过程留痕**（不是「一路绿」）：本轮中途 `verify` 曾两次为红 ——
      一次红在**并行的 T03/T04 在途文件**上（`viewer/renderer/panels/*` 的 biome 格式/导入顺序、
      `tests/integration/viewer-panels-*.test.ts` 的 1 条断言），与本轮 T05 改动无关；
      另一次是 `node_modules` 被清空（隔离验证时误删，已按设计 §2.2 的命令用
      `--frozen-lockfile` + 干净 store 重装恢复，锁文件未变）。⇒ 最终读数以上面这句为准。
+     📌 **给下一个人的一条环境事实**（本轮实测，踩了三次）：`pnpm install` 若只报
+     `ERR_PNPM_IGNORED_BUILDS`（electron 的构建脚本被忽略，属**预期**），pnpm 会**认定整次安装失败
+     而不写 `node_modules/.modules.yaml`** ⇒ 之后**每一个** `pnpm run <script>` 都会在跑之前再自动装一遍
+     ⇒ 与别人的 gate 互相把 `.bin` 清掉。处置：加 `--config.strict-dep-builds=false` 重装
+     （**不要** `pnpm approve-builds`：那会开始下载 ~100MB 的 Chromium，见设计 §2.2），
+     装完以 `node_modules/.modules.yaml` 存在为「真的装好了」的判据。
   ⚠️ **未做**：`stats` / `get` / `inhibitionTrace` 等读工具的暴露、HTTP/SSE 传输、
      `sweep` 之外的维护面（理由逐个写在 `mcp/tools.ts` 的决策块 ③）。
   ⚠️ 本文件**头部**那句「68 文件 / 1,213 条断言」是上一轮的读数，本轮**没有改**
