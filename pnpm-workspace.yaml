@@ -9,3 +9,15 @@ allowBuilds:
   better-sqlite3: true
   esbuild: true
   '@biomejs/biome': true
+
+# ⚠️★ **electron 不得加进 allowBuilds**（阶段 5 · p5-t01-t05-design.md §2.2）。
+#
+#   Electron 的 `install.js` 会下载 ~100MB 的平台二进制并写 `path.txt`。
+#   查看器本轮**只需要类型**（`electron.d.ts` 随 npm tarball 发布，不跑 install 脚本也有）
+#   ⇒ 放进来就等于：装一个 `devDependencies` 顺手拖下一个 Chromium。
+#
+#   它**不在这里**是**结构性**的保证（pnpm 默认不跑依赖的构建脚本），
+#   而不是「记得别装」的纪律。万一以后有人把它加进来：
+#   · CI 的两个 job 已经各自带了 `ELECTRON_SKIP_BINARY_DOWNLOAD=1`（`.github/workflows/ci.yml`）；
+#   · 任何测试都**不得** `require('electron')` —— 二进制不存在时它会抛
+#     "Electron failed to install correctly"，`require` 一出现就是红。

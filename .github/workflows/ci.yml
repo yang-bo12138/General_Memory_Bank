@@ -18,6 +18,13 @@ jobs:
   verify:
     name: 门禁（verify）
     runs-on: ubuntu-latest
+    # ⚠️ **P2 防线（阶段 5 · p5-t01-t05-design.md §3.1）**：`electron` 是 `devDependencies`
+    #   但**只要类型、不要二进制**（`electron.d.ts` 随 tarball 发布，不跑 install 脚本也有）。
+    #   主防线是「不加进 `pnpm-workspace.yaml` 的 allowBuilds」（pnpm 默认不跑依赖构建脚本）；
+    #   这一行防的是**将来有人把它加进去** —— Electron 的 install.js 读的是
+    #   `process.env.ELECTRON_SKIP_BINARY_DOWNLOAD`（**不读** `npm_config_*` ⇒ 写进 `.npmrc` 是假动作）。
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
     steps:
       - name: 检出
         uses: actions/checkout@v4
@@ -50,6 +57,9 @@ jobs:
   build:
     name: 构建（tsup）
     runs-on: ubuntu-latest
+    # ⚠️ 同 verify job：只要 electron 的类型，不下载二进制。
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
     steps:
       - name: 检出
         uses: actions/checkout@v4
