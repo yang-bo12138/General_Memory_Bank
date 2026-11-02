@@ -197,7 +197,7 @@ function parseStageMethodManifest(planDoc: string): {
  *
  * ⚠️ **阶段 0 不新增方法**（只建开关与不变量测试）⇒ 它在清单里是空集，列出来只为**对齐**。
  */
-const LANDED_STAGES: readonly number[] = [0, 1, 2, 3];
+const LANDED_STAGES: readonly number[] = [0, 1, 2, 3, 4];
 
 /**
  * ★ **已落地阶段里、但门面上还没有的方法**（**唯一**的例外清单）。

@@ -337,6 +337,23 @@ export interface SweepReclusterEventPayload {
   largestClusterRatio: number;
 }
 
+/**
+ * `sweep` 事件的 **`action='rebuildArchive'`** 字段集（§8.4 硬规则 4）。
+ *
+ * ⚠️ **为什么单列一个接口**（与 `rebuildBuckets` / `recluster` 同款理由）：
+ *   用 `SweepSummaryEventPayload` 就得把 `purged` / `vacuumed` / `coactPairsActive` 一并填上
+ *   ⇒ 那等于**伪造**「本次重算清理了 0 条、淘汰了 0 条共激活边」这些**根本没发生**的事实
+ *   ⇒ 消费方按 `type='sweep'` 推断「数据被销毁」时会被误导。
+ */
+export interface SweepRebuildArchiveEventPayload {
+  /** 维护动作。 */
+  action: 'rebuildArchive';
+  /** 扫过多少条未删记忆。 */
+  scanned: number;
+  /** 实际写进 `archival_schedule` 的行数。 */
+  repaired: number;
+}
+
 /** `sweep` 事件的**逐条**字段集（§8.4 的 sweep 行）。 */
 export interface SweepItemEventPayload {
   id: string;
@@ -349,7 +366,8 @@ export type SweepEventPayload =
   | SweepItemEventPayload
   | SweepSummaryEventPayload
   | SweepRebuildBucketsEventPayload
-  | SweepReclusterEventPayload;
+  | SweepReclusterEventPayload
+  | SweepRebuildArchiveEventPayload;
 
 /**
  * `config` 事件的 payload（§8.4 的 config 行）。

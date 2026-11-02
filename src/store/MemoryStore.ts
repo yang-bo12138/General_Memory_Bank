@@ -1,7 +1,9 @@
 /**
  * 门面 `MemoryStore` —— DESIGN-v2.md §6 的公开 API 入口
  * （阶段 1 的 10 个方法 + 阶段 2 的 `rebuildVectorBuckets`
- *   + 阶段 3 的 `inhibitionTrace` / `recluster` / `clusters`）。
+ *   + 阶段 3 的 `inhibitionTrace` / `recluster` / `clusters`
+ *   + **阶段 4 的 8 个**：`forget` / `restore` / `updateContent` / `setParams` /
+ *     `stats` / `sweep` / `close` / `rebuildArchivalSchedule`）。
  *
  * ⚠️ **本文件只做「委托」，一行业务逻辑都没有**（§14.3 边界原则 1：
  *   「每个承诺都要能指到唯一代码路径」）：
@@ -19,7 +21,8 @@
  *   · **阶段 3 的 3 个**：`inhibitionTrace`（§4.13 的抑制诊断；P3-T02 落地）/
  *     `recluster`（§4.12.3 的簇重算；P3-T03 落地）/
  *     `clusters`（§4.12 的簇导航；P3-T05 落地）。
- * ⇒ **刻意不实现 `stats`**（阶段 4）、**不提前实现其余 10 个**：
+ * ⇒ **不提前实现阶段 5 的 `verifyIntegrity`**（它由 `src/tools/verify.ts` 提供，
+ *   但**不挂在门面上**——阶段 5 才挂）：
  *   每多一个公开方法都是一次**公开承诺**，而 §6 的 23 个方法分属阶段 1~5
  *   ⇒ 门面只承诺**已落地阶段**的那几个，其余的等各自阶段落地时再加
  *   （**导出了却没实现 = 空承诺，比不导更糟**）。
@@ -40,12 +43,13 @@ import type Database from 'better-sqlite3';
 
 import { resolveNow } from '../core/clock.js';
 import { MemoryError } from '../core/errors.js';
-import { DEFAULT_PARAMS, type Params, applyParamPatch } from '../core/params.js';
+import { DEFAULT_PARAMS, type ParamPatch, type Params, applyParamPatch } from '../core/params.js';
 import { SCHEMA_VERSION } from '../core/version.js';
 import { openDatabase, readUserVersion } from '../db/connection.js';
 import { assertV2TablesComplete, ensureSchema } from '../db/migrate.js';
 import { FileLogger, type Logger } from '../util/log.js';
 import { CentroidCache } from '../vector/centroids.js';
+import { rebuildArchivalScheduleInternal } from './archival.js';
 import {
   type ClustersOptions,
   type ClustersResult,
@@ -59,6 +63,7 @@ import {
   setAlias as setAliasImpl,
 } from './entities.js';
 import { EventWriter } from './events.js';
+import { type ForgetOptions, forget as forgetImpl } from './forget.js';
 import { type MemoryReadStore, type MemoryView, get as getImpl } from './get.js';
 import {
   type InhibitionTraceOptions,
@@ -79,7 +84,17 @@ import {
 } from './maintain.js';
 import { pin as pinImpl, unpin as unpinImpl } from './pin.js';
 import { type RecallOptions, type RecallResult, recall as recallImpl } from './recall.js';
+import { type RestoreOptions, restore as restoreImpl } from './restore.js';
+import {
+  type SetParamsResult,
+  readStoredParams,
+  recordInitialConfig,
+  setParams as setParamsImpl,
+} from './setParams.js';
+import { type MemoryStats, stats as statsImpl } from './stats.js';
+import { type SweepOptions, type SweepResult, sweep as sweepImpl } from './sweep.js';
 import { type TouchOptions, type TouchOutcome, touch as touchImpl } from './touch.js';
+import { type UpdateContentStore, updateContent as updateContentImpl } from './updateContent.js';
 import { type WriteInput, type WriteResult, type WriteStore, write as writeImpl } from './write.js';
 /**
  * 门面的构造配置 —— DESIGN-v2.md §6 的 `MemoryConfig`。
@@ -230,6 +245,17 @@ export class MemoryStore {
   readonly #maintainer: MemoryMaintainer;
 
   /**
+   * 库句柄（★ 只为 `close()` 保存）。
+   *
+   * ⚠️ **业务逻辑一律走上下文对象里的 `db`**：本字段不参与任何读写，
+   *   否则「哪个 db 在写」会出现两份引用（清理时容易漏掉一处）。
+   */
+  readonly #db: Database.Database;
+
+  /** `close()` 是否已执行（幂等：重复关闭不抛错）。 */
+  #closed = false;
+
+  /**
    * 构造一个门面实例。
    *
    * ⚠️ **构造期做的四件事**（都不是业务逻辑，是「把依赖接上」）：
@@ -245,7 +271,15 @@ export class MemoryStore {
     const db = openDatabase({ dbPath: config.dbPath, readonly });
     ensureSchemaForMode(db, readonly);
 
-    const params = resolveParams(config.params);
+    // ⚠️ **参数来源的三层**（P4-T04 落地后的口径）：
+    //   ① 调用方显式给 `config.params` ⇒ 用它（**显式优先**：否则「我传了参数却不生效」是更坏的意外）；
+    //   ② 否则读库里存的（上一次 `setParams()` 的结果）；
+    //   ③ 都没有 ⇒ 默认表。
+    //   ⚠️ 只读实例也走这条：只读**读得到**参数，只是改不了。
+    const params =
+      config.params === undefined
+        ? (readStoredParams(db) ?? resolveParams(undefined))
+        : resolveParams(config.params);
 
     // ⚠️ **日志目录 = 数据库文件所在目录**（§8.1：`<数据目录>/logs/<YYYY>/<MM>/<MM-DD>.log`）。
     //   `dataDir` 取 `dirname(dbPath)`：调用方给的是「库文件路径」，
@@ -296,6 +330,8 @@ export class MemoryStore {
       ...(config.embedder === undefined ? {} : { embedder: config.embedder }),
     };
 
+    this.#db = db;
+
     // ⚠️ **维护器**（阶段 2 的 `rebuildVectorBuckets`，§4.15.5）：
     //   重训**之后**必须让中心缓存失效 ⇒ 否则路由继续用**旧中心** ⇒ 召回静默变差。
     this.#maintainer = new MemoryMaintainer({
@@ -306,6 +342,12 @@ export class MemoryStore {
       buckets,
       reloadCentroids: () => this.#centroids.reload(),
     });
+
+    // ⚠️ ★ **第 0 步：构造期也要记一条 `config` 事件**（§8.4 硬规则 2）：
+    //   「参数变更会改变所有历史数据的解读方式，不记录则『可完整重放』在第 0 步就断了」
+    //   ⇒ 构造的一条**不带 `changed`**（没有变更），但**必须带** `SCHEMA_VERSION` 与完整 `params`。
+    //   ⚠️ 只读实例上由 `appendEvent()` 自己短路（不落库、不抛错）。
+    recordInitialConfig(this.#context, params);
   }
 
   /**
@@ -565,5 +607,153 @@ export class MemoryStore {
     // ⚠️ **只读上下文刻意不含 `events`**（`ClusterQueryStore` 只有 `db` + `params`）
     //   ⇒ **结构上**杜绝了「顺手记一条事件」的写法（§6：只读导航不记事件）。
     return clustersImpl(this.#readContext, options, now);
+  }
+
+  /**
+   * 遗忘 —— §6 的 `forget(id, options?, now?)`（§4.8）。
+   *
+   * ⚠️ **软删可撤销（`restore`），硬删不可**；硬删会把该记忆的事件正文脱敏。
+   * ⚠️ **软删幂等**：已软删再软删 ⇒ 不重写 `deleted_at`（重写会把 sweep 的清理倒计时往后推）。
+   *
+   * @param id 记忆 id
+   * @param options `hard` / `keepAuditContent`
+   * @param now 注入时钟（C37）
+   * @throws {MemoryError} `NOT_FOUND` / `READONLY_VIOLATION`
+   */
+  forget(id: string, options?: ForgetOptions, now?: number): void {
+    forgetImpl(this.#context, id, options, now);
+  }
+
+  /**
+   * 撤销遗忘 —— §6 的 `restore(id, options?)`（§4.8.1）。
+   *
+   * ⚠️ **默认路径不删任何东西**：撞 `content_hash` 且不传 `mergeInto` ⇒ 抛 `CONFLICT`
+   *   （让调用方决定；库不替用户猜）。
+   *
+   * @param id 记忆 id
+   * @param options `mergeInto`
+   * @param now 注入时钟（C37）
+   * @throws {MemoryError} `NOT_FOUND` / `CONFLICT`（带 `conflictingId`）/ `INVALID_INPUT` / `READONLY_VIOLATION`
+   */
+  restore(id: string, options?: RestoreOptions, now?: number): void {
+    restoreImpl(this.#context, id, options, now);
+  }
+
+  /**
+   * 修正正文 —— §6 的 `updateContent(id, newContent, now?, embedding?)`（§4.9.1）。
+   *
+   * ⚠️ **只改正文、不加固**：`stability` / `last_access` / `access_count` 一个都不动。
+   * ⚠️ **不传向量 ⇒ 置 NULL**（旧向量描述的正文已经不存在了）⇒ 同时退桶。
+   *
+   * @param id 记忆 id
+   * @param newContent 新正文
+   * @param now 注入时钟（C37）
+   * @param embedding 新向量（不传 = 置 NULL）
+   * @throws {MemoryError} `NOT_FOUND` / `CONFLICT` / `INVALID_INPUT` / `READONLY_VIOLATION`
+   */
+  updateContent(id: string, newContent: string, now?: number, embedding?: number[]): void {
+    // ⚠️ `#writeContext` 结构上满足 `UpdateContentStore`（多了 logger / embedder 不影响）
+    //   ⇒ 复用它，不另造一份上下文（造多份只是把同一件事抄五遍）。
+    updateContentImpl(this.#writeContext as UpdateContentStore, id, newContent, now, embedding);
+  }
+
+  /**
+   * 运行时改参数 —— §6 的 `setParams(patch)`（§5）。
+   *
+   * ⚠️ **原子性**：先全量校验 → 再单事务写入 → 同事务记 `config` 事件
+   *   ⇒ 任一不满足即抛 `INVALID_INPUT`，**一个参数都不落库**。
+   * ⚠️ ★ **改 `ARCHIVE_LINE` 会触发归档缓存全量重建**（§9.4.3 的第 10 条路径）。
+   *
+   * @param patch 要改的键（`EMBED_DIM` 会被两层拦截）
+   * @param now 注入时钟（C37）
+   * @returns `{ params, changed }`
+   * @throws {MemoryError} `INVALID_INPUT` / `READONLY_VIOLATION`
+   */
+  setParams(patch: ParamPatch, now?: number): SetParamsResult {
+    // ⚠️ 就地更新共享的 params 容器 ⇒ 门面的四个上下文与维护器同时看到新值
+    return setParamsImpl(this.#context, patch, now);
+  }
+
+  /**
+   * 观测接口 —— §6 的 `stats(now?)`（§11.4 的 9 项指标 → **20 个字段**）。
+   *
+   * ⚠️ ★ **不扫 `coacts`**：它回答「当前状态」，簇覆盖率属 `clusters()`。
+   *
+   * @param now 判定基准（层级 / 归档 / 7 天窗口，C37）
+   */
+  stats(now?: number): MemoryStats {
+    return statsImpl(
+      {
+        db: this.#db,
+        params: this.#context.params,
+        inRetrain: () => this.#maintainer.inRetrain,
+      },
+      resolveNow(now),
+    );
+  }
+
+  /**
+   * 维护清扫 —— §6 的 `sweep(options?, now?)`（§4.10）。
+   *
+   * ⚠️ ★ **整体归入写操作范畴** ⇒ 只读实例上一律抛 `READONLY_VIOLATION`（**即使不传任何参数**）。
+   * ⚠️ **唯一多事务的写操作**：每条记忆一个事务；`VACUUM` 在事务外。
+   *
+   * @param options `purgeDeletedDays` / `vacuum`
+   * @param now 注入时钟（C37）
+   * @returns `{ purged, archivedCount, coactPairsPurged }`
+   * @throws {MemoryError} `READONLY_VIOLATION`
+   */
+  sweep(options?: SweepOptions, now?: number): SweepResult {
+    return sweepImpl(this.#context, options, now);
+  }
+
+  /**
+   * 重建归档缓存 —— §6 的 `rebuildArchivalSchedule(now?)`（§9.4.3 / §9.4.5）。
+   *
+   * ⚠️ ★ **阻塞 1~3 分钟**（百万级）：全库重算 `archive_at` ⇒ 与 `recluster` /
+   *   `rebuildVectorBuckets` 同类的维护方法 ⇒ **MCP 不得暴露**（§6 / §12 阶段 5）。
+   * ⚠️ **写方法** ⇒ 只读实例上抛 `READONLY_VIOLATION`。
+   *
+   * @param now 注入时钟（事件时间戳，C37）
+   * @returns `{ scanned, repaired }`（扫了多少行 / 写了多少行）
+   * @throws {MemoryError} `READONLY_VIOLATION`
+   */
+  rebuildArchivalSchedule(now?: number): { scanned: number; repaired: number } {
+    if (this.#context.events.readonly) {
+      throw MemoryError.readonlyViolation(
+        '只读实例上不能执行 rebuildArchivalSchedule（§7.1：真正的写操作一律抛 READONLY_VIOLATION）',
+        { method: 'rebuildArchivalSchedule' },
+      );
+    }
+    const at = resolveNow(now);
+    const scanned = (
+      this.#db.prepare('SELECT count(*) AS n FROM memories WHERE deleted = 0').get() as {
+        n: number;
+      }
+    ).n;
+    const repaired = rebuildArchivalScheduleInternal(this.#db, this.#context.params, at);
+    // ⚠️ 事件用 `action='rebuildArchive'` 的**专属字段集**（`scanned` / `repaired`），
+    //   不填 `purged` / `vacuumed` 那些本次**没发生**的动作结果（§8.4 硬规则 4）。
+    this.#context.events.appendEvent(
+      'sweep',
+      null,
+      { action: 'rebuildArchive', scanned, repaired },
+      at,
+    );
+    return { scanned, repaired };
+  }
+
+  /**
+   * 关闭库句柄 —— §6 的 `close()`。
+   *
+   * ⚠️ **幂等**：重复调用不抛错（调用方常在 `finally` 里关，重复关是常态）。
+   * ⚠️ 关闭后**任何其它方法都会抛 SQLite 的「database is closed」**——
+   *   这只是把错误提早暴露出来，不额外包装成 `MemoryError`
+   *   （§11.2 的五个 code 描述的是**业务语义**，不覆盖「句柄已关」这种误用）。
+   */
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#db.close();
   }
 }

@@ -117,6 +117,23 @@ node --import tsx scripts/audit-tier-qualifiers.ts path/to/README.md
   `.mjs` / `.d.mts` 一旦回来 ⇒ 立刻红）⇒ ⇒ **不许以「纯 node 也能跑」为由把它加回来**
   （要「纯 node 能跑」的话，`tsx` 本来就是 devDependency，`pnpm run audit:*` 就是那个入口）。
 
+## 运维脚本（**不是门禁**：它们要库文件 / 要跑几分钟）
+
+| 脚本 | 做什么 | 何时跑 |
+| --- | --- | --- |
+| `scripts/backup.ts` | `VACUUM INTO` 备份 + `integrity_check` + **登记尺寸与 sha256** + 按份数轮转 | 定期；★ **硬删之前必须先跑一次**（`coacts.coact_count` 不可重建） |
+| `scripts/restore-checklist.md` | 恢复 runbook（三条硬规则 / 六步恢复 / 四项自检 / 最短排障路径） | 出事时 |
+| `bench/regression/weights.ts` | 打分权重的**排序回归**（只比 id 序列，不比分数） | 改 `recall` 打分链路前后 |
+
+```bash
+pnpm exec tsx scripts/backup.ts --db data/ocean.db --out-dir backup
+pnpm exec tsx bench/regression/weights.ts            # 比对；不一致 ⇒ exit 1
+pnpm exec tsx bench/regression/weights.ts --capture  # 重新采集 golden
+```
+
+⚠️ **它们刻意不进 `verify`**：备份要真实库文件、回归要跑十几秒建库 ⇒
+放进每次门禁只会让「本地全绿」变慢，而**不会**多拦下什么（与三条文档审计不同，那三条是纯文本判定）。
+
 ## C25~C37 对照表
 
 ### （A）实现前必须做（阻塞对应任务的合并）

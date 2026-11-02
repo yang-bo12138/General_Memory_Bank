@@ -344,7 +344,7 @@ describe('P1-T10 · 门面的 10 个公开方法（§6）', () => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe('P1-T10 · 门面的边界（公开面 / 错误透出 / 只读）', () => {
-  it('★ 公开方法恰好是那 14 个（阶段 1 的 10 个 + 阶段 2 的 1 个 + 阶段 3 的 3 个）', () => {
+  it('★ 公开方法恰好是那 22 个（阶段 1 的 10 + 阶段 2 的 1 + 阶段 3 的 3 + 阶段 4 的 8）', () => {
     const methods = Object.getOwnPropertyNames(MemoryStore.prototype)
       .filter((name) => name !== 'constructor')
       .filter((name) => {
@@ -358,20 +358,31 @@ describe('P1-T10 · 门面的边界（公开面 / 错误透出 / 只读）', () 
     // ⚠️ **阶段 3 新增三个**：`inhibitionTrace`（只读诊断，P3-T02）/
     //   `recluster`（写方法，簇重算，P3-T03）/
     //   `clusters`（只读导航，簇快照，P3-T05）⇒ 公开面从 11 个长到 14 个。
+    // ⚠️ **阶段 4 新增八个**（§3.1 的归位表，P4-T02 ~ P4-T06）：
+    //   `forget` / `restore` / `updateContent` / `setParams` / `stats` / `sweep` /
+    //   `close` / `rebuildArchivalSchedule` ⇒ 公开面从 14 个长到 **22 个**。
     expect(methods).toEqual([
+      'close',
       'clusters',
+      'forget',
       'get',
       'inhibitionTrace',
       'link',
       'linkByIds',
       'mergeEntities',
       'pin',
+      'rebuildArchivalSchedule',
       'rebuildVectorBuckets',
       'recall',
       'recluster',
+      'restore',
       'setAlias',
+      'setParams',
+      'stats',
+      'sweep',
       'touch',
       'unpin',
+      'updateContent',
       'write',
     ]);
   });
@@ -627,7 +638,11 @@ describe('P3 · 阶段 3 的两个公开方法（§6 的 `inhibitionTrace` / `re
     expect(countRows(h.reader, 'cluster_snapshot_meta')).toBe(1);
     expect(countRows(h.reader, 'theme_clusters')).toBe(0);
     // ★ 事件：一条 `sweep`（§8.4 的 `action='recluster'`）。
-    const events = h.reader.prepare('SELECT type FROM events').all() as Array<{ type: string }>;
+    //   ⚠️ **阶段 4 起构造期也会记一条 `config`**（§8.4 硬规则 2 的第 0 步）
+    //   ⇒ 这里按 type 过滤，**不数「全部事件」**（那会把 config 也算进来）。
+    const events = h.reader
+      .prepare(`SELECT type FROM events WHERE type <> 'config'`)
+      .all() as Array<{ type: string }>;
     expect(events).toHaveLength(1);
     expect(events[0]?.type).toBe('sweep');
 
@@ -635,7 +650,14 @@ describe('P3 · 阶段 3 的两个公开方法（§6 的 `inhibitionTrace` / `re
     const second = h.store.recluster(T0 + 1000);
     expect(second.computed).toBe(false);
     expect(second.skipped).toBe('too_soon');
-    expect(countRows(h.reader, 'events')).toBe(1);
+    // ⚠️ 阶段 4 起构造期有一条 `config` ⇒ 数「非 config」的事件才是「本轮写了什么」
+    expect(
+      (
+        h.reader.prepare(`SELECT count(*) AS n FROM events WHERE type <> 'config'`).get() as {
+          n: number;
+        }
+      ).n,
+    ).toBe(1);
   });
 
   it('★ 只读实例：`recluster` 被拒绝（§7.1 的 16 个写方法之一），`inhibitionTrace` 照常可用', () => {

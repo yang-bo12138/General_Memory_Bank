@@ -112,6 +112,33 @@ export interface CoactivationDeclaration {
   activatedAt?: number;
 }
 
+/**
+ * `meta` 表里的「累计丢弃对数」计数器键（P4-T05 的 `coactWriteDrops`）。
+ *
+ * ⚠️ **为什么要有它**：共激活有两个**静默收敛点**（截断 / 种子无效），
+ *   只落在 `events` 里 ⇒ 不读事件的调用方完全看不见「边喂边漏」。
+ *   ⇒ 事件是**逐次**归因，本计数器是**累计**归因；两者不重复（不同问题）。
+ */
+export const COACT_WRITE_DROPS_KEY = 'coact_write_drops';
+
+/**
+ * 累加丢弃对数（**写入时累加，统计时只读一行**）。
+ *
+ * ⚠️ 严格禁止「`stats()` 时扫 `coacts` 或扫 `events` 算这个数」：
+ *   `stats()` 不得扫 `coacts` 是 §11.4 的观测纪律，而扫 `events` 同样会把一个
+ *   「读一行」的观测口变成一次全表聚合（面板每次刷新都要付这个代价）。
+ *
+ * @param db 库句柄（调用方负责事务：本函数总在 `writeCoactivations` 的事务里）
+ * @param drops 本次丢弃的对数（= `truncated + skippedInvalidSeed`）
+ */
+export function addCoactWriteDrops(db: Database.Database, drops: number): void {
+  if (drops <= 0) return;
+  db.prepare(
+    `INSERT INTO meta (key, value) VALUES (?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + CAST(? AS INTEGER) AS TEXT)`,
+  ).run(COACT_WRITE_DROPS_KEY, String(drops), drops);
+}
+
 /** 共激活写入所需的上下文（库句柄 + 生效参数）。 */
 export interface CoactStore {
   db: Database.Database;
@@ -629,6 +656,11 @@ export function writeCoactivations(store: CoactStore, input: CoactWriteInput): C
       });
     }
   }
+
+  // ── 收尾：把本次的丢弃数累加进 `meta` 计数器（P4-T05 的 `coactWriteDrops`）──
+  //   ⚠️ 口径 = `truncated + skippedInvalidSeed`（**与 `touch()` 返回值同源**）
+  //     ⇒ `stats().coactWriteDrops` 才能与「调用方累计看到的丢弃数」对得上。
+  addCoactWriteDrops(db, result.truncated + result.skippedInvalidSeed);
 
   return result;
 }
