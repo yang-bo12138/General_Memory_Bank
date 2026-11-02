@@ -29,7 +29,7 @@ import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdirSync, statfsSync, writeFileSync } from 'node:fs';
 import { cpus as cpus_, freemem, totalmem } from 'node:os';
-import { dirname, join, parse as parsePath } from 'node:path';
+import { dirname, join, win32 } from 'node:path';
 import { Worker } from 'node:worker_threads';
 
 import type Database from 'better-sqlite3';
@@ -519,7 +519,13 @@ const defaultCommandRunner: CommandRunner = (file, args) =>
 
 /** Windows 的介质探测（PowerShell）；失败 ⇒ `'unknown'`。 */
 function detectWindowsMedia(targetPath: string, runner: CommandRunner): StorageMediaInfo {
-  const root = parsePath(targetPath).root;
+  // ⚠️ **必须用 `win32.parse` 而不是 `parse`（后者跟着宿主平台走）**：
+  //   在 Linux / macOS 上 `path.parse('D:/probe-target').root` === `''`
+  //   ⇒ 下面 `driveLetter === ''` 会直接返回 `unknown`
+  //   ⇒ **Windows 分支在非 Windows 宿主上永远拿不到结果**（而它本该是「平台可注入」的）。
+  //   ⚠️ 这不是纯理论问题：CI 跑在 Ubuntu 上，`tests/bench/storage-media.test.ts` 的
+  //     「Windows：MediaType 的四个取值都判对」在那里**红了 5 次**（main 上一直红）。
+  const root = win32.parse(targetPath).root;
   const driveLetter = root.replace(/[:\\/]/g, '').toUpperCase();
   if (driveLetter === '') {
     return { mediaClass: 'unknown', source: 'none', detected: false, detail: null };
