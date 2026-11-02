@@ -9,8 +9,8 @@
 **★ 阶段 5 收官**：6 个任务 **T01~T06 全部落地** —— Electron 只读查看器的 **7 个面板**、
 **MCP Server 最小集**（10 工具）与护栏方法 `verifyIntegrity()`
 ⇒ `pnpm run verify` **EXIT=0**（**82 文件 / 1,738 断言**，2026-11-02 定稿实跑；含 QA 独立验收探针）
-⇒ ⚠️ 阶段 5 的提交**尚未推送**（分支 `feat/p5-verify-integrity` · PR #5 已开）；
-`main` 上的读数仍是阶段 4 的 **67 文件 / 1,194 断言**
+⇒ ✅ **阶段 5 已合入 `main`**（merge commit `9a3eec9`，PR #5 · 27 提交 / 72 文件）；
+合后在 `main` 上复跑：`verify` **EXIT=0**（**82 文件 / 1,738 断言**）· `build` **EXIT=0**
 
 > ⚠️ **本文件只记「当前状态」** ⇒ 阶段 1 / 阶段 2 的完整交付总结已归档到
 > `docs/progress/stage0-stage1-progress.md` 与 `docs/progress/stage2-progress.md` ⇒
@@ -113,7 +113,7 @@ const reason = result.skipped;       // 'too_soon' | 'disabled' | null
 
 | 项 | 值 |
 |---|---|
-| **阶段** | **阶段 5 收官**（T01~T06 全部落地；提交在 `feat/p5-verify-integrity`，PR #5 待合） |
+| **阶段** | **阶段 5 收官且已合入 `main`**（`9a3eec9` · PR #5）⇒ T01~T06 全部落地 |
 | **门禁** | `pnpm run verify` **EXIT=0** —— **14 段链**：typecheck → lint → test → 8 条契约脚本 → **3 条文档审计** |
 | **构建** | `pnpm run build` 通过（ESM / CJS / d.ts 三个产物） |
 | **测试** | **82 文件 / 1,738 断言**（本分支定稿实测；`main` 上仍是 67 / 1,194） |

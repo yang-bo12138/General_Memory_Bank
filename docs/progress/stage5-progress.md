@@ -1,6 +1,6 @@
 # 阶段 5（P5 · 只读查看器与服务集成）进度与交接账
 
-> 时点：2026-11-02（Asia/Shanghai）· 分支 `feat/p5-verify-integrity`（基于 main 的合并点）
+> 时点：2026-11-02（Asia/Shanghai）· **已合入 `main`（merge commit `9a3eec9`，PR #5）** · 开发分支 `feat/p5-verify-integrity`
 > 门禁：`pnpm run verify` **EXIT=0**（**14 段链**）· 测试 **82 文件 / 1,738 条断言**（2026-11-02 定稿读数，见 **§九.8**；数字为何变过三次见 §9.8 的「读数沿革」）
 > ⚠️ 本文件的 §〇~§二 写于「只有 T06 落地」时，**已被 §九 取代**（§九 记 T01~T05 全量落地与断言判别力审计）。
 > ⚠️ **本文件是阶段 5 的交接文档**：读完它应当能直接接手阶段 5 剩下的 T01~T05，不需要回放对话。
@@ -430,3 +430,17 @@ npx vitest run mcp/                                        # 期望 2 文件 / 6
 
 ⇒ ★ **教训**：文档里的读数一旦写成「定稿」，就必须在**最后一次提交之后**重取一次；
 本轮就是先写了 1,636、后面又落了两个提交 ⇒ 差点变成「照文档复跑会看到不同的数」。
+
+### 9.11 合并记录（2026-11-02）
+
+| 项 | 值 |
+|---|---|
+| PR | **#5** `feat/p5-verify-integrity` → `main` |
+| 合并方式 | **merge commit**（不 squash，与前三个 PR 一致）⇒ 保留 27 个提交的谱系 |
+| merge commit | **`9a3eec9`**（父：`774e9b8` 阶段 4 合并点 ＋ `32a4d4a` 阶段 5 末提交） |
+| 合入内容 | 72 文件 / +21,081 −39：`viewer/` 32 文件 ＋ `mcp/` 4 文件 ＋ `src/` 3 文件（`verifyIntegrity`）＋ 配置 6 ＋ `tests/` 21 ＋ `docs/` 5 |
+| 合后复验（在 `main` 上实跑） | `pnpm run verify` **EXIT=0** · **82 文件 / 1,738 断言**；`pnpm run build` **EXIT=0**；`dist/` 仍只有 `index.*`，产物不引用 react / electron / MCP SDK |
+| 对宿主的唯一 API 影响 | 公开面 **22 → 23 个方法**（多 `verifyIntegrity`）；`dependencies` 仍只有 `better-sqlite3` |
+
+⚠️ 合并过程中 `github.com:443` 又短暂不可达（`git fetch` 失败两次后自行恢复），
+最终用 fetch + `reset --hard origin/main` 对齐，**没有用任何 API 重建或强推**。
