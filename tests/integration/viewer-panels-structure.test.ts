@@ -674,6 +674,87 @@ describe('T03 补强 · ⑨(b) 面板侧的 `reinforce: false`（原先只有 IP
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// ④ter T04 补强 · 每个面板都**真的**过同一套状态组件（含加载态）
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('T04 补强 · ⑥ 七个面板各自的**加载态**都由同一个 `StatusBlock` 画出', () => {
+  /** `{status:'loading'}`：面板拿不到数据时唯一该走的分支。 */
+  const LOADING = { status: 'loading' as const };
+
+  /** 把七个面板各渲一遍（喂 `loading`），返回 `面板名 → markup`。 */
+  function renderLoadingPanels(): ReadonlyArray<readonly [string, string]> {
+    return [
+      [
+        'overview',
+        renderToStaticMarkup(createElement(OverviewView, { state: LOADING, now: FIXED_NOW })),
+      ],
+      [
+        'memoryList',
+        renderToStaticMarkup(
+          createElement(MemoryListView, { state: LOADING, now: FIXED_NOW, memoryId: 'm-1' }),
+        ),
+      ],
+      [
+        'recallSimulator',
+        renderToStaticMarkup(
+          createElement(RecallSimulatorView, { state: LOADING, now: FIXED_NOW, context: 'x' }),
+        ),
+      ],
+      [
+        'graphView',
+        renderToStaticMarkup(createElement(GraphViewView, { state: LOADING, now: FIXED_NOW })),
+      ],
+      [
+        'logViewer',
+        renderToStaticMarkup(
+          createElement(LogViewerView, {
+            state: LOADING,
+            query: { year: 2024, month: 1 },
+            now: FIXED_NOW,
+          }),
+        ),
+      ],
+      [
+        'versionHistory',
+        renderToStaticMarkup(
+          createElement(VersionHistoryView, { state: LOADING, current: null, now: FIXED_NOW }),
+        ),
+      ],
+      [
+        'clusterMap',
+        renderToStaticMarkup(
+          createElement(ClusterMapView, { state: LOADING, previous: null, now: FIXED_NOW }),
+        ),
+      ],
+    ];
+  }
+
+  it('★ 七个面板在加载态下都渲染 `data-status="loading"` 与「计算中」', () => {
+    const panels = renderLoadingPanels();
+    // ⚠️ 分母：必须真的是七个（少一个就不是「七个面板共用一套」）
+    expect(panels.length).toBe(7);
+    for (const [name, html] of panels) {
+      expect(html, `${name} 没有加载态`).toContain('data-status="loading"');
+      expect(html, `${name} 没有「计算中」`).toContain('计算中');
+      // 加载态不该顺带画出「库调用失败」的错误块
+      expect(html, `${name} 的加载态里混进了错误块`).not.toContain('data-status="error"');
+    }
+  });
+
+  it('★ 判别力：就绪态里**没有** `data-status="loading"`（否则上面那条对任何状态都成立）', () => {
+    const ready = renderToStaticMarkup(
+      createElement(ClusterMapView, {
+        state: readyState(makeClustersResult()),
+        previous: null,
+        now: FIXED_NOW,
+      }),
+    );
+    expect(ready).not.toContain('data-status="loading"');
+    expect(ready).not.toContain('计算中');
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 // ⑤bis 交互层（T04 补遗）：按钮在场 ≠ 按钮有用
 // ═══════════════════════════════════════════════════════════════════════════
 

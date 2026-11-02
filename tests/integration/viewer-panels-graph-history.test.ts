@@ -48,7 +48,7 @@ import {
   makeMemoryError,
   makeMemoryView,
 } from '../helpers/panelFixtures.js';
-import { listSourceFiles, readCode } from '../helpers/sourceScan.js';
+import { filesCallingWriteMethods, listSourceFiles, readCode } from '../helpers/sourceScan.js';
 import { allTableNames, tableFingerprints } from '../helpers/tableHashes.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -376,9 +376,13 @@ describe('T04 · `ForceGraph` 的布局确定性', () => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe('T04 · 面板 4 不调任何写方法', () => {
-  it('静态：`viewer/renderer/**` 里 16 个写方法名一个都不出现（见 T03 的同一判据，此处补分母）', () => {
+  it('静态：`viewer/renderer/**` 里 16 个写方法名一个都不出现（**用判据本身断言**，不只数文件数）', () => {
+    // ⚠️ 原来这里只有 `files.length >= 16` —— 那只是**分母**，不是判据：
+    //   真正的判据（`filesCallingWriteMethods(...) === {}`）在 T03 的文件里。
+    //   同一个「不调写方法」的保证不该指望「另一个文件里的某条断言还没被删」。
     const files = listSourceFiles('viewer/renderer');
     expect(files.length).toBeGreaterThanOrEqual(16);
+    expect(filesCallingWriteMethods('viewer/renderer')).toEqual({});
   });
 
   it('★ 运行时：真只读句柄上跑一次 `select` + 渲染面板，**全表指纹完全不变**', async () => {
@@ -532,6 +536,126 @@ describe('T04 补遗 · 面板 6：「加载更早的版本」是**按需加载*
     const html = renderHistory([threeRows[0] as SqlRow], 137);
     for (const forbidden of ['回滚', '恢复', '删除', '加固']) {
       expect(html).not.toContain(forbidden);
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ⑧ T04 补强 · 面板 6 的分页在**真库**上真的按 `replaced_at` 逆序
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('T04 补强 · 面板 6：真库上的 `contentHistoryPage`（原来是零分母）', () => {
+  /** 两侧时刻：显式注入，保证两版 `replaced_at` **严格不同**（同一毫秒会让「逆序」断言飘）。 */
+  const T1 = FIXED_NOW - 2 * 3_600_000;
+  const T2 = FIXED_NOW - 1 * 3_600_000;
+
+  /**
+   * ⚠️ ★ 为什么必须在真库上跑：
+   *   原来那条「分页带 LIMIT / 逆序」的运行时断言跑在**空表**上（`total: 0` / `page: []`），
+   *   「按 `replaced_at` 降序」这件事**零分母** —— 空数组永远是「有序的」。
+   *   这里用 `write()` + 两次 `updateContent()` 造出**两行**历史（`reason='manual_fix'`），
+   *   再让**只读句柄**跑同一条 SQL。
+   */
+
+  it('★ 2 行历史、`replaced_at` 严格递减、首页取到**最新那版旧正文**', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'memory-ocean-history-'));
+    const dbPath = join(dataDir, 'memory.db');
+
+    const writer = new MemoryStore({ dbPath });
+    const written = writer.write({ content: 'v1 正文', entities: ['张三'] });
+    writer.updateContent(written.id, 'v2 正文', T1);
+    writer.updateContent(written.id, 'v3 正文', T2);
+    writer.close();
+
+    const reader: Database.Database = openDatabase({ dbPath, readonly: true });
+    try {
+      const verdict = guard(SQL_QUERIES.contentHistoryPage);
+      expect(verdict.ok).toBe(true);
+      if (!verdict.ok) {
+        return;
+      }
+
+      const rows = reader
+        .prepare(verdict.sql)
+        .all({ memoryId: written.id, limit: CONTENT_HISTORY_PAGE_SIZE, offset: 0 }) as SqlRow[];
+
+      // 非空分母：真的有两版
+      expect(rows.length).toBe(2);
+
+      const times = rows.map((row) => Number(row.replaced_at));
+      expect(times[0]).toBe(T2);
+      expect(times[1]).toBe(T1);
+      // 「逆序」的直接形式：严格递减（不是「不递增」）
+      expect(times[0]).toBeGreaterThan(times[1] as number);
+
+      // 历史存的是**被顶掉的旧正文**（`updateContent` 的 INSERT 语义）
+      expect(String(rows[0]?.content)).toBe('v2 正文');
+      expect(String(rows[1]?.content)).toBe('v1 正文');
+      // 每版都带 reason 与替换时间（面板要显示这两个）
+      expect(String(rows[0]?.reason)).toBe('manual_fix');
+      expect(typeof rows[0]?.replaced_at).toBe('number');
+    } finally {
+      reader.close();
+    }
+  });
+
+  it('★ `limit: 1, offset: 0` ⇒ 只拿到**最新那一版**（分页真的在库侧生效）', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'memory-ocean-history-limit-'));
+    const dbPath = join(dataDir, 'memory.db');
+
+    const writer = new MemoryStore({ dbPath });
+    const written = writer.write({ content: 'v1 正文', entities: ['张三'] });
+    writer.updateContent(written.id, 'v2 正文', T1);
+    writer.updateContent(written.id, 'v3 正文', T2);
+    writer.close();
+
+    const reader: Database.Database = openDatabase({ dbPath, readonly: true });
+    try {
+      const verdict = guard(SQL_QUERIES.contentHistoryPage);
+      expect(verdict.ok).toBe(true);
+      if (!verdict.ok) {
+        return;
+      }
+      const rows = reader
+        .prepare(verdict.sql)
+        .all({ memoryId: written.id, limit: 1, offset: 0 }) as SqlRow[];
+      expect(rows.length).toBe(1);
+      expect(String(rows[0]?.content)).toBe('v2 正文');
+
+      // 第二页（offset 1）拿到更早那版
+      const older = reader
+        .prepare(verdict.sql)
+        .all({ memoryId: written.id, limit: 1, offset: 1 }) as SqlRow[];
+      expect(older.length).toBe(1);
+      expect(String(older[0]?.content)).toBe('v1 正文');
+    } finally {
+      reader.close();
+    }
+  });
+
+  it('总数查询与分页查询**同一个分母**（`contentHistoryCount` == 2）', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'memory-ocean-history-count-'));
+    const dbPath = join(dataDir, 'memory.db');
+
+    const writer = new MemoryStore({ dbPath });
+    const written = writer.write({ content: 'v1 正文', entities: ['张三'] });
+    writer.updateContent(written.id, 'v2 正文', T1);
+    writer.updateContent(written.id, 'v3 正文', T2);
+    writer.close();
+
+    const reader: Database.Database = openDatabase({ dbPath, readonly: true });
+    try {
+      const verdict = guard(SQL_QUERIES.contentHistoryCount);
+      expect(verdict.ok).toBe(true);
+      if (!verdict.ok) {
+        return;
+      }
+      const counted = reader
+        .prepare(verdict.sql)
+        .all({ memoryId: written.id, limit: 1 }) as SqlRow[];
+      expect(Number(counted[0]?.total)).toBe(2);
+    } finally {
+      reader.close();
     }
   });
 });

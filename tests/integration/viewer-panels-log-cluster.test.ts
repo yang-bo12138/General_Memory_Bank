@@ -16,9 +16,16 @@
  *   ⑦ **「上次结果」基准说明常驻**（「本次会话内」逐字）。
  */
 
+import { createHash } from 'node:crypto';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
+
+import { readLogPage } from '../../viewer/main/db-worker.js';
 
 import type { ClustersResult } from '../../src/store/clusters.js';
 import {
@@ -290,33 +297,69 @@ describe('T04 · 面板 7：`coverage` 与 `largestClusterRatio` 同时显示', 
   });
 });
 
-describe('T04 · 面板 7：巨型簇不隐藏', () => {
-  it('★ 一个占 60% 的簇必须**显示**出来，并标注 `60.0%`', () => {
+describe('T04 · 面板 7：巨型簇不隐藏（且**气泡自己**要标注占比）', () => {
+  /** 60 个成员。⚠️ 原夹具是 `memberIds: ['m-1'], size: 60` —— **自相矛盾**，这里改成一致。 */
+  const GIANT_MEMBER_IDS = Array.from({ length: 60 }, (_, index) => `m-${index + 1}`);
+  /** 全库未删记忆数。 */
+  const TOTAL_MEMORIES = 100;
+
+  /**
+   * ⚠️ `largestClusterRatio` **不手填 0.6**，由 `size / totalMemories` 推出：
+   *   手填的话，「用 `memberIds.length` 算占比」的实现也能过（它恰好也是 60/100）。
+   *   推出来之后，只有真的按 `size` 算的实现才能对得上。
+   */
+  function giantSnapshot(): ClustersResult {
     const giant = makeClusterView({
       clusterId: 'c-giant',
-      memberIds: Array.from({ length: 60 }, (_, index) => `m-${index + 1}`),
-      size: 60,
+      memberIds: GIANT_MEMBER_IDS,
+      size: GIANT_MEMBER_IDS.length,
     });
-    const snapshot = makeClustersResult({
-      totalMemories: 100,
-      largestClusterRatio: 0.6,
-      clusters: [giant, makeClusterView({ clusterId: 'c-small', memberIds: ['m-99'], size: 1 })],
+    return makeClustersResult({
+      totalMemories: TOTAL_MEMORIES,
+      largestClusterRatio: giant.size / TOTAL_MEMORIES,
+      coveredMemories: GIANT_MEMBER_IDS.length,
+      clusters: [giant],
     });
-    const html = renderClusters(snapshot);
-    expect(html).toContain('c-giant');
-    expect(html).toContain('60.0%');
+  }
+
+  it('★ 巨型簇**不被过滤**：气泡在场（`data-cluster-id`）', () => {
+    const html = renderClusters(giantSnapshot());
+    expect(html).toContain('data-cluster-id="c-giant"');
+    expect(html).not.toContain('当前没有任何簇');
+  });
+
+  it('★ 聚合行显示 `最大簇占比 60.0%`', () => {
+    const html = renderClusters(giantSnapshot());
     expect(html).toContain('最大簇占比 60.0%');
   });
 
+  it('★ **气泡自己**标注占比：`data-cluster-share="0.6000"`（PLAN 要的是「显示它并标注占比」）', () => {
+    // ⚠️ 原来只断「html 里含 60.0%」，而那句是被**聚合行**（`最大簇占比 60.0%`）满足的
+    //   ⇒ 把气泡上「占全库 X%」整段删掉，三条断言照样全绿（不咬人）。
+    const html = renderClusters(giantSnapshot());
+    expect(html).toContain('data-cluster-share="0.6000"');
+  });
+
+  it('★ 气泡内的文本节点**恰好**是「成员 60 条（占全库 60.0%）」（不是聚合行那句）', () => {
+    const html = renderClusters(giantSnapshot());
+    expect(html).toContain('data-field="size">成员 60 条（占全库 60.0%）</p>');
+  });
+
   it('★ 空簇集才走空态（巨型簇不会因为「太大」被过滤成空态）', () => {
-    const onlyGiant = makeClustersResult({
-      totalMemories: 100,
-      largestClusterRatio: 0.6,
-      clusters: [makeClusterView({ clusterId: 'c-giant', memberIds: ['m-1'], size: 60 })],
+    const giant = makeClusterView({
+      clusterId: 'c-giant',
+      memberIds: GIANT_MEMBER_IDS,
+      size: GIANT_MEMBER_IDS.length,
     });
-    const html = renderClusters(onlyGiant);
+    const html = renderClusters(
+      makeClustersResult({
+        totalMemories: TOTAL_MEMORIES,
+        largestClusterRatio: giant.size / TOTAL_MEMORIES,
+        clusters: [giant],
+      }),
+    );
     expect(html).not.toContain('当前没有任何簇');
-    expect(html).toContain('c-giant');
+    expect(html).toContain('data-cluster-id="c-giant"');
   });
 });
 
@@ -417,6 +460,25 @@ describe('T04 · 面板 7：「最近两次快照对比」用成员重叠度，�
     expect(html).toContain('最近两次快照对比');
     expect(html).toContain('成员重叠度 100.0%');
   });
+
+  it('★ **接线**级：`key` 相同、成员不同 ⇒ 渲染出 `成员重叠度 50.0%`', () => {
+    // ⚠️ ★ 这条是 PLAN 原话的正面要求。上一条用的是「成员完全相同」的夹具 ⇒ `100.0%`
+    //   对**任何**实现都成立（按 key 配对的实现也会渲 100.0%）⇒ 不咬人。
+    //   这里让两次快照的 `key` **相同**（都是 `m-1`，= 簇内最小成员 id）而成员不同：
+    //   按 `key` 配对的实现会渲 100.0%，按**成员重叠度**的才渲 50.0%。
+    const previous = makeClustersResult({
+      clusters: [makeClusterView({ key: 'm-1', clusterId: 'p-1', memberIds: ['m-1', 'm-2'] })],
+    });
+    const current = makeClustersResult({
+      clusters: [makeClusterView({ key: 'm-1', clusterId: 'c-9', memberIds: ['m-1', 'm-7'] })],
+    });
+    // 前提：两次的 key 真的相同（否则这条测试想证明的东西不成立）
+    expect(previous.clusters[0]?.key).toBe(current.clusters[0]?.key);
+
+    const html = renderClusters(current, previous);
+    expect(html).toContain('成员重叠度 50.0%');
+    expect(html).not.toContain('成员重叠度 100.0%');
+  });
 });
 
 describe('T04 · 面板 7：「上次结果」的基准说明常驻', () => {
@@ -439,12 +501,14 @@ describe('T04 · 面板 7：「上次结果」的基准说明常驻', () => {
 });
 
 describe('T04 · 面板 7：无写入口 + 错误呈现', () => {
-  it('★ 渲染树里的 `<button>` 文案 ⊆ 白名单（本面板一个按钮都不需要）', () => {
+  it('★ 渲染树里的 `<button>` 文案 ⊆ 白名单（本面板只有「对比上次」一个按钮）', () => {
     const whitelist = ['上一页', '下一页', '模拟召回', '刷新快照', '加载更早的版本', '对比上次'];
     const html = renderClusters(makeClustersResult());
     const labels = [...html.matchAll(/<button[^>]*>([\s\S]*?)<\/button>/g)].map((match) =>
       (match[1] ?? '').replace(/<[^>]*>/g, '').trim(),
     );
+    // ⚠️ 显式断言分母：不带这一条时，面板 7 若一个按钮都不渲染，下面的循环是**空转**
+    expect(labels).toEqual(['对比上次']);
     for (const label of labels) {
       expect(whitelist).toContain(label);
     }
@@ -506,6 +570,9 @@ describe('T04 · 七个面板文件全部存在，且共用同一套状态组件
       const code = readCode(file);
       expect(code, `${file} 没有 import useReadCall`).toContain('state/useReadCall.js');
       expect(code, `${file} 没有 import StatusBlock`).toContain('state/StatusBlock.js');
+      // ⚠️ ★ 「import 了」不等于「用了」：把 `<StatusBlock>` 从 JSX 里摘掉只留 import，
+      //   上面两条**照样绿**。所以补一条源码断言要求它真的出现在 JSX 里。
+      expect(code, `${file} import 了 StatusBlock 却没用它`).toContain('<StatusBlock');
       expect(/catch\s*\(/.test(code), `${file} 里出现了 catch (`).toBe(false);
     }
   });
@@ -639,5 +706,72 @@ describe('T04 补遗 · 面板 7：「对比上次」动作', () => {
   it('★ 基准说明仍在场（补交互不许删那句「本次会话内」）', () => {
     const html = renderClusters(makeClustersResult(), null);
     expect(html).toContain('本次会话内');
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 五、T04 补强 · 面板 5 的 `logs` 实现：真读文件、不写盘
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('T04 补强 · 面板 5：真夹具读到行 + 文件 sha1 不变 + 穿越同一判据的负控', () => {
+  /** ★ **唯一的**「写磁盘痕迹」判据（产品代码与负控**共用这一个**函数）。 */
+  const WRITE_TOKENS = ['writeFile', 'appendFile', 'mkdir'] as const;
+
+  /** 返回命中的痕迹（空数组 = 干净）。 */
+  function scanWriteTokens(code: string): string[] {
+    return WRITE_TOKENS.filter((token) => code.includes(token));
+  }
+
+  it('★ 真夹具：`logs/2024/01/31.log` 能读到 2 行，且读前读后**文件 sha1 不变**', () => {
+    // ⚠️ 原来只有「请求级（调用序列只有 logs）」+「源码扫描」⇒ 「真的读到了东西」与
+    //   「读的过程中没写过」都只是推断。这里用真文件把两者都变成读数。
+    const dataDir = mkdtempSync(join(tmpdir(), 'memory-ocean-logs-fixture-'));
+    const monthDir = join(dataDir, 'logs', '2024', '01');
+    mkdirSync(monthDir, { recursive: true });
+    const filePath = join(monthDir, '01-31.log');
+    writeFileSync(
+      filePath,
+      '2024-01-31 12:00:00  info  写入  id=m-1\n2024-01-31 12:00:01  warn  错误  op=recall err=只读\n',
+      'utf8',
+    );
+
+    const before = createHash('sha1').update(readFileSync(filePath)).digest('hex');
+    const page = readLogPage(dataDir, { year: 2024, month: 1, day: 31 });
+    const after = createHash('sha1').update(readFileSync(filePath)).digest('hex');
+
+    // 非空分母：真的读到了 2 行（不是「空页也算过」）
+    expect(page.lines.length).toBe(2);
+    expect(page.total).toBe(2);
+    expect(page.lines[0]?.level).toBe('info');
+    expect(page.lines[1]?.level).toBe('warn');
+    expect(page.lines[1]?.raw).toContain('err=只读');
+    // 读完没有改写文件
+    expect(after).toBe(before);
+  });
+
+  it('★ 目录不存在 ⇒ 空页而不抛错（新库本来就没有 logs/）', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'memory-ocean-logs-empty-'));
+    const page = readLogPage(dataDir, { year: 2024, month: 1 });
+    expect(page).toEqual({ lines: [], total: 0 });
+  });
+
+  it('★ 负控：**同一个判据**必须能抓到「自己造的那个坏文件」', () => {
+    // ⚠️ 原来的负控是「自己拼一个字符串再断言它含某个子串」⇒ **不经过被测判据** ⇒ 恒真。
+    //   现在把坏代码真的写进临时文件，再用**产品代码用的同一个** `scanWriteTokens` 去扫。
+    const probeDir = mkdtempSync(join(tmpdir(), 'memory-ocean-logs-probe-'));
+    const probePath = join(probeDir, 'bad.ts');
+    writeFileSync(
+      probePath,
+      "import { writeFileSync, mkdirSync } from 'node:fs';\nwriteFileSync(p, t);\nmkdirSync(p, { recursive: true });\n",
+      'utf8',
+    );
+
+    const hits = scanWriteTokens(readFileSync(probePath, 'utf8'));
+    expect(hits.length).toBeGreaterThanOrEqual(2);
+    expect(hits).toContain('writeFile');
+    expect(hits).toContain('mkdir');
+
+    // 而真正的实现里一个都没有
+    expect(scanWriteTokens(readCode('viewer/main/db-worker.ts'))).toEqual([]);
   });
 });
