@@ -203,3 +203,48 @@ pnpm run build         # 期望 EXIT=0
 - `src/**` 一行未动（本节只写文档）；`tests/**` 一行未动。
 - §六 的「未达成清单」**一条都没变**：H1 / H2 仍红、矢量路仍未接线、缺陷①②③仍在、百万级 perf 未按实测口径重采。
 - **三个 PR 都没有合入 `main`** —— 合并是主理人的决定，本节只负责把「验证到哪一步」记录下来。
+
+---
+
+## 十、★★ 2026-11-02 · **合并收尾**：三条分支已进 `main`（**本节之后，§9.5 的最后一条已失效**）
+
+> ⚠️ **只追加，不改上文**：§9.5 写的是「本节时点」的事实（那时确实没合）。
+> 本节记录同一晚后来的动作 ⇒ **§9.5 最后一条「三个 PR 都没有合入 main」自此作废**，
+> 其余四条（源码未动、未达成清单）仍然成立。
+
+### 10.1 合并结果（实测，GitHub REST API 逐个核对 check-runs）
+
+| 顺序 | PR | head | 合并后 `main` | 合并前 head 的 CI |
+|---|---|---|---|---|
+| 1 | **#4** `fix/storage-media-win-path` | `6552b79` | `a08c69d` | 构建 / 门禁 均 `success` |
+| 2 | **#2** `feat/p3-audit-gate` | `c010720` | `7942843` | 构建 / 门禁 均 `success` |
+| 3 | **#3** `feat/p4-lifecycle` | `17bd96c` | **`774e9b8`** | 构建 / 门禁 均 `success` |
+
+- **合并方式 `merge`（非 squash）**；每合一个都**等**下一个合并点的 CI `success` 才继续。
+- ⚠️ ★ **#3 的 base 不会自动改**：GitHub 不会因为 #2 合入就把 #3 的 base 从
+  `feat/p3-audit-gate` 改成 `main`（base 分支还在 ⇒ 保持原样）⇒ 必须
+  `PATCH /pulls/3 {base: main}` 显式 retarget。**栈式 PR 合完中段一定要查这一步。**
+
+### 10.2 `main` 上的复验读数（实测，2026-11-02 本轮）
+
+| 项 | 读数 |
+|---|---|
+| `pnpm run verify` | **EXIT=0**（14 段链）· **67 文件 / 1,194 断言** |
+| `pnpm run build` | **EXIT=0**（ESM / CJS / d.ts） |
+| 远端 `774e9b8` 的 CI | 「门禁（verify）」+「构建（tsup）」均 `success` |
+
+⇒ **与 §9.2 的读数一致**（67 / 1,194），合并**没有**改变任何一条断言的结论。
+
+### 10.3 ⚠️ 本地 `main` 是重建的（下次接手必读）
+
+本轮 `git fetch` / `git push` 对 `github.com:443` **持续失败**（`Connection was reset` ⇒ 后续连不上），
+只有 `api.github.com` / `codeload.github.com` 可用 ⇒ 合并走 REST API，git 传输层拿不到新对象。
+
+为让「在 main 上复跑门禁」成立，本地按**同序同方式**重建了 main：
+`3d477d8+6552b79 → 3cfeee8`、`3cfeee8+c010720 → 1178b0a`、`1178b0a+17bd96c → 949e8f7`。
+
+- **commit SHA 不同**（本地 merge 的时间戳与服务端不同）；
+- **但内容已被证明等价**：本地 `HEAD^{tree}` = `01c61b45…` == 远端 `774e9b8` 的 `tree.sha`（实测，逐字相同）。
+
+⇒ ⚠️ **网络恢复后不要 `git push main`**（会与远端分叉）⇒ 正确做法：
+`git fetch origin && git reset --hard origin/main`，丢掉那三个重建的 merge commit，再在新 main 上继续。
