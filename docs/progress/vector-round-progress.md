@@ -1,7 +1,7 @@
 # 矢量路接线轮（P2-T09~T12）· 交付与遗留
 
 > 时点：2026-11-03（Asia/Shanghai）· 分支 `perf/ivf-single-pass` → PR **#6**
-> 门禁：`pnpm run verify` **EXIT=0**（14 段链）· **90 文件 / 1,832 条断言** · `pnpm run build` **EXIT=0**
+> 门禁：`pnpm run verify` **EXIT=0**（14 段链）· **90 文件 / 1,838 条断言** · `pnpm run build` **EXIT=0**
 > 设计：`docs/design/p5-vector-path-design.md`（D1~D9 + §11 实现后读数）· 裁决索引：`DECISIONS.md` 的 **ADR-P5-VEC** · 勘误：`DESIGN-v2-errata.md` **§11**
 >
 > ⚠️ **本文件取代以下过期陈述**（那几处已同步改掉或加了指针）：
