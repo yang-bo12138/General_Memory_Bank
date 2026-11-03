@@ -347,7 +347,7 @@ function main(): void {
   const options: CorpusOptions = { ...DEFAULT_CORPUS_OPTIONS, size: scale, seed };
   // ⚠️ **机器信息在开始时采集**（不是结束时）：
   //   “运行开始时还有多少可用内存”才是“这个规模跑得动”的证据。
-  const machine = machineInfo();
+  const machine = machineInfo(dbPath);
   process.stdout.write(
     `前置测量（flat 路线的向量路耗时占比）：语料 ${scale} 条 / 查询 ${queryCount} 条\n`,
   );

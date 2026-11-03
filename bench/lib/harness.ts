@@ -1145,9 +1145,14 @@ function diskInfo(): { totalDiskBytes: number; freeDiskBytes: number } {
 /**
  * 采集机器环境。
  *
+ * @param storageTargetPath 判定**存储介质**用的路径（**传库文件路径**）。
+ *   ⚠️ **不传会退回 `process.cwd()` 所在盘**，而当库放在**另一个盘**上时，那会把介质**标错**：
+ *   例：库在 NVMe `E:`、cwd 在机械盘 `D:` ⇒ 旧实现记成 `HDD`
+ *   ⇒ 而「每行读成本（µs/行）」这条推论**完全依赖这个标签** ⇒ 标签错，读成本就不可解释。
+ *   （2026-11-03 修正：原实现无参，等价于「永远报 cwd 的盘」。）
  * @returns 机器环境快照
  */
-export function machineInfo(): MachineInfo {
+export function machineInfo(storageTargetPath?: string): MachineInfo {
   const cpus = cpus_();
   const totalMemoryBytes = totalmem();
   const freeMemoryBytes = freemem();
@@ -1163,7 +1168,8 @@ export function machineInfo(): MachineInfo {
     totalDiskBytes: disk.totalDiskBytes,
     freeDiskBytes: disk.freeDiskBytes,
     // ⚠️ **介质探测失败不抛错**（`detectStorageMedia` 内部全吞）⇒ 这一行不会让 bench 挂掉。
-    storageMedia: detectStorageMedia(),
+    // ⚠️ **按库文件所在的盘判介质**（不传 ⇒ 退回 cwd 的盘 ⇒ 库放在别的盘时会标错）。
+    storageMedia: detectStorageMedia(storageTargetPath),
   };
 }
 
