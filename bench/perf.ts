@@ -15,13 +15,33 @@
  *     （flat 路线下向量路占绝对多数 ⇒ §12 的「≥80%」那条），
  *     而**改造后**的口径是「向量路在一次召回里占多少」⇒ **分母是 recall 全程**。
  *
- * ⚠️ **本脚本测的「向量路」是「生产后端被单独调用」的耗时**，
- *   **不是**「recall 内部真的走了向量路」的耗时
- *   ⇒ 因为**本仓库当前的 `recall()` 尚未接线向量路**
- *   （`src/store/recall.ts` 步骤 2c 仍写着「本阶段整路缺席」）
- *   ⇒ **这一点必须在报告里写明**，否则「向量路占比」会被读成「流水线内的占比」
- *   ⇒ **实际流水线里的占比 = 本脚本测的向量路耗时 / (recall 耗时 + 向量路耗时)**，
- *   因为接线后向量路是**额外**的一段（它不在现在的 recall 里）。
+ * ⚠️ ★★★ **本脚本测两个「召回档」**（2026-11-02 补：`recall()` 已接线向量路，`96568eb`）：
+ *   · **old-path 档** = `store.recall({ context, now })` —— **不传 `queryEmbedding`**
+ *     ⇒ 向量路**整段不执行**（`src/store/recall.ts` 步骤 2c 的入口条件是「有向量 ∧ 有端口」）
+ *     ⇒ 它就是「**接线之前**」的召回形状 ⇒ **这是对照组，结构与键名一个都不许改**
+ *     （改掉 = **永久丢失**「接线前后快慢」的唯一对照）；
+ *   · **new-path 档** = `store.recall({ context, queryEmbedding, now })`
+ *     ⇒ 向量路**真的在召回内部跑**（采样前由一次性 `diagnostics` 探针证实
+ *     `explain.routes.vector.ran === true`，探针结果落盘）。
+ *   ⇒ **落盘键名**（不复用、不并列重名）：
+ *     · old-path ⇒ `recallLatency` / `recallP99Ms`（**原有键，原样不动**）；
+ *     · new-path ⇒ `recallVectorPath`（**新键**，内含 `latency` / `p99Ms` / `meanMs` /
+ *       `oldPathMeanMs` / `meanDeltaMs` / `probe`）。
+ *   ⇒ **文件头这一句就是键名的权威说明**：`recall*` = old-path，`recallVectorPath` = new-path。
+ *
+ * ⚠️ ★★ **「向量扫描本身」与「整条召回」是两条不同的数（绝不混成一个）**：
+ *   · `vectorRouteLatency` / `vectorRouteP99Ms` / `candidateReadRows` / `hitFineBuckets`
+ *     —— **直接调 `backend.route()` + `backend.search()`** 量出来的
+ *     ⇒ 它回答「**向量扫描（含路由）这一段自己花多少**」，
+ *     **不含**文本路 / 图谱路 / 打分 / 排序 ⇒ **它不是召回读数**（落盘另有 `vectorScanNote` 声明）；
+ *   · `recallVectorPath`（new-path 档）—— **整条召回**（向量路在里面）
+ *     ⇒ 它回答「**一次召回花多少**」。
+ *   ⇒ ⇒ 「向量路在一次召回里占多少」的正确算法是
+ *     `vectorRouteLatency.meanMs ÷ recallVectorPath.latency.meanMs`（**同一次运行内**比），
+ *     已作为推导值落盘在 `recallVectorPath.vectorScanShareOfNewPath`。
+ *   ⚠️ **为什么仍保留「独立跑一遍向量扫描」这种写法**：bench **不改 `src/**`**
+ *     ⇒ 无法在 `recall()` 内部插桩 ⇒ **分档归因只能靠独立跑一遍**
+ *     ⇒ 保留它，但**口径必须落盘**（`vectorScanNote`）⇒ 读的人不会把它当召回读数。
  *
  * ⚠️ **预热轮次与首次 IO**（口径必须写死，否则 P99 没有可判定性）：
  *   · **预热** = 前 N 次调用**不计入**统计（V8 的 JIT 优化 + SQLite 页缓存 +
@@ -91,7 +111,12 @@ import { countBucketMembers } from '../src/vector/bucketAssign.js';
 import { loadCentroidModel } from '../src/vector/centroids.js';
 import { normalizeNumbers } from '../src/vector/dot.js';
 import { IvfVectorBackend } from '../src/vector/ivf.js';
-import { type CorpusOptions, DEFAULT_CORPUS_OPTIONS, generateQueries } from './corpus.js';
+import {
+  type BenchQuery,
+  type CorpusOptions,
+  DEFAULT_CORPUS_OPTIONS,
+  generateQueries,
+} from './corpus.js';
 import { embedText } from './embedder.js';
 import { prepareBench } from './lib/db.js';
 import {
@@ -225,12 +250,101 @@ export interface WriteSegmentSummary {
   readonly note: string;
 }
 
+/**
+ * ★ **new-path 档的一次性探针**（回答「向量路在召回里到底跑没跑」）。
+ *
+ * ⚠️ **为什么必须有它**（没有它，new-path 档的数字不可辩护）：
+ *   `recall()` 的向量路有两个入口条件（**有 `queryEmbedding`  ∧  **端口可装配**）
+ *   ⇒ 传了向量**仍可能整路缺席**（库规模 < 门槛 ⇒ `flat_auto` 走 flat；
+ *   或 ≥ 门槛但桶未训练 ⇒ `absent` ⇒ 端口为 `null`）
+ *   ⇒ **只看耗时差无法区分「向量路跑了但很快」与「向量路根本没跑」**
+ *   ⇒ ⇒ 探针用 `diagnostics: true` 读 `explain.routes.vector` ⇒ **落盘成证据**。
+ *
+ * ⚠️ **探针跑在计时之外**（`diagnostics` 会多算一次 recall，且它本身有开销）
+ *   ⇒ 它的耗时**不进任何 P99 样本**。
+ */
+export interface VectorPathProbe {
+  /** 向量路**跑没跑**（`explain.routes.vector.ran`）。 */
+  readonly ran: boolean;
+  /** 向量路本次产出的**候选条数**（`explain.routes.vector.candidates`；`ran=false` ⇒ 0）。 */
+  readonly candidates: number;
+  /**
+   * 后端**四态模式**（`stats().vectorBackend.mode`）：
+   * `'ivf'` / `'flat_explicit'` / `'flat_auto'` / `'absent'` / `'unknown'`。
+   *
+   * ⚠️ **为什么要把模式一起落盘**：同样是 new-path 档，
+   *   `mode='ivf'` 与 `mode='flat_auto'` 是**两条完全不同的性能故事**
+   *   （后者 = 全表精确点积 ⇒ 百万级上必然慢）⇒ 不写模式 ⇒ 读的人会把 flat 的慢
+   *   读成「接线本身慢」。
+   * ⚠️ `'unknown'` = 读 `stats()` 抛错 ⇒ **不猜**（`stats()` 是观测面 ⇒ 它坏掉不该弄死测量）。
+   */
+  readonly mode: string;
+  /** 口径说明（**必须落盘** ⇒ 读的人知道这是探针，不是测量样本）。 */
+  readonly note: string;
+}
+
+/**
+ * ★ **new-path 档（传 `queryEmbedding` 的召回）的读数** —— 与 old-path 档**并列落盘**。
+ *
+ * ⚠️ **键名纪律**：本对象用**新键** `recallVectorPath`；old-path 档继续用原有的
+ *   `recallLatency` / `recallP99Ms` / `recallSamples`
+ *   ⇒ ⇒ 有脚本 / 文档在读旧键（`docs/baseline/*.json`）⇒ **旧键一个都不许改名或挪位**。
+ */
+export interface RecallVectorPathSummary {
+  /** new-path 档的样本数（**必须与 old-path 同批查询**；0 ⇒ 本档缺席）。 */
+  readonly samples: number;
+  /** new-path 档的耗时分布（**整条召回**，含向量路）。 */
+  readonly latency: LatencyDistribution;
+  /** new-path 档 P99（毫秒；便于与 old-path 的 `recallP99Ms` 并排读）。 */
+  readonly p99Ms: number;
+  /** new-path 档均值（毫秒）。 */
+  readonly meanMs: number;
+  /** old-path 档均值（毫秒）——**同一次运行内**量与它比 ⇒ 读的人不必自己回算。 */
+  readonly oldPathMeanMs: number;
+  /** `meanMs − oldPathMeanMs`（毫秒；**正数 = 接线后更慢**）。 */
+  readonly meanDeltaMs: number;
+  /**
+   * 「向量扫描本身」占 new-path 整条召回的**均值比例**（0~1；**推导值**）。
+   *
+   * ⚠️ **分子与分母来自同一次运行**（`vectorRouteLatency.meanMs` ÷ 本档 `meanMs`）
+   *   ⇒ 这条推导才有意义；⚠️ 两者**不是同一次调用**（向量扫描是独立跑的一遍）
+   *   ⇒ 它只能当归因的量级参考，**不是**精确拆分。
+   * ⚠️ `null` ⇒ new-path 均值为 0（本档缺席）⇒ **不是「占比为 0」**。
+   */
+  readonly vectorScanShareOfNewPath: number | null;
+  /**
+   * **一次性探针**（采样**之后**、计时窗口**之外**跑；`diagnostics: true`）。
+   *
+   * ⚠️ **为什么放在采样之后**：探针要回答「刚刚那批样本里向量路跑没跑」
+   *   ⇒ 先跑探针再采样 ⇒ 探针可能**自己**把页缓存 / 端口装配预热掉 ⇒
+   *   两档读数都被它改变；放在采样之后 ⇒ 它**碰不到**任何已落盘的样本。
+   */
+  readonly probe: VectorPathProbe;
+  /** 口径说明（**必须落盘**）。 */
+  readonly note: string;
+}
+
 /** 一次 P99 测量的结果。 */
 export interface PerfResult {
   /** 语料规模（**实测**）。 */
   readonly corpusSize: number;
   /** recall 的样本数（**报告必须写明**）。 */
   readonly recallSamples: number;
+  /**
+   * ★ **new-path 档（传 `queryEmbedding` 的召回）** —— 与 old-path 档并列。
+   *
+   * ⚠️ **old-path 档在 `recallLatency` / `recallP99Ms` / `recallSamples`**（原有键，未改）
+   *   ⇒ 本字段是**新增的对照档**，不是替换。
+   */
+  readonly recallVectorPath: RecallVectorPathSummary;
+  /**
+   * ★ **「向量扫描」口径声明**（`vectorRoute*` / `candidateReadRows` 那几块的口径）。
+   *
+   * ⚠️ **必须落盘**：`vectorRouteLatency` 是「直接调 `backend.search()`」的耗时
+   *   ⇒ 它**不含**文本路 / 图谱路 / 打分 / 排序 ⇒ **它不是召回读数**
+   *   ⇒ 不声明，读的人会把它与 `recallVectorPath` 混成一个数。
+   */
+  readonly vectorScanNote: string;
   /** 写入的样本数。 */
   readonly writeSamples: number;
   /** ★ **第一条被计入统计的写入耗时**（毫秒）—— 冷启动是否已被预热掉的证据。 */
@@ -239,7 +353,12 @@ export interface PerfResult {
   readonly vectorRouteSamples: number;
   /** 预热轮次（**不计入统计**）。 */
   readonly warmupRounds: number;
-  /** recall P99（毫秒）。 */
+  /**
+   * recall P99（毫秒）—— ★ **old-path 档**（不传 `queryEmbedding` ⇒ 向量路整段不执行）。
+   *
+   * ⚠️ **这是对照组**（接线前的形状）⇒ 键名保持原样，**不许改**。
+   *   new-path 档见 `recallVectorPath.p99Ms`。
+   */
   readonly recallP99Ms: number;
   /** 写入 P99（毫秒）。 */
   readonly writeP99Ms: number;
@@ -276,7 +395,7 @@ export interface PerfResult {
   readonly perRowReadCostUs: number | null;
   /** ★ **写入路径的分段计时**（见 `WriteSegmentSummary` 的口径说明）。 */
   readonly writeSegments: WriteSegmentSummary;
-  /** recall 的耗时分布。 */
+  /** recall 的耗时分布 —— ★ **old-path 档**（不传 `queryEmbedding`）；new-path 见 `recallVectorPath.latency`。 */
   readonly recallLatency: LatencyDistribution;
   /** 写入的耗时分布。 */
   readonly writeLatency: LatencyDistribution;
@@ -315,6 +434,113 @@ export function toDistribution(samples: readonly number[]): LatencyDistribution 
     maxMs: summary.maxMs,
     meanMs: summary.meanMs,
   };
+}
+
+/**
+ * ★ **「向量扫描本身」的口径声明** —— 落盘字段 `vectorScanNote`。
+ *
+ * ⚠️ **为什么必须是一段落盘的文字**（而不是只写在文件头注释里）：
+ *   文件头注释**不会随 JSON 一起走**（`docs/baseline/*.json` 会被单独读、单独引用）
+ *   ⇒ 只在文件头声明 ⇒ 读 JSON 的人**看不到这条边界** ⇒ 必然把
+ *   `vectorRouteLatency`（向量扫描）读成「召回耗时」⇒ 两条数被混成一个结论。
+ *   ⇒ ⇒ 口径**跟着数据走**：声明必须是 JSON 的一个字段。
+ */
+export const VECTOR_SCAN_NOTE: string =
+  '① ★ **本段（`vectorRouteLatency` / `vectorRouteP99Ms` / `vectorRouteSamples` / ' +
+  '`candidateReadRows` / `hitFineBuckets` / `perRowReadCostUs`）测的是「向量扫描本身」**：' +
+  '它**直接调** `IvfVectorBackend.route()` + `search()`（**绕过 `recall()`**）' +
+  '⇒ 量的是「**向量扫描（含路由 + 闸门过滤）这一段自己花多少**」，' +
+  '**不含**文本路 / 图谱路 / 五路打分 / 侧抑制 / 排序 ⇒ ⇒ **它不是召回读数**；' +
+  '② **它回答的问题与 new-path 档不同**：它对应文档里的 **R6 / `RECALL_VEC_ROWS`** 口径 ' +
+  '（「向量扫描这一步要读多少行、多重」），而 `recallVectorPath`（new-path 档）' +
+  '回答「**一次召回总共多重**」⇒ **两条数回答两个不同问题，绝不可互换、不可相加**；' +
+  '③ 「向量路在一次召回里占多少」只能用 **同一次运行内**的推导值 ' +
+  '`recallVectorPath.vectorScanShareOfNewPath`（= 本段 `meanMs` ÷ new-path 档 `meanMs`）' +
+  '—— 那两个数来自同一次运行，但**不是同一次调用**（见 ④）；' +
+  '④ ⚠️ **为什么保留「独立跑一遍向量扫描」而不在 `recall()` 内部插桩**：' +
+  'bench **不改 `src/**`**（本轮纪律）⇒ 拿不到召回内部的段计时 ⇒ 分档归因只剩' +
+  '「独立跑一遍」这一条路 ⇒ ⇒ 保留它；代价是**分子（扫描）与分母（整条召回）不是同一次调用**' +
+  '⇒ 该比例**只作归因的量级参考**，**不是精确拆分**（精确拆分要在 `src/store/recall.ts` 里加观测点）。';
+
+/**
+ * ★ **new-path 档的一次性探针**：证实「传了 `queryEmbedding` 之后向量路真的在
+ * `recall()` 内部跑了」。
+ *
+ * ⚠️ **为什么需要它**（没有它，new-path 档的读数不可辩护）：见 `VectorPathProbe` 的说明
+ *   —— 传了向量**仍可能整路缺席**（库小 ⇒ `flat_auto`；桶未训练 ⇒ `absent`）
+ *   ⇒ **只看耗时差无法区分「向量路跑了但很快」与「向量路根本没跑」**。
+ *
+ * ⚠️ **只跑一次**（第一条查询）⇒ 它是**存在性证据**，不是统计量
+ *   ⇒ 它的耗时**不进任何 P99 样本**（`diagnostics: true` 本身有开销）。
+ *   ⚠️ 用 `diagnostics` 而**不是** `explain`：前者**不写** `recall` 事件
+ *   ⇒ 探针不会污染被测库（`explain` 会写一条事件 ⇒ 多一次写放大）。
+ *
+ * @param store 生产门面（**与计时用的是同一个实例** ⇒ 状态一致）
+ * @param queries 查询集（取第 0 条；**空集 ⇒ 探针无从执行**）
+ * @param queryVectors **已经转成 `number[]`** 的查询向量（与计时用的是同一批）
+ * @returns 探针结果（**永不抛错** ⇒ 观测面坏掉不该弄死测量）
+ */
+export function probeVectorPathOfRecall(
+  store: MemoryStore,
+  queries: readonly BenchQuery[],
+  queryVectors: readonly number[][],
+): VectorPathProbe {
+  // ① **先取后端四态模式**：它不依赖 `recall()` 成功与否 ⇒ 即使探针跑挂也能落盘。
+  //    ⚠️ `stats()` 抛错 ⇒ `'unknown'`（**不猜**；`stats()` 是观测面）。
+  let mode = 'unknown';
+  try {
+    mode = store.stats(BENCH_NOW).vectorBackend.mode;
+  } catch {
+    mode = 'unknown';
+  }
+
+  const query = queries[0];
+  const queryVector = queryVectors[0];
+  if (query === undefined || queryVector === undefined) {
+    return {
+      ran: false,
+      candidates: 0,
+      mode,
+      note:
+        '⚠️ 本轮**没有查询**（`--queries=0`）⇒ 探针无从执行 ⇒ `ran=false` 是**未测**，' +
+        '**不代表**向量路缺席。',
+    };
+  }
+
+  // ② **真的调一次带向量的召回**（`diagnostics: true` ⇒ 只读诊断、不记事件）。
+  let ran = false;
+  let candidates = 0;
+  let note: string;
+  try {
+    const result = store.recall({
+      context: query.context,
+      queryEmbedding: queryVector,
+      now: BENCH_NOW,
+      diagnostics: true,
+    });
+    const vectorRoute = result.explain?.routes.vector;
+    ran = vectorRoute?.ran === true;
+    candidates = vectorRoute?.candidates ?? 0;
+    note =
+      '① **存在性证据**（只跑 1 次、取第一条查询）⇒ 不是统计量，耗时不计入任何 P99；' +
+      '② `ran=true` ⇒ 该次召回的 `explain.routes.vector.ran === true`' +
+      '⇒ 向量路**真的在 `recall()` 内部执行了**（不是「传了向量但被入口条件挡掉」）；' +
+      '③ `ran=false` ⇒ 该次召回**向量路整路缺席**，原因看 `mode`：' +
+      '`flat_auto`（库规模 < `ROUTER_MIN_TRAINING` ⇒ 全表精确点积）/ ' +
+      '`absent`（过了门槛但桶未训练）/ `flat_explicit`（调用方显式选了 flat）；' +
+      '④ ⚠️ `mode` 与 `ran` 是**两个观测面**（`stats()` 说「后端处于哪一态」，' +
+      '`explain` 说「这一次跑没跑」）⇒ 若 `mode=ivf` 而 `ran=false`，说明**入口条件另有拦口**' +
+      '（如查询向量不合法被丢弃）⇒ **必须查**，不能当成「偶然」；' +
+      '⑤ ⚠️ `diagnostics: true`（**不是** `explain: true`）⇒ 探针**不写** `recall` 事件' +
+      '⇒ 不污染被测库的写放大。';
+  } catch (error) {
+    // ⚠️ **探针自己跑挂 ≠ 向量路缺席**：这两件事必须分开说，否则读数会被误判。
+    note =
+      `⚠️ 探针本身抛错（${error instanceof Error ? error.message : String(error)}）⇒ ` +
+      '这一条**不是**「向量路缺席」的证据，它只说明**探针跑挂了**' +
+      '⇒ new-path 档的耗时读数仍有效，但「向量路跑没跑」**未证实**。';
+  }
+  return { ran, candidates, mode, note };
 }
 
 /**
@@ -371,6 +597,8 @@ export function measurePerf(
   });
 
   const recallSamples: number[] = [];
+  // ★ **new-path 档的样本**（传 `queryEmbedding` ⇒ 向量路在召回内部真的跑）。
+  const recallVectorSamples: number[] = [];
   const writeSamples: number[] = [];
   const vectorRouteSamples: number[] = [];
   // ★ **H1 的两个计数样本**（候选读取行数 / 命中细桶数）。
@@ -412,6 +640,18 @@ export function measurePerf(
   //   ⇒ 不预热 ⇒ **P99 = max = 第一次写入**（实测：首次写 245ms，后续写 ~4ms）
   //   ⇒ 那个数测的是「冷启动」，不是「写入 P99」。
   //   ⇒ 预热写用**独立正文**（不与语料重复 ⇒ 不触发合并路径 ⇒ 测的仍是「新建」）。
+  //
+  // ★★ **new-path 档的查询向量必须在计时之外先转好**：
+  //   ⚠️ `bench/corpus.ts` 的 `BenchQuery.embedding` 是 **`Float32Array`**，
+  //   而 `RecallOptions.queryEmbedding` 要的是 **`number[]`** ⇒ **必须先 `Array.from()`**：
+  //   · **不许 `as` 强转**：`Float32Array` 与 `number[]` 不是同一类对象，
+  //     强转只是把错误推迟到运行时；而 `normalizeQueryEmbedding()` 按下标读时
+  //     TypedArray **碰巧也能读** ⇒ 这类错误会**静默**通过（`Array.isArray()` 才是判据，
+  //     强转骗不过它，但骗得过「先跑起来看看」）⇒ ⇒ 早晚在换实现时炸；
+  //   · **也不许在计时窗口里转**：转换是**调用方**的成本（生产里向量由调用方算好再传进来），
+  //     计入就污染 P99 ⇒ ⇒ 一次转好，两档共用。
+  const queryVectors: number[][] = queries.map((query) => Array.from(query.embedding));
+
   for (let round = 0; round < WARMUP_ROUNDS; round += 1) {
     const query = queries[round % Math.max(1, queries.length)];
     if (query !== undefined) {
@@ -423,6 +663,13 @@ export function measurePerf(
       backend.search(query.embedding, DEFAULT_PARAMS.VECTOR_TOPK);
     }
     store.recall({ context: '预热', now: BENCH_NOW });
+    // ★ **new-path 档也要预热**（同一条理由：JIT + 页缓存 + 后端对象的首次分配
+    //   + 四态判定的首次 count）⇒ 不预热 ⇒ new-path 的 P99 会被「第一轮的冷启动」主导
+    //   ⇒ 那时两档的差是「预热差」而不是「接线差」。
+    const warmVector = queryVectors[round % Math.max(1, queryVectors.length)];
+    if (warmVector !== undefined) {
+      store.recall({ context: '预热', queryEmbedding: warmVector, now: BENCH_NOW });
+    }
     const warmContent = `预热写入第${round}条、独立的正文、不与语料重复`;
     store.write({
       content: warmContent,
@@ -431,13 +678,55 @@ export function measurePerf(
     });
   }
 
-  // ── recall（**生产的 `MemoryStore.recall()`**）──
-  for (const query of queries) {
-    const start = process.hrtime.bigint();
-    store.recall({ context: query.context, now: BENCH_NOW });
-    const end = process.hrtime.bigint();
-    recallSamples.push(Number(end - start) / 1_000_000);
+  // ── recall · **两档并列测**（old-path = 生产的 `MemoryStore.recall()`，不传向量）──
+  // ★ old-path 档：`store.recall({ context, now })` —— **这一行是接线前的形状，原样保留**
+  //   （删它就永久丢失对照组 ⇒ 「接线前后快慢」再也测不出来）。
+  // ★ new-path 档：`store.recall({ context, queryEmbedding, now })` —— 向量路在召回内部跑。
+  //
+  // ⚠️ ★ **两档在同一轮里背靠背跑，且**按查询序号**轮换先后顺序**（偶数 old 先 / 奇数 new 先）：
+  //   · **为什么背靠背**（而不是「先跑完 200 条 old、再跑 200 条 new」）：中间隔几分钟，
+  //     页缓存 / SQLite 的 WAL 检查点 / 后台合并都可能变化 ⇒ 两档就不是同一条时间线上的数；
+  //   · **为什么必须轮换顺序**：先跑的那一档要**替后跑的那一档**装载页缓存
+  //     ⇒ 固定顺序 ⇒ 后跑的一档被系统性优待（读数偏乐观）⇒ 而本档要回答的正是「这两档谁快」
+  //     ⇒ ⇒ 顺序偏置必须**对称掉**（各占一半）⇒ 剩下的差才可辩护。
+  //   · **代价（诚实记）**：new-path 档的召回会顺带把文本路 / 图谱路的缓存也带热
+  //     （两档共用同一条文本路）⇒ 两档的差里含「向量路之外的热身差异」；
+  //     但这条差异**方向固定且远小于向量路本身**，且 old-path 档的绝对读数不受影响。
+  for (let index = 0; index < queries.length; index += 1) {
+    const query = queries[index];
+    if (query === undefined) {
+      continue;
+    }
+    const queryVector = queryVectors[index] ?? [];
+    /** old-path 档的一次采样（**不传 `queryEmbedding`** ⇒ 向量路整段不执行）。 */
+    const sampleOldPath = (): void => {
+      const start = process.hrtime.bigint();
+      store.recall({ context: query.context, now: BENCH_NOW });
+      const end = process.hrtime.bigint();
+      recallSamples.push(Number(end - start) / 1_000_000);
+    };
+    /** new-path 档的一次采样（**传 `queryEmbedding`** ⇒ 向量路在召回内部跑）。 */
+    const sampleNewPath = (): void => {
+      const start = process.hrtime.bigint();
+      store.recall({ context: query.context, queryEmbedding: queryVector, now: BENCH_NOW });
+      const end = process.hrtime.bigint();
+      recallVectorSamples.push(Number(end - start) / 1_000_000);
+    };
+    if (index % 2 === 1) {
+      // 奇数轮：new-path 先跑（对称掉「后跑者得利」）。
+      sampleNewPath();
+      sampleOldPath();
+    } else {
+      // 偶数轮：old-path 先跑（对照组不因新档的改动而系统性变慢）。
+      sampleOldPath();
+      sampleNewPath();
+    }
   }
+
+  // ★ **一次性探针（采样之后、计时窗口之外）**：证实「new-path 档里向量路真的跑了」。
+  //   ⚠️ **为什么不放在采样之前**：探针自己会装载页缓存 / 装配端口 ⇒ 放前面会**改变**
+  //   两档的采样条件（尤其 old-path 档）⇒ ⇒ 放后面，它碰不到任何已落盘的样本。
+  const vectorPathProbe = probeVectorPathOfRecall(store, queries, queryVectors);
 
   // ── 向量路（**生产后端**：route + search）──
   // ⚠️ ★ **候选读取行数的统计口径**（H1 的判据）：
@@ -539,6 +828,38 @@ export function measurePerf(
   const vectorRouteShare =
     recallMean + vectorMean === 0 ? 0 : vectorMean / (recallMean + vectorMean);
 
+  // ── ★ **new-path 档（传 `queryEmbedding`）的读数** ──
+  // ⚠️ **与 old-path 档并列落盘**（old-path 的键原样不动）。
+  const recallVectorLatency = toDistribution(recallVectorSamples);
+  const recallVectorPath: RecallVectorPathSummary = {
+    samples: recallVectorSamples.length,
+    latency: recallVectorLatency,
+    p99Ms: recallVectorLatency.p99Ms,
+    meanMs: recallVectorLatency.meanMs,
+    oldPathMeanMs: recallMean,
+    meanDeltaMs: recallVectorLatency.meanMs - recallMean,
+    vectorScanShareOfNewPath:
+      recallVectorLatency.meanMs > 0 ? vectorMean / recallVectorLatency.meanMs : null,
+    probe: vectorPathProbe,
+    note:
+      '① **new-path 档** = `store.recall({ context, queryEmbedding, now })`' +
+      '⇒ `queryEmbedding` 取自 `query.embedding`，且**用 `Array.from()` 真转成 `number[]`**' +
+      '（`bench/corpus.ts` 给的是 `Float32Array`；`as` 强转不算转换）⇒ 转换在**计时之外**做；' +
+      '② **old-path 档 = 本文件原有的 `recallLatency` / `recallP99Ms`**（不传 `queryEmbedding`' +
+      ' ⇒ 向量路整段不执行）⇒ **两档同一批查询、同一次运行、同一条时间线**；' +
+      '③ **两档背靠背跑，且按查询序号轮换先后顺序**（偶数 old 先 / 奇数 new 先）' +
+      '⇒ 先跑者替后跑者装载页缓存 ⇒ 固定顺序会让后跑的一档偏乐观 ⇒ 顺序偏置必须对称掉；' +
+      '④ `meanDeltaMs` = new-path 均值 − old-path 均值（**正数 = 接线后更慢**，单位毫秒）；' +
+      '⑤ `vectorScanShareOfNewPath` = **向量扫描本身**（`vectorRouteLatency.meanMs`）÷ 本档均值' +
+      '—— **推导值**，分子分母**不是同一次调用**（扫描是独立跑的一遍）⇒ 只作量级参考；' +
+      '⑥ `probe` = **一次性探针**（`diagnostics: true`，跑在采样**之后**、计时窗口**之外**）：' +
+      '`ran=false` ⇒ **本轮向量路整路缺席**（`mode` 会说明是 `flat_auto` 还是 `absent`）' +
+      '⇒ 那时 `meanDeltaMs` **不能**读成「向量路的成本」；' +
+      '⑦ ⚠️ **本档不参与 `checkPerf` 的门槛判定**：门槛（recall P99 ≤ 200ms）是**架构师裁决**的口径，' +
+      '工程师不能把旧门槛悄悄顺延到一个新口径上 ⇒ 本档先**只落盘观测值**；' +
+      '要不要给它定门槛，由架构师裁决。',
+  };
+
   // ── ★ **候选读取行数（H1/H2 的判据）** ──
   const candidateReadRowsMeasured = toCountSummary(candidateRowSamples);
   const candidateReadRowsDerived = toCountSummary(candidateRowDerivedSamples);
@@ -606,6 +927,8 @@ export function measurePerf(
   return {
     corpusSize: options.size,
     recallSamples: recallSamples.length,
+    recallVectorPath,
+    vectorScanNote: VECTOR_SCAN_NOTE,
     writeSamples: writeSamples.length,
     firstWriteMs,
     vectorRouteSamples: vectorRouteSamples.length,
@@ -802,6 +1125,14 @@ function main(): void {
     trainedCells: prepared.fineCells,
     trainedMembers: prepared.members,
     thresholds: THRESHOLDS,
+    // ⚠️ ★★★ **两个召回档并列落盘**（键名不复用 ⇒ 读的人不会把两档混成一个数）：
+    //   · `recallP99Ms` / `recallLatency` / `recallSamples` ⇒ **old-path 档**（原有键，**一个都没改**
+    //     ⇒ `tests/bench/bench-smoke.test.ts` 与 `docs/baseline/README.md` 读的就是它们）；
+    //   · `recallVectorPath` ⇒ **new-path 档**（**新键**，含 `latency` / `p99Ms` / `meanMs` /
+    //     `oldPathMeanMs` / `meanDeltaMs` / `vectorScanShareOfNewPath` / `probe`）。
+    recallVectorPath: result.recallVectorPath,
+    // ⚠️ ★ **「向量扫描本身」的口径声明**（跟数据一起走 ⇒ 读 JSON 的人看得到边界）。
+    vectorScanNote: result.vectorScanNote,
     recallP99Ms: result.recallP99Ms,
     writeP99Ms: result.writeP99Ms,
     firstWriteMs: result.firstWriteMs,
@@ -831,9 +1162,16 @@ function main(): void {
   });
 
   process.stdout.write(
-    `  recall P99 = ${result.recallP99Ms.toFixed(3)}ms（门槛 ${THRESHOLDS.recallP99Ms}ms，样本 ${result.recallSamples}）\n` +
+    `  recall P99（old-path · 不传向量）= ${result.recallP99Ms.toFixed(3)}ms（门槛 ${THRESHOLDS.recallP99Ms}ms，样本 ${result.recallSamples}）\n` +
+      `  recall P99（new-path · 传向量）= ${result.recallVectorPath.p99Ms.toFixed(3)}ms（**只观测、不判门槛**，样本 ${result.recallVectorPath.samples}）\n` +
+      `    ★ 两档均值差 = ${result.recallVectorPath.meanDeltaMs.toFixed(3)}ms` +
+      `（new ${result.recallVectorPath.meanMs.toFixed(3)}ms − old ${result.recallVectorPath.oldPathMeanMs.toFixed(3)}ms；正数 = 接线后更慢）\n` +
+      `    ★ new-path 探针：向量路 ran = ${result.recallVectorPath.probe.ran}（mode = ${result.recallVectorPath.probe.mode}，` +
+      `候选 ${result.recallVectorPath.probe.candidates} 条）\n` +
+      `    ★ 向量扫描占 new-path 整条召回 = ${result.recallVectorPath.vectorScanShareOfNewPath === null ? '**未测到**' : `${(result.recallVectorPath.vectorScanShareOfNewPath * 100).toFixed(2)}%`}（推导值）\n` +
       `  写入 P99 = ${result.writeP99Ms.toFixed(3)}ms（门槛 ${THRESHOLDS.writeP99Ms}ms，样本 ${result.writeSamples}）\n` +
-      `  向量路 P99 = ${result.vectorRouteP99Ms.toFixed(3)}ms（门槛 ${THRESHOLDS.vectorRouteP99Ms}ms，样本 ${result.vectorRouteSamples}）\n` +
+      `  向量扫描本身 P99 = ${result.vectorRouteP99Ms.toFixed(3)}ms（门槛 ${THRESHOLDS.vectorRouteP99Ms}ms，样本 ${result.vectorRouteSamples}）` +
+      '（⚠️ **直接调 backend.route()+search()** ⇒ 不是召回读数，见 vectorScanNote）\n' +
       `  向量路占总耗时 = ${(result.vectorRouteShare * 100).toFixed(2)}%（门槛 ≤ ${(THRESHOLDS.vectorRouteShare * 100).toFixed(0)}%）\n` +
       `  ★ H1 候选读取行数 = ${result.candidateReadRows.max} 行（判定取 max；均值 ${result.candidateReadRows.mean.toFixed(1)} 行，` +
       `门槛 ≤ ${THRESHOLDS.candidateReadRowsMax} 行，样本 ${result.candidateReadRows.count}）\n` +
