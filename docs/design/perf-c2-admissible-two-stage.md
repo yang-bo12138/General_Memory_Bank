@@ -3,7 +3,7 @@
 > **归属**：`docs/decisions/adr-perf-recall-vs-h1.md` **§8 裁决**（2026-11-04）的施工落点。
 > **一句话**：把「桶内全量精确点积」换成「**先读 768B 的 int8 码算上界，只对可能入选的行读 3KB 原向量精确重排**」，
 > 用 Cauchy–Schwarz 给每一行一个**可证上界** ⇒ **结果与全量扫描逐位相同**，而字节量降到 1/4。
-> **状态**：**T01 / T02 / T03 已落地（2026-11-04）**；**T04 已实现（2026-11-05，未提交 —— 差异台账见 §5.1.11，待裁见 §5.1.12）**；**R8 已裁 · 部分落地（§7.1）**；**R11 已裁（§6）**。
+> **状态**：**T01 / T02 / T03 已落地（2026-11-04）**；**T04 已落地（2026-11-05，提交 `f9c966f` —— 差异台账见 §5.1.11，裁决见 §5.1.12「已裁」）**；**T05 已落地（2026-11-04 · 提交 `4637d38`）**；**T06 已落地（2026-11-05，提交 `b339534` + `58bde37`）**；**R8 已裁 · 部分落地（§7.1）**；**R11 已裁（§6）**。
 > **验收断言 A1~A8 一条都没跑过之前，本档的收益数字全部是 ⚠️推断。**
 > ⚠️ **T01 的落地形状与原计划不同**（更省一步），差异与理由见 §5 的 T01 行注。
 > ⚠️ **R8 的事实底座与原稿不同**（今天有 2 条合法写 `embedding` 的路径，不是 0 条），订正见 §7.1.1。
@@ -176,9 +176,9 @@ return exact 转数组（结果键降序、同分 id 升序）
 | **T01** | 码表 DDL（**增量表**） | ✅ **已落地**：`schema/001_schema_v2.sql` + `schema/002_migration_v1_to_v2.sql` 各一段（带 `IF NOT EXISTS`）；运行时副本 `src/db/schema.sql.ts` 同步生成；`src/core/schema.ts` 加 `VECTOR_CODES_SQL`；`src/db/migrate.ts` 加 `ensureVectorCodesTable()` 并挂进 `ensureSchema()` 的三个分支 | — | `tests/unit/vector-codes-schema.test.ts` **6 条**：不在指纹表 / 形状对 / 两处 DDL 不漂移 / 存量库可补建 / 幂等 / 只读侧容忍缺表 |
 | **T02** | 编码器 + 上界单测 | ✅ **已落地**：`src/vector/quantize.ts`（`encodeVector` / `approxDot` / `upperBound` / `decodeVector` / `codeToBlob` / `blobToCode`）；`tests/unit/quantize.test.ts` **8 条** | — | **A3 / A4 绿**（10 万对零破界；eps 是真误差） |
 | **T03** | 回填脚本（分批、可断点） | ✅ **已落地（2026-11-04）**：`scripts/backfill-codes.ts`（`pnpm codes:backfill`）；`tests/integration/backfill-codes.test.ts`（**26 条**） | T01 T02 | 1M 回填完成（**1,000,000 / 73.42s / 库 +944.2 MB**）；**A6** 绿；中断后重跑幂等（`encoded=0`） |
-| **T04** | 读取路径两段化 | ✅ **已实现（未提交）** —— 契约见 **§5.1**、差异台账见 **§5.1.11**、待裁见 **§5.1.12**。改哪里：`src/vector/prune.ts`（新）；`src/vector/ivf.ts`（`search()` / `scanBucketCandidates()` / 新增 `readCodes()`·`buildSurvivorSql()`·`countUncodedCandidates()`）；`IvfVectorBackendOptions.prune?: boolean`（缺省 `true`）；**`src/store/dedupCandidates.ts:303` 加一个 options 实参（唯一一行非向量层改动）**；`src/store/recall.ts` 两行（`explain.routes.vector.codesMissing` 接线） | T01 T02 | **A1 / A2 / A7 / A8** 绿（`prune=false` 与 HEAD 逐位一致） |
+| **T04** | 读取路径两段化 | ✅ **已落地（2026-11-05 · 提交 `f9c966f`）** —— 契约见 **§5.1**、差异台账见 **§5.1.11**、裁决见 **§5.1.12（已裁）**。改哪里：`src/vector/prune.ts`（新）；`src/vector/ivf.ts`（`search()` / `scanBucketCandidates()` / 新增 `readCodes()`·`buildSurvivorSql()`·`countUncodedCandidates()`）；`IvfVectorBackendOptions.prune?: boolean`（缺省 `true`）；**`src/store/dedupCandidates.ts:303` 加一个 options 实参（唯一一行非向量层改动）**；`src/store/recall.ts` 两行（`explain.routes.vector.codesMissing` 接线） | T01 T02 | **A1 / A2 / A7 / A8** 绿（`prune=false` 与 HEAD 逐位一致） |
 | **T05** | 写入路径维护码行（同事务） | ✅ **已落地（2026-11-04）**：`src/vector/bucketAssign.ts` 的 `assignBucket()` 现在在**同一事务**里 `writeCodeRow()`（先删旧码行 → 按**本次**向量重编码 → 插新行），`unassignBucket()` 里 `clearCodeRows()`；`fineId === null` 早退分支**删码行**（fail-open）。`src/store/updateContent.ts` 收敛成只调这两个函数（**不再删码**，因为 `assignBucket` 会重编码）。 | T01 T02 | ✅ A6 活域相等；✅ `grep -c vector_codes src/store/write.ts` == 0；✅ `check:bucket-write` 扫到 `bucketAssign.ts` 的码行写入（4 处）；✅ 6 条新断言（换桶跟随 / 重编码 / 退桶删码 / 未训练早退删码 / updateContent 同桶重编码 / 旧码反证） |
-| **T06** | bench 计数口径 + H1′ 判据 | 🔨 **施工中（2026-11-05 · 口径已冻结）**：① `bench/lib/harness.ts` —— `classifyReadKind()` **两个结论**（legacy 行读**逐位复现** + 字节来源**形状登记表**）、快照加 `calls`（`get()` **调用次数**）、字节**当场累加标量**（O(1) 内存）；② **`bench/lib/byteSources.ts`（新增 · 纯函数解析，无 db 依赖）**；③ `bench/perf.ts` —— **四读数并列落盘**（`bytesRead` / `codeRowsRead` / `memoryRowsRead` / `candidateUniverse`，`CountSummary` 分布、**判定取 `max`**）+ `breakdown`（含 `contentBytes`）⇒ **H1′ 判字节** | T04 T05 | **A5** 绿；**四读数并列落盘**（旧 H1 行数判据**降级为并列观测**，常量 `candidateReadRowsMax` / `candidateReadRowsRatioMax` **保留不删**）<br>⚠️ **本轮硬边界：零 `src/**` 改动**（含注释）⇒ 剪枝率分子改由 bench 侧 `get()` **调用次数**取得（定义上 ≡ `prune` 的 `exactReads`，等价性由 `tests/unit/prune.test.ts` 单测钉住）<br>⇒ **口径定稿**：`docs/design/perf-c2-t06-byte-metering.md`（**唯一权威**）＋ `docs/design/perf-c2-t06-byte-metering-spec.md`（施工规格） |
+| **T06** | bench 计数口径 + H1′ 判据 | ✅ **已落地（2026-11-05 · 提交 `b339534` + `58bde37`）**：① `bench/lib/harness.ts` —— `classifyReadKind()` **两个结论**（legacy 行读**逐位复现** + 字节来源**形状登记表**）、快照加 `calls`（`get()` **调用次数**）、字节**当场累加标量**（O(1) 内存）；② **`bench/lib/byteSources.ts`（新增 · 纯函数解析，无 db 依赖）**；③ `bench/perf.ts` —— **四读数并列落盘**（`bytesRead` / `codeRowsRead` / `memoryRowsRead` / `candidateUniverse`，`CountSummary` 分布、**判定取 `max`**）+ `breakdown`（含 `contentBytes`）⇒ **H1′ 判字节** | T04 T05 | **A5** 绿；**四读数并列落盘**（旧 H1 行数判据**降级为并列观测**，常量 `candidateReadRowsMax` / `candidateReadRowsRatioMax` **保留不删**）<br>⚠️ **本轮硬边界：零 `src/**` 改动**（含注释）⇒ 剪枝率分子改由 bench 侧 `get()` **调用次数**取得（定义上 ≡ `prune` 的 `exactReads`，等价性由 `tests/unit/prune.test.ts` 单测钉住）<br>⇒ **口径定稿**：`docs/design/perf-c2-t06-byte-metering.md`（**唯一权威**）＋ `docs/design/perf-c2-t06-byte-metering-spec.md`（施工规格）<br>⇒ ★ **独立验证**：QA 判定 `NoOne` · 11 条断言全通 · **34/34 打红实验全打红**（零恒绿守卫）⇒ ⇒ **实测值待 T07 冷 / 热两档重采回填** |
 | **T07** | 冷/热两档重采 + 质量曲线 | 只跑，不改码 | T06 | 见 §7「出关条件」 |
 
 ⚠️ **T04 与 T05 可以并行**（都只依赖 T01/T02），但 **T06 必须等两者都完** —— 否则采到的字节数缺一半。
@@ -203,7 +203,7 @@ return exact 转数组（结果键降序、同分 id 升序）
 
 ## §5.1 T04 实施规格（两段式可证剪枝）—— 施工定稿
 
-> **状态：已按本节实现（2026-11-05，未提交）。** 本节仍是契约的**权威文本**；实现与契约的 6 条差异见 **§5.1.11**。
+> **状态：已按本节实现并提交（2026-11-05 · `f9c966f`）。** 本节仍是契约的**权威文本**；实现与契约的 6 条差异见 **§5.1.11**。
 > 与 §4 冲突处以本节为准（§4 是算法意图 + 证明，本节是代码形状 + 代价）。
 > 每条「不这么定会怎样」**不是修辞**：那是我在写这一节时实际推出来的失效模式。
 
@@ -622,9 +622,9 @@ const scoreOf = (id: string): number | null => {
 那 T04 就退化成 HEAD（读 5,521 行的 3KB）⇒ **H1′ 直接红，而所有等价性断言全绿** ——
 这是本档最容易犯的错：**「结果对」与「收益在」是两件事，A1/A2 只测前者。**
 
-### 5.1.11 ★ T04 落地状态与 6 条偏离（2026-11-05，**代码已实现、未提交**）
+### 5.1.11 ★ T04 落地状态与 6 条偏离（2026-11-05，**代码已实现并提交 · `f9c966f`**）
 
-**状态**：`prune.ts` + `ivf.ts` 两段式 + 写路径接线 + `codesMissing` 已实现，**未 commit**。
+**状态**：`prune.ts` + `ivf.ts` 两段式 + 写路径接线 + `codesMissing` 已实现，**已 commit（`f9c966f` · 2026-11-04 18:30）**。
 改动面：**15 个代码/测试文件**（2 新增：`src/vector/prune.ts`(477 行)、`tests/unit/prune.test.ts`；
 13 修改：`src/vector/ivf.ts`、`src/store/dedupCandidates.ts`、`src/store/recall.ts`、`scripts/backfill-codes.ts` + 9 个测试）。
 ⇒ **本节 = 契约与实现的差异台账**。凡「实现比契约弱」的，都写在这里，**不许只活在提交 message 里**。
