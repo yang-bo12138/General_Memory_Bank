@@ -3,7 +3,9 @@
 > **归属**：`docs/decisions/adr-perf-recall-vs-h1.md` **§8 裁决**（2026-11-04）的施工落点。
 > **一句话**：把「桶内全量精确点积」换成「**先读 768B 的 int8 码算上界，只对可能入选的行读 3KB 原向量精确重排**」，
 > 用 Cauchy–Schwarz 给每一行一个**可证上界** ⇒ **结果与全量扫描逐位相同**，而字节量降到 1/4。
-> **状态**：设计（未开工）。**验收断言 A1~A8 一条都没跑过之前，本档的收益数字全部是 ⚠️推断。**
+> **状态**：**T01 / T02 已落地（2026-11-04）**，其余未开工。
+> **验收断言 A1~A8 一条都没跑过之前，本档的收益数字全部是 ⚠️推断。**
+> ⚠️ **T01 的落地形状与原计划不同**（更省一步），差异与理由见 §5 的 T01 行注。
 
 ---
 
@@ -122,8 +124,8 @@ return exact 转数组（cos 降序、同分 id 升序）
 
 | # | 任务 | 改哪里 | 依赖 | 完成判据 |
 |---|---|---|---|---|
-| **T01** | 码表 DDL + 迁移段 | `schema/002_vector_codes.sql`（新）；`scripts/migrate.ts` 加 `--phase codes-ddl` | — | 迁移可重复执行；`PRAGMA integrity_check` 通过 |
-| **T02** | 编码器 + 上界单测 | `src/vector/quantize.ts`（新）；`tests/unit/quantize.test.ts` | — | **A3 / A4** 绿 |
+| **T01** | 码表 DDL（**增量表**） | ✅ **已落地**：`schema/001_schema_v2.sql` + `schema/002_migration_v1_to_v2.sql` 各一段（带 `IF NOT EXISTS`）；运行时副本 `src/db/schema.sql.ts` 同步生成；`src/core/schema.ts` 加 `VECTOR_CODES_SQL`；`src/db/migrate.ts` 加 `ensureVectorCodesTable()` 并挂进 `ensureSchema()` 的三个分支 | — | `tests/unit/vector-codes-schema.test.ts` **6 条**：不在指纹表 / 形状对 / 两处 DDL 不漂移 / 存量库可补建 / 幂等 / 只读侧容忍缺表 |
+| **T02** | 编码器 + 上界单测 | ✅ **已落地**：`src/vector/quantize.ts`（`encodeVector` / `approxDot` / `upperBound` / `decodeVector` / `codeToBlob` / `blobToCode`）；`tests/unit/quantize.test.ts` **8 条** | — | **A3 / A4 绿**（10 万对零破界；eps 是真误差） |
 | **T03** | 回填脚本（分批、可断点） | `scripts/backfill-codes.ts`（新）；`package.json` 加 `codes:backfill` | T01 T02 | 1M 行回填完成；**A6** 绿；中断后重跑幂等 |
 | **T04** | 读取路径两段化 | `src/vector/ivf.ts`（`search()` / `scanBucketCandidates()`）；`src/vector/prune.ts`（新）；`IvfVectorBackendOptions.prune?: boolean`（缺省 `true`） | T01 T02 | **A1 / A2 / A7** 绿（`prune=false` 与 HEAD 逐位一致） |
 | **T05** | 写入路径维护码行（同事务） | `src/vector/bucketAssign.ts`（`assignBucket` / `unassignBucket` 里 delete+insert 码行）；`src/store/write.ts` 的调用点 | T01 T02 | **A6** 绿（换桶后 `fine_id` 集合相等） |
@@ -131,6 +133,19 @@ return exact 转数组（cos 降序、同分 id 升序）
 | **T07** | 冷/热两档重采 + 质量曲线 | 只跑，不改码 | T06 | 见 §7「出关条件」 |
 
 ⚠️ **T04 与 T05 可以并行**（都只依赖 T01/T02），但 **T06 必须等两者都完** —— 否则采到的字节数缺一半。
+
+> ⚠️ ★ **T01 落地时的形状变更（比原计划省掉一步，理由两条）**：
+> 原计划是「新建 `schema/002_vector_codes.sql` + 给 `scripts/migrate.ts` 加 `--phase codes-ddl`」。
+> 实际改成一件事：**DDL 直接进 001/002 两个脚本 + `ensureSchema()` 里幂等补建**。为什么更好：
+> ① **`ensureSchema()` 在 `user_version === 2` 时早退**（只校验、不重跑建库脚本）
+>   ⇒ 建库脚本里那行对**存量库**永远不执行 ⇒ 必须有一步「补建」，而它天然属于 `ensureSchema()`，
+>   不该让运维记着去跑一条 `--phase codes-ddl`（**忘了跑 ⇒ 码表不存在 ⇒ 读取路径静默走精确兜底 ⇒ 优化没生效而没人知道**）；
+> ② **`vector_codes` 刻意不进 `V2_NEW_TABLES`**（那张表是「这个库是不是 v2」的指纹）
+>   ⇒ 加进去会让**全部存量库**在 `assertV2TablesComplete()` 上抛错，而它们的数据其实完好。
+>   ⇒ 于是「建库 / 迁移 / 存量补建」三条路都通向同一张表，且**指纹仍是 9 张**。
+>   ⚠️ 代价（诚实记）：DDL 现在有**两份文字**（`schema/*.sql` 与 `src/core/schema.ts` 的 `VECTOR_CODES_SQL`）
+>   ⇒ 用一条测试钉死漂移：「去注释 + 压平空白后逐字相等」（`tests/unit/vector-codes-schema.test.ts` ③）。
+
 ⚠️ **不加 `Params` 开关**：`params` 现在是 **60 项且被三处副本 + 一条门禁守着**（`check:params` / `params.test.ts` / DESIGN §5）。
 为了「运行时可关」加第 61 项，成本是同步四处文档；而**构造选项 `prune` 已经够用**（A1/A2/A7 的对照就靠它）。
 ⇒ 生产环境的回滚手段 = `VECTOR_ROUTER='flat'`（已有）或代码回退，**不新增参数**。

@@ -132,6 +132,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_vcm_memory_unique ON vector_cell_members(m
                                                    --   ★ **一条记忆只属一个细桶**的最终防线。
 
 -- ═══════════════════════════════════════════════════════════════════════════
+-- ★ 码表（2026-11-04 · C′ 档的两段式第一级）—— 与建库脚本**逐字同形**
+-- ⚠️ 本表**不属于**「九张指纹表」；这里建它只是让「v1 → v2 的库」与「新建库」形状一致。
+-- ⚠️ 建出来是**空表** ⇒ 对既有行为零影响（读取路径遇到无码行走精确兜底）。
+-- ═══════════════════════════════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS vector_codes (
+  fine_id   TEXT NOT NULL REFERENCES vector_fine_cells(fine_id) ON DELETE CASCADE,
+  memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+  code      BLOB NOT NULL,                         -- 768 个 int8（小端有符号）；长度必须 == EMBED_DIM
+  scale     REAL NOT NULL,                         -- x̂ = scale × code；per-vector 单一标量 = max|x| / 127
+  eps       REAL NOT NULL,                         -- ★ 编码时**实算**的 ‖x − x̂‖₂（不是估算上界）
+  PRIMARY KEY (fine_id, memory_id)
+) WITHOUT ROWID;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vcode_memory_unique ON vector_codes(memory_id);
+
+-- ═══════════════════════════════════════════════════════════════════════════
 -- 归档缓存（§9.4）：把「何时归档」从**每次查询实时算**改成**一次算好、按索引取**
 -- ═══════════════════════════════════════════════════════════════════════════
 -- ★ 只装 `deleted = 0` 的行 ⇒ countArchived() 是纯索引扫描，不需要 JOIN memories。
