@@ -345,8 +345,26 @@ export interface VectorByteSample {
    *   ⇒ ⇒ 不等 ⇒ **`search()` 与 `route()` 看到的不是同一批桶** ⇒ ⇒ 落盘的
    *     `candidateUniverse` 对不上 ⇒ ⇒ **不可判定 ⇒ 判红**。
    *
-   * ⚠️ ★ **不许拿 `candidateUniverse` 当比较对象**：它是 `COUNT(DISTINCT memory_id)`
-   *   ⇒ 一个记忆落在多个命中桶时它**小于**成员行总数 ⇒ ⇒ 1M 规模下**不成立**。
+   * ⚠️ ★ **不许用 `bucketMemberRows === candidateUniverse`**（**读路径**）——
+   *   ⇒ ★ **理由不是「`COUNT(DISTINCT)` 会偏小」，而是「两个量【来源不同】」**：
+   *   `bucketMemberRows` = **计数器实测**（`search()` 侧真正扫的那批桶的成员行数）；
+   *   读路径的 `candidateUniverse` = **`COUNT(DISTINCT memory_id)`**
+   *   （**在计时窗口之外**、用**外层 `route()` 的 fineIds** 算的）
+   *   ⇒ ⇒ **两者不是同一批桶的同一个量** ⇒ ⇒ 互比 ⇒
+   *   **会把「`search()` 内部的路由 ≠ 外层 `route()` 的路由」这个真正的失配掩盖掉**
+   *   ⇒ ⇒ ★ **方向纪律**：两批桶的成员行数**恰好相等**时 ⇒ 互比 ⇒ **假绿**
+   *   ⇒ ⇒ **混用 ⇒ 这条守卫失明** ⇒ ⇒ **不许用这个比较**。
+   *
+   * ⚠️ ★★ **旧理由已废**（口径 §6.12 裁决 9 / §11 第 13 条）⇒ ⇒ **禁令不变、只换理由**：
+   *   旧理由是「`COUNT(DISTINCT)` 会偏小」⇒ ⇒ **那个前提在当前 schema 下【不成立】** ——
+   *   `vector_cell_members` 上有**唯一索引** `idx_vcm_memory_unique`
+   *   （`src/db/schema.sql.ts:352` / `schema/001_schema_v2.sql:335` /
+   *   `schema/002_migration_v1_to_v2.sql:129`）⇒ ⇒ **一条记忆只属一个细桶**
+   *   ⇒ ⇒ **同一批桶内 `COUNT(DISTINCT memory_id)` 恒等于 `COUNT(*)`（= 成员行总数）**
+   *   ⇒ ⇒ ⚠️ **被推翻的是「前提」、不是「禁令」**
+   *   ⇒ ⇒ ⚠️ **「它可能偏小」只作【防御性】理由保留**（唯一索引是 **schema 级不变式**
+   *   ⇒ ⇒ **可被人工 `DROP`** ⇒ 老库迁移前也可能缺 ⇒ ⇒ 那时这条禁令救场）
+   *   ⇒ ⇒ **理由栏不许把它写成当前事实**。
    */
   readonly bucketMemberRowsDerived: number | null;
   /** 码长 ≠ 768 的行数（**健康库恒 0** ⇒ 非 0 ⇒ 前提违例 ⇒ 判红）。 */
@@ -1422,13 +1440,32 @@ export function measurePerf(
   //   ② 两个量**同形可比**：都是「命中桶的成员行总数」
   //      （`readMemberIds()` 逐桶全量读、无 LIMIT；`membersOf()` = `countBucketMembers()`
   //      是桶计数的**唯一口径**）；
-  //   ③ ⚠️ **不许用 `bucketMemberRows === candidateUniverse`** —— 后者是
-  //      `COUNT(DISTINCT memory_id)` ⇒ 当一个记忆落在多个命中桶时它**小于**成员行总数
-  //      ⇒ ⇒ 1M 规模下**不成立**。
-  const readSamplesAligned = readSamplesAlignedOf(
-    readByteSamples.map((sample) => sample.bucketMemberRows),
-    readByteSamples.map((sample) => sample.bucketMemberRowsDerived),
-  );
+  //   ③ ⚠️ **不许用 `bucketMemberRows === candidateUniverse`**（**读路径**）——
+  //      ⇒ ★ **理由不是「`COUNT(DISTINCT)` 会偏小」，而是「两个量【来源不同】」**：
+  //      `bucketMemberRows` = **计数器实测**（`search()` 侧真正扫的那批桶的成员行数）；
+  //      读路径的 `candidateUniverse` = **`COUNT(DISTINCT memory_id)`**
+  //      （**在计时窗口之外**、用**外层 `route()` 的 fineIds** 算的）
+  //      ⇒ ⇒ **两者不是同一批桶的同一个量** ⇒ ⇒ 互比 ⇒
+  //      **会把「`search()` 内部的路由 ≠ 外层 `route()` 的路由」这个真正的失配掩盖掉**
+  //      ⇒ ⇒ ★ **方向纪律**：两批桶的成员行数**恰好相等**时 ⇒ 互比 ⇒ **假绿**
+  //      ⇒ ⇒ **混用 ⇒ 这条守卫失明** ⇒ ⇒ **不许用这个比较**。
+  //      ⚠️ ★★ **旧理由已废**（口径 §6.12 裁决 9 / §11 第 13 条）⇒ ⇒ **禁令不变、只换理由**：
+  //      旧理由是「`COUNT(DISTINCT)` 会偏小」⇒ ⇒ **那个前提在当前 schema 下【不成立】** ——
+  //      `vector_cell_members` 上有**唯一索引** `idx_vcm_memory_unique`
+  //      （`src/db/schema.sql.ts:352` / `schema/001_schema_v2.sql:335` /
+  //      `schema/002_migration_v1_to_v2.sql:129`）⇒ ⇒ **一条记忆只属一个细桶**
+  //      ⇒ ⇒ **同一批桶内 `COUNT(DISTINCT memory_id)` 恒等于 `COUNT(*)`（= 成员行总数）**
+  //      ⇒ ⇒ ⚠️ **被推翻的是「前提」、不是「禁令」**
+  //      ⇒ ⇒ ⚠️ **「它可能偏小」只作【防御性】理由保留**（唯一索引是 **schema 级不变式**
+  //      ⇒ ⇒ **可被人工 `DROP`** ⇒ 老库迁移前也可能缺 ⇒ ⇒ 那时这条禁令救场）
+  //      ⇒ ⇒ **理由栏不许把它写成当前事实**。
+  // ⚠️ ★★ **接线抽成纯函数**（`readSamplesAlignedInputs()`）⇒ ⇒ **接线本身可被测试看见**
+  //   ⇒ ⇒ ★ **为什么必须抽**：schema 的唯一索引保证同一批桶内 `candidateUniverse` 与
+  //   `bucketMemberRows` **数值相同** ⇒ ⇒ 接线若被改坏（喂错列 / 自比较）⇒ ⇒
+  //   **数值上看不出来** ⇒ ⇒ ⇒ 只能按【来源】验 ⇒ ⇒ ⇒ **接线必须能被单独调用**。
+  //   ⇒ ⇒ **语义零变化**（那两行 `map` 原样搬进那个纯函数 ⇒ 落盘值逐位不变）。
+  const readInputs = readSamplesAlignedInputs(readByteSamples);
+  const readSamplesAligned = readSamplesAlignedOf(readInputs.measured, readInputs.derived);
 
   // ⚠️ ★★ **写路径的字节读数**（★ H1′ / H2′ 的**唯一**判据量）。
   const writeVectorByteReads = buildVectorByteReads(
@@ -1495,6 +1532,8 @@ export function measurePerf(
       '**逐样本等于** **推算桶成员行**（`route()` 命中的桶各自 `countBucketMembers()` 之和）' +
       '⇒ ⇒ 不等 ⇒ `search()` 看到的桶与 `route()` 看到的不是同一批' +
       '⇒ ⇒ 落盘的 `candidateUniverse` 对不上 ⇒ ⇒ **不可判定 ⇒ 判红**；' +
+      '⇒ ⚠️ **不许用 `bucketMemberRows === candidateUniverse`**' +
+      '（读路径：二者【来源不同】—— 计数器 `search()` 侧实测 vs 外层 `route()` 侧的 COUNT(DISTINCT memory_id) ⇒ 互比会掩盖真正的失配 ⇒ 详见 §2 断言 1d 理由③）；' +
       '⚠️ ★ **读路径原先那条「字节样本数 == 计时样本数」是【恒真的】**' +
       '（两个 `push` 在同一个循环体内、无条件、无 `continue` / `break` ⇒ 长度必然相等' +
       '⇒ ⇒ 挂在判红守卫上却**永远打不红**）⇒ ⇒ **已换掉**；' +
@@ -1696,9 +1735,25 @@ function samplesAlignedOf(roundA: readonly number[], roundB: readonly number[]):
  *   ② 两个量**同形可比**：都是「命中桶的成员行总数」
  *      （`readMemberIds()` 逐桶全量读、无 LIMIT；`membersOf()` = `countBucketMembers()`
  *      是桶计数的**唯一口径**）；
- *   ③ ⚠️ **不许用 `bucketMemberRows === candidateUniverse`** —— 后者是
- *      `COUNT(DISTINCT memory_id)` ⇒ 当一个记忆落在多个命中桶时它**小于**成员行总数
- *      ⇒ ⇒ 1M 规模下**不成立**。
+ *   ③ ⚠️ **不许用 `bucketMemberRows === candidateUniverse`**（**读路径**）——
+ *      ⇒ ★ **理由不是「`COUNT(DISTINCT)` 会偏小」，而是「两个量【来源不同】」**：
+ *      `bucketMemberRows` = **计数器实测**（`search()` 侧真正扫的那批桶的成员行数）；
+ *      读路径的 `candidateUniverse` = **`COUNT(DISTINCT memory_id)`**
+ *      （**在计时窗口之外**、用**外层 `route()` 的 fineIds** 算的）
+ *      ⇒ ⇒ **两者不是同一批桶的同一个量** ⇒ ⇒ 互比 ⇒
+ *      **会把「`search()` 内部的路由 ≠ 外层 `route()` 的路由」这个真正的失配掩盖掉**
+ *      ⇒ ⇒ ★ **方向纪律**：两批桶的成员行数**恰好相等**时 ⇒ 互比 ⇒ **假绿**
+ *      ⇒ ⇒ **混用 ⇒ 这条守卫失明** ⇒ ⇒ **不许用这个比较**。
+ *      ⚠️ ★★ **旧理由已废**（口径 §6.12 裁决 9 / §11 第 13 条）⇒ ⇒ **禁令不变、只换理由**：
+ *      旧理由是「`COUNT(DISTINCT)` 会偏小」⇒ ⇒ **那个前提在当前 schema 下【不成立】** ——
+ *      `vector_cell_members` 上有**唯一索引** `idx_vcm_memory_unique`
+ *      （`src/db/schema.sql.ts:352` / `schema/001_schema_v2.sql:335` /
+ *      `schema/002_migration_v1_to_v2.sql:129`）⇒ ⇒ **一条记忆只属一个细桶**
+ *      ⇒ ⇒ **同一批桶内 `COUNT(DISTINCT memory_id)` 恒等于 `COUNT(*)`（= 成员行总数）**
+ *      ⇒ ⇒ ⚠️ **被推翻的是「前提」、不是「禁令」**
+ *      ⇒ ⇒ ⚠️ **「它可能偏小」只作【防御性】理由保留**（唯一索引是 **schema 级不变式**
+ *      ⇒ ⇒ **可被人工 `DROP`** ⇒ 老库迁移前也可能缺 ⇒ ⇒ 那时这条禁令救场）
+ *      ⇒ ⇒ **理由栏不许把它写成当前事实**。
  *
  * ⚠️ ★ **为什么 `derived` 允许 `null`**：写路径没有「推算桶成员行」这个量
  *   （写路径的对账量是**两轮 `candidateUniverse`**，见 `samplesAlignedOf()`）
@@ -1723,6 +1778,49 @@ export function readSamplesAlignedOf(
     }
     return value === other;
   });
+}
+
+/**
+ * ★ **读路径对账量的「接线」（抽成纯函数 ⇒ 接线本身可被测试看见）**。
+ *
+ * ⚠️ ★★★ **为什么必须抽成函数（接线被改坏时【数值上】看不出来）**：
+ *   `readSamplesAlignedOf()` 比的是「实测桶成员行」与「route 侧推算桶成员行」两个数组
+ *   ⇒ ⇒ 而 **schema 的唯一索引 `idx_vcm_memory_unique` 保证一条记忆只属一个细桶**
+ *   ⇒ ⇒ **同一批桶内 `candidateUniverse` 与 `bucketMemberRows` 的【数值相同】**
+ *   ⇒ ⇒ ⇒ ★ **接线若被改坏成「拿 `candidateUniverse` 当 `measured`」或「拿自己跟自己比」
+ *   ⇒ ⇒ ⇒ 在数值上【几乎不可能被发现】**（两个数恰好相等 ⇒ `samplesAligned` 照样是 `true`
+ *   ⇒ ⇒ ⇒ **守卫失明**）⇒ ⇒ ⇒ **守卫必须能看见「接线喂了【哪一列】」**
+ *   ⇒ ⇒ ⇒ **所以接线必须是能被单独调用的纯函数**（否则测试侧看不见它）。
+ *
+ * ⚠️ ★★ **两个数组的语义（**不许混**）**：
+ *   · `measured` = **计数器实测**的桶成员行（`sample.bucketMemberRows`
+ *     = `search()` 侧真正扫的那批桶的成员行数）；
+ *   · `derived` = **`route()` 侧推算**的桶成员行（`sample.bucketMemberRowsDerived`
+ *     = `route()` 命中的桶各自 `countBucketMembers()` 之和）。
+ *   ⇒ ⇒ **两者必须取自【不同的列】** ⇒ ⇒ **自比较（两个数组取自同一列）是无效对账**
+ *   ⇒ ⇒ ⇒ **接线被改成自比较 ⇒ 这个函数就能被抓出来**（门禁按列断言即可）。
+ *
+ * ⚠️ ★ **返回结构 = 两个【具名】数组**（**不是**匿名元组）⇒ ⇒ 门禁能按列断言
+ *   「`measured` 是不是 `bucketMemberRows` 那一列」与「`derived` 是不是
+ *   `bucketMemberRowsDerived` 那一列」⇒ ⇒ ⇒ **这才是「同值不同源」的守卫形态**
+ *   （★ 注意：schema 保证两者**数值相同** ⇒ ⇒ 只能按【来源】验，不能按【数值】验）。
+ *
+ * ⚠️ ★ **语义零变化**：本函数只是把 `measurePerf()` 里那两行 `map` 原样搬过来
+ *   ⇒ ⇒ **落盘值逐位不变** ⇒ ⇒ **机器凭据** = `handover/bench/check-json-note-fidelity.ts`
+ *   实跑仍是 `WRITE: true  READ: true`。
+ *
+ * @param samples 逐样本字节读数（**读路径**的样本）
+ * @returns 两个**具名**数组：`measured`（计数器实测的桶成员行）/
+ *   `derived`（`route()` 侧推算的桶成员行；`null` = 没算 ⇒ 不可判定）
+ */
+export function readSamplesAlignedInputs(samples: readonly VectorByteSample[]): {
+  measured: readonly number[];
+  derived: readonly (number | null)[];
+} {
+  return {
+    measured: samples.map((sample) => sample.bucketMemberRows),
+    derived: samples.map((sample) => sample.bucketMemberRowsDerived),
+  };
 }
 
 /**

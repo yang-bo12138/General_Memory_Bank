@@ -387,7 +387,7 @@ $ grep -n "readSamplesAligned" bench/perf.ts
 | ③ ★ **负控测试**（喂两个**不相等**的数组 ⇒ 必须返回 `false`） | `tests/bench/t06-byte-metering.test.ts` → `★ 读路径对账量的负控：readSamplesAlignedOf() 喂不相等的两个数组 ⇒ 必须返回 false（证明它不是恒绿守卫）` |
 | ④ **守卫生效（文案）** | `bench/perf.ts` `checkPerf()` 的读路径那条 ⇒ 「**实测桶成员行 ≠ 推算桶成员行 ⇒ `search()` 看到的桶与 `route()` 看到的不是同一批 ⇒ 落盘的 `candidateUniverse` 对不上 ⇒ 不可判定**」 |
 
-⚠️ ★ **为什么这个量有牙**（裁决落地 #1 的原文理由，已原样写进代码注释与读路径 note 的 ⑧）：
+⚠️ ★ **为什么这个量有牙**（裁决落地 #1 的原文理由；⚠️ ★ **T07 起第 ③ 条的理由已按 ① §6.12 裁决 9 换掉** ⇒ ⇒ 下面第 ③ 条与 `bench/perf.ts` 的三处代码注释、读路径 note 的 ⑧ 现在都写的是**「来源不同」那条** ⇒ ⇒ **禁令不变、只换理由**）：
 
 1. 读路径落盘的 `candidateUniverse` 来自 `countDistinctMembers(db, route() 的 fineIds)`
    （**在计时窗口之外**算），而字节来自 **`search()` 实际扫的桶**
@@ -396,8 +396,14 @@ $ grep -n "readSamplesAligned" bench/perf.ts
 2. 两个量**同形可比**：都是「命中桶的成员行总数」
    （`readMemberIds()` 逐桶全量读、无 LIMIT；`membersOf()` = `countBucketMembers()`
    是桶计数的**唯一口径**）；
-3. ⚠️ **不许用 `bucketMemberRows === candidateUniverse`** —— 后者是 `COUNT(DISTINCT memory_id)`
-   ⇒ 当一个记忆落在多个命中桶时它**小于**成员行总数 ⇒ ⇒ 1M 规模下**不成立**。
+3. ⚠️ **不许用 `bucketMemberRows === candidateUniverse`**（**读路径**）——
+   ⇒ ★ **理由 = 两个量【来源不同】**（计数器 `search()` 侧实测 vs 外层 `route()` 侧的
+   `COUNT(DISTINCT memory_id)`）⇒ ⇒ 互比**会把「`search()` 内部路由 ≠ 外层 `route()` 路由」
+   这个真正的失配掩盖掉** ⇒ ⇒ **守卫失明** ⇒ ⇒ **禁令不变、理由只有这一条**；
+   ⇒ ⇒ ★ **理由与「唯一索引」那条事实的全文只写在 ①**（① §2 断言 1d 理由③ +
+   ① §6.12 裁决 9 + ① §11 第 13 条）⇒ ⇒ **这里只指路、不抄一份**
+   （抄一份 = 多一份会漂移的副本）⇒ ⇒ ★ **同一套措辞的落点**：
+   `bench/perf.ts` 的三处代码注释 + 读路径 note 的 ⑧（**落盘字段**）。
 
 #### 11.5.1 ★ 实测数据（**裁决的经验闸门**：逐样本对照）
 
@@ -446,11 +452,17 @@ $ grep -n "readSamplesAligned" bench/perf.ts
 ⇒ ⇒ **同形可比**（**注意**：不是「去重后的成员数」——去重是 `readMemberIds()` 返回 `Set` 之后的事，
 计数器数的是**读到的行数**）。
 
-⚠️ ★ **为什么本轮 `candidateUniverse` 也恰好等于这两个数**（**不是**恒等，**只是本轮语料恰好如此**）：
-`candidateUniverse` = `COUNT(DISTINCT memory_id)` ⇒ 当**没有**一个记忆同时落在多个命中桶时
-它才等于成员行总数 ⇒ ⇒ **本轮 20 个样本里没有跨桶成员** ⇒ ⇒ 三者相等
-⇒ ⇒ **但这正是裁决明令「不许用 `candidateUniverse` 当比较对象」的原因**（1M 规模下跨桶成员会出现
-⇒ ⇒ `bucketMemberRows === candidateUniverse` 就会**不成立** ⇒ ⇒ 那种写法是**假绿**）。
+⇒ ⇒ ★ **为什么本轮 `candidateUniverse` 也恰好等于这两个数**（**不是「本轮语料恰好如此」**）：
+`candidateUniverse` = `COUNT(DISTINCT memory_id)` ⇒ ⇒ ★ **在当前 schema 下、同一批桶内
+它与成员行总数是【恒等】**（`vector_cell_members` 上有**唯一索引** ⇒ 一记忆只属一个细桶
+⇒ ⇒ 同一批桶内 `COUNT(DISTINCT)` 恒等于 `COUNT(*)`）⇒ ⇒ **所以「本轮三者相等」不是巧合
+而是【不变式】**（20/20 逐位相等、差值全 0 ⇒ 见上表）
+⇒ ⇒ ⇒ ★ **但这正是裁决明令「不许用 `candidateUniverse` 当比较对象」的原因** ——
+**理由 = 两个量【来源不同】**（计数器 `search()` 侧实测 vs 外层 `route()` 侧的
+`COUNT(DISTINCT memory_id)`）⇒ ⇒ 互比**会把「`search()` 内部路由 ≠ 外层 `route()` 路由」
+这个真正的失配掩盖掉** ⇒ ⇒ **守卫失明** ⇒ ⇒ **禁令不变、理由只有这一条**
+⇒ ⇒ ★ **理由与「唯一索引」那条事实的全文只写在 ①**（① §2 断言 1d 理由③ +
+① §6.12 裁决 9 + ① §11 第 13 条）⇒ ⇒ **这里只指路、不抄一份**。
 
 ## 12. 断言 × 落点 × 测试用例（**逐条对齐，一行都不许空**）
 
@@ -706,7 +718,7 @@ $ grep -n "readSamplesAligned" bench/perf.ts
     },
     "samplesAligned": true
   },
-  "note": "① ★ **口径**：`bytesRead` = **向量载荷字节**（码 BLOB + embedding BLOB 的**实测** `byteLength` 之和；**恒等式** `bytesRead = codeBytes + embeddingBytes`，零容差）；**不含**正文 / 标量 / 成员标识 / SQLite 行头与页开销 ⇒ ⇒ **是真实搬运量的【下界】⇒ 判据偏严、不会假绿**（口径 §1.3 裁决 A）；② ⚠️ ★ **ADR §8.6 那个 4.44 MB 也是【下界】** ⇒ ⇒ **实测大于它是预期、不是回归**（口径更严）；③ ★ **读路径**：无 Q4（survivors 的 `embedding` 只读一次）⇒ 字节构成 = 码字节 + `scoreOf` 的向量字节；④ **候选宇宙** = `COUNT(DISTINCT memory_id)`（**在计时窗口之外**执行）；⚠️ ★ **等价前提**：bench 的 `backend` 是**新建实例** ⇒ `overlay` 空；`backend.search(q, k)` **不带 filter** ⇒ 无 `excludeIds`、无时间窗 ⇒ **Q3 不发** ⇒ ⇒ 该值 **== `memberIds.size`**（逐位）⇒ **前提一破即不等**（口径 §1.7 / §13 第 3 条）；⑤ ⚠️ **读路径【不判门槛】**（与 R6 同组：观测值）⇒ 判据只在 `writeSegments.vectorByteReads`；⑥ ⚠️ ★ **剪枝率的分子（`embeddingCalls`）只在【两段式分支】与 `prune` 的 `exactReads` 定义性相等**；⚠️ ★ **方向纪律**：**绝不许用「返回行数」当分子**（偏小 = 偏松 = 假绿）；⑦ ★ **计时口径**：**读路径 = 单轮**（计数器**装着且在计数** + 计时 ⇒ **与 HEAD 逐字同形**）⇒ ⇒ **字节读数与毫秒数来自【同一个计时窗口】** ⇒ **字节与毫秒天然同源**；⚠️ ★ **因此**：`vectorRouteP99Ms` 与历史基线是**同量级而非逐位**（逐行字节计算的微小开销落在窗口里）⇒ 但相对每行 3 KB 的读取开销**可忽略（< 1%）** ⇒ **判门槛的 `vectorRouteP99Ms` 不受影响**；⑧ ★★ **读路径的对账量（口径裁决落地 #1）**：`samplesAligned` = **实测桶成员行**（计数器认领的「成员来源」行数 = `search()` 真正扫的桶）**逐样本等于** **推算桶成员行**（`route()` 命中的桶各自 `countBucketMembers()` 之和）⇒ ⇒ 不等 ⇒ `search()` 看到的桶与 `route()` 看到的不是同一批⇒ ⇒ 落盘的 `candidateUniverse` 对不上 ⇒ ⇒ **不可判定 ⇒ 判红**；⚠️ ★ **读路径原先那条「字节样本数 == 计时样本数」是【恒真的】**（两个 `push` 在同一个循环体内、无条件、无 `continue` / `break` ⇒ 长度必然相等⇒ ⇒ 挂在判红守卫上却**永远打不红**）⇒ ⇒ **已换掉**；⚠️ **注意：写路径才是两轮制**（轮 A 计时**不装**计数器 / 轮 B 计量**装**计数器）⇒ `samplesAligned` 的**两轮对账只在写路径有牙**（读路径的对账量是**上面第 ⑧ 条**）。"
+  "note": "① ★ **口径**：`bytesRead` = **向量载荷字节**（码 BLOB + embedding BLOB 的**实测** `byteLength` 之和；**恒等式** `bytesRead = codeBytes + embeddingBytes`，零容差）；**不含**正文 / 标量 / 成员标识 / SQLite 行头与页开销 ⇒ ⇒ **是真实搬运量的【下界】⇒ 判据偏严、不会假绿**（口径 §1.3 裁决 A）；② ⚠️ ★ **ADR §8.6 那个 4.44 MB 也是【下界】** ⇒ ⇒ **实测大于它是预期、不是回归**（口径更严）；③ ★ **读路径**：无 Q4（survivors 的 `embedding` 只读一次）⇒ 字节构成 = 码字节 + `scoreOf` 的向量字节；④ **候选宇宙** = `COUNT(DISTINCT memory_id)`（**在计时窗口之外**执行）；⚠️ ★ **等价前提**：bench 的 `backend` 是**新建实例** ⇒ `overlay` 空；`backend.search(q, k)` **不带 filter** ⇒ 无 `excludeIds`、无时间窗 ⇒ **Q3 不发** ⇒ ⇒ 该值 **== `memberIds.size`**（逐位）⇒ **前提一破即不等**（口径 §1.7 / §13 第 3 条）；⑤ ⚠️ **读路径【不判门槛】**（与 R6 同组：观测值）⇒ 判据只在 `writeSegments.vectorByteReads`；⑥ ⚠️ ★ **剪枝率的分子（`embeddingCalls`）只在【两段式分支】与 `prune` 的 `exactReads` 定义性相等**；⚠️ ★ **方向纪律**：**绝不许用「返回行数」当分子**（偏小 = 偏松 = 假绿）；⑦ ★ **计时口径**：**读路径 = 单轮**（计数器**装着且在计数** + 计时 ⇒ **与 HEAD 逐字同形**）⇒ ⇒ **字节读数与毫秒数来自【同一个计时窗口】** ⇒ **字节与毫秒天然同源**；⚠️ ★ **因此**：`vectorRouteP99Ms` 与历史基线是**同量级而非逐位**（逐行字节计算的微小开销落在窗口里）⇒ 但相对每行 3 KB 的读取开销**可忽略（< 1%）** ⇒ **判门槛的 `vectorRouteP99Ms` 不受影响**；⑧ ★★ **读路径的对账量（口径裁决落地 #1）**：`samplesAligned` = **实测桶成员行**（计数器认领的「成员来源」行数 = `search()` 真正扫的桶）**逐样本等于** **推算桶成员行**（`route()` 命中的桶各自 `countBucketMembers()` 之和）⇒ ⇒ 不等 ⇒ `search()` 看到的桶与 `route()` 看到的不是同一批⇒ ⇒ 落盘的 `candidateUniverse` 对不上 ⇒ ⇒ **不可判定 ⇒ 判红**；⇒ ⚠️ **不许用 `bucketMemberRows === candidateUniverse`**（读路径：二者【来源不同】—— 计数器 `search()` 侧实测 vs 外层 `route()` 侧的 COUNT(DISTINCT memory_id) ⇒ 互比会掩盖真正的失配 ⇒ 详见 §2 断言 1d 理由③）；⚠️ ★ **读路径原先那条「字节样本数 == 计时样本数」是【恒真的】**（两个 `push` 在同一个循环体内、无条件、无 `continue` / `break` ⇒ 长度必然相等⇒ ⇒ 挂在判红守卫上却**永远打不红**）⇒ ⇒ **已换掉**；⚠️ **注意：写路径才是两轮制**（轮 A 计时**不装**计数器 / 轮 B 计量**装**计数器）⇒ `samplesAligned` 的**两轮对账只在写路径有牙**（读路径的对账量是**上面第 ⑧ 条**）。"
 }
 ```
 
