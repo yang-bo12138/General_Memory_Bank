@@ -39,13 +39,26 @@
  * ⇒ ⇒ **图写坏了不会被任何门禁抓到**（`pnpm run verify` 照样 exit 0）
  * ⇒ ⇒ 本实现用**静态结构体检**兜底（首行 / 末行 / 嵌套围栏 / `%%` 形态）。
  *
- * 用法：
+ * ## ⚠️ ★ `--write` 是**幂等**的（为什么这条很重要）
+ *
+ * ⚠️ ★ **一个每次运行都弄脏工作区的工具，会把「工作区脏 ⇒ 一定有东西要查」这条信号变成噪声。**
+ *   而那正是本项目最核心的纪律之一 ⇒ ⇒ 所以 `--write` 的规则是：
+ *
+ *   · 先把权威版按锚点抽成**正文** ⇒ 与现有副本**逐字比对**：
+ *     · **正文一致 且 头部（除「抽取时刻」那一行）也一致** ⇒ ⇒ **一行都不改**（连「抽取时刻」都不动）
+ *       ⇒ ⇒ 「抽取时刻」记录的是【最后一次**正文真的变了**的时刻】，**不是**最后一次运行时刻；
+ *     · **正文变了 或 头部过时了**（例如头部还写着旧措辞 / 旧行号）⇒ ⇒ 才写盘，并**刷新「抽取时刻」**。
+ *
+ * ⇒ ⇒ 「只更新必要的那一行？⇒ **不** ⇒ 要么全不改，要么整体重写」⇒ ⇒ **跑一次 `--write`
+ *   不会在工作区留下任何痕迹**（除非权威版真的变了）。
+ *
+ * ## 用法
  *   tsx scripts/check-mermaid-copies.ts                # 校验（默认）
- *   tsx scripts/check-mermaid-copies.ts --write        # 按锚点重抽（重生成两份副本）
+ *   tsx scripts/check-mermaid-copies.ts --write        # 按锚点重抽（**幂等**：没变就一行都不改）
  *   tsx scripts/check-mermaid-copies.ts --self-test    # 自带正控 + 负控（证明这条守卫有牙）
  */
 
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -220,6 +233,19 @@ function describeFirstDiff(actual: string, expected: string): string {
     }
   }
   return '（逐行相同但总行数不同）';
+}
+
+/** 读副本头里「抽取时刻」那一行的原文（供自测判断它有没有被刷新）。 */
+function readStampOf(path: string): string {
+  try {
+    return (
+      readFileSync(path, 'utf8')
+        .split('\n')
+        .find((line) => line.includes(TIMESTAMP_MARK)) ?? '（无）'
+    );
+  } catch {
+    return '（读不到）';
+  }
 }
 
 // ── 结构体检（**替代不存在的 mermaid 解析器**）──
@@ -405,8 +431,12 @@ function checkCopies(options: CheckOptions): Report {
 
 // ── 生成副本（`--write`）──
 
-function buildCopyText(spec: CopySpec, block: string, timestamp: string): string {
-  const header = [
+/** 「抽取时刻」那一行的标记（**用它把时间戳从「可比对的头部」里摘掉**）。 */
+const TIMESTAMP_MARK = '抽取时刻：';
+
+/** 生成副本的**头部注释行**（含「抽取时刻」那一行）。 */
+function buildHeader(spec: CopySpec, timestamp: string): string[] {
+  return [
     `%% T06 ${spec.kind === 'class' ? '字节计量装置 · 类图' : '字节计量 · 写路径计量轮时序'}（C′ 档 · ADR §8.5 的 H1′ 判据）`,
     '%%',
     `%% ⚠️ ★★ **本文件是【抽取副本】，不是权威版** ⇒ 权威版 = ② \`${SOURCE_PATH}\` 的「${SECTION_HEADING}」节内（architect 独家维护）`,
@@ -414,9 +444,97 @@ function buildCopyText(spec: CopySpec, block: string, timestamp: string): string
     '%% ⇒ ⇒ **不要在本文件里改内容** ⇒ 要改改 ② §12 ⇒ 然后重新抽取（否则副本会漂移）',
     `%% ${anchorSourceLine(SOURCE_PATH, SECTION_HEADING)}`,
     `%%        ${anchorOrdinalLine(spec.ordinal, spec.role)}`,
-    `%% 抽取时刻：${timestamp}`,
+    `%% ${TIMESTAMP_MARK}${timestamp}`,
   ];
-  return `${header.join('\n')}\n${block}`;
+}
+
+function buildCopyText(spec: CopySpec, block: string, timestamp: string): string {
+  return `${buildHeader(spec, timestamp).join('\n')}\n${block}`;
+}
+
+/** 头部里**去掉「抽取时刻」**之后的部分（⇒ 这才是可逐字比对的部分）。 */
+function headerKeyOf(header: readonly string[]): string {
+  return header.filter((line) => !line.includes(TIMESTAMP_MARK)).join('\n');
+}
+
+interface WriteResult {
+  readonly path: string;
+  readonly state: 'written' | 'unchanged';
+  readonly detail: string;
+}
+
+/**
+ * 按锚点重抽两份副本（**幂等**）。
+ *
+ * ⚠️ ★ **正文与头部（除「抽取时刻」）都一致 ⇒ 一行都不改** ⇒ ⇒ 跑一次不会弄脏工作区
+ *   （「工作区脏 ⇒ 有东西要查」这条信号不能被工具噪声稀释）。
+ */
+function writeCopies(
+  sourcePath: string,
+  copies: readonly CopySpec[],
+): { results: WriteResult[]; error: string | null } {
+  let markdown = '';
+  try {
+    markdown = readFileSync(sourcePath, 'utf8');
+  } catch (error) {
+    return { results: [], error: `读不到权威版：${String(error)}` };
+  }
+
+  let section = '';
+  try {
+    section = extractSection(markdown, SECTION_HEADING);
+  } catch {
+    return { results: [], error: `权威版里找不到节标题「${SECTION_HEADING}」` };
+  }
+
+  const { blocks, unclosed } = extractMermaidBlocks(section);
+  if (unclosed) {
+    return { results: [], error: '权威版围栏不闭合 ⇒ 不重抽' };
+  }
+
+  const stamp = timestampNow();
+  const results: WriteResult[] = [];
+
+  for (const spec of copies) {
+    const block = blocks[spec.ordinal - 1];
+    if (block === undefined) {
+      return { results: [], error: `找不到第 ${spec.ordinal} 个 mermaid 块 ⇒ 不重抽` };
+    }
+
+    let existing: { header: string[]; body: string } | null = null;
+    try {
+      existing = splitCopy(readFileSync(spec.path, 'utf8').replace(/\n$/, ''));
+    } catch {
+      existing = null;
+    }
+
+    const expectedHeaderKey = headerKeyOf(buildHeader(spec, stamp));
+    const bodySame = existing !== null && existing.body === block;
+    const headerSame = existing !== null && headerKeyOf(existing.header) === expectedHeaderKey;
+
+    if (bodySame && headerSame) {
+      results.push({
+        path: spec.path,
+        state: 'unchanged',
+        detail: '正文与头部（除「抽取时刻」）都逐字一致 ⇒ 一行都不改',
+      });
+      continue;
+    }
+
+    writeFileSync(spec.path, `${buildCopyText(spec, block, stamp)}\n`, 'utf8');
+    results.push({
+      path: spec.path,
+      state: 'written',
+      detail:
+        existing === null
+          ? '副本原先不存在 ⇒ 新建'
+          : bodySame
+            ? '正文一致但**头部过时** ⇒ 重写头部并刷新「抽取时刻」'
+            : '正文有变 ⇒ 已写盘并刷新「抽取时刻」',
+    });
+  }
+
+  return { results, error: null };
 }
 
 function timestampNow(): string {
@@ -632,6 +750,52 @@ function runSelfTest(): number {
       }
     }
 
+    // ── 写盘路径自测（正例 + 幂等）──
+    //   ★ 这两条合起来才证明「--write 不会弄脏工作区」：
+    //     ① 正例：正文真的变了 ⇒ 必须写盘、且**刷新「抽取时刻」**（证明写盘路径没被写死）；
+    //     ② 幂等：紧接着再跑一次 ⇒ 必须**零改动**（内容逐字节不变 + mtime 不变）。
+    {
+      // ① 正例：先把副本正文改坏 ⇒ --write 必须写盘并刷新「抽取时刻」
+      write({ ...base, classCopy: base.classCopy.replace('+value number', '+value numbe') });
+      const stampBefore = readStampOf(classPath);
+      const first = writeCopies(sourcePath, specs);
+      const stampAfter = readStampOf(classPath);
+      const firstState = first.results[0]?.state;
+      if (firstState === 'written' && stampBefore !== stampAfter) {
+        process.stdout.write(
+          '✅ 写盘正例：副本正文有变 ⇒ --write **写盘**且**刷新了「抽取时刻」**（写盘路径没被写死）\n',
+        );
+      } else {
+        failures += 1;
+        process.stdout.write(
+          `✗ 写盘正例失败（state=${firstState ?? '（无）'} · 时刻前=${stampBefore} 后=${stampAfter}）\n`,
+        );
+      }
+
+      // ② 幂等：紧接着再跑一次 ⇒ 必须零改动
+      const contentBefore = readFileSync(classPath, 'utf8');
+      const mtimeBefore = statSync(classPath).mtimeMs;
+      const second = writeCopies(sourcePath, specs);
+      const contentAfter = readFileSync(classPath, 'utf8');
+      const mtimeAfter = statSync(classPath).mtimeMs;
+      const secondState = second.results[0]?.state;
+      // ⚠️ `state` 才是**判定依据**（内容比较可能被「同一秒内写盘 ⇒ 时间戳相同」掩盖）
+      if (
+        secondState === 'unchanged' &&
+        contentBefore === contentAfter &&
+        mtimeBefore === mtimeAfter
+      ) {
+        process.stdout.write(
+          '✅ 幂等：紧接着第二次 --write ⇒ **零改动**（内容逐字节不变 + mtime 不变）⇒ 不弄脏工作区\n',
+        );
+      } else {
+        failures += 1;
+        process.stdout.write(
+          `✗ 幂等失败（state=${secondState ?? '（无）'} · 内容相同=${contentBefore === contentAfter} · mtime 相同=${mtimeBefore === mtimeAfter}）\n`,
+        );
+      }
+    }
+
     // ── 负控：每个都必须报出**对应类别**（证明夹具真的进了判定路径）──
     for (const control of NEGATIVE_CONTROLS) {
       write(control.mutate(base));
@@ -684,28 +848,14 @@ function runCli(argv: readonly string[]): number {
   ];
 
   if (argv.includes('--write')) {
-    let markdown = '';
-    try {
-      markdown = readFileSync(sourcePath, 'utf8');
-    } catch (error) {
-      process.stderr.write(`✗ 读不到权威版：${String(error)}\n`);
+    const outcome = writeCopies(sourcePath, copies);
+    if (outcome.error !== null) {
+      process.stderr.write(`✗ ${outcome.error}\n`);
       return 1;
     }
-    const section = extractSection(markdown, SECTION_HEADING);
-    const { blocks, unclosed } = extractMermaidBlocks(section);
-    if (unclosed) {
-      process.stderr.write('✗ 权威版围栏不闭合 ⇒ 不重抽\n');
-      return 1;
-    }
-    const stamp = timestampNow();
-    for (const spec of copies) {
-      const block = blocks[spec.ordinal - 1];
-      if (block === undefined) {
-        process.stderr.write(`✗ 找不到第 ${spec.ordinal} 个 mermaid 块 ⇒ 不重抽\n`);
-        return 1;
-      }
-      writeFileSync(spec.path, `${buildCopyText(spec, block, stamp)}\n`, 'utf8');
-      process.stdout.write(`  已按锚点重抽：${spec.path}\n`);
+    for (const result of outcome.results) {
+      const verb = result.state === 'written' ? '已按锚点重抽' : '未改动（幂等）';
+      process.stdout.write(`  ${verb}：${result.path}（${result.detail}）\n`);
     }
   }
 

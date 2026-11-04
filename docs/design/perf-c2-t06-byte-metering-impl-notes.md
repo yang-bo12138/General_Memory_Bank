@@ -740,18 +740,23 @@ $ grep -n "readSamplesAligned" bench/perf.ts
 
 ## 14. 校验结果（**命令 × 结果**）
 
-> ⚠️ **下面是「裁决落地 #1」最终轮的【亲自重跑】的真实输出**（不是引述上一轮的；**每条命令本轮都亲自跑过**）。
+> ⚠️ **下面是「裁决落地 #1 + QA 的 P1 + 注释机器守卫」最终轮的【亲自重跑】的真实输出**（不是引述上一轮的；**每条命令本轮都亲自跑过**）。
+> ⚠️ ★ **实测时间窗**：2026-11-04 **22:00 ~ 22:08**（⇒ 与 team-lead / QA 的任何一次运行**都不重叠** ⇒ ⇒ 下面每个数字都对应**磁盘上的当前快照**）。
 
 | 命令 | 真实输出（原文） | 结果 |
 |---|---|---|
-| `pnpm run lint` | `$ biome check .` / `Checked 253 files in 490ms. No fixes applied.` | ✅ **exit 0** |
+| `pnpm run lint` | `$ biome check .` / `Checked 254 files in 586ms. No fixes applied.` | ✅ **exit 0** |
 | `pnpm run typecheck` | `$ tsc --noEmit`（**无任何输出**） | ✅ **exit 0** |
-| `pnpm exec vitest run tests/bench/t06-byte-metering.test.ts tests/bench/h1-measurement.test.ts tests/unit/prune.test.ts` | `Test Files  3 passed (3)` / `Tests  77 passed (77)` / `Duration  89.82s` | ✅ **exit 0**（**77 = 75 + 本轮新增 2 条**：读路径对账量的负控 + 口径张力钉死） |
-| `pnpm exec vitest run tests/contracts/table-name-boundary.test.ts` | `Test Files  1 passed (1)` / `Tests  3 passed (3)` / `Duration  731ms` | ✅ **exit 0** |
+| `pnpm exec vitest run tests/bench/t06-byte-metering.test.ts tests/bench/h1-measurement.test.ts tests/unit/prune.test.ts` | `Test Files  3 passed (3)` / `Tests  79 passed (79)` / `Duration  146.95s` | ✅ **exit 0**（**79 = 77 + 本轮新增 2 条**：形状逐判定的**负控** + 「注释说谎」的**机器守卫**） |
+| `pnpm exec vitest run tests/bench/t06-byte-metering.test.ts -t "机器守卫"` | `Test Files  1 passed (1)` / `Tests  1 passed | 42 skipped (43)` / `Duration  7.55s` | ✅ **exit 0**（★ **单独点名跑** ⇒ 证明这条守卫**真的在被执行**，不是「文件名对但没跑」） |
+| `pnpm exec vitest run tests/contracts/table-name-boundary.test.ts` | `Test Files  1 passed (1)` / `Duration  2.01s` | ✅ **exit 0** |
 | `pnpm run check:params`（★ 仍 60 项） | `§5 解析出的参数条数：60` / `DEFAULT_PARAMS 的键数：60` / `✓ §5 表与 DEFAULT_PARAMS 逐键逐值相等` | ✅ **exit 0** |
 | `git diff --stat src/`（★ **必须为空**） | **无任何输出**（`wc -l` = **0**） | ✅ **空** |
-| `pnpm run verify` | 末行 `✅ 全部负控符合预期 ⇒ 审计脚本**有判别力**（不是恒绿守卫）`；`VERIFY_EXIT=0` | ✅ **exit 0** |
-| `pnpm test` | `Test Files  97 passed (97)` / `Tests  1957 passed (1957)` / `Duration  108.27s` | ✅ **exit 0**（**1957 = 1955 + 本轮新增 2 条**） |
+| `pnpm run verify` | 末行 `✅ 全部负控符合预期 ⇒ 审计脚本**有判别力**（不是恒绿守卫）`；`VERIFY_EXIT=0`（整体 2 分 29 秒） | ✅ **exit 0** |
+| `pnpm test`（`verify` 内那一轮） | `Test Files  97 passed (97)` / `Tests  1959 passed (1959)` / `Duration  98.20s` | ✅ **exit 0**（**1959 = 1957 + 本轮新增 2 条**） |
+| `pnpm exec tsx .tmp/bench/check-json-note-fidelity.ts`（★ 只读自检） | `JSON note 块数量：2` / `note[0]（1560 字）在 bench/perf.ts 中逐字命中：true` / `note[1]（1287 字）在 bench/perf.ts 中逐字命中：true` / `WRITE: true  READ: true` | ✅ **§13 的 JSON 与 `bench/perf.ts` 的 note 逐字一致**（⇒ 它不是手写样例） |
+| **章节引用消歧**（3 条 `grep -c`） | **0 / 0 / 0**（★ 三条**全部清零** ⇒ 「§N 指向不唯一」的坑已堵死；⚠️ **本行故意不写出那三条 grep 的模式原文** ⇒ ⇒ 否则本行会**命中它自己** ⇒ ⇒ 下一个人复跑会得到 **1** 而不是 **0** ⇒ ⇒ **模式见 §0 的「引用纪律」表**（那里列了哪几种前缀算**作废写法**）⇒ ⇒ 复跑命令：`grep -c "作废前缀1" …` 之类，**自己拼**） |
+
 
 ⚠️ ★ **另附一次真实落盘运行**（证明 §13 的 JSON 不是手写样例）：
 ```
@@ -799,9 +804,9 @@ $ pnpm exec tsx bench/perf.ts --scale=2000 --queries=20 --writes=20 --allow-smal
 | ② 遗留 TODO / 调试代码 / `console.log`？ | ✅ 无（临时脚本已删；上一轮那段**临时诊断打印**（`T06_DIAG`）**采样完已删** ⇒ `grep -rn "T06_DIAG" bench/ tests/` = **0 命中**；⚠️ **本轮的采样改用「另写一个只读脚本」**（`.tmp/bench/read-align-diag.ts` ⇒ **gitignored** ⇒ **仓库源码一个字没动** ⇒ ⇒ **零「改文件瞬间」窗口** ⇒ ⇒ **不会撞出假红的 verify**）；`bench/**` 里只有 `main()` 的 stdout 打印 ⇒ 那是**产物**，不是调试残留） |
 | ③ 注释里的「为什么」说清？ | ✅ 说清了（尤其：为什么读路径单轮 / 写路径两轮、`calls` 为什么无条件、载荷字节为什么只记一次、为什么 `bucketCandidate` 只做防御、为什么标量列 = 0 字节）⇒ ⚠️ **原先那句【说谎】的注释已删**（「仍有牙：漏采一个样本就红」⇒ **恒真 ⇒ 说谎**）⇒ ⇒ 换成**裁决落地 #1 的三条理由**（原文照抄进代码注释与读路径 note 的 ⑧）；★ **并且已加一条「机器守卫」**（QA 登记 1 的建议 ⇒ §15 ⑮）⇒ ⇒ **「注释说谎」从此不再是靠人记得去读**：凡是提到那条已废口径的地方，**必须同时否定它** ⇒ ⇒ 违反即打红（守卫自己带负控 ⇒ 不是恒绿） |
 | ④ 计时口径未被破坏？ | ✅ **读路径**：逐字回到 HEAD（装计数器 + 计数 + 计时）⇒ **口径同源**（代价 = 逐行字节计算的微小开销 < 1% ⇒ 已如实写进 note）；✅ **写路径**：两轮制 ⇒ 轮 A **不装**计数器 ⇒ **与历史基线逐位可比**；⚠️ ⚠️ **读路径的「对账量」变了**（**不是计时口径变了**）⇒ ⇒ **计时窗口一个字没动**（仍是 `route()` 之后、`search()` 前后那两行） |
-| ⑤ 既有测试仍全绿？ | ✅ 全绿（`pnpm test` **97 文件 / 1957 用例**全过 · exit 0；三个目标文件 **3 文件 / 77 用例**全过）⇒ ⇒ **1957 = 1955 + 本轮新增 2 条**（读路径对账量的**负控** + **口径张力钉死**） |
+| ⑤ 既有测试仍全绿？ | ✅ 全绿（`pnpm test` **97 文件 / 1959 用例**全过 · exit 0；三个目标文件 **3 文件 / 79 用例**全过）⇒ ⇒ **1959 = 1957 + 本轮新增 2 条**（① 形状逐判定的**负控** —— QA 的 P1 ⇒ §15 ⑭；② **「注释说谎」的机器守卫** ⇒ §15 ⑮）⇒ ⇒ ⚠️ **这两条都各自带负控** ⇒ ⇒ **不是恒绿守卫** |
 | ⑥ 旧落盘键一个都没动？ | ✅ **零删除、只新增**（**机器比对**：`HEAD` vs 当前，三个结构的键名集合做 `comm` 差集 ⇒ **DELETED 集合为空**）—— `THRESHOLDS`：DELETED **空** / ADDED = `bytesReadMax` / `bytesReadRatioMax` / `pruneRateMax`；`WriteSegmentSummary`：DELETED **空** / ADDED = `vectorByteReads`；`PerfResult`：DELETED **空** / ADDED = `vectorRouteByteReads`；`GateRegrouping`：DELETED **空** / ADDED **空**（**逐字未动**）；⚠️ `candidateReadRowsMax` / `candidateReadRowsRatioMax` **两个常量按要求保留不删**；⚠️ **本轮新增的 `VectorByteSample.bucketMemberRowsDerived` 是【样本层】字段，不是落盘键** ⇒ ⇒ **落盘结构零变化**（`samplesAligned` 的**名字 / 类型 / 位置**都没动，只换了「怎么算」） |
 | ⑦ `Params` 仍 60 项？ | ✅（`pnpm run check:params` 绿；本轮**没碰** `src/core/params.ts`） |
 | ⑧ **`src/**` 零改动？**（★ 断言 4） | ✅ **`git diff --stat src/` 为空**（连注释都没动） |
 
-**IS_PASS: YES（第二段 · 裁决落地 #1）**
+**IS_PASS: YES（第二段 · 裁决落地 #1 + QA 的 P1 闭环 + 「注释说谎」机器守卫）**
