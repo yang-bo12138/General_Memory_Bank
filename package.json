@@ -35,6 +35,7 @@
     "check:contract-ids": "tsx scripts/check-contract-ids.ts",
     "check:clamp": "tsx scripts/check-clamp.ts",
     "check:mermaid-copies": "tsx scripts/check-mermaid-copies.ts",
+    "check:json-note": "tsx scripts/check-json-note-fidelity.ts",
     "audit:tier-qualifiers": "tsx scripts/audit-tier-qualifiers.ts",
     "audit:two-layer": "tsx scripts/audit-two-layer.ts",
     "audit:negative-control": "tsx scripts/audit-tier-qualifiers.negative-control.ts",
