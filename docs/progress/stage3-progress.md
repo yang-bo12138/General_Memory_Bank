@@ -1,5 +1,6 @@
 # 阶段 3（P3 · 神经元交互）进度与交接账
 
+> ⚠️ **口径更新（2026-11-05 · T06 · 字节口径）**：本文件的 H1 / H2 按**行**口径记录（**历史事实，正文一个字未改**）；自 T06 起判据改为**字节**口径 —— **唯一判据 = H1′ = `bytesRead.max ≤ 6,144,000 B`**（判定取 `max` · 只计向量载荷 ⇒ 是真实搬运量的**下界** ⇒ 判据偏严、不会假绿），旧行数口径**降级为并列观测**（常量 `candidateReadRowsMax` / `candidateReadRowsRatioMax` **保留不删**、不再判红绿）⇒ 口径唯一权威 = `docs/design/perf-c2-t06-byte-metering.md`。
 > 时点：2026-11-02（Asia/Shanghai）
 > 仓库：`General_Memory_Bank` · 分支 `docs/stage3-closing`（基于 `origin/main` = `93d4f1b`）
 > 验收证据：`docs/qa/p3-t02-acceptance-report.md` · `docs/qa/p3-t06-acceptance-report.md`

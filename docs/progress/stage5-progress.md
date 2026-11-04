@@ -1,5 +1,6 @@
 # 阶段 5（P5 · 只读查看器与服务集成）进度与交接账
 
+> ⚠️ **口径更新（2026-11-05 · T06 · 字节口径）**：本文件的 H1 / H2 按**行**口径记录（**历史事实，正文一个字未改**）；自 T06 起判据改为**字节**口径 —— **唯一判据 = H1′ = `bytesRead.max ≤ 6,144,000 B`**（判定取 `max` · 只计向量载荷 ⇒ 是真实搬运量的**下界** ⇒ 判据偏严、不会假绿），旧行数口径**降级为并列观测**（常量 `candidateReadRowsMax` / `candidateReadRowsRatioMax` **保留不删**、不再判红绿）⇒ 口径唯一权威 = `docs/design/perf-c2-t06-byte-metering.md`。
 > 时点：2026-11-02（Asia/Shanghai）· **已合入 `main`（merge commit `9a3eec9`，PR #5）** · 开发分支 `feat/p5-verify-integrity`
 > ★ **后续轮次（2026-11-03）**：矢量路**已接进 `recall()`**（分支 `perf/ivf-single-pass` · PR #6）
 > ⇒ 本文件的 **82 文件 / 1,738 断言** 是**阶段 5 收官时**的读数（当前为 **90 / 1,832**）；

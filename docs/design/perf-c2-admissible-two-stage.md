@@ -178,7 +178,7 @@ return exact 转数组（结果键降序、同分 id 升序）
 | **T03** | 回填脚本（分批、可断点） | ✅ **已落地（2026-11-04）**：`scripts/backfill-codes.ts`（`pnpm codes:backfill`）；`tests/integration/backfill-codes.test.ts`（**26 条**） | T01 T02 | 1M 回填完成（**1,000,000 / 73.42s / 库 +944.2 MB**）；**A6** 绿；中断后重跑幂等（`encoded=0`） |
 | **T04** | 读取路径两段化 | ✅ **已实现（未提交）** —— 契约见 **§5.1**、差异台账见 **§5.1.11**、待裁见 **§5.1.12**。改哪里：`src/vector/prune.ts`（新）；`src/vector/ivf.ts`（`search()` / `scanBucketCandidates()` / 新增 `readCodes()`·`buildSurvivorSql()`·`countUncodedCandidates()`）；`IvfVectorBackendOptions.prune?: boolean`（缺省 `true`）；**`src/store/dedupCandidates.ts:303` 加一个 options 实参（唯一一行非向量层改动）**；`src/store/recall.ts` 两行（`explain.routes.vector.codesMissing` 接线） | T01 T02 | **A1 / A2 / A7 / A8** 绿（`prune=false` 与 HEAD 逐位一致） |
 | **T05** | 写入路径维护码行（同事务） | ✅ **已落地（2026-11-04）**：`src/vector/bucketAssign.ts` 的 `assignBucket()` 现在在**同一事务**里 `writeCodeRow()`（先删旧码行 → 按**本次**向量重编码 → 插新行），`unassignBucket()` 里 `clearCodeRows()`；`fineId === null` 早退分支**删码行**（fail-open）。`src/store/updateContent.ts` 收敛成只调这两个函数（**不再删码**，因为 `assignBucket` 会重编码）。 | T01 T02 | ✅ A6 活域相等；✅ `grep -c vector_codes src/store/write.ts` == 0；✅ `check:bucket-write` 扫到 `bucketAssign.ts` 的码行写入（4 处）；✅ 6 条新断言（换桶跟随 / 重编码 / 退桶删码 / 未训练早退删码 / updateContent 同桶重编码 / 旧码反证） |
-| **T06** | bench 计数口径 + H1′ 判据 | `bench/lib/harness.ts:977 classifyReadKind()`（认 `vector_codes`，并**按 SQL 分别累计字节**）；`bench/perf.ts`（落盘 `bytesRead` / `codeRowsRead` / `memoryRowsRead` / `candidateUniverse`；H1′ 判字节） | T04 T05 | **A5** 绿；三读数并列落盘 |
+| **T06** | bench 计数口径 + H1′ 判据 | 🔨 **施工中（2026-11-05 · 口径已冻结）**：① `bench/lib/harness.ts` —— `classifyReadKind()` **两个结论**（legacy 行读**逐位复现** + 字节来源**形状登记表**）、快照加 `calls`（`get()` **调用次数**）、字节**当场累加标量**（O(1) 内存）；② **`bench/lib/byteSources.ts`（新增 · 纯函数解析，无 db 依赖）**；③ `bench/perf.ts` —— **四读数并列落盘**（`bytesRead` / `codeRowsRead` / `memoryRowsRead` / `candidateUniverse`，`CountSummary` 分布、**判定取 `max`**）+ `breakdown`（含 `contentBytes`）⇒ **H1′ 判字节** | T04 T05 | **A5** 绿；**四读数并列落盘**（旧 H1 行数判据**降级为并列观测**，常量 `candidateReadRowsMax` / `candidateReadRowsRatioMax` **保留不删**）<br>⚠️ **本轮硬边界：零 `src/**` 改动**（含注释）⇒ 剪枝率分子改由 bench 侧 `get()` **调用次数**取得（定义上 ≡ `prune` 的 `exactReads`，等价性由 `tests/unit/prune.test.ts` 单测钉住）<br>⇒ **口径定稿**：`docs/design/perf-c2-t06-byte-metering.md`（**唯一权威**）＋ `docs/design/perf-c2-t06-byte-metering-spec.md`（施工规格） |
 | **T07** | 冷/热两档重采 + 质量曲线 | 只跑，不改码 | T06 | 见 §7「出关条件」 |
 
 ⚠️ **T04 与 T05 可以并行**（都只依赖 T01/T02），但 **T06 必须等两者都完** —— 否则采到的字节数缺一半。
@@ -358,7 +358,9 @@ export function pruneTopK(entries: readonly PruneEntry[], options: PruneOptions)
 | **Q2 码池** | 新增 `readCodes(db, fineIds)` | `SELECT vc.memory_id AS id, vc.code, vc.scale, vc.eps FROM vector_codes vc WHERE vc.fine_id IN (...)` | ❌ ★ | 两路都吃它做剪枝 |
 | **Q3 窄列 gate** | 新增 `readGateColumns(db, ids)` | `SELECT id, last_access, pin_factor FROM memories WHERE id IN (...)` | ✅（窄列） | **只有读路径、且只在不带窗口时跳过** |
 | **Q4 survivors 整行（写）** | 新增 `buildSurvivorSql(ids)` | `SELECT m.id, m.content, m.content_tokens, m.stability, m.last_access, m.access_count, m.difficulty, m.embedding FROM memories m WHERE m.id IN (...) AND m.deleted = 0 AND m.embedding IS NOT NULL` | ✅（整行） | 写路径 survivors（~K 条） |
-| **Q5 survivors 整行（读）** | **复用** `readCandidateRows(ids)`（`ivf.ts:844`） | 原样（`id, embedding, last_access, pin_factor`，带 `deleted = 0 AND embedding IS NOT NULL`） | ✅（整行） | 读路径 survivors（~k 条） |
+| **Q5 survivors 整行（读）** | **复用** `readCandidateRows(ids)`（`ivf.ts:844`） | 原样（`id, embedding, last_access, pin_factor`，带 `deleted = 0 AND embedding IS NOT NULL`） | ✅（整行） | ⚠️ **生产读路径不使用；仅 `prune=false` 对照分支用** —— `readCandidateRows()` 的**唯一**调用点是 `ivf.ts:1110` 的 `searchExactBuckets()` ⇒ `searchPruned()` **不发这条 SQL** ⇒ 读路径 survivors 的 `embedding` **只读一次**（`scoreOf` 那次）⇒ **不补 Q5**（`pruneTopK()` 的 `out.survivors` 已带 `score`，`searchPruned()` 不消费 `embedding`/正文 ⇒ 补它是**无消费者的白读** `k × 3,072 B`） |
+
+⚠️ ★ **限定：下面这三句只对【写路径】成立**（**读路径无 Q5** ⇒ `readCandidateRows()` 只被 `prune=false` 对照分支用 ⇒ 读路径 survivors 的 `embedding` **只读一次**（`scoreOf` 那次）⇒ **没有第二次读、也没有那 `0.20MB`**）：
 
 ★ **两条 SQL 的分工不许混**：`scoreOf` 逐条读 `embedding`（5.1.10），**Q4/Q5 又为 survivors 批量读一次整行**
 ⇒ survivors 的 `embedding` 被读**两次**。这是**刻意**的（不缓存 ⇒ 峰值内存只与一条向量成正比，与 HEAD 的内存纪律一致），
@@ -744,7 +746,7 @@ lonelyCodes / fineIdDrift 同样 JOIN memories 且 m.deleted = 0
 | # | 风险 | 处置 |
 |---|---|---|
 | **R1** | 浮点求和顺序打破上界（A3 偶发红） | `eps` 落库前 `+1e-6`；A3 用 1e5 样本 |
-| **R2** | **剪枝率未测** ⇒ `bytesRead` 可能达不到预估的 ≈4.8MB（订正后，见 §5.1.2 的预算复算） | 出关条件①：1M 实测 `bytesRead` ≤ 6.14MB **且** 剪枝率（`exactReads / candidates`，口径见 §5.1.10）**≤ 15%** |
+| **R2** | **剪枝率未测** ⇒ `bytesRead` 可能达不到预估的 ≈4.8MB（订正后，见 §5.1.2 的预算复算） | 出关条件①：1M 实测 **`bytesRead.max` ≤ 6,144,000 B**（= 原 2,000 行 × 3,072 B；**判定取 `max`**；**只计向量载荷** = 码 BLOB + embedding BLOB 的实测 `byteLength` ⇒ 是真实搬运量的**下界** ⇒ 判据偏严、不会假绿）**且** 剪枝率 **≤ 15%**（分母 = `candidateUniverse`；★ 分子 = **`embeddingCalls`（bench 侧 `get()` 调用次数）= 定义上等于 `prune` 的 `exactReads`** ⇒ ⚠️ **不许用「返回行数」**——偏小 = 偏松 = 假绿；口径见 §5.1.10 与 `docs/design/perf-c2-t06-byte-metering.md` §1.7） |
 | **R3** | **码宽未选**：int8（768B）只到约 8~14 倍，瓶颈从 IO 转到 CPU；更窄的码（PQ/二值）`eps` 更大 ⇒ 剪枝率更差 | 出关条件②：先出「码宽 ↔ ε ↔ 剪枝率 ↔ 延迟」四列表（这是选码宽的唯一依据，**不许拍脑袋**） |
 | **R4** | 重编码时长未测 | 出关条件③：1M 重编码实测 < 5 分钟（否则重训反馈环从 111 分钟变成 ≈116 分钟） |
 | **R5** | 存储 +784 MB | 已知、接受（`memories.embedding` 的 3 GB 仍在，暂不删 —— 删了就产生不可逆点） |
