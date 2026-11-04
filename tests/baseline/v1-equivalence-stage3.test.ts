@@ -725,7 +725,12 @@ describe("P3-T06 · 开关逐条复验 ⑤ `VECTOR_ROUTER='flat'`（向量路）
     //   ⚠️ 它把**理由**钉在「这一路没跑」上，而不是「跑了但没产出」（两者在 `fromVector` 上同形，
     //     只有 `ran` 能区分 —— 设计 D5 的 A 行 vs C 行）。
     const explained = recall(flat.store, { context: '猫粮品牌', now: NOW, explain: true });
-    expect(explained.explain?.routes.vector).toEqual({ ran: false, candidates: 0 });
+    //   ⚠️ `codesMissing: 0` 也是**确定值**（整路缺席 ⇒ 桶集为空）⇒ 三个字段全部钉死。
+    expect(explained.explain?.routes.vector).toEqual({
+      ran: false,
+      candidates: 0,
+      codesMissing: 0,
+    });
   });
 
   it('★ **正控**（D7 新增）：`flat` **且传** `queryEmbedding` ⇒ 必须产出 `fromVector` / `cos` / `vectorPart`', () => {

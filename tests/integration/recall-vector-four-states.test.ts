@@ -249,7 +249,7 @@ describe('T03 · D5 的 B 行 · 传了但整路缺席 ⇒ `ran=false`（且输�
     });
 
     // ── B 行的五个标志：全部是缺项值 ──
-    expect(result.explain?.routes.vector).toEqual({ ran: false, candidates: 0 });
+    expect(result.explain?.routes.vector).toEqual({ ran: false, candidates: 0, codesMissing: 0 });
     expect(qaReadVectorUsed(world.db)).toEqual([false]);
     expect(result.hits.length).toBeGreaterThan(0);
     for (const hit of result.hits) {
@@ -363,7 +363,7 @@ describe('T03 · D5 的 D 行 · 命中 N 条 ⇒ `candidates === N`，命中者
     );
 
     // ── call 级：跑了，且过了闸的候选恰好两条（0.9 / 0.6；正交那条不进候选）──
-    expect(outcome.vectorRoute).toEqual({ ran: true, candidates: 2 });
+    expect(outcome.vectorRoute).toEqual({ ran: true, candidates: 2, codesMissing: 0 });
     expect(outcome.vectorUsed).toEqual([true]);
 
     const byId = new Map(outcome.hits.map((hit) => [hit.id, hit]));
@@ -469,7 +469,7 @@ describe('T03 · D3 ⑥ · 三道闸门的顺序**不可换**（先截断再精�
     });
 
     // ── 正确顺序下：25 条归档全被强度精筛剔掉，剩下 1 条活着的 ──
-    expect(outcome.vectorRoute).toEqual({ ran: true, candidates: 1 });
+    expect(outcome.vectorRoute).toEqual({ ran: true, candidates: 1, codesMissing: 0 });
     expect(outcome.hits.map((hit) => hit.id)).toEqual(['m-alive']);
     expect(outcome.hits[0]?.breakdown?.cos).toBe(Math.fround(0.5));
 
@@ -762,7 +762,7 @@ describe('T03 · 偏离② · 「显式 `ivf` + 低于门槛」的两套词（`f
       explain: true,
       queryEmbedding: qaNumbers(qaAxisVector(0)),
     });
-    expect(result.explain?.routes.vector).toEqual({ ran: true, candidates: 2 });
+    expect(result.explain?.routes.vector).toEqual({ ran: true, candidates: 2, codesMissing: 0 });
     // ── 结果正确：cos 就是 0.95 / 0.6 两个精确值（flat 是全表精确点积）──
     const cosById = new Map(result.hits.map((hit) => [hit.id, hit.breakdown?.cos]));
     expect(cosById.get('m-a')).toBe(Math.fround(0.95));

@@ -17,16 +17,31 @@ import type Database from 'better-sqlite3';
 import { describe, expect, it } from 'vitest';
 
 import { DEFAULT_PARAMS } from '../../src/core/params.js';
-import { type IvfCentroidModel, loadCentroidModel } from '../../src/vector/centroids.js';
+import { cosineOf } from '../../src/store/dedupCandidates.js';
+import {
+  type IvfCentroidModel,
+  blobToVector,
+  loadCentroidModel,
+} from '../../src/vector/centroids.js';
+import { normalize } from '../../src/vector/dot.js';
 import { FlatVectorBackend, type VectorCandidateRow } from '../../src/vector/flat.js';
 import {
   IvfVectorBackend,
   assignFineBucket,
   buildCentroidModel,
+  countUncodedCandidates,
+  scanBucketCandidates,
   trainCentroids,
 } from '../../src/vector/ivf.js';
 import { sphericalKmeans } from '../../src/vector/kmeans.js';
-import { EMBED_DIM, createTestDb, insertMemories, pseudoUnitVector } from '../fixtures/vector.js';
+import { codeToBlob, encodeVector } from '../../src/vector/quantize.js';
+import {
+  EMBED_DIM,
+  createTestDb,
+  insertMemories,
+  insertMemory,
+  pseudoUnitVector,
+} from '../fixtures/vector.js';
 
 /** 一个固定的时间基准。 */
 const T0 = 1_700_000_000_000;
@@ -614,5 +629,765 @@ describe('性能轮 · `maxIterations` 真的到达了 k-means', () => {
       withDefault.fine.map((cell) => cell.fineId),
     );
     expect(withThree.fine.length).toBe(withDefault.fine.length);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  C′ 档 **T04**：两段式可证剪枝（规格 §5.1 / §6 的 A1 · A1′ · A2 · A7 · A8）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** 一天的毫秒数（时间窗夹具用）。 */
+const DAY = 24 * 60 * 60 * 1000;
+
+/** 夹具的时间基准。 */
+const T04_NOW = 1_700_000_000_000;
+
+/**
+ * 造一条与 `base` 余弦**恰好（浮点精度内）等于 `target`** 的单位向量。
+ *
+ * 用途：把「近重复」钉在 `DEDUP_COS_MIN`（0.92）两侧 —— 一条 0.925、一条 0.915
+ * ⇒ 前者该合并、后者不该 ⇒ 剪枝若丢行，边界上的那一条会立刻现形。
+ *
+ * @param base 基准单位向量
+ * @param target 目标余弦（`[-1, 1]`）
+ * @param seed 造正交分量的伪随机种子
+ * @returns 单位向量
+ */
+function withCos(base: Float32Array, target: number, seed: number): Float32Array {
+  const raw = pseudoUnitVector(seed);
+  let projection = 0;
+  for (let index = 0; index < raw.length; index += 1) {
+    projection += (raw[index] as number) * (base[index] as number);
+  }
+  const orthogonal = new Float32Array(raw.length);
+  let squared = 0;
+  for (let index = 0; index < raw.length; index += 1) {
+    const value = (raw[index] as number) - projection * (base[index] as number);
+    orthogonal[index] = value;
+    squared += value * value;
+  }
+  const inverse = 1 / Math.sqrt(squared);
+  const scale = Math.sqrt(Math.max(0, 1 - target * target));
+  const result = new Float32Array(base.length);
+  for (let index = 0; index < base.length; index += 1) {
+    result[index] =
+      target * (base[index] as number) + scale * (orthogonal[index] as number) * inverse;
+  }
+  return normalize(result);
+}
+
+/** T04 夹具的一行。 */
+interface T04Row {
+  /** 记忆 id。 */
+  id: string;
+  /** 向量（已 L2 归一化）。 */
+  vector: Float32Array;
+  /** 上次访问时刻（毫秒）。 */
+  lastAccess?: number;
+  /** pin 倍率（> 1 即被 pin）。 */
+  pinFactor?: number;
+  /** 是否给它写码（缺省 `true`；`false` ⇒ 造「无码行」，A8 的夹具）。 */
+  coded?: boolean;
+}
+
+/** T04 的夹具（真库 + 训练 + 落归属 + **落码**）。 */
+interface T04Fixture {
+  /** 库句柄。 */
+  db: Database.Database;
+  /** 中心模型。 */
+  model: IvfCentroidModel;
+  /** 活行 id（升序）。 */
+  liveIds: string[];
+  /** 无码的活行 id（A8 的判据）。 */
+  uncodedIds: string[];
+  /** 软删行 id（A1′ 的判据）。 */
+  softDeletedIds: string[];
+  /** 向量（按 id 索引，含软删行）。 */
+  vectors: Map<string, Float32Array>;
+}
+
+/**
+ * 建 T04 的夹具。
+ *
+ * 边界（**刻意都要有**，见 §5.1.8 的夹具要求）：
+ * · **近重复**：`m-01`/`m-02` 与 `m-00` 的余弦分别是 0.925 / 0.915（`DEDUP_COS_MIN` 两侧）；
+ * · **同分不同 id**：`m-00` 与 `m-03` 向量**完全相同** ⇒ 余弦逐位相同 ⇒ 定序只能靠 id；
+ * · **无码行**：`m-05` / `m-12` **没有码行**（模拟回填未完成 ⇒ 精确兜底）；
+ * · **时间窗**：`m-06` 太旧（不 pin）、`m-07` 太旧但被 pin（走 `pinnedTimeFloor` 那半边）；
+ * · **软删**：可选（A1′ 才需要 3 条）—— 软删**保留**桶归属（`forget()` 不调 `unassignBucket`）。
+ *
+ * ⚠️ **规模刻意小**（50 条活行 + ≤3 条软删）：这几条断言比的是「同一份数据、两条实现的输出
+ *   是否逐位相同」⇒ 与规模无关；用大库只会让「哪一位不同」变成灾难（§5.1.8 的结论）。
+ * ⚠️ 但**必须多于 `VECTOR_TOPK`（20）**，否则「剪枝」与「全量」天然相等 ⇒ A1 会变成真空断言。
+ *
+ * @param options 软删行数
+ * @returns 夹具
+ */
+function t04Fixture(options: { softDeleted?: number } = {}): T04Fixture {
+  const db = createTestDb();
+  const base = pseudoUnitVector(1);
+
+  const rows: T04Row[] = [
+    { id: 'm-00', vector: base },
+    { id: 'm-01', vector: withCos(base, 0.925, 2) },
+    { id: 'm-02', vector: withCos(base, 0.915, 3) },
+    { id: 'm-03', vector: base },
+    { id: 'm-04', vector: pseudoUnitVector(101) },
+    { id: 'm-05', vector: pseudoUnitVector(102), coded: false },
+    { id: 'm-06', vector: withCos(base, 0.99, 4), lastAccess: T04_NOW - 400 * DAY },
+    { id: 'm-07', vector: withCos(base, 0.98, 5), lastAccess: T04_NOW - 400 * DAY, pinFactor: 2 },
+    { id: 'm-08', vector: pseudoUnitVector(103) },
+    { id: 'm-09', vector: pseudoUnitVector(104) },
+    { id: 'm-10', vector: withCos(base, 0.96, 6) },
+    { id: 'm-11', vector: withCos(base, 0.94, 7) },
+    { id: 'm-12', vector: pseudoUnitVector(200), coded: false },
+    { id: 'm-13', vector: pseudoUnitVector(200) },
+    { id: 'm-14', vector: pseudoUnitVector(301) },
+    { id: 'm-15', vector: pseudoUnitVector(302) },
+    { id: 'm-16', vector: withCos(base, 0.93, 8) },
+    { id: 'm-17', vector: pseudoUnitVector(303) },
+    { id: 'm-18', vector: withCos(base, 0.921, 9) },
+    { id: 'm-19', vector: withCos(base, 0.919, 10) },
+  ];
+  // 30 条普通行（把候选宇宙撑到 50 条 > `VECTOR_TOPK` ⇒ 剪枝才有东西可剪）
+  for (let index = 0; index < 30; index += 1) {
+    rows.push({
+      id: `m-${String(20 + index).padStart(2, '0')}`,
+      vector: pseudoUnitVector(1000 + index),
+    });
+  }
+
+  const vectors = new Map<string, Float32Array>();
+  const liveIds: string[] = [];
+  for (const row of rows) {
+    insertMemory(db, row.id, row.vector, {
+      lastAccess: row.lastAccess ?? T04_NOW,
+      pinFactor: row.pinFactor ?? 1,
+    });
+    vectors.set(row.id, row.vector);
+    liveIds.push(row.id);
+  }
+
+  // ⚠️ **软删行**：`forget()` 只改 `deleted = 1`、**不调** `unassignBucket`
+  //   ⇒ 它们**仍然在桶里**（A1′ 的 `scanned` 偏差就是它们）。
+  const softDeletedIds: string[] = [];
+  const softDeletedCount = options.softDeleted ?? 0;
+  for (let index = 0; index < softDeletedCount; index += 1) {
+    const id = `m-9${String(index)}`;
+    const vector = withCos(base, 0.97, 20 + index);
+    insertMemory(db, id, vector, { deleted: true, lastAccess: T04_NOW });
+    vectors.set(id, vector);
+    softDeletedIds.push(id);
+  }
+
+  // 训练（`trainCentroids()` 只看活行 —— 软删行不进训练集，这是既有口径）
+  const trained = trainCentroids(db, {
+    coarseCenters: 2,
+    fineCenters: 4,
+    maxIterations: 5,
+    nprobeCoarse: 2,
+    now: T04_NOW,
+  });
+
+  // 代 T03 落归属：活行用训练算出来的归属；软删行**在训练集之外** ⇒ 现场算一次
+  const insertMember = db.prepare(
+    'INSERT INTO vector_cell_members (fine_id, memory_id) VALUES (?, ?)',
+  );
+  trained.fineBucketIds.forEach((fineId, index) => {
+    const id = liveIds[index];
+    if (fineId !== null && id !== undefined) {
+      insertMember.run(fineId, id);
+    }
+  });
+  for (const id of softDeletedIds) {
+    const vector = vectors.get(id);
+    if (vector === undefined) {
+      continue;
+    }
+    const fineId = assignFineBucket(trained.model, vector, 2);
+    if (fineId !== null) {
+      insertMember.run(fineId, id);
+    }
+  }
+
+  // 落码（只给活行 + `coded !== false` 的行；软删行**永远没有码** —— 回填只扫活行）
+  const insertCode = db.prepare(
+    'INSERT INTO vector_codes (fine_id, memory_id, code, scale, eps) VALUES (?, ?, ?, ?, ?)',
+  );
+  const fineIdOf = db.prepare('SELECT fine_id FROM vector_cell_members WHERE memory_id = ?');
+  const uncodedIds: string[] = [];
+  for (const row of rows) {
+    if (row.coded === false) {
+      uncodedIds.push(row.id);
+      continue;
+    }
+    const fineId = (fineIdOf.get(row.id) as { fine_id: string } | undefined)?.fine_id;
+    if (fineId === undefined) {
+      continue;
+    }
+    const encoded = encodeVector(row.vector);
+    insertCode.run(fineId, row.id, codeToBlob(encoded.code), encoded.scale, encoded.eps);
+  }
+
+  return { db, model: trained.model, liveIds, uncodedIds, softDeletedIds, vectors };
+}
+
+/** 造一个 T04 后端（中心模型从库里加载 ⇒ 走真实的加载路径）。 */
+function makeT04Backend(
+  fixture: T04Fixture,
+  options: { prune: boolean; nprobeFine?: number },
+): IvfVectorBackend {
+  const backend = new IvfVectorBackend({
+    db: fixture.db,
+    centroids: () => loadCentroidModel(fixture.db),
+    nprobeCoarse: 2,
+    nprobeFine: options.nprobeFine ?? fixture.model.fine.length,
+    prune: options.prune,
+  });
+  backend.init(CONFIG);
+  return backend;
+}
+
+/**
+ * 写路径的 `scoreOf`（**照抄** `dedupCandidates.ts` 的注入形状：同一条 SQL、同一个 `cosineOf`）。
+ *
+ * ⚠️ 由**调用方**注入是 §5.1.1 纪律②：余弦只有一份实现（`dedupCandidates.ts` 的 `cosineOf`），
+ *   剪枝原语不自己算点积。
+ */
+function writeScoreOf(db: Database.Database, query: Float32Array): (id: string) => number | null {
+  const one = db.prepare(
+    'SELECT embedding FROM memories WHERE id = ? AND deleted = 0 AND embedding IS NOT NULL',
+  );
+  return (id: string): number | null => {
+    const row = one.get(id) as { embedding: Buffer } | undefined;
+    return row === undefined ? null : cosineOf(query, blobToVector(row.embedding));
+  };
+}
+
+/** 写路径的扫描选项（**照抄** `dedupCandidates.ts` 传的三个口径：threshold / k / scoreOf）。 */
+function writeScanOptions(
+  db: Database.Database,
+  query: Float32Array,
+): { threshold: number; k: number; scoreOf: (id: string) => number | null } {
+  return {
+    threshold: DEFAULT_PARAMS.DEDUP_COS_MIN,
+    k: DEFAULT_PARAMS.VECTOR_TOPK,
+    scoreOf: writeScoreOf(db, query),
+  };
+}
+
+/** 一条「下游会留下」的候选（写路径 `collectVectorCandidates()` 的等价物）。 */
+interface ExpectedCandidate {
+  /** 记忆 id。 */
+  id: string;
+  /** 余弦。 */
+  cos: number;
+}
+
+/**
+ * 从**全量候选行**独立算一遍「下游会留在候选集里的东西」（§4.9 步骤 3a2 的口径）：
+ * `cos ≥ DEDUP_COS_MIN` ⇒ 按 (cos 降序, id 升序) 排 ⇒ 取前 `VECTOR_TOPK`。
+ *
+ * ⚠️ **排序与过滤在这里是手写的**（不复用被测模块的 `pruneTopK`）——
+ *   但**余弦公式必须是同一份**（C36）：换一份实现测出来的只是「两份实现之差」。
+ *
+ * @param query 查询向量
+ * @param rows 全量候选行（每个 id 的 `embedding` BLOB）
+ * @returns 期望的候选序列
+ */
+function referenceWriteCandidates(
+  query: Float32Array,
+  rows: readonly { id: string; embedding: Buffer }[],
+): ExpectedCandidate[] {
+  const scored: ExpectedCandidate[] = [];
+  for (const row of rows) {
+    const cos = cosineOf(query, blobToVector(row.embedding));
+    if (cos === null || cos < DEFAULT_PARAMS.DEDUP_COS_MIN) {
+      continue;
+    }
+    scored.push({ id: row.id, cos });
+  }
+  scored.sort((left, right) => {
+    if (left.cos !== right.cos) {
+      return right.cos - left.cos;
+    }
+    if (left.id === right.id) {
+      return 0;
+    }
+    return left.id < right.id ? -1 : 1;
+  });
+  return scored.slice(0, DEFAULT_PARAMS.VECTOR_TOPK);
+}
+
+/**
+ * 把一个 `BucketCandidateScan.rows` 过一遍**下游的**口径（cos 门槛 + 排序 + top-K）
+ * —— 因为 `prune` 的 survivors 里可能含「上界够但精确分不够」的占位行（§5.1.6 的推导）。
+ *
+ * @param query 查询向量
+ * @param rows 扫描产物
+ * @returns 候选序列
+ */
+function downstreamCandidates(
+  query: Float32Array,
+  rows: readonly { id: string; embedding: Buffer }[],
+): ExpectedCandidate[] {
+  return referenceWriteCandidates(query, rows);
+}
+
+/**
+ * **HEAD 的候选 SQL**（从 `ivf.ts` 的 `buildBucketCandidateSql()` **手工抄一份**）。
+ *
+ * ⚠️ **刻意抄而不 import**：A7 要证明的是「`prune = false` 与 **HEAD 的行为**逐位一致」，
+ *   如果参照复用生产代码里的构造函数，那测的就是「生产代码 == 生产代码」。
+ */
+function headCandidateSql(fineIds: readonly string[]): string {
+  const placeholders = fineIds.map(() => '?').join(', ');
+  return `SELECT m.id AS id, m.content AS content, m.content_tokens AS content_tokens,
+            m.stability AS stability, m.last_access AS last_access, m.access_count AS access_count,
+            m.difficulty AS difficulty, m.embedding AS embedding
+       FROM vector_cell_members vcm
+       JOIN memories m ON m.id = vcm.memory_id
+      WHERE vcm.fine_id IN (${placeholders})
+        AND m.deleted = 0
+        AND m.embedding IS NOT NULL`;
+}
+
+describe('T04 · 两段式可证剪枝（A1 / A1′ / A2 / A7 / A8）', () => {
+  /** 写路径的探针数（用写入专用的那套）。 */
+  const WRITE_COARSE = DEFAULT_PARAMS.ROUTER_NPROBE_WRITE_COARSE;
+  const WRITE_FINE = DEFAULT_PARAMS.ROUTER_NPROBE_WRITE_FINE;
+
+  it('★ A1 · 写路径等价：`collectVectorCandidates()` 的候选 **id 序列 + cos + scanned** 逐位相同', () => {
+    const fixture = t04Fixture();
+    const query = pseudoUnitVector(1); // == `m-00` 的向量 ⇒ 近重复落在阈值两侧
+
+    const all = scanBucketCandidates(fixture.db, fixture.model, query, WRITE_COARSE, WRITE_FINE, {
+      prune: false,
+    });
+    const pruned = scanBucketCandidates(
+      fixture.db,
+      fixture.model,
+      query,
+      WRITE_COARSE,
+      WRITE_FINE,
+      {
+        ...writeScanOptions(fixture.db, query),
+      },
+    );
+
+    // ── 参照：从**全量**候选行手算下游会留下的东西 ──
+    const expected = downstreamCandidates(query, all.rows);
+    // ── 被测：剪枝后的 survivors 过**同一道**下游口径 ──
+    const actual = downstreamCandidates(query, pruned.rows);
+
+    expect(expected.length).toBeGreaterThan(0); // 不是真空通过
+
+    // ① id **序列**（含顺序）逐位相同
+    expect(actual.map((item) => item.id)).toEqual(expected.map((item) => item.id));
+    // ② cos **逐位**相同（`Object.is`，禁止 `toBeCloseTo`）
+    for (let index = 0; index < expected.length; index += 1) {
+      expect(Object.is(actual[index]?.cos, expected[index]?.cos)).toBe(true);
+    }
+
+    // ③ embedding **字节**逐位相同（同一个 id 的两条路读到的是同一份 BLOB）
+    const bytesOf = (
+      rows: readonly { id: string; embedding: Buffer }[],
+      id: string,
+    ): string | undefined => {
+      const row = rows.find((item) => item.id === id);
+      return row === undefined ? undefined : Buffer.from(row.embedding).toString('hex');
+    };
+    for (const item of expected) {
+      expect(bytesOf(pruned.rows, item.id)).toBe(bytesOf(all.rows, item.id));
+    }
+
+    // ④ `scanned` **逐位相同**（本夹具**没有软删成员** ⇒ 两个口径重合；A1′ 才拉开）
+    expect(pruned.scanned).toBe(all.scanned);
+    // ⑤ 负控：剪枝**真的剪了**（否则上面四条会退化成「全量 == 全量」）
+    expect(pruned.exactReads).toBeLessThan(all.rows.length);
+    // ⑥ `uncoded` 如实反映「无码行数」（本夹具 2 条 ⇒ 每次都进 survivors）
+    expect(pruned.uncoded).toBeGreaterThanOrEqual(fixture.uncodedIds.length);
+
+    fixture.db.close();
+  });
+
+  it('★ A1′（负控）· 3 条**软删但保留桶归属**的行 ⇒ `scanned` 偏大 3，而候选仍逐位相同', () => {
+    const withSoftDeleted = t04Fixture({ softDeleted: 3 });
+    const query = pseudoUnitVector(1);
+
+    // 前置：这 3 条确实「软删 + 有归属」（否则本用例测不到东西）
+    expect(withSoftDeleted.softDeletedIds).toHaveLength(3);
+    const membership = withSoftDeleted.db
+      .prepare(
+        `SELECT count(*) AS n FROM vector_cell_members vcm
+           JOIN memories m ON m.id = vcm.memory_id
+          WHERE m.deleted = 1`,
+      )
+      .get() as { n: number };
+    expect(membership.n).toBe(3);
+
+    const all = scanBucketCandidates(
+      withSoftDeleted.db,
+      withSoftDeleted.model,
+      query,
+      WRITE_COARSE,
+      WRITE_FINE,
+      { prune: false },
+    );
+    const pruned = scanBucketCandidates(
+      withSoftDeleted.db,
+      withSoftDeleted.model,
+      query,
+      WRITE_COARSE,
+      WRITE_FINE,
+      writeScanOptions(withSoftDeleted.db, query),
+    );
+
+    // ★ **偏差是「可预期的算式」，不是免责声明**（§5.1.3）：
+    //   软删保留桶归属 ⇒ `scanned`（成员数）比 HEAD 的「活行数」多 3
+    expect(pruned.scanned).toBe(all.scanned + 3);
+
+    // 而**结果**一位都不差（软删行走 `scoreOf → null` ⇒ 不进 survivors）
+    const expected = downstreamCandidates(query, all.rows);
+    const actual = downstreamCandidates(query, pruned.rows);
+    expect(actual.map((item) => item.id)).toEqual(expected.map((item) => item.id));
+    for (let index = 0; index < expected.length; index += 1) {
+      expect(Object.is(actual[index]?.cos, expected[index]?.cos)).toBe(true);
+    }
+    // 软删行绝不出现在 survivors 里（`deleted = 0` 是候选宇宙的口径）
+    for (const id of withSoftDeleted.softDeletedIds) {
+      expect(pruned.rows.some((row) => row.id === id)).toBe(false);
+    }
+
+    withSoftDeleted.db.close();
+  });
+
+  it('★ A2 · 读路径等价：50 条查询（含**带时间窗**与 `{}` 两类 filter）的 `{id, score}` 逐位相同', () => {
+    const fixture = t04Fixture();
+    const pruning = makeT04Backend(fixture, { prune: true });
+    const exact = makeT04Backend(fixture, { prune: false });
+    // ⚠️ **两个 k 都要跑**：
+    //   · `60` > 成员数（50）⇒ 堆**永远不满** ⇒ 早停不触发（覆盖「不早停」的形状）；
+    //   · `40` < 成员数 ⇒ 堆会满 ⇒ 早停真的触发。而这一档**必然踩到「第 K 名的分 = 0」**
+    //     （50 条里约一半的余弦为负 ⇒ 被 `clampCos` 钳成 0 ⇒ 大量同分）
+    //     ⇒ 只有这一档能验出「`upper` 对**钳制后**的结果键不再成立」那条（`scoreFloor`）。
+    const kValues = [DEFAULT_PARAMS.VECTOR_TOPK * 3, 40];
+
+    const filters: Array<{
+      name: string;
+      filter: { timeFloor?: number; pinnedTimeFloor?: number };
+    }> = [
+      // ① `{}` ⇒ **不发** Q3 窄列 gate
+      { name: '无时间窗（{}）', filter: {} },
+      // ② 带窗 ⇒ 走 Q3（`m-06` 被挡、`m-07` 靠 pinned 窗留下）
+      {
+        name: '带时间窗（30 天 / pinned 800 天）',
+        filter: { timeFloor: T04_NOW - 30 * DAY, pinnedTimeFloor: T04_NOW - 800 * DAY },
+      },
+    ];
+
+    let compared = 0;
+    let nonEmpty = 0;
+    for (const { name, filter } of filters) {
+      for (const k of kValues) {
+        for (let seed = 1; seed <= 50; seed += 1) {
+          const query = pseudoUnitVector(seed);
+          const a = pruning.search(query, k, filter);
+          const b = exact.search(query, k, filter);
+          if (b.length > 0) {
+            nonEmpty += 1;
+          }
+
+          expect(a.length, `${name} · k=${String(k)} · seed=${String(seed)} 的条数`).toBe(b.length);
+          for (let index = 0; index < b.length; index += 1) {
+            // ⚠️ **`Object.is`**：`toBeCloseTo` 会把「浮点求和顺序变了」这类真回归吃掉
+            expect(
+              Object.is(a[index]?.score, b[index]?.score),
+              `${name} · k=${String(k)} · seed=${String(seed)} · 第 ${String(index)} 条 score`,
+            ).toBe(true);
+            expect(
+              a[index]?.id,
+              `${name} · k=${String(k)} · seed=${String(seed)} · 第 ${String(index)} 条 id`,
+            ).toBe(b[index]?.id);
+          }
+          compared += 1;
+        }
+      }
+    }
+    // 负控：真的比了 200 组（50 查询 × 2 种 filter × 2 个 k）
+    expect(compared).toBe(200);
+    // ⚠️ 负控之二：**不能「两边都空」**（那会让上面所有逐位比较变成真空通过）
+    expect(nonEmpty).toBeGreaterThanOrEqual(190);
+
+    fixture.db.close();
+  });
+
+  it('★ A7 · 零影响：`prune = false` 与**手写参照**（照抄 HEAD 的 SQL 与循环）逐位一致', () => {
+    const fixture = t04Fixture({ softDeleted: 1 });
+    const query = pseudoUnitVector(1);
+
+    // ── ① 手写参照：HEAD 的 SQL + HEAD 的循环 ──
+    const fineIds = makeT04Backend(fixture, { prune: false }).route(
+      query,
+      2,
+      fixture.model.fine.length,
+    );
+    const headRows = fixture.db.prepare(headCandidateSql(fineIds)).all(...fineIds) as Array<{
+      id: string;
+      content: string;
+      content_tokens: string;
+      stability: number;
+      last_access: number;
+      access_count: number;
+      difficulty: number;
+      embedding: Buffer;
+    }>;
+    const headHits = headRows
+      .map((row) => ({
+        id: row.id,
+        score: Math.min(1, Math.max(0, referenceDot(query, blobToVector(row.embedding)))),
+      }))
+      .sort((left, right) => {
+        if (left.score !== right.score) {
+          return right.score - left.score;
+        }
+        return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+      })
+      .slice(0, 20);
+
+    // ── ② 被测：写路径 `prune = false` ──
+    const scan = scanBucketCandidates(
+      fixture.db,
+      fixture.model,
+      query,
+      2,
+      fixture.model.fine.length,
+      {
+        prune: false,
+      },
+    );
+    expect(scan.scanned).toBe(headRows.length);
+    expect(scan.rows.map((row) => row.id)).toEqual(headRows.map((row) => row.id));
+    for (let index = 0; index < headRows.length; index += 1) {
+      expect(Buffer.from(scan.rows[index]?.embedding ?? Buffer.alloc(0)).toString('hex')).toBe(
+        Buffer.from(headRows[index]?.embedding ?? Buffer.alloc(0)).toString('hex'),
+      );
+      expect(scan.rows[index]?.content).toBe(headRows[index]?.content);
+    }
+
+    // ── ③ 被测：读路径 `prune = false` ──
+    const backend = makeT04Backend(fixture, { prune: false });
+    const hits = backend.search(query, 20);
+    expect(hits.map((hit) => hit.id)).toEqual(headHits.map((hit) => hit.id));
+    for (let index = 0; index < headHits.length; index += 1) {
+      expect(Object.is(hits[index]?.score, headHits[index]?.score)).toBe(true);
+    }
+    // ④ 且 `searchExact()`（同一段代码的显式入口）给的是同一份东西
+    expect(backend.searchExact(query, 20).map((hit) => hit.id)).toEqual(hits.map((hit) => hit.id));
+
+    fixture.db.close();
+  });
+
+  it('★ A8 · 无码兜底：删掉若干码行 ⇒ 结果与「全码」**逐位相同**，且 `uncoded` 如实计数', () => {
+    const fixture = t04Fixture();
+    const query = pseudoUnitVector(1);
+
+    const before = {
+      write: scanBucketCandidates(fixture.db, fixture.model, query, WRITE_COARSE, WRITE_FINE, {
+        ...writeScanOptions(fixture.db, query),
+      }),
+      read: makeT04Backend(fixture, { prune: true }).search(query, 30),
+    };
+
+    // 再删 4 条码行（模拟「回填只做了一半」）。
+    // ⚠️ **必须删「本来会被选中」的那几条**（余弦 > 0.92 的近重复）：
+    //   若只删几条「反正也进不了候选」的行，本用例连「无码行真的进了 survivors」都没验证到
+    //   ⇒ 断言会退化成「两边都空/都没含它」的真空形状。
+    // ⚠️ ★ **诚实记（T04 收尾 · 本轮实测，2026-11-05）**：本条**不是**「`upper` 写成 `0`」这个
+    //   变异的牙 —— 实测把 `prune.ts` 里无码行的 `upper` 改成 `0` 之后，**本条仍然通过**：
+    //   写路径的剪枝队列长度 < `k`（夹具 50 条活行、删 4 条码行之后仍远少于
+    //   `VECTOR_TOPK = 20`，且写路径还带 `DEDUP_COS_MIN` 的**上界**门槛 ⇒ 入队只有几条）
+    //   ⇒ 堆**永远不会填满** ⇒ 早停判据一次都不执行 ⇒ `upper` 写什么都丢不了行。
+    //   （变异实测红的是：下方那条小 `k` 用例 + 同文件两条「命中桶内 top-K 与全量精确扫描
+    //     逐位一致」的用例 —— 也就是说该变异**不是全绿**，只是**本条**抓不到它。）
+    //   ⇒ 本条守的是「无码行 ⇒ 精确兜底 ⇒ 结果不变」，**真正的牙在下面那条小 `k` 用例**
+    //     （`★★ 无码行的上界必须是 +∞：k 小于队列长度时…`）—— 那条才钉「`upper = 0` 会丢行」。
+    const removed = ['m-01', 'm-03', 'm-16', 'm-18'];
+    fixture.db
+      .prepare(`DELETE FROM vector_codes WHERE memory_id IN (${removed.map(() => '?').join(', ')})`)
+      .run(...removed);
+
+    const after = {
+      write: scanBucketCandidates(fixture.db, fixture.model, query, WRITE_COARSE, WRITE_FINE, {
+        ...writeScanOptions(fixture.db, query),
+      }),
+      read: makeT04Backend(fixture, { prune: true }).search(query, 30),
+    };
+
+    // ① 写路径：候选序列与 cos 逐位相同
+    const beforeCandidates = downstreamCandidates(query, before.write.rows);
+    const afterCandidates = downstreamCandidates(query, after.write.rows);
+    expect(afterCandidates.map((item) => item.id)).toEqual(beforeCandidates.map((item) => item.id));
+    for (let index = 0; index < beforeCandidates.length; index += 1) {
+      expect(Object.is(afterCandidates[index]?.cos, beforeCandidates[index]?.cos)).toBe(true);
+    }
+    // ② 读路径：`{id, score}` 逐位相同
+    expect(before.read.length).toBeGreaterThan(0); // 负控：不是「两边都空」
+    expect(after.read.length).toBe(before.read.length);
+    for (let index = 0; index < before.read.length; index += 1) {
+      expect(after.read[index]?.id).toBe(before.read[index]?.id);
+      expect(Object.is(after.read[index]?.score, before.read[index]?.score)).toBe(true);
+    }
+    // ③ `uncoded` 增长 = 被删的条数（原本 2 条无码 → 6 条）
+    expect(after.write.uncoded).toBe(before.write.uncoded + removed.length);
+    // ④ `scanned` 不变（它数的是成员数，与码表状态无关 —— §5.1.3 的理由）
+    expect(after.write.scanned).toBe(before.write.scanned);
+
+    fixture.db.close();
+  });
+
+  it('`countUncodedCandidates()`：数「有成员、无码」的行（**含软删成员**），且**不是**错误/门槛', () => {
+    const fixture = t04Fixture({ softDeleted: 2 });
+
+    // 先算一遍命中桶集（把探针吃满 ⇒ 桶集 = 全部细桶）
+    const backend = makeT04Backend(fixture, { prune: true });
+    const fineIds = backend.route(pseudoUnitVector(1), 2, fixture.model.fine.length);
+
+    // 本夹具：2 条活行无码 + 2 条软删成员无码 = 4
+    expect(countUncodedCandidates(fixture.db, fineIds)).toBe(4);
+    // 桶集为空 ⇒ 0（不是抛错）
+    expect(countUncodedCandidates(fixture.db, [])).toBe(0);
+    // 给其中一条补上码 ⇒ 立刻少 1（这是 A8 的「运行时伴生读数」）
+    const fineId = (
+      fixture.db
+        .prepare('SELECT fine_id FROM vector_cell_members WHERE memory_id = ?')
+        .get('m-05') as { fine_id: string }
+    ).fine_id;
+    const encoded = encodeVector(fixture.vectors.get('m-05') ?? new Float32Array(EMBED_DIM));
+    fixture.db
+      .prepare(
+        'INSERT INTO vector_codes (fine_id, memory_id, code, scale, eps) VALUES (?, ?, ?, ?, ?)',
+      )
+      .run(fineId, 'm-05', codeToBlob(encoded.code), encoded.scale, encoded.eps);
+    expect(countUncodedCandidates(fixture.db, fineIds)).toBe(3);
+  });
+
+  it('`prune = true` 但调用方**没注入** `scoreOf` ⇒ 响亮失败（不静默退化成「不剪」）', () => {
+    const fixture = t04Fixture();
+    expect(() =>
+      scanBucketCandidates(
+        fixture.db,
+        fixture.model,
+        pseudoUnitVector(1),
+        WRITE_COARSE,
+        WRITE_FINE,
+      ),
+    ).toThrowError(/scoreOf/);
+    fixture.db.close();
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // T04 补强（追加于本轮 · 2026-11-05）
+  //   这两条补的是**变异实验打出来的缺口**：缺的不是「行为」，而是
+  //   「**`prune` 的默认值**」与「**无码行在队列里的位次**」这两件事**没有被任何断言看过**。
+  //   ⚠️ 订正：这里原先写着「复核人：严过关 / 全量 1,899 条仍然全绿」——
+  //     那两处**引用的复核结论与计数本轮无法核实**（复核报告尚未归档），故按实情删掉；
+  //     本文件只对**能自己复现的读数**负责（下面两条各自的注释里写的都是可复现的观测面）。
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  it('★★ 生产默认 `prune = true`：不传选项 ⇒ 走两段式（**真的读码表**）；显式 `false` ⇒ 老路', () => {
+    // ⚠️ 为什么必须单独钉这一条：T04 的**全部收益**都挂在「默认是 true」这一行
+    //   （`this.prune = options.prune ?? true`）。它翻转成 `false` 时**结果完全不变**
+    //   （A1/A2/A7 都在证明「两条路逐位相同」）⇒ 任何「比结果」的断言都抓不住它
+    //   ⇒ 只能观测「**走了哪条路**」：`prune = true` 必须发 `FROM vector_codes`（第一段读码），
+    //     `prune = false` 必须不发、且必须发 HEAD 那条 `JOIN` 候选 SQL。
+    const fixture = t04Fixture();
+    const query = pseudoUnitVector(1);
+
+    /**
+     * 跑一次 `search()` 并录下它 prepare 过的全部 SQL。
+     *
+     * ⚠️ 就地替换 `db.prepare`（与 `bench/lib/harness.ts` 的 `installRowReadCounter()` 同一手法）
+     *   ⇒ 用完**逐位还原**。
+     *
+     * @param prune `undefined` = 不传该选项（测默认值）
+     * @returns 这次检索发过的 SQL 文本
+     */
+    const sqlOfSearch = (prune: boolean | undefined): string[] => {
+      const seen: string[] = [];
+      const handle = fixture.db as unknown as { prepare: (source: string) => unknown };
+      const originalPrepare = handle.prepare;
+      handle.prepare = (source: string): unknown => {
+        seen.push(source);
+        return originalPrepare.call(fixture.db, source);
+      };
+      try {
+        const backend = new IvfVectorBackend({
+          db: fixture.db,
+          centroids: () => loadCentroidModel(fixture.db),
+          nprobeCoarse: 2,
+          nprobeFine: fixture.model.fine.length,
+          ...(prune === undefined ? {} : { prune }),
+        });
+        backend.init(CONFIG);
+        backend.search(query, 5);
+      } finally {
+        handle.prepare = originalPrepare;
+      }
+      return seen;
+    };
+
+    const readsCodes = (sqls: readonly string[]): boolean =>
+      sqls.some((sql) => /FROM\s+vector_codes\b/i.test(sql));
+    /**
+     * HEAD 老路**独有的**那条取行 SQL（`readCandidateRows()`：一次把**全部成员**的整行取回来，
+     * 含 3KB 的 `embedding`）—— 两段式**不会**发它（它只对 survivors 逐条点查）。
+     */
+    const readsAllMemberRows = (sqls: readonly string[]): boolean =>
+      sqls.some((sql) => /FROM\s+memories\s+WHERE\s+id\s+IN/i.test(sql));
+
+    const defaultSql = sqlOfSearch(undefined);
+    // ★ 缺省 ⇒ 两段式：**读码**（第一段），且**不**发「一次取全部成员整行」的老 SQL
+    expect(readsCodes(defaultSql)).toBe(true);
+    expect(readsAllMemberRows(defaultSql)).toBe(false);
+
+    const legacySql = sqlOfSearch(false);
+    // ★ 显式关掉 ⇒ HEAD 老路：**不读码**，且**发**那条「一次取全部成员整行」的 SQL
+    expect(readsCodes(legacySql)).toBe(false);
+    expect(readsAllMemberRows(legacySql)).toBe(true);
+
+    fixture.db.close();
+  });
+
+  it('★★ 无码行的上界必须是 `+∞`：k 小于队列长度时，**本该进 top-k 的无码行不能被早停跳过**', () => {
+    // ⚠️ 本条的来历（**不是**重复 prune.test.ts 的同名用例）：
+    //   `t04Fixture()` 有 50 条活行，写路径 `k = VECTOR_TOPK = 20`
+    //   ⇒ 删掉几条码行之后**队列长度仍 < 20 ⇒ 堆永不填满 ⇒ 早停压根不触发**
+    //   ⇒ 「无码行的 `upper` 写成 `0` 而不是 `+∞`」这个变异在 A8 里**打不红**（复核实测：全绿）。
+    //   ⇒ 这里用**读路径 + 小 k**（k ≤ 5，堆 3 步就满）把它变成可观测的：
+    //     先把「同分不同 id」那两条（余弦 = 1.0）的码行删掉 ⇒ 它们变成**无码且必须进 top-3**，
+    //     若 `upper` 不是 `+∞`，它们在按上界排的队列里会沉到最后 ⇒ 早停直接把它们跳掉
+    //     ⇒ survivors 变成 m-06/m-07/m-10（0.99/0.98/0.96）⇒ 本条红。
+    const fixture = t04Fixture();
+    const query = pseudoUnitVector(1);
+
+    // 前提自检：这两条确实**没有码了**（否则本用例测不到「无码」这条路）
+    fixture.db.prepare("DELETE FROM vector_codes WHERE memory_id IN ('m-00', 'm-03')").run();
+    const stillCoded = fixture.db
+      .prepare("SELECT count(*) AS n FROM vector_codes WHERE memory_id IN ('m-00', 'm-03')")
+      .get() as { n: number };
+    expect(stillCoded.n).toBe(0);
+
+    const pruned = makeT04Backend(fixture, { prune: true });
+    const head = makeT04Backend(fixture, { prune: false });
+
+    // ① 与「全量精确」逐位相同（含 k = 1/2/3/5 ⇒ 堆在 3 次读之后就满）
+    for (const k of [1, 2, 3, 5]) {
+      expect(pruned.search(query, k)).toEqual(head.search(query, k));
+    }
+    // ② 具体形状（负控：确认 top-3 里**真的**有无码行 —— 否则①可能是「两边都把它们丢了」）
+    expect(pruned.search(query, 3).map((hit) => hit.id)).toEqual(['m-00', 'm-03', 'm-06']);
+
+    fixture.db.close();
   });
 });

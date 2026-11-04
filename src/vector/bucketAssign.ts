@@ -10,6 +10,9 @@
  *     **全库写 `vector_cell_members` 的地方只有这里**
  *     （由 `tests/unit/bucketAssign.test.ts` 的静态扫描断言守着
  *     ⇒ T04 的 lint 规则照这条形状落地即可，不用返工）。
+ *   ★ **T04 收尾追加**：本模块同时是**码表**的唯一写入点 —— `clearCodeRow()`
+ *     （让码失效，fail-open 降级）。加它的理由见该函数的注释；
+ *     `src/store/**` 里**一处都不出现码表名**（`tests/contracts/table-name-boundary.test.ts` 守着）。
  *
  * ⚠️ ★ **换桶必须「先 DELETE 旧归属行、再 INSERT 新行」**（§4.15.5）：
  *   `INSERT OR REPLACE` 只按 `(fine_id, memory_id)` 复合主键覆盖
@@ -214,6 +217,53 @@ export function unassignBucket(context: BucketAssignContext, memoryId: string): 
   assertMemoryId(memoryId);
   try {
     db.prepare('DELETE FROM vector_cell_members WHERE memory_id = ?').run(memoryId);
+  } catch (error) {
+    throw translateSqliteError(error, { path: db.name });
+  }
+}
+
+/**
+ * **让一条记忆的码行失效**（删掉它在码表里的那一行）—— 码行的**唯一写入点**。
+ *
+ * ⚠️ ★ **为什么需要单独一个「删码」函数**（C′ 档 T04 收尾的裁决，不是随手加的）：
+ *   `assignBucket()` 的**终态**是「搬桶 **+ 重编码**」（T05 的交付：码与成员同生同死）。
+ *   **但在 T05 落地之前，`assignBucket()` 只会搬桶、根本不碰码** ⇒
+ *   于是「向量换了、码却没跟着换」这件事**没有任何函数负责** ⇒
+ *   码行描述的还是**旧向量** ⇒ 两段式剪枝（`src/vector/prune.ts`）算出的
+ *   `upper = q·x̂ + eps` **不再是上界** ⇒ 若新向量落在**同一个细桶**，
+ *   剪枝会按过期上界把该行跳掉 ⇒ **静默漏召回**（A6 / `codesMissing` 都查不出来）。
+ *   ⇒ 在 T05 到位之前，需要一个**显式**的「让码失效」入口，而不是指望调用方记得删。
+ *
+ * ⚠️ **本函数是「降级」，不是「维护」**：删掉之后该行变成**无码行**
+ *   ⇒ 两段式走精确兜底（多读一次 3KB，**不漏召回**）；
+ *   `codesMissing` +1（可见）；A6 会显示 `codes − members = −1`
+ *   （可观测，跑一次 `pnpm codes:backfill` 即修复）。
+ *   **不做重编码**：重编码只有一份实现的位置 —— `assignBucket()`（T05）。
+ *   在这里再写一份「编码 + 落码」就是第二份码维护实现
+ *   ⇒ `EPS_SAFETY_MARGIN` 之类只在一处生效 ⇒ 上界在其中一条路上不再是上界。
+ *
+ * ⚠️ **和 `unassignBucket()` 是同一件事的两个半边**：两者都因为
+ *   「这一行的向量**不再对应一个有效归属 / 有效码**」而把派生数据清掉
+ *   （一个清桶成员、一个清码行）⇒ 所以放在同一个模块里，而不是另开一个文件。
+ *
+ * ⚠️ **表名不外泄**：码表只在向量层出现（本模块写、`src/vector/ivf.ts` 读）
+ *   ⇒ `src/store/**` **一处都不出现码表名**（`tests/contracts/table-name-boundary.test.ts` 守着）。
+ *
+ * ⚠️ **幂等**：对没有码行的 id 调用不报错（删 0 行是合法的）。
+ * ⚠️ **必须在调用方的事务内调用**（与 `memories.embedding` 的 UPDATE 同事务，§9.3.2 ①）：
+ *   事务外删 ⇒ 崩在中间时「码没了、向量还是旧的」或「向量变了、码还在」——
+ *   后者正是上面那个**静默漏召回**的形状。
+ *
+ * @param context 上下文（`db`）
+ * @param memoryId 记忆 id
+ * @throws {MemoryError} `INVALID_INPUT`（事务外调用 / id 非法）
+ */
+export function clearCodeRow(context: BucketAssignContext, memoryId: string): void {
+  const db = context.db;
+  assertInWriteTransaction(db, 'clearCodeRow');
+  assertMemoryId(memoryId);
+  try {
+    db.prepare('DELETE FROM vector_codes WHERE memory_id = ?').run(memoryId);
   } catch (error) {
     throw translateSqliteError(error, { path: db.name });
   }

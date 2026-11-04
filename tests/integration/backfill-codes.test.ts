@@ -903,3 +903,215 @@ describe('★ A6 后半句 · 桶归属口径（行数相等也可能是假绿�
     expect(report).not.toContain('码表 == 桶表');
   });
 });
+
+/**
+ * ★ **R11 · A6 的「活记忆域」口径**（2026-11-05 裁决；规格 `perf-c2-admissible-two-stage.md` §7 的 R11 行）
+ *
+ * ## 这一组要钉死的事
+ *
+ * A6 的三个数**必须同域**。改前它们各说各话：
+ * ```
+ * codes    = count(vector_codes)                                       ← 只有活行（回填只扫活行）
+ * members  = count(vector_cell_members)                                ← ★ 含软删行的归属
+ * memories = count(memories WHERE deleted = 0 AND embedding NOT NULL)  ← 只有活行
+ * ```
+ * ⇒ 只要库里有 ≥1 条「软删 + 有向量 + 有桶归属」的记忆（**这是既有裁决**：
+ *   `forget.ts` 只改 `deleted = 1`、**不调** `unassignBucket`），`members > codes`
+ *   ⇒ `mismatch ≠ 0` ⇒ **A6 恒红，且红得没有信息量**（它报的是「软删机制在工作」）。
+ *
+ * ## 三条用例（少一条都不成立）
+ *
+ * | # | 夹具 | 期望 | 少它会怎样 |
+ * |---|---|---|---|
+ * | ① | 软删行**保留**桶归属且有码 | A6 **绿**（三数相等、`mismatch = 0`） | 「修好了没有」不可证 |
+ * | ② | 该软删行的 `fine_id` 被人为改乱 | A6 **仍然绿**（**刻意**：它在活记忆域外） | 口径会被放宽成「查不出任何东西」也没人发现 |
+ * | ③ | **活行**里造漂移 | A6 **仍然红** | ②的理由会被误读成「A6 不查漂移了」 |
+ *
+ * ⚠️ **② 为什么是「刻意」**：软删行的「码 ↔ 归属」对不上，是 `restore()` 那条路的事
+ *   （它要不要恢复向量路、恢复时归属怎么定），**不是** T05 的漏。
+ *   把它算进 A6 ⇒ 运维会被一条**永远修不掉**的红追着跑（除非去删软删行的归属 —— 而那会
+ *   让「软删可恢复」这条语义破掉，正是 §9.3.2 ② 明令禁止的做法）。
+ * ⇒ 所以口径是：**A6 只在活记忆域内判定**；软删行的漂移由 `restore()` 的用例守。
+ */
+describe('★ R11 · A6 的活记忆域口径（软删行不该让 A6 恒红）', () => {
+  let dir: string;
+  let dbPath: string;
+
+  beforeEach(() => {
+    ({ dir, dbPath } = makeDbPath());
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  });
+
+  /**
+   * 往库里塞一条**带向量 + 带桶归属**的记忆（`deleted` 可指定）。
+   *
+   * ⚠️ 不复用 `seed()`：它会重建桶模型（`INSERT OR REPLACE vector_coarse_cells`），
+   *   而 `ON DELETE CASCADE` 会把已有的 `f-1` 连同归属和码行一起清空（R10 的形状）。
+   */
+  function addMemoryRow(
+    id: string,
+    options: { deleted?: boolean; fineId?: string; lastAccess?: number } = {},
+  ): void {
+    const db = new Database(dbPath);
+    try {
+      db.pragma('foreign_keys = ON');
+      const deleted = options.deleted === true ? 1 : 0;
+      db.prepare(
+        `INSERT INTO memories (id, kind, content, content_tokens, content_hash,
+                               created_at, last_access, access_count, stability, difficulty,
+                               pin_factor, source, deleted, deleted_at, embedding)
+         VALUES (?, 'fact', ?, ?, ?, 1000, ?, 0, 10, 1, 1, 'cli', ?, ?, ?)`,
+      ).run(
+        id,
+        `内容 ${id}`,
+        `内 容 ${id}`,
+        `hash-${id}`,
+        options.lastAccess ?? 1000,
+        deleted,
+        deleted === 1 ? 1000 : null,
+        vectorToBlob(unitVector(id.length + 7)),
+      );
+      db.prepare('INSERT INTO vector_cell_members (fine_id, memory_id) VALUES (?, ?)').run(
+        options.fineId ?? 'f-1',
+        id,
+      );
+    } finally {
+      db.close();
+    }
+  }
+
+  /** 造第二个细桶（`f-2`），并把若干条记忆的**桶归属**搬过去（码表一行不动）。 */
+  function moveMembershipToNewBucket(ids: readonly string[], newFineId: string): void {
+    const db = new Database(dbPath);
+    try {
+      db.pragma('foreign_keys = ON');
+      db.prepare(
+        `INSERT INTO vector_fine_cells (fine_id, coarse_id, centroid, updated_at)
+         VALUES (?, 'c-1', ?, 1000)`,
+      ).run(newFineId, vectorToBlob(unitVector(999)));
+      db.prepare(
+        `UPDATE vector_cell_members SET fine_id = ? WHERE memory_id IN (${ids.map(() => '?').join(',')})`,
+      ).run(newFineId, ...ids);
+    } finally {
+      db.close();
+    }
+  }
+
+  /** 直接把一条记忆标成软删（**只改 `deleted`**，与 `forget.ts` 的形状一致）。 */
+  function softDelete(ids: readonly string[]): void {
+    const db = new Database(dbPath);
+    try {
+      db.prepare(
+        `UPDATE memories SET deleted = 1, deleted_at = 1000 WHERE id IN (${ids.map(() => '?').join(',')})`,
+      ).run(...ids);
+    } finally {
+      db.close();
+    }
+  }
+
+  /** 库里**物理上**有多少条「码与归属的 `fine_id` 不一致」（不区分活/死）。 */
+  function physicalDriftRows(): number {
+    return countOf(
+      dbPath,
+      `SELECT count(*) AS n
+         FROM vector_codes vc
+         JOIN vector_cell_members vcm ON vcm.memory_id = vc.memory_id
+        WHERE vc.fine_id <> vcm.fine_id`,
+    );
+  }
+
+  it('① 软删但**保留桶归属且有码** ⇒ A6 三数相等、`mismatch = 0`（改前这里恒红）', () => {
+    seed(dbPath, sixGoodRows());
+    runBackfill({ dbPath, dryRun: false, force: false }, { onProgress: SILENT });
+
+    // 造「软删 + 保留归属 + 有码」的那一行：**先活着写进去（于是有码），再软删**
+    addMemoryRow('m-gone');
+    runBackfill({ dbPath, dryRun: false, force: false }, { onProgress: SILENT });
+    expect(
+      countOf(dbPath, "SELECT count(*) AS n FROM vector_codes WHERE memory_id = 'm-gone'"),
+    ).toBe(1);
+    softDelete(['m-gone']);
+
+    // 前置：**物理上**桶表比码表多一行（软删的归属还在）—— 这正是 R11 的成因
+    expect(countOf(dbPath, 'SELECT count(*) AS n FROM vector_cell_members')).toBe(7);
+    expect(countOf(dbPath, 'SELECT count(*) AS n FROM vector_codes')).toBe(7);
+    expect(
+      countOf(
+        dbPath,
+        'SELECT count(*) AS n FROM memories WHERE deleted = 0 AND embedding IS NOT NULL',
+      ),
+    ).toBe(6);
+
+    const selfCheck = runBackfill({ dbPath, dryRun: false, force: false }, { onProgress: SILENT });
+    // ★ 三数**同域**（活记忆域）⇒ 都等于 6
+    expect(selfCheck.consistency).toMatchObject({
+      codes: 6,
+      members: 6,
+      memories: 6,
+      mismatch: 0,
+      lonelyCodes: 0,
+      fineIdDrift: 0,
+    });
+    expect(selfCheck.a6Passed).toBe(true);
+    expect(formatReport(selfCheck, { dbPath, dryRun: false, force: false })).toContain('✓ A6 通过');
+
+    // ⚠️ **数据一行没删**（我们改的是**读数口径**，不是数据 —— 改数据会让「软删可恢复」破掉）
+    expect(countOf(dbPath, 'SELECT count(*) AS n FROM vector_cell_members')).toBe(7);
+    expect(countOf(dbPath, 'SELECT count(*) AS n FROM vector_codes')).toBe(7);
+  });
+
+  it('② 该软删行的 `fine_id` 被人为改乱 ⇒ A6 **仍然绿**（**刻意**：它在活记忆域外）', () => {
+    seed(dbPath, sixGoodRows());
+    addMemoryRow('m-gone');
+    runBackfill({ dbPath, dryRun: false, force: false }, { onProgress: SILENT });
+
+    // ① 先软删，② 再把它的**归属**搬到 f-2（码行留在 f-1 ⇒ 物理上是「漂移」）
+    softDelete(['m-gone']);
+    moveMembershipToNewBucket(['m-gone'], 'f-2');
+
+    // 前置：物理上确实存在 1 条漂移行（不区分活/死）
+    expect(physicalDriftRows()).toBe(1);
+
+    const selfCheck = runBackfill({ dbPath, dryRun: false, force: false }, { onProgress: SILENT });
+    // ★★ **刻意**：A6 判的是「**活**记忆的码表与桶表对不对齐」。
+    //   这条软删行的归属要不要留、要不要跟着码搬，是 `restore()` 的语义问题
+    //   （恢复时它会被重新 `assignBucket`），**不是** T05 的漏。
+    //   ⇒ 把它算进 A6 ⇒ 运维被一条**永远修不掉**的红追着跑
+    //     （除非去删软删行的归属 —— 而那是 §9.3.2 ② 明令禁止的做法）。
+    expect(selfCheck.consistency.mismatch).toBe(0);
+    expect(selfCheck.consistency.fineIdDrift).toBe(0);
+    expect(selfCheck.consistency.lonelyCodes).toBe(0);
+    expect(selfCheck.a6Passed).toBe(true);
+    // 负控：**物理漂移仍然在**（上一条绿不是「把漂移修掉了」）
+    expect(physicalDriftRows()).toBe(1);
+  });
+
+  it('③ 活行里造漂移 ⇒ **仍然红**（防止 ② 的口径被放宽成「什么都查不出」）', () => {
+    seed(dbPath, sixGoodRows());
+    runBackfill({ dbPath, dryRun: false, force: false }, { onProgress: SILENT });
+
+    // 只动**活行**的归属（码行留在旧桶 ⇒ 漂移）
+    moveMembershipToNewBucket(['m-1', 'm-2'], 'f-2');
+
+    const selfCheck = runBackfill({ dbPath, dryRun: false, force: false }, { onProgress: SILENT });
+    expect(selfCheck.consistency.codes).toBe(6);
+    expect(selfCheck.consistency.members).toBe(6);
+    expect(selfCheck.consistency.memories).toBe(6);
+    // 行数完全相等（漂移只在 `fine_id` 上）—— 这就是「只数行数」会漏的形状
+    expect(selfCheck.consistency.mismatch).toBe(0);
+    expect(selfCheck.consistency.fineIdDrift).toBe(2);
+    expect(selfCheck.a6Passed).toBe(false);
+
+    // 退出码也非 0（同一条命令行）
+    const cli = spawnSync(
+      process.execPath,
+      ['--import', 'tsx', join(REPO_ROOT, 'scripts', 'backfill-codes.ts'), `--db=${dbPath}`],
+      { encoding: 'utf8', cwd: REPO_ROOT },
+    );
+    expect(cli.status).toBe(1);
+    expect(cli.stdout).toContain('A6 fineIdDrift = 2');
+  });
+});

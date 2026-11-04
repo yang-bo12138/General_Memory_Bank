@@ -252,8 +252,11 @@ describe('P2-T10 · A 行 · 不传 `queryEmbedding` ⇒ 召回行为**一位都
       );
 
       // ── 冻结期望值（字面量）：向量路**整路缺席**（A 行的第一个字段就是它）──
-      expect(a.explain?.routes.vector).toEqual({ ran: false, candidates: 0 });
-      expect(b.explain?.routes.vector).toEqual({ ran: false, candidates: 0 });
+      // ⚠️ **`toEqual` 而不是 `toMatchObject`**（T04 收尾）：整路缺席时
+      //   `codesMissing` 是**确定值 0**（桶集为空 ⇒ 没什么可"缺码"的）
+      //   ⇒ 三个字段逐字段钉死，多一个/少一个字段都要红。
+      expect(a.explain?.routes.vector).toEqual({ ran: false, candidates: 0, codesMissing: 0 });
+      expect(b.explain?.routes.vector).toEqual({ ran: false, candidates: 0, codesMissing: 0 });
       // ── 另外两路照常（证明「整路缺席」不是「三路都没跑」）──
       expect(a.explain?.routes.text).toEqual({ ran: true, candidates: 2 });
 
@@ -349,7 +352,12 @@ describe('P2-T10 · B 行 · 传了但向量路整路缺席（`absent`）⇒ `ra
 
       expect(plain.hits.length).toBe(2);
       // ── 整路缺席：`ran=false` / `candidates=0` ──
-      expect(withVector.explain?.routes.vector).toEqual({ ran: false, candidates: 0 });
+      // ⚠️ `toEqual`：整路缺席 ⇒ `codesMissing` 同样是**确定值 0**
+      expect(withVector.explain?.routes.vector).toEqual({
+        ran: false,
+        candidates: 0,
+        codesMissing: 0,
+      });
       // ── 与「不传」逐字段相同（hits / suppressed / diffused）──
       expect(withVector.hits).toEqual(plain.hits);
       expect(withVector.suppressed).toEqual(plain.suppressed);
@@ -386,7 +394,7 @@ describe('P2-T10 · D 行 · 传了且命中 ⇒ `cos` / `vectorPart` / `fromVec
       queryEmbedding: numbersOf(unitVector(0)),
     });
 
-    expect(result.explain?.routes.vector).toEqual({ ran: true, candidates: 1 });
+    expect(result.explain?.routes.vector).toEqual({ ran: true, candidates: 1, codesMissing: 0 });
     const hit = result.hits.find((item) => item.id === 'v-hit');
     expect(hit, '向量路命中的那条必须进 hits').toBeDefined();
     if (hit === undefined) {
@@ -431,7 +439,7 @@ describe('P2-T10 · D 行 · 传了且命中 ⇒ `cos` / `vectorPart` / `fromVec
     });
 
     // ── 只有 1 条：弱的**根本没进候选**（若实现「留 0 分」⇒ 这里会是 2）──
-    expect(result.explain?.routes.vector).toEqual({ ran: true, candidates: 1 });
+    expect(result.explain?.routes.vector).toEqual({ ran: true, candidates: 1, codesMissing: 0 });
     expect(result.hits.map((hit) => hit.id)).toEqual(['v-strong']);
     expect(result.hits.some((hit) => hit.id === 'v-weak')).toBe(false);
   });
@@ -452,7 +460,7 @@ describe('P2-T10 · D 行 · 传了且命中 ⇒ `cos` / `vectorPart` / `fromVec
     // ── 文本路照常召回（分母不为 0 ⇒ 下面「全 false / 全 null」不是空转）──
     expect(result.hits.length).toBeGreaterThanOrEqual(1);
     // ── 三个标志：跑了、但零候选 ──
-    expect(result.explain?.routes.vector).toEqual({ ran: true, candidates: 0 });
+    expect(result.explain?.routes.vector).toEqual({ ran: true, candidates: 0, codesMissing: 0 });
     for (const hit of result.hits) {
       expect(hit.fromVector).toBe(false);
       expect(hit.breakdown?.cos).toBeNull();
@@ -500,7 +508,7 @@ describe('P2-T10 · D3 · 三道过滤的顺序不可换（cos 阈值 → 强度
     });
 
     // ── 保留的是「cos 次高但活着」的那条 ──
-    expect(result.explain?.routes.vector).toEqual({ ran: true, candidates: 1 });
+    expect(result.explain?.routes.vector).toEqual({ ran: true, candidates: 1, codesMissing: 0 });
     expect(result.hits.map((hit) => hit.id)).toEqual(['alive-lower-cos']);
     // ── 负控：cos 更高的那条**必须不在** hits 里（它已归档）──
     expect(result.hits.some((hit) => hit.id === 'archived-high-cos')).toBe(false);
@@ -579,12 +587,20 @@ describe('P2-T10 · `includeArchived:true` ⇒ 粗筛取消 **且** 强度精筛
 
     // ── 默认（不查归档层）⇒ 被强度精筛剔除 ──
     const excluded = recall(store, options);
-    expect(excluded.explain?.routes.vector).toEqual({ ran: true, candidates: 0 });
+    expect(excluded.explain?.routes.vector).toEqual({
+      ran: true,
+      candidates: 0,
+      codesMissing: 0,
+    });
     expect(excluded.hits.some((hit) => hit.id === 'archived-vec')).toBe(false);
 
     // ── `includeArchived:true` ⇒ 进得了候选（两件事都生效）──
     const included = recall(store, { ...options, includeArchived: true });
-    expect(included.explain?.routes.vector).toEqual({ ran: true, candidates: 1 });
+    expect(included.explain?.routes.vector).toEqual({
+      ran: true,
+      candidates: 1,
+      codesMissing: 0,
+    });
     const hit = included.hits.find((item) => item.id === 'archived-vec');
     expect(hit).toBeDefined();
     expect(hit?.fromVector).toBe(true);

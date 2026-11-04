@@ -206,10 +206,19 @@ describe('T03 · IVF 端到端 · 门面 → ivf 端口 → CentroidCache → se
     });
 
     // ── call 级：向量路真的跑了，且产出了 `VECTOR_TOPK` 条候选 ──
-    expect(result.explain?.routes.vector).toEqual({
+    // ⚠️ **T04（C′ 档 §5.1.9）**：`routes.vector` 多了第三个字段 `codesMissing`
+    //   （命中桶内「有成员、无码」的行数）。本夹具**没有任何码行**（T05 未落地）
+    //   ⇒ 它是**真值 > 0**，**不能**钉 0（钉 0 就是拿一个假的期望值把断言弄红）。
+    //   ⇒ `ran` / `candidates` 两个数逐字段钉死；第三个数**单独**钉在一个**可独立推导**的值上。
+    expect(result.explain?.routes.vector).toMatchObject({
       ran: true,
       candidates: DEFAULT_PARAMS.VECTOR_TOPK,
     });
+    // ★ `codesMissing` 的真值 = **命中桶的成员行数**。
+    //   本夹具的探针吃满（`ROUTER_NPROBE_COARSE = 20` / `ROUTER_NPROBE_FINE = 40` ⇒ 全部细桶）
+    //   ⇒ 「命中桶」= 全库的桶 ⇒ 成员行数 = `PER_CLUSTER × 2`（与上面那条前提用例
+    //   `stats().vectorBackend.members` 断言的是同一个数，这里用字面量冻结，不拿被测函数当分母）。
+    expect(result.explain?.routes.vector?.codesMissing).toBe(PER_CLUSTER * 2);
     // ── 文本路为空（上下文与正文汉字集不相交）⇒ 每条 hit 都只能来自向量路 ──
     expect(result.hits.length).toBeGreaterThan(0);
     expect(result.hits.every((hit) => hit.fromText === false)).toBe(true);
@@ -395,8 +404,24 @@ describe('T03 · 成对反例 ② · 同一世界：`ivf`（已训练、探针�
       });
 
       // ── 两边的 `candidates` 也必须相同（探针吃满 ⇒ 桶覆盖 = 全库）──
-      expect(viaIvf.explain?.routes.vector).toEqual(viaFlat.explain?.routes.vector);
+      // ⚠️ **T04**：`routes.vector` 多了 `codesMissing`，它是**桶**的概念 ——
+      //   `flat` 没有桶（`route()` 只回 `__flat_all__`）⇒ 它恒为 0，而 ivf 的数 > 0
+      //   ⇒ 「两个后端的 explain 逐字段相等」不再成立。这里比对**共有的两个字段**。
+      const routeOf = (value: {
+        explain?: { routes: { vector: { ran: boolean; candidates: number } } };
+      }) => ({
+        ran: value.explain?.routes.vector.ran ?? false,
+        candidates: value.explain?.routes.vector.candidates ?? -1,
+      });
+      expect(routeOf(viaIvf)).toEqual(routeOf(viaFlat));
       expect(viaIvf.explain?.routes.vector.ran).toBe(true);
+      // ★ **第三个字段不能就这么被丢掉**（T04 收尾）：它不是「两边相同」，而是
+      //   「**两边各有确定值**」—— 本夹具**没有任何码行**（T05 未落地），探针吃满
+      //   ⇒ ivf 的命中桶 = 全部细桶 ⇒ 它 = 成员数 = `PER_CLUSTER × 2`；
+      //   而 flat 的路由只回 `__flat_all__`（没有桶的概念）⇒ 恒 0。
+      //   ⇒ 逐字钉死；否则这个字段在本文件里等于**没人看**（放宽成 `routeOf` 就把它丢了）。
+      expect(viaIvf.explain?.routes.vector.codesMissing).toBe(PER_CLUSTER * 2);
+      expect(viaFlat.explain?.routes.vector.codesMissing).toBe(0);
 
       // ── ① id 序列逐位相同（顺序也一致：同一个 compareHits 全序）──
       expect(viaIvf.hits.map((hit) => hit.id)).toEqual(viaFlat.hits.map((hit) => hit.id));

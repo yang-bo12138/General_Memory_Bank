@@ -156,10 +156,18 @@ const FROZEN_HITS: ReadonlyArray<{
   },
 ];
 
-/** 冻结的三路计数（与上面同一时刻的真实输出）。 */
+/**
+ * 冻结的三路计数（与上面同一时刻的真实输出）。
+ *
+ * ⚠️ ★ **T04（C′ 档 §5.1.9）**：`routes.vector` 多了第三个字段 `codesMissing`
+ *   （命中桶内「有成员、无码」的行数）。本用例**不传 `queryEmbedding`** ⇒ 向量路整路缺席
+ *   ⇒ 一个桶都没扫 ⇒ 它**确定地**等于 0（不是「没算所以没有」）。
+ *   ⇒ 这里**显式补字段**而不是换成 `toMatchObject`：冻结字面量的价值就在于
+ *     「形状变了就红」—— 换 `toMatchObject` 会把「多了/少了字段」一起放过。
+ */
 const FROZEN_ROUTES = {
   text: { ran: true, candidates: 3 },
-  vector: { ran: false, candidates: 0 },
+  vector: { ran: false, candidates: 0, codesMissing: 0 },
   graph: { ran: true, candidates: 4 },
 } as const;
 

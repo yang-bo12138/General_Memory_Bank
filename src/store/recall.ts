@@ -96,6 +96,7 @@ import {
 import { buildMatchQuery } from '../core/tokenize.js';
 import { inhibitCandidates, loadInhibitionFacts } from '../neuron/inhibit.js';
 import type { VectorFilter } from '../vector/backend.js';
+import { countUncodedCandidates } from '../vector/ivf.js';
 import { normalizeQueryEmbedding } from '../vector/query.js';
 import { type DiffusedItem, diffuse } from './diffuse.js';
 import type { EventWriter } from './events.js';
@@ -336,12 +337,40 @@ export interface RecallRouteInfo {
   candidates: number;
 }
 
+/**
+ * **向量路**的运行情况（= `RecallRouteInfo` + 一个只属于向量路的读数）。
+ *
+ * ★ **为什么用子接口，而不是给 `RecallRouteInfo` 加一个可选字段**（C′ 档 §5.1.9）：
+ *   加可选字段会**污染** `text` / `graph` —— 它们不产这个数，却会被允许存在
+ *   ⇒ 下一个人会去填它，而填什么都是编的。
+ *   ⇒ 子接口把「只有向量路才有这个数」写成**类型**。
+ *
+ * ⚠️ 这是一次**加法式破缺**：对 `routes.vector` 做严格相等（`toEqual({ran, candidates})`）
+ *   的断言会变红 ⇒ 改成 `toMatchObject` 或补字段即可，**不是回归**（§5.1.9 已预告）。
+ */
+export interface RecallVectorRouteInfo extends RecallRouteInfo {
+  /**
+   * 本次**命中桶内「有成员、无码」的行数**（`> 0` = **码没铺满**）。
+   *
+   * · **它是上界**：数的是桶内「有成员、无码行」的行，**不施加**行级谓词
+   *   （`excludeIds` / 时间窗 / 软删）—— 软删成员保留桶归属，因此也会让它 `> 0`；
+   * · **它不是错误、不是门槛、不抛错**（C′ 档 §7.1.2 ④）：做成阈值/告警
+   *   ⇒「回填还没跑完的库」直接不可用，而那正是本档要支持的处境；
+   * · **谁该关心**：① 运维 —— 回填跑完没有（终态应为 0，除软删）；
+   *   ② 工程师 —— 码行的写入点漏了吗（漏了它会随写入单调上涨）。
+   * · ⚠️ **它数不出「码过期」**（`updateContent()` 改了向量但码没重编 ⇒ 码还行、`fine_id` 也对
+   *   ⇒ 这个数是 0）⇒ 那条依赖 T05（在 `assignBucket` 里重编码）来关闭。
+   * · **只在 `explain` / `diagnostics` 时计算** ⇒ 正常召回**零成本**。
+   */
+  codesMissing: number;
+}
+
 /** 一次调用的**级**诊断（§6 的 `explain`）。 */
 export interface RecallExplain {
   /** 三条路各自的运行情况。 */
   routes: {
     text: RecallRouteInfo;
-    vector: RecallRouteInfo;
+    vector: RecallVectorRouteInfo;
     graph: RecallRouteInfo;
   };
   /**
@@ -833,6 +862,13 @@ export interface VectorRouteResult {
   ran: boolean;
   /** 精筛 + slice 之后、**去重之前**的候选（顺序 = `search()` 的 cos 降序）。 */
   rows: Array<CandidateRow & { cos: number }>;
+  /**
+   * 命中桶内「有成员、无码」的行数（C′ 档 §5.1.9 的 `codesMissing`）。
+   *
+   * ⚠️ **只在调用方要求诊断（`withVectorDiagnostics`）时才计算** ⇒ 正常召回**零成本**、
+   *   这个字段**缺省不存在**（不是 0）——「没算」与「算了是 0」是两件事，别混。
+   */
+  codesMissing?: number;
 }
 
 /**
@@ -921,7 +957,8 @@ function loadVectorCandidateRows(
  * @param includeArchived 是否显式查询归档层
  * @param archiveLine 精筛阈值（`null` = 归档模式 ⇒ **整体不判强度**）
  * @param now 注入时钟
- * @returns 步骤 2c 的战果（`ran` + 精筛截断后的候选）
+ * @param withDiagnostics 是否计算 `codesMissing`（**只在 `explain` / `diagnostics` 时为真**）
+ * @returns 步骤 2c 的战果（`ran` + 精筛截断后的候选 + 可选的 `codesMissing`）
  * @throws {MemoryError} code = `INVALID_INPUT`（`queryEmbedding` 维度不符 / 含 NaN·Inf / 零向量）
  */
 function collectVectorCandidates(
@@ -931,6 +968,7 @@ function collectVectorCandidates(
   includeArchived: boolean,
   archiveLine: number | null,
   now: number,
+  withDiagnostics: boolean,
 ): VectorRouteResult {
   const db = store.db;
   const params = store.params;
@@ -944,18 +982,28 @@ function collectVectorCandidates(
   //   `ran` 的判据写死为「有 port ∧ 有 queryEmbedding ∧ route() 非空」（D5）。
   //   ⚠️ 此时**不调 `search()`**：它内部会再路由一次（拿到的仍是空），纯浪费一次查询。
   if (fineIds.length === 0) {
-    return { ran: false, rows: [] };
+    return withDiagnostics ? { ran: false, rows: [], codesMissing: 0 } : { ran: false, rows: [] };
   }
 
   // ── ③④ 时间窗（唯一计算处）→ 过滤器 ──
   const filter = vectorFilterOf(coarseGateWindow(params, now, includeArchived));
+
+  // ── ★ 诊断读数：**命中桶内「有成员、无码」的行数**（C′ 档 §5.1.9）──
+  //   ⚠️ **只在 `explain` / `diagnostics` 时算**（一次桶表区间扫 + 每行一次唯一索引探针）
+  //     ⇒ 正常召回**零成本**。
+  //   ⚠️ **放在 `search()` 之前**：它数的是「这次检索的桶集里有多少行没用上码」，
+  //     与「最终命中几条」无关（`hits = 0` 时它照样有意义）。
+  //   ⚠️ **它不是错误、不是门槛**：`> 0` = 码没铺满（回填未完成 / 某条路径漏了维护）。
+  const codesMissing = withDiagnostics ? countUncodedCandidates(db, fineIds) : undefined;
 
   // ── ⑤ 检索（后端应用时间窗；**不做** cos 阈值与强度精筛）──
   const hits = port.backend.search(query, params.VECTOR_TOPK * VECTOR_OVERFETCH_FACTOR, filter);
   // ⚠️ **`ran` 仍是 true**：路由通了、检索也执行了，只是桶里没有东西（或全被时间窗挡掉）
   //   ⇒ 这是 D5 的 C 行，与 A/B 行（整路缺席）**必须能区分开**。
   if (hits.length === 0) {
-    return { ran: true, rows: [] };
+    return codesMissing === undefined
+      ? { ran: true, rows: [] }
+      : { ran: true, rows: [], codesMissing };
   }
 
   // ── ⑥ 回表补齐（`VectorHit` 只有 id + score，D3）──
@@ -997,7 +1045,7 @@ function collectVectorCandidates(
       break;
     }
   }
-  return { ran: true, rows };
+  return codesMissing === undefined ? { ran: true, rows } : { ran: true, rows, codesMissing };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1225,6 +1273,14 @@ export interface CandidatePipelineInput {
    *   ⇒ 「诊断工具看到的分数」与「生产实际发生的分数」在**同一个输入**下逐位相同（D8）。
    */
   queryEmbedding?: number[];
+  /**
+   * 是否顺带算**向量路的诊断读数**（`codesMissing`，C′ 档 §5.1.9）。
+   *
+   * ⚠️ **缺省 `false` ⇒ 一次额外的桶表聚合都不发**（正常召回零成本）。
+   *   只有 `recall()` 在 `explain || diagnostics` 时才传 `true`；
+   *   `inhibitionTrace()` 等诊断工具**不传**（它们不产出 `explain.routes`）。
+   */
+  withVectorDiagnostics?: boolean;
 }
 
 /** 共用流水线的产物（步骤 3 的候选 + 诊断所需的计数）。 */
@@ -1306,6 +1362,7 @@ export function collectScoredCandidates(
           input.includeArchived,
           archiveLine,
           input.now,
+          input.withVectorDiagnostics === true,
         );
 
   // ── 步骤 2.5：候选去重合并（三路；向量路排最后，D4）──
@@ -1374,6 +1431,9 @@ export function recall(store: RecallStore, options: RecallOptions): RecallResult
     // ⚠️ **`exactOptionalPropertyTypes` ⇒ 条件展开**：显式写 `queryEmbedding: undefined`
     //   与「没有这个属性」是**两件事**（后者才是「没传」）。
     ...(options.queryEmbedding === undefined ? {} : { queryEmbedding: options.queryEmbedding }),
+    // ⚠️ **诊断读数只在要 `explain` / `diagnostics` 时才算**（C′ 档 §5.1.9）：
+    //   `codesMissing` 要发一次桶表聚合 ⇒ 正常召回不为它付任何成本。
+    withVectorDiagnostics: withBreakdown,
   });
   const scored = pipeline.scored;
   const contextEntityIds = pipeline.contextEntityIds;
@@ -1554,7 +1614,15 @@ export function recall(store: RecallStore, options: RecallOptions): RecallResult
         //   ⚠️ `candidates === 0` 时读的人**分不出**「跑到 60 条但被闸门砍光」与
         //     「桶里本来就没东西」—— 这是**已知且可接受**的代价（D3-b）：
         //     复盘要问的第一个问题（「向量路到底跑没跑」）已由 `ran` 回答。
-        vector: { ran: pipeline.vector.ran, candidates: pipeline.vector.rows.length },
+        // ⚠️ △ **T04 的加法式破缺**：`routes.vector` 多了第三个字段 `codesMissing`
+        //   （`RecallVectorRouteInfo`，C′ 档 §5.1.9）⇒ 对 `routes.vector` 做**严格相等**
+        //   的断言会变红，改成 `toMatchObject` 即可（不是回归）。
+        //   ⚠️ `?? 0` 只在「没算」时兜底；`explain` 存在 ⇒ `withBreakdown === true` ⇒ 一定算过。
+        vector: {
+          ran: pipeline.vector.ran,
+          candidates: pipeline.vector.rows.length,
+          codesMissing: pipeline.vector.codesMissing ?? 0,
+        },
         // ⚠️ `ran=false` = 本次没有解析出任何实体。
         graph: { ran: contextEntityIds.length > 0, candidates: pipeline.graphCount },
       },

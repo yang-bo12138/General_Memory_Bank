@@ -29,6 +29,8 @@ import { type IvfCentroidModel, blobToVector, saveCentroidModel } from './centro
 import { assertValidEmbedding, dot } from './dot.js';
 import { type VectorCandidateRow, compareHits, passesTimeWindow } from './flat.js';
 import { DEFAULT_MAX_ITERATIONS, sphericalKmeans } from './kmeans.js';
+import { type PruneEntry, WRITE_EXACT_RESCORE_BUDGET, pruneTopK } from './prune.js';
+import { blobToCode } from './quantize.js';
 
 /** IVF 后端在 `stats().backend` 里的名字。 */
 export const IVF_BACKEND_NAME = 'ivf';
@@ -405,12 +407,21 @@ export interface BucketCandidateRow {
   embedding: Buffer;
 }
 
-/** 桶内候选扫描的结果（§4.9 步骤 3a2 ②）。 */
+/** 桶内候选扫描的结果（§4.9 步骤 3a2 ② / C′ 档 T04）。 */
 export interface BucketCandidateScan {
   /** 命中的细桶 id（**按中心距离升序** = 点积降序）。 */
   fineIds: string[];
   /**
-   * **被扫描的候选行数**（= 命中桶里 `deleted = 0` 且有向量的行数）。
+   * **被扫描的候选行数** = **命中桶的成员行数**（`vector_cell_members` 去重后）。
+   *
+   * ⚠️ ★ **口径在 T04 变了「来源」、没变「语义」**（规格 §5.1.3）：
+   *   · HEAD：= 那次 JOIN 查询返回的行数（桶内 `deleted = 0` 且有向量的行数）；
+   *   · T04：= `readMembers()` 得到的成员 id 去重个数（**只依赖桶表**，与码表状态无关）。
+   *   ⇒ 它仍然是「**候选宇宙**大小」，**不是**「返回的候选数」、**更不是** survivors 的个数
+   *     （改成 survivors 就是 `scanned` 与 `exactReads` 混成一个 ⇒ 「剪枝率」这个出关条件消失）。
+   *   ⇒ 与 HEAD 的差 = **命中桶内的软删成员数**（软删**保留**桶归属，`forget.ts` 不调
+   *     `unassignBucket`）⇒ 方向**恒为偏大**（H1 看起来更差，不会假绿），
+   *     且由 `A1'` 负控钉死（`scanned(prune=true) === scanned(prune=false) + 软删成员数`）。
    *
    * ⚠️ **这才是「候选扫描量」**（不是「返回的候选数」）：
    *   §4.9 步骤 3a2 的「候选 ≤ 2000」指的是**扫描量**
@@ -420,6 +431,21 @@ export interface BucketCandidateScan {
   scanned: number;
   /** 候选行（**按 `fineIds` 的命中顺序**，桶内按 `memory_id` 升序）。 */
   rows: BucketCandidateRow[];
+  /**
+   * 走**精确兜底**的条数（命中桶内「有成员、无可用码」的行数，规格 §5.1.5）。
+   *
+   * ⚠️ **必填**（不是可选）：TS 逼每个实现填上 ⇒ 「有码 / 无码」这个区分不会在某条路径上消失。
+   *   `dedupCandidates.ts` **不读它** ⇒ 存储层仍然零改动。
+   */
+  uncoded: number;
+  /**
+   * **为精确分付了代价的行数**（`scoreOf` 的调用次数，规格 §5.1.10）。
+   *
+   * ⚠️ 它是**剪枝率**的分子（`exactReads / scanned` ⇒ 出关条件①的「≤ 15%」）：
+   *   若 `exactReads ≈ scanned` ⇒ **剪枝没生效**（`eps` 太大 / 码坏了）**而结果仍然全对**
+   *   ⇒ 只有这个数能发现它。
+   */
+  exactReads: number;
 }
 
 /**
@@ -470,6 +496,205 @@ export function buildBucketCandidateSql(fineIds: readonly string[]): string {
 }
 
 /**
+ * 读命中桶的**成员 id 并集**（Q1，C′ 档 §5.1.2）。
+ *
+ * ⚠️ **这是 `vector_cell_members` 的唯一读取口径**（两段式读路径与写路径共用）：
+ *   过去它是 `IvfVectorBackend#readMembers()` 的私有实现，T04 起提到模块级 ——
+ *   因为「按桶扫成员」现在有**两个**调用方（`search()` 与 `scanBucketCandidates()`），
+ *   两份实现会让「候选宇宙」的口径分叉（C36）。
+ *
+ * ⚠️ **不碰 `memories`**（写路径 H1′ 的硬约束：判 `deleted` 与搬运 3KB 向量是同一笔页读）。
+ * ⚠️ **软删成员仍然在这里**（桶表**故意**保留软删归属，`forget.ts` 不调 `unassignBucket`）
+ *   ⇒ 它们是 `scanned` 与 HEAD 的差（方向恒为偏大，见 `BucketCandidateScan.scanned`）。
+ *
+ * @param db 库句柄
+ * @param fineIds 命中的细桶 id（按路由顺序）
+ * @returns 成员 id 集合（**去重**；迭代顺序 = 桶顺序 → 桶内 rowid 顺序 ⇒ 确定性）
+ */
+function readMemberIds(db: Database.Database, fineIds: readonly string[]): Set<string> {
+  const ids = new Set<string>();
+  const statement = db.prepare(
+    'SELECT fine_id, memory_id FROM vector_cell_members WHERE fine_id = ?',
+  );
+  for (const fineId of fineIds) {
+    const rows = statement.all(fineId) as Array<{ fine_id: string; memory_id: string }>;
+    for (const row of rows) {
+      ids.add(row.memory_id);
+    }
+  }
+  return ids;
+}
+
+/** 一条**可用**的码行（`readCodes()` 的产物）。 */
+export interface CodedVectorRow {
+  /** 维度个 int8（`x̂ = scale × code`）。 */
+  readonly code: Int8Array;
+  /** 还原标量（`x̂ = scale × code`）。 */
+  readonly scale: number;
+  /** 编码期实算的 `‖x − x̂‖₂`（已含安全余量）。 */
+  readonly eps: number;
+}
+
+/**
+ * 读命中桶的**码池**（Q2，C′ 档 §5.1.2 / §5.1.5 的 fail-open 判定）。
+ *
+ * ★ **不碰 `memories`**（这是 H1′ 成立的前提，规格 §5.1.0 的硬约束）：
+ *   若这里 `JOIN memories`（哪怕只 `SELECT m.deleted`），`bench` 的 `classifyReadKind()`
+ *   会把这条读认成 `candidate` ⇒ T06 的 `codeRowsRead` 永远 0、`memoryRowsRead` 永远满额
+ *   ⇒ **H1′ 的账从根上算错，而报表看起来很正常**。
+ *
+ * ★ **「无码」的五种形状在这里一次判完**（§5.1.5 的表）：
+ *   · 码行不存在（池里没这个 id）；
+ *   · `code` 长度 ≠ `EMBED_DIM`；
+ *   · `scale` 非有限；
+ *   · `eps` 非有限或为负；
+ *   · 码行的 `fine_id` 漂移 / 成为孤儿码（`WHERE vc.fine_id IN (...)` 天然把它排除）。
+ *   ⇒ 前四种在下面**直接不放进池**；第五种由 SQL 的 `fine_id` 条件排除
+ *   ⇒ 五种都落进调用方的 `uncoded` ⇒ `upper = +∞` ⇒ 精确兜底 ⇒ **迟一步、但不错**。
+ *
+ * @param db 库句柄
+ * @param fineIds 命中的细桶 id
+ * @returns `memory_id → 码行`（**不含**坏行：坏行 = 无码）
+ */
+export function readCodes(
+  db: Database.Database,
+  fineIds: readonly string[],
+): Map<string, CodedVectorRow> {
+  const pool = new Map<string, CodedVectorRow>();
+  if (fineIds.length === 0) {
+    return pool;
+  }
+  const dimensions = DEFAULT_PARAMS.EMBED_DIM;
+  for (const chunk of chunkIds(fineIds, SQL_PARAM_CHUNK)) {
+    const placeholders = chunk.map(() => '?').join(', ');
+    const rows = db
+      .prepare(
+        'SELECT vc.memory_id AS id, vc.code AS code, vc.scale AS scale, vc.eps AS eps ' +
+          `FROM vector_codes vc WHERE vc.fine_id IN (${placeholders})`,
+      )
+      .all(...chunk) as Array<{ id: string; code: Buffer; scale: number; eps: number }>;
+    for (const row of rows) {
+      // ⚠️ **码长对不上 ⇒ 当无码**（不抛错、不补零）：回填按 `length(embedding) = @bytes`
+      //   分类，所以「坏维度 + 有码」只可能来自手工改库 ⇒ 这里 fail-open 比响亮失败更安全
+      //   （响亮失败会让整条召回不可用；fail-open 只是多读 3KB）。
+      if (row.code.byteLength !== dimensions) {
+        continue;
+      }
+      if (!Number.isFinite(row.scale)) {
+        continue;
+      }
+      if (!Number.isFinite(row.eps) || row.eps < 0) {
+        continue;
+      }
+      pool.set(row.id, { code: blobToCode(row.code), scale: row.scale, eps: row.eps });
+    }
+  }
+  return pool;
+}
+
+/**
+ * 读「行级谓词」需要的**窄列**（Q3，C′ 档 §5.1.2 / §5.1.6 ②）。
+ *
+ * ⚠️ **只读三列**（`id` / `last_access` / `pin_factor`）：剪枝前把它当**筛子**用
+ *   ⇒ 注定被时间窗挡掉的行**不会**被读 3KB 向量。
+ * ⚠️ **刻意不带 `deleted = 0`**：软删行由 `scoreOf` 的 `null` 兜底
+ *   （它的 `SELECT` 带 `deleted = 0`）⇒「候选宇宙」的口径**只有一处**（不在两个地方各写一遍）。
+ * ⚠️ **只在 filter 带时间窗时才发**（两个键都 `undefined` ⇒ 整步跳过，见 `search()`）。
+ *
+ * @param db 库句柄
+ * @param memoryIds 待判的行 id
+ * @returns `id → { lastAccess, pinFactor }`（库里没有的 id 不在结果里）
+ */
+export function readGateColumns(
+  db: Database.Database,
+  memoryIds: readonly string[],
+): Map<string, { lastAccess: number; pinFactor: number }> {
+  const gate = new Map<string, { lastAccess: number; pinFactor: number }>();
+  if (memoryIds.length === 0) {
+    return gate;
+  }
+  for (const chunk of chunkIds(memoryIds, SQL_PARAM_CHUNK)) {
+    const placeholders = chunk.map(() => '?').join(', ');
+    const rows = db
+      .prepare(
+        'SELECT id, last_access, pin_factor FROM memories ' + `WHERE id IN (${placeholders})`,
+      )
+      .all(...chunk) as Array<{ id: string; last_access: number; pin_factor: number }>;
+    for (const row of rows) {
+      gate.set(row.id, { lastAccess: row.last_access, pinFactor: row.pin_factor });
+    }
+  }
+  return gate;
+}
+
+/**
+ * 构造「只读 survivors 整行」的 SQL（Q4，C′ 档 §5.1.2）。
+ *
+ * ⚠️ **为什么要一条新 SQL、而不是给 `buildBucketCandidateSql()` 加 `AND m.id IN (...)`**
+ *   （两条原因，缺一条就踩坑）：
+ *   ① `prune = false` 路径**必须**用旧 SQL —— 那是 A7「与 HEAD 逐位一致」的唯一依据；
+ *   ② `tests/**` 里那条 `EXPLAIN QUERY PLAN` 断言（P2-T07：两张表都得是 `SEARCH`）
+ *      钉的就是**旧 SQL 的文本** ⇒ 改它等于「测试跟着实现走」。
+ * ⚠️ **单表 + 主键 `id IN`** ⇒ 执行计划是主键 `SEARCH`（不是全表扫）
+ *   ⇒ 只对 survivors（≈ K 条）付 3KB/行。
+ *
+ * @param memoryIds survivors 的 id（**必须非空**：`IN ()` 是语法错误）
+ * @returns 可直接 `prepare()` 的 SQL（占位符与 `memoryIds` 一一对应）
+ * @throws {MemoryError} `INVALID_INPUT`（`memoryIds` 为空）
+ */
+export function buildSurvivorSql(memoryIds: readonly string[]): string {
+  if (memoryIds.length === 0) {
+    throw MemoryError.invalidInput('survivor SQL 需要至少一个 id（空列表会生成非法的 IN ()）', {
+      reason: 'empty-ids',
+      expected: '>= 1 个 id',
+      actual: '0',
+    });
+  }
+  const placeholders = memoryIds.map(() => '?').join(', ');
+  return `SELECT m.id AS id, m.content AS content, m.content_tokens AS content_tokens,
+            m.stability AS stability, m.last_access AS last_access, m.access_count AS access_count,
+            m.difficulty AS difficulty, m.embedding AS embedding
+       FROM memories m
+      WHERE m.id IN (${placeholders})
+        AND m.deleted = 0
+        AND m.embedding IS NOT NULL`;
+}
+
+/**
+ * 命中桶内「**有成员、无码**」的条数（`explain.routes.vector.codesMissing`，C′ 档 §5.1.9）。
+ *
+ * ⚠️ **它是「上界」，不是精确值**：数的是「桶里有成员、没有码行」的行，
+ *   **不施加**任何行级谓词（`excludeIds` / 时间窗 / 软删）。
+ *   真要精确，得再读一遍 `memories` —— 而 `codesMissing` **不该为了一次诊断去读上千行向量字节**。
+ *   ⇒ 文档里写「上界」，比写一个「看起来精确」的数诚实。
+ * ⚠️ **不碰 `memories`**：成本 = 桶表区间扫 + 每行一次 `idx_vcode_memory_unique` 探针。
+ * ⚠️ **它不是错误、不是门槛**（§7.1.2 ④）：`> 0` = **码没铺满**（回填未完成 / 某条路径漏了维护）。
+ *   做成阈值/告警 ⇒「回填还没跑完的库」直接不可用，而那正是本档要支持的处境。
+ *
+ * @param db 库句柄
+ * @param fineIds 命中的细桶 id
+ * @returns 无码成员行数（桶集为空 ⇒ 0）
+ */
+export function countUncodedCandidates(db: Database.Database, fineIds: readonly string[]): number {
+  if (fineIds.length === 0) {
+    return 0;
+  }
+  let total = 0;
+  for (const chunk of chunkIds(fineIds, SQL_PARAM_CHUNK)) {
+    const placeholders = chunk.map(() => '?').join(', ');
+    const row = db
+      .prepare(
+        'SELECT count(*) AS n FROM vector_cell_members vcm ' +
+          `WHERE vcm.fine_id IN (${placeholders}) ` +
+          'AND NOT EXISTS (SELECT 1 FROM vector_codes vc WHERE vc.memory_id = vcm.memory_id)',
+      )
+      .get(...chunk) as { n: number };
+    total += row.n;
+  }
+  return total;
+}
+
+/**
  * 扫命中桶取候选（§4.9 步骤 3a2 ②）—— **写入路径的向量路候选的唯一扫描点**。
  *
  * ⚠️ **为什么放在向量层**（§4.6 步骤 2c 的硬边界）：
@@ -489,12 +714,21 @@ export function buildBucketCandidateSql(fineIds: readonly string[]): string {
  * ⚠️ **分桶尚未训练 ⇒ 扫描量为 0**（不是抛错、也不是静默回落 flat）：
  *   §4.15.3：「模型为空 ⇒ 向量路整体缺席」⇒ 写入路径退回纯文本路（**不是降级报错**）。
  *
+ * ★ **两条分支各自完整**（`prune = false` **不是**「`threshold = -Infinity` 的退化」）：
+ *   · `prune = true`（缺省，两段式）：Q1 成员 → Q2 码池 → 剪枝 → Q4 survivors 整行；
+ *     `scanned = 成员数`（**不调** `buildBucketCandidateSql()`）；
+ *   · `prune = false`（**仅供对照**，A1 / A7）：HEAD 的 `buildBucketCandidateSql()` 一字不改，
+ *     `scanned = rows.length`（**不调** `readMemberIds()`）。
+ *   ⇒ 退化成「剪枝实现的参数化版本」会让 A7 测的不再是 HEAD 行为
+ *     （旧 SQL 没人执行 ⇒ `EXPLAIN QUERY PLAN` 那条断言变成对死代码的断言）。
+ *
  * @param db 库句柄
  * @param model 中心模型
  * @param query 查询向量（**已 L2 归一化**）
  * @param nprobeCoarse 粗层探针数（写入路径用 `ROUTER_NPROBE_WRITE_COARSE`）
  * @param nprobeFine 细层探针数（写入路径用 `ROUTER_NPROBE_WRITE_FINE`）
- * @returns 命中桶 + 扫描量 + 候选行
+ * @param options 剪枝开关 + 上界门槛 + K + 精确分口径（见 `BucketScanOptions`）
+ * @returns 命中桶 + 扫描量 + 候选行（+ 两个诊断计数）
  */
 export function scanBucketCandidates(
   db: Database.Database,
@@ -502,35 +736,152 @@ export function scanBucketCandidates(
   query: Float32Array,
   nprobeCoarse: number,
   nprobeFine: number,
+  options: BucketScanOptions = {},
 ): BucketCandidateScan {
   const fineIds = routeFineBuckets(model, query, nprobeCoarse, nprobeFine);
   if (fineIds.length === 0) {
-    return { fineIds: [], scanned: 0, rows: [] };
+    return { fineIds: [], scanned: 0, rows: [], uncoded: 0, exactReads: 0 };
   }
 
-  const raw = db.prepare(buildBucketCandidateSql(fineIds)).all(...fineIds) as Array<{
-    id: string;
-    content: string;
-    content_tokens: string;
-    stability: number;
-    last_access: number;
-    access_count: number;
-    difficulty: number;
-    embedding: Buffer;
-  }>;
+  if (!(options.prune ?? true)) {
+    // ── 分支 A：HEAD 的原路（`buildBucketCandidateSql()` + `rows.length` 当扫描量）──
+    const raw = db.prepare(buildBucketCandidateSql(fineIds)).all(...fineIds) as Array<{
+      id: string;
+      content: string;
+      content_tokens: string;
+      stability: number;
+      last_access: number;
+      access_count: number;
+      difficulty: number;
+      embedding: Buffer;
+    }>;
 
-  const rows: BucketCandidateRow[] = raw.map((row) => ({
-    id: row.id,
-    content: row.content,
-    content_tokens: row.content_tokens,
-    stability: row.stability,
-    last_access: row.last_access,
-    access_count: row.access_count,
-    difficulty: row.difficulty,
-    embedding: row.embedding,
-  }));
+    const headRows: BucketCandidateRow[] = raw.map((row) => ({
+      id: row.id,
+      content: row.content,
+      content_tokens: row.content_tokens,
+      stability: row.stability,
+      last_access: row.last_access,
+      access_count: row.access_count,
+      difficulty: row.difficulty,
+      embedding: row.embedding,
+    }));
 
-  return { fineIds, scanned: rows.length, rows };
+    // ⚠️ `uncoded: 0` / `exactReads: rows.length` 是**如实陈述**：
+    //   这条路上「有码 / 无码」这个区分**没有被使用**（一条码都没读），
+    //   而每一行的 `embedding` 都被读出来算了精确分 ⇒ 精确代价 = 行数。
+    return {
+      fineIds,
+      scanned: headRows.length,
+      rows: headRows,
+      uncoded: 0,
+      exactReads: headRows.length,
+    };
+  }
+
+  // ── 分支 B：两段式（§5.1.0 ①~⑦）──
+  const scoreOf = options.scoreOf;
+  if (scoreOf === undefined) {
+    // ⚠️ **响亮失败**：没有精确分口径 ⇒ 剪枝无从谈起。
+    //   `scoreOf` 由调用方注入是**刻意的**（§5.1.1 纪律②）：cos 口径只有一份，
+    //   而它在存储层（`cosineOf`）—— 放进本模块就成了第二份，且 A1 会因此偶发红。
+    throw MemoryError.invalidInput('两段式扫描需要调用方注入 scoreOf（精确分口径）', {
+      reason: 'scoreOf',
+      expected: '由调用方提供（写路径 = cosineOf）',
+      actual: 'undefined',
+    });
+  }
+
+  // ① 成员（Q1）② 码池（Q2）③ 交集 / ④ 差集（无码 ⇒ 精确兜底）
+  const memberIds = readMemberIds(db, fineIds);
+  const codePool = readCodes(db, fineIds);
+  const entries: PruneEntry[] = [];
+  for (const id of memberIds) {
+    const coded = codePool.get(id);
+    if (coded === undefined) {
+      entries.push({ kind: 'uncoded', id });
+      continue;
+    }
+    entries.push({ kind: 'coded', id, code: coded.code, scale: coded.scale, eps: coded.eps });
+  }
+
+  // ⑤ 剪枝（阈值 + top-K；两条路只差这里传的 threshold / k）
+  const outcome = pruneTopK(entries, {
+    query,
+    k: options.k ?? DEFAULT_PARAMS.VECTOR_TOPK,
+    ...(options.threshold === undefined ? {} : { threshold: options.threshold }),
+    // ⚠️ 写路径的结果键是 `cosineOf()`（同样钳进 `[0, 1]`）⇒ 同一条理由，下界为 `0`。
+    scoreFloor: 0,
+    // ★ **写路径显式带预算**（`WRITE_EXACT_RESCORE_BUDGET` = 64；见 `prune.ts` 的常量注释）：
+    //   写路径 `k = VECTOR_TOPK`（20）⇒ 正常早停只付 ~20 次 ⇒ 64 是 3 倍余量，永远碰不到它。
+    //   ⚠️ 读路径**不传**（`k = 60`，64 会让剪枝名存实亡）⇒ 见 `searchPruned()`。
+    exactRescoreBudget: WRITE_EXACT_RESCORE_BUDGET,
+    scoreOf,
+  });
+
+  // ⑥ survivors 整行（Q4）—— 只对入选的行付 3KB/行
+  const rowsById = new Map<string, BucketCandidateRow>();
+  const survivorIds = outcome.survivors.map((hit) => hit.id);
+  for (const chunk of chunkIds(survivorIds, SQL_PARAM_CHUNK)) {
+    const raw = db.prepare(buildSurvivorSql(chunk)).all(...chunk) as Array<{
+      id: string;
+      content: string;
+      content_tokens: string;
+      stability: number;
+      last_access: number;
+      access_count: number;
+      difficulty: number;
+      embedding: Buffer;
+    }>;
+    for (const row of raw) {
+      rowsById.set(row.id, {
+        id: row.id,
+        content: row.content,
+        content_tokens: row.content_tokens,
+        stability: row.stability,
+        last_access: row.last_access,
+        access_count: row.access_count,
+        difficulty: row.difficulty,
+        embedding: row.embedding,
+      });
+    }
+  }
+  // ⚠️ **按 survivors 的顺序出队**（精确分降序、同分 id 升序）：`id IN (...)` 的返回顺序
+  //   是执行计划的副产品，不能当契约 ⇒ 这里**只信 `pruneTopK()` 定的序**。
+  const rows: BucketCandidateRow[] = [];
+  for (const id of survivorIds) {
+    const row = rowsById.get(id);
+    if (row !== undefined) {
+      rows.push(row);
+    }
+  }
+
+  // ⑦ scanned = **候选宇宙**（成员数），不是 survivors、也不是码行数（§5.1.3）
+  return {
+    fineIds,
+    scanned: memberIds.size,
+    rows,
+    uncoded: outcome.uncoded,
+    exactReads: outcome.exactReads,
+  };
+}
+
+/** 写路径的扫描选项（C′ 档 §5.1.4；**构造参数，不是 `Params` 键**）。 */
+export interface BucketScanOptions {
+  /** 是否走两段式剪枝（缺省 `true`）。`false` ⇒ **逐位回到 HEAD 行为**（A7）。**仅供对照**。 */
+  prune?: boolean;
+  /**
+   * **上界门槛**；**必须**由调用方传 `params.DEDUP_COS_MIN`（`setParams()` 可改它，
+   * 不许用 `DEFAULT_PARAMS` 顶）。缺省 ⇒ 不设门槛（结果同样正确，只是少剪一刀）。
+   */
+  threshold?: number;
+  /** 取前 K 条（缺省 `DEFAULT_PARAMS.VECTOR_TOPK`）；**必须**由调用方传 `params.VECTOR_TOPK`。 */
+  k?: number;
+  /**
+   * **精确分口径**（必填，当 `prune !== false`）：写路径 = `cosineOf(query, embedding)`
+   * （`dedupCandidates.ts` 的余弦唯一实现），`null` = 维度不符。
+   */
+  scoreOf?: (id: string) => number | null;
 }
 
 /** IVF 后端的构造选项。 */
@@ -545,6 +896,23 @@ export interface IvfVectorBackendOptions {
   nprobeFine?: number;
   /** 重训后让中心提供方失效缓存（可选）。 */
   invalidateCentroids?: () => void;
+  /**
+   * 读路径是否做两段式剪枝（缺省 `true`）。`false` ⇒ **逐位回到 HEAD 行为**（A7）。
+   *
+   * ⚠️ **这是构造选项，不是 `Params` 键**（§5 末：参数表 60 项被三处副本 + 一条门禁守着，
+   *   为「运行时可关」加第 61 项要同步四处文档，而对照用的开关不需要进参数表）。
+   * ⚠️ 写路径**没有**对应的配置来源（`collectVectorCandidates()` 手上只有 `params` 与 `buckets`）
+   *   ⇒ 写路径要关只能**代码回退**。这是刻意的：给写路径加一个配置来源
+   *   = 第二个「后端行为由谁决定」的答案。
+   *
+   * ★ **码行必须是按当前 `memories.embedding` 编的**（T04 的正确性前提）。
+   *   T05（在 `assignBucket` 里重编码）落地前，这个前提由「改向量的路径**让码失效**」维持：
+   *   `updateContent()` 传新向量时会在同一事务里调 `clearCodeRow()`
+   *   （`src/vector/bucketAssign.ts` 的 fail-open 降级：删掉该行的码行
+   *   ⇒ 该行变「无码」⇒ 精确兜底 ⇒ **不漏召回**，`codesMissing` 可见）。
+   *   ⇒ 详见 `src/vector/prune.ts` 的文件头「前提：码行必须按当前向量编」。
+   */
+  prune?: boolean;
 }
 
 /**
@@ -570,6 +938,9 @@ export class IvfVectorBackend implements VectorBackend {
   /** 重训后的缓存失效钩子。 */
   private readonly invalidateCentroids: (() => void) | undefined;
 
+  /** 读路径是否做两段式剪枝（`false` ⇒ 逐位回到 HEAD 行为；A7 的对照开关）。 */
+  private readonly prune: boolean;
+
   /** 生效配置（`init` 之后才有）。 */
   private config: VectorBackendConfig | undefined;
 
@@ -588,6 +959,7 @@ export class IvfVectorBackend implements VectorBackend {
     this.nprobeCoarse = options.nprobeCoarse ?? DEFAULT_PARAMS.ROUTER_NPROBE_COARSE;
     this.nprobeFine = options.nprobeFine ?? DEFAULT_PARAMS.ROUTER_NPROBE_FINE;
     this.invalidateCentroids = options.invalidateCentroids;
+    this.prune = options.prune ?? true;
   }
 
   /**
@@ -635,10 +1007,16 @@ export class IvfVectorBackend implements VectorBackend {
   }
 
   /**
-   * 检索近邻：**命中桶内做全量精确点积**（§4.15.3：「桶内是全量精确点积，不是近似召回」）。
+   * 检索近邻（§4.15.3：「桶内是全量精确点积，不是近似召回」）—— 两条路，**结果逐位相同**。
    *
-   * ⚠️ **桶内不设 LIMIT**：命中桶内的成员**全部**参与点积
+   * ★ **两段式（C′ 档 T04）**：先读 768B 的 int8 码算**可证上界**，只对「可能入选」的行
+   *   读 3KB 原向量精确重排（`prune = true`，缺省）。`prune = false` ⇒ **HEAD 的原路**
+   *   （全量精确点积），仅用于对照（A7）。
+   *
+   * ⚠️ **桶内不设 LIMIT**：命中桶内的成员**全部**参与竞争
    *   ⇒ 「桶内 top-K」与「对该桶做全量精确扫描的 top-K」逐位一致。
+   *   ★ **剪枝不是 `LIMIT`**（本档 §8 第 2 条）：它跳过的是**可证不会入选**的行
+   *     （`upper = q·x̂ + eps` 已经低于第 K 名的精确分），不是「前 N 行」。
    * ⚠️ **候选宇宙**：`deleted = 0` 且 `embedding IS NOT NULL`（§4.6 步骤 2c 的参考 SQL）
    *   ——`embedding IS NOT NULL` **必须有**：桶里可能有向量已被置 NULL 的行，
    *   对它算点积会得到 NaN，而 NaN 进排序会让**整条查询的排序失效**（不报错）。
@@ -669,25 +1047,66 @@ export class IvfVectorBackend implements VectorBackend {
     }
 
     const effectiveFilter: VectorFilter = filter ?? {};
+    if (!this.prune) {
+      // ⚠️ **独立的代码分支**（不是「把剪枝调成不剪」）：见 `IvfVectorBackendOptions.prune`。
+      return this.searchExactBuckets(query, k, effectiveFilter, fineIds);
+    }
+    return this.searchPruned(query, k, effectiveFilter, fineIds);
+  }
+
+  /**
+   * **HEAD 的原路**：全量精确点积 + `compareHits` + `slice(0, k)`（A7 的参照物）。
+   *
+   * ⚠️ **公开**是为了让 A7 能直接对「手写参照」比对：`prune = false` 的 `search()` 走的就是它
+   *   ⇒ 「新路径可关」不是一句空话，而是**旧路上真的有流量**。
+   *
+   * @param query 查询向量（**已 L2 归一化**）
+   * @param k 返回条数
+   * @param filter 候选过滤（**已解析**：`{}` 或带时间窗 / 排除集）
+   * @returns 按相似度降序的候选
+   */
+  searchExact(query: Float32Array, k: number, filter?: VectorFilter): VectorHit[] {
+    const config = this.assertInitialized();
+    assertValidEmbedding(query, config.dimensions);
+    if (!Number.isInteger(k) || k < 0) {
+      throw MemoryError.invalidInput('k 必须是非负整数', {
+        reason: 'k',
+        expected: '>= 0 的整数',
+        actual: String(k),
+      });
+    }
+    if (k === 0) {
+      return [];
+    }
+    const fineIds = this.route(query, this.nprobeCoarse, this.nprobeFine);
+    if (fineIds.length === 0) {
+      return [];
+    }
+    return this.searchExactBuckets(query, k, filter ?? {}, fineIds);
+  }
+
+  /**
+   * 「全量精确点积」的实现体（`fineIds` 已算好）。
+   *
+   * ⚠️ **逐行与 HEAD 同形**（取行 → 排除集 → overlay 覆盖 → 维度校验 → 时间窗 → 打分
+   *   → `compareHits` → `slice`）：这几步的**顺序**是行为的一部分
+   *   （维度校验先于时间窗 ⇒ 坏维度行会抛错而不是被窗口悄悄滤掉）。
+   *
+   * @param query 查询向量
+   * @param k 返回条数
+   * @param effectiveFilter 已解析的过滤器
+   * @param fineIds 命中的细桶
+   * @returns 按相似度降序的候选
+   */
+  private searchExactBuckets(
+    query: Float32Array,
+    k: number,
+    effectiveFilter: VectorFilter,
+    fineIds: readonly string[],
+  ): VectorHit[] {
+    const config = this.assertInitialized();
     const excluded = new Set(effectiveFilter.excludeIds ?? []);
-
-    // ⚠️ **桶成员（库里的归属）+ 索引侧增量（`upsert` 进来的）**。
-    const members = this.readMembers(fineIds);
-    const memberIds = new Set<string>();
-    for (const ids of members.values()) {
-      for (const id of ids) {
-        memberIds.add(id);
-      }
-    }
-    // ⚠️ **索引侧增量（`upsert` 进来的）**：它的向量覆盖库里的向量，
-    //   但**归属仍以库里的 `vector_cell_members` 为准**（落库是 T03 的唯一写入点）
-    //   ⇒ 这里只把它的 id 加进取行名单（取行是为了拿 `last_access` / `pin_factor`）。
-    for (const [id, entry] of this.overlay) {
-      if (entry.fineId !== null && fineIds.includes(entry.fineId)) {
-        memberIds.add(id);
-      }
-    }
-
+    const memberIds = this.collectMemberIds(fineIds);
     const rows = this.readCandidateRows([...memberIds]);
     const hits: VectorHit[] = [];
 
@@ -716,6 +1135,149 @@ export class IvfVectorBackend implements VectorBackend {
 
     hits.sort(compareHits);
     return hits.slice(0, k);
+  }
+
+  /**
+   * **两段式**（C′ 档 §5.1.0 的读路径 ①~⑦）：码算上界 → 精确重排 + 早停。
+   *
+   * ★ **过滤的先后写死**（§5.1.6）：① id 级谓词 → ② 行级谓词（窄列 gate）→ ③ 上界剪枝
+   *   → ④ 精确重排。①② 前置的理由不是「惯例」：
+   *   · 把行级谓词塞进 `scoreOf`（返回 `null`）**结果仍然对**，但会为注定被剔掉的行付 3KB/行；
+   *   · 写成「先入堆、事后再 filter」**会真的坏**（被剔掉的行占住 K 个名额 ⇒ survivors 不足 k
+   *     ⇒ `hits` 比 HEAD 少 ⇒ A2 红，且 `fuseScore` 下游全变）。
+   *
+   * @param query 查询向量（**已 L2 归一化**）
+   * @param k 返回条数
+   * @param effectiveFilter 已解析的过滤器
+   * @param fineIds 命中的细桶
+   * @returns 按相似度降序的候选（**与 `searchExact()` 逐位相同**）
+   */
+  private searchPruned(
+    query: Float32Array,
+    k: number,
+    effectiveFilter: VectorFilter,
+    fineIds: readonly string[],
+  ): VectorHit[] {
+    const config = this.assertInitialized();
+    const excluded = new Set(effectiveFilter.excludeIds ?? []);
+
+    // ── ① 成员 + overlay（与 `searchExact()` 同源）──
+    const memberIds = this.collectMemberIds(fineIds);
+
+    // ── ① id 级谓词：**在池上直接剔**（零成本、零数据依赖 ⇒ 可以前移）──
+    for (const id of [...memberIds]) {
+      if (excluded.has(id) || this.removed.has(id)) {
+        memberIds.delete(id);
+      }
+    }
+
+    // ── ② 行级谓词：窄列 gate（只在 filter 带时间窗时才发 SQL）──
+    //   ⚠️ 两个键都 `undefined` ⇒ **整步跳过**（`vectorFilterOf()` 的 `{}` 分支）。
+    const hasWindow =
+      effectiveFilter.timeFloor !== undefined || effectiveFilter.pinnedTimeFloor !== undefined;
+    const gate = hasWindow ? readGateColumns(this.db, [...memberIds]) : null;
+    if (gate !== null) {
+      for (const id of [...memberIds]) {
+        const columns = gate.get(id);
+        if (columns === undefined) {
+          // 库里没有这一行（刚硬删 / overlay 里还没落库的记忆）⇒ 不在候选宇宙里。
+          memberIds.delete(id);
+          continue;
+        }
+        if (!passesTimeWindow(windowProbe(id, columns), effectiveFilter)) {
+          memberIds.delete(id);
+        }
+      }
+    }
+
+    // ── ③ 码池 → 有码 / 无码（无码 ⇒ `upper = +∞` ⇒ 必进 survivors）──
+    const codePool = readCodes(this.db, fineIds);
+    const entries: PruneEntry[] = [];
+    for (const id of memberIds) {
+      // ⚠️ **overlay 命中的 id 一律当「无码」**：它的向量是**索引侧**的新值，
+      //   而码行是按**库里的旧向量**编的 ⇒ 用旧码算出的"上界"对新向量**不再是上界**
+      //   ⇒ 那是本档唯一能产生**静默漏检**的形状（§5.1.5 的 fail-open 纪律）。
+      const coded = this.overlay.has(id) ? undefined : codePool.get(id);
+      if (coded === undefined) {
+        entries.push({ kind: 'uncoded', id });
+        continue;
+      }
+      entries.push({ kind: 'coded', id, code: coded.code, scale: coded.scale, eps: coded.eps });
+    }
+
+    // ── ④ 精确重排 + 早停（读路径**不传** `threshold`：没有上界门槛）──
+    const out = pruneTopK(entries, {
+      query,
+      k,
+      // ⚠️ **`scoreFloor: 0`**：结果键是 `clampCos(dot(...))`（下界 `0`）⇒ 早停判据必须抬到
+      //   `max(upper, 0)`，否则「第 K 名 = 0（被钳制的负余弦）」时会把同分且 id 更小的行跳掉
+      //   —— 那是**静默丢行**（条数、分数都一样，只有 id 不同）。见 `PruneOptions.scoreFloor`。
+      scoreFloor: 0,
+      // ★ **读路径刻意不传 `exactRescoreBudget`**（= 无预算）：`k = VECTOR_TOPK × 3 = 60`
+      //   ⇒ 写路径那个 64 只留 4 次早停机会 ⇒ 剪枝在读路径上等于不存在
+      //   ⚠️ 这不是估计：本轮实测（300 行夹具 / 探针吃满 12 个细桶 / `k = 60`）——
+      //     不带预算 ⇒ `exactReads = 67`（早停正常）；把 64 硬塞回读路径 ⇒ `exactReads = 300`
+      //     = `scanned`（预算用尽 ⇒ 撤回剪枝 ⇒ 扫完整个桶，剪枝归零）。
+      //   ⇒ 早停只由「剩余 `upper` 最大值 < 第 K 名」判定 —— 这是**证明**过的判据，
+      //     不需要保险丝兜底（无预算 = 不撤回剪枝，也就不会多读）。
+      scoreOf: this.makeScoreOf(query, config.dimensions),
+    });
+
+    // ⚠️ `survivors` 已经按 `compareHits` 定序；这里再排一次是**幂等**的
+    //   （§5.1.0 ⑦：去掉省不下什么，留着让「谁定序」只有一处疑问）。
+    const hits: VectorHit[] = [...out.survivors];
+    hits.sort(compareHits);
+    return hits.slice(0, k);
+  }
+
+  /**
+   * 造读路径的**精确分函数**（逐条 prepared statement，**不做批量预取**）。
+   *
+   * ⚠️ **不做批量预取**（§5.1.10）：预取就是在**猜** survivors —— 猜大了白读 3KB、
+   *   猜小了要多一轮 IO；而早停的正确性依赖「按需、按 upper 降序」。
+   * ⚠️ **必须先用库里的行确认「在候选宇宙里」**（`deleted = 0` 且有向量），
+   *   再考虑 overlay 覆盖：只存在于 overlay 的 id（刚 upsert、还没落库）**不进结果**
+   *   —— 与 `searchExact()` 同口径（它压根取不到这种行）。
+   */
+  private makeScoreOf(query: Float32Array, dimensions: number): (id: string) => number | null {
+    const one = this.db.prepare(
+      'SELECT embedding FROM memories WHERE id = ? AND deleted = 0 AND embedding IS NOT NULL',
+    );
+    return (id: string): number | null => {
+      const row = one.get(id) as { embedding: Buffer } | undefined;
+      if (row === undefined) {
+        // 软删 / 无向量 / 已硬删 ⇒ **不在候选宇宙里**（不入堆、不占 K 名额）
+        return null;
+      }
+      const vector = this.overlay.get(id)?.vector ?? blobToVector(row.embedding);
+      if (vector.length !== dimensions) {
+        throw MemoryError.invalidInput('候选行的向量维度与后端配置不符', {
+          reason: 'dim',
+          expected: dimensions,
+          actual: vector.length,
+        });
+      }
+      return clampCos(dot(query, vector));
+    };
+  }
+
+  /**
+   * 收集命中桶的**成员 id**（库里的桶归属 ∪ overlay 里落在这些桶的 id）。
+   *
+   * ⚠️ overlay 的归属**仍以库里的 `vector_cell_members` 为准**（落库是 `assignBucket`
+   *   的唯一职责）⇒ 它只影响「取行名单」，不影响归属。
+   *
+   * @param fineIds 命中的细桶
+   * @returns 成员 id 集合（迭代顺序 = 桶顺序 → 桶内 rowid 顺序，随后是 overlay 顺序）
+   */
+  private collectMemberIds(fineIds: readonly string[]): Set<string> {
+    const memberIds = readMemberIds(this.db, fineIds);
+    for (const [id, entry] of this.overlay) {
+      if (entry.fineId !== null && fineIds.includes(entry.fineId)) {
+        memberIds.add(id);
+      }
+    }
+    return memberIds;
   }
 
   /**
@@ -817,27 +1379,14 @@ export class IvfVectorBackend implements VectorBackend {
   }
 
   /**
-   * 读命中细桶的成员（`vector_cell_members`）。
+   * 读 **survivors** 的行（`memories`）—— **live 数据**（`last_access` 会被 `touch()` 改动）。
    *
-   * ⚠️ **本模块是 `vector_cell_members` 的唯一读取点** ⇒ 表名不外泄。
-   */
-  private readMembers(fineIds: readonly string[]): Map<string, string[]> {
-    const members = new Map<string, string[]>();
-    const statement = this.db.prepare(
-      'SELECT fine_id, memory_id FROM vector_cell_members WHERE fine_id = ?',
-    );
-    for (const fineId of fineIds) {
-      const rows = statement.all(fineId) as Array<{ fine_id: string; memory_id: string }>;
-      members.set(
-        fineId,
-        rows.map((row) => row.memory_id),
-      );
-    }
-    return members;
-  }
-
-  /**
-   * 读候选行（`memories`）—— **live 数据**（`last_access` 会被 `touch()` 改动）。
+   * ⚠️ ★★ **入参只能是 survivors 的 id**（C′ 档 T04，§5.1.2）：
+   *   本方法一次就把 3KB 的 `embedding` 全取回来 ⇒ 在 T04 之后它**只对 survivors 调用**
+   *   （典型 ~60 行而不是 ~5,521 行）——**这正是收益的来源**。
+   *   ⚠️ 若下一个人把它当「全量候选读」继续用，收益会**静默消失而所有测试都绿**
+   *     （A1/A2 只测「结果对不对」，不测「读了多少行」；后者是 T06 的 `memoryRowsRead`）。
+   *   ⚠️ 写路径的对应物是 `buildSurvivorSql()`（**另一条** SQL：`prune = false` 那条路必须留着旧 SQL）。
    *
    * ⚠️ `deleted = 0` 是**候选宇宙**的口径（不是 filter 字段，§4.15.2 的 `VectorFilter` 没有它）。
    */
@@ -921,6 +1470,34 @@ function chunkIds(ids: readonly string[], size: number): string[][] {
     chunks.push(ids.slice(index, index + size));
   }
   return chunks;
+}
+
+/**
+ * `passesTimeWindow()` 的**探针向量**（空数组：那个函数只读 `lastAccess` / `pinFactor`）。
+ *
+ * ⚠️ 为什么不自己写一遍窗口判定：`passesTimeWindow()` 是「粗筛窗口」的**唯一实现**
+ *   （`flat.ts`，与 `recall.ts` 的 `COARSE_WINDOW_SQL` 逐字一致）⇒ 在本模块抄一遍
+ *   就是第二份口径，而两份口径哪怕只差一个 `>=` 与 `>` 也会让**两后端不再逐位一致**。
+ */
+const WINDOW_PROBE_VECTOR = new Float32Array(0);
+
+/**
+ * 造一个只带「窗口判据」两列的探针行（供 `passesTimeWindow()` 复用）。
+ *
+ * @param id 记忆 id
+ * @param columns 窄列 gate 读到的两列
+ * @returns 形状合法的候选行（`vector` 是空数组 —— 窗口判定不读它）
+ */
+function windowProbe(
+  id: string,
+  columns: { lastAccess: number; pinFactor: number },
+): VectorCandidateRow {
+  return {
+    id,
+    vector: WINDOW_PROBE_VECTOR,
+    lastAccess: columns.lastAccess,
+    pinFactor: columns.pinFactor,
+  };
 }
 
 /**

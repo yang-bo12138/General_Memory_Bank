@@ -139,7 +139,12 @@ describe('T03 补强 · B 行：过门槛但分桶未训练（`absent`）⇒ 传
       // ── 分母不为 0（否则下面的「相同」是空转）──
       expect(plain.hits.length).toBeGreaterThanOrEqual(1);
       // ── B 行的五个字段（与 A 行**同值**）──
-      expect(withVector.explain?.routes.vector).toEqual({ ran: false, candidates: 0 });
+      // ⚠️ 整路缺席 ⇒ `codesMissing` 同样是**确定值 0**（桶集为空）⇒ 逐字段钉死（`toEqual`）。
+      expect(withVector.explain?.routes.vector).toEqual({
+        ran: false,
+        candidates: 0,
+        codesMissing: 0,
+      });
       for (const hit of withVector.hits) {
         expect(hit.fromVector).toBe(false);
         expect(hit.breakdown?.cos).toBeNull();

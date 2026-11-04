@@ -23,6 +23,48 @@
  *
  * ⚠️ **幂等返回时不校验也不更新 embedding**：正文没变 ⇒ 向量就不需要变
  *   ⇒ 此时覆盖向量等于让调用方误以为「传了向量就等于改了正文」。
+ *
+ * ★★ **改向量 ⇒ 必须让该行的码行失效**（C′ 档 T04 收尾）：
+ *   两段式剪枝（`src/vector/prune.ts`）的**全部正确性**建立在
+ *   「码行是按 `memories.embedding` 的**当前值**编的」上（`eps` 是**这一条向量**的误差）。
+ *   而本函数会把向量**就地换成另一个值**（`旧值 → 新值`）⇒ 码、`fine_id`、`eps`
+ *   全都还是**旧向量**的 ⇒ `upper = q·x̂ + eps` **不再是上界**。
+ *
+ *   两种命运（**只有第二种是事故**）：
+ *   · 新向量落到**别的细桶** ⇒ 码行的 `fine_id` 是旧的 ⇒ `readCodes(fine_id IN …)` 取不到它
+ *     ⇒ 该行变成「无码」⇒ 精确兜底 ⇒ **安全**（且 A6 的 `fineIdDrift` 会红，可观测）；
+ *   · ★ 新向量落到**同一个细桶** ⇒ 码行仍被取到、`fine_id` 也对得上
+ *     ⇒ `upper` 不再是上界 ⇒ **静默漏召回**，而 A6 与 `codesMissing` **都查不出来**
+ *     （前者只看归属对不对得上，后者只数「没有码」的行）。
+ *     细桶数只有 4~9966 量级 ⇒ 「改完还在同一个桶」是**常见**结果，不是边角。
+ *
+ *   ⇒ **本轮（T04 收尾）的取舍：fail-open 降级 —— 不做重编码，直接让码行失效**：
+ *     该行**立刻变成「无码」** ⇒ 两段式走精确兜底（多读 3KB，**不漏召回**）；
+ *     `codesMissing` +1（可见）；A6 会显示 `codes − members = −1`（可观测，
+ *     跑一次 `pnpm codes:backfill` 即修复）。
+ *
+ *   ⚠️ **删码这一步不在本文件里写 SQL**：调 `clearCodeRow()`（`src/vector/bucketAssign.ts`）
+ *     —— 码表属于向量层，**表名只在向量层出现**（§4.6 步骤 2c；
+ *     `tests/contracts/table-name-boundary.test.ts` 有静态断言守着）。
+ *     本文件只管「什么时候该失效」，不管「怎么删」。
+ *
+ *   ⚠️ **为什么不是「在这里重编码」**：码行的维护必须收在
+ *     `assignBucket()` / `unassignBucket()`（桶归属的唯一写入点，6 处生产调用点全走它）
+ *     —— 那是 **T05 的正式交付**（码与成员「同生同死」，先 DELETE 再 INSERT，同一事务）。
+ *     在这里再写一份「编码 + 落码」就是**第二份码维护实现** ⇒ 两处必然漂移
+ *     （例如 `EPS_SAFETY_MARGIN` 只在一处生效 ⇒ 上界在其中一条路上不再是上界）。
+ *     本轮只做「降级到**安全**」，把「重编码」留给 T05 的唯一写入点；
+ *     T05 落地后**本文件这一行调用应当删掉**（由 `assignBucket()` 统一维护）。
+ *
+ *   ⚠️ **必须与 `assignBucket` 在同一个事务里**（`runWriteTransaction`）：
+ *     事务外删 ⇒ 崩在中间时「旧码还在、向量已经变了」⇒ 正是上面那种**静默漏召回**的形状。
+ *
+ *   ⚠️ **`vector === null` 的分支不必删码**（`unassignBucket` 已经让该行退出候选宇宙：
+ *     没有桶成员 ⇒ `memberIds` 里没有它 ⇒ 码行根本用不上；`embedding IS NULL` 也进不了
+ *     候选宇宙）。⇒ 本轮**刻意不删**（最小改动）；副作用是留一条孤儿码行
+ *     （`lonelyCodes +1`，A6 会红一次，`pnpm codes:backfill` 或 T05 落地后自然清掉），
+ *     **不会**造成漏召回 —— 孤儿码行的 `fine_id` 只会在旧桶被命中且该 id 恰好也在
+ *     `memberIds` 里时才有机会被用上，而那一行的成员已经没了。
  */
 
 import { createHash } from 'node:crypto';
@@ -34,7 +76,12 @@ import { MemoryError } from '../core/errors.js';
 import type { ManualFixEventPayload } from '../core/events.types.js';
 import type { Params } from '../core/params.js';
 import { normalize, tokenize } from '../core/tokenize.js';
-import { type BucketAssignContext, assignBucket, unassignBucket } from '../vector/bucketAssign.js';
+import {
+  type BucketAssignContext,
+  assignBucket,
+  clearCodeRow,
+  unassignBucket,
+} from '../vector/bucketAssign.js';
 import { vectorToBlob } from '../vector/centroids.js';
 import { normalizeNumbers } from '../vector/dot.js';
 import type { EventWriter } from './events.js';
@@ -76,6 +123,15 @@ const UPDATE_CONTENT_SQL = `UPDATE memories
        content_hash = @hash,
        embedding = @embedding
  WHERE id = @id`;
+
+// ★ **让码行失效的调用点在本文件末尾**（步骤 4 续），实现不在本文件：
+//   调 `clearCodeRow()`（`src/vector/bucketAssign.ts`，**码表的唯一写入点**）。
+//   ⚠️ 本文件**不写码表的 SQL、也不出现码表名**（§4.6 步骤 2c：表名只在向量层）——
+//     这里只决定「**什么时候**该让码失效」（向量真的换了、且新向量已落库），
+//     「**怎么**删」归向量层（`tests/contracts/table-name-boundary.test.ts` 静态守着）。
+//   ⚠️ 必须与 `assignBucket` 同一个事务：`clearCodeRow()` 自己会断言「在事务里」，
+//     事务外调会**抛错**而不是静默删。
+//   ⚠️ 刻意**不导出**任何东西：「什么时候让码失效」不该成为调用方可选的第二个开关。
 
 function assertWritable(store: UpdateContentStore): void {
   if (store.events.readonly) {
@@ -179,6 +235,9 @@ export function updateContent(
     if (vector === null) {
       unassignBucket(store.buckets, id);
     } else {
+      // ★ **先让旧向量的码行失效、再落新归属**（两条都在本事务内；实现见 `clearCodeRow()`）：
+      //   顺序无关正确性（两张表互不引用），但「作废 → 重建」读起来才是因果顺序。
+      clearCodeRow(store.buckets, id);
       assignBucket(store.buckets, id, vector);
     }
 

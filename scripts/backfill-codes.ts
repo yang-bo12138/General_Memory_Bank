@@ -130,9 +130,32 @@ export interface BackfillCounters {
  * ⚠️ ②的两项也**互不覆盖**：`lonelyCodes` 抓「归属丢了」，`fineIdDrift` 抓「归属搬了」。
  */
 export interface A6Consistency {
-  /** `SELECT count(*) FROM vector_codes`。 */
+  /**
+   * **活记忆域**里的码行数（★ R11 订正：**不是** `SELECT count(*) FROM vector_codes`）。
+   *
+   * 实际口径（与实现逐字一致，见 `snapshotConsistency()`）：
+   * ```sql
+   * SELECT count(*) FROM vector_codes vc
+   *   JOIN memories m ON m.id = vc.memory_id
+   *  WHERE m.deleted = 0
+   * ```
+   * ⚠️ **这条注释曾经是旧口径**（`SELECT count(*) FROM vector_codes`，「只有活行」的理由
+   *   来自「回填只扫活行」，而**查**的时候并不是）⇒ 与 `members` / `memories` 不同域
+   *   ⇒ 一条「软删 + 有向量 + 有归属」的记忆就足以让 `mismatch ≠ 0` 而 A6 恒红。
+   *   ⇒ 注释与判定两套词正是上次「假绿 / 恒红」的成因，故同步到实现。
+   */
   codes: number;
-  /** `SELECT count(*) FROM vector_cell_members`。 */
+  /**
+   * **活记忆域**里的桶成员行数（★ R11 订正：**不是** `SELECT count(*) FROM vector_cell_members`
+   * —— 那条会**含软删行的归属**，而 `forget.ts` 故意保留它们，见 `snapshotConsistency()`）。
+   *
+   * 实际口径：
+   * ```sql
+   * SELECT count(*) FROM vector_cell_members vcm
+   *   JOIN memories m ON m.id = vcm.memory_id
+   *  WHERE m.deleted = 0
+   * ```
+   */
   members: number;
   /** `SELECT count(*) FROM memories WHERE deleted = 0 AND embedding IS NOT NULL`。 */
   memories: number;
@@ -329,25 +352,73 @@ export function hasVectorCodesTable(db: Database.Database): boolean {
   return row.n > 0;
 }
 
-/** 取一次 A6 快照（三表行数 + 总偏差 + 桶归属口径；**纯读**）。 */
+/**
+ * 取一次 A6 快照（三表行数 + 总偏差 + 桶归属口径；**纯读**）。
+ *
+ * ★★ **R11 订正（2026-11-05）：三数统一到「活记忆域」**（`deleted = 0`）。
+ *
+ * **改前的形状**（三个数各自的口径互不相容）：
+ * ```
+ * codes    = count(vector_codes)                                       ← 只有活行（回填只扫活行）
+ * members  = count(vector_cell_members)                                ← ★ 含软删行的归属
+ * memories = count(memories WHERE deleted = 0 AND embedding NOT NULL)  ← 只有活行
+ * ```
+ * ⇒ 库里只要有 ≥1 条「软删 + 有向量 + 有桶归属」的记忆（`forget.ts` 只改 `deleted = 1`、
+ *   **不**调 `unassignBucket` ⇒ 归属**故意**留着），`members > codes` ⇒ `mismatch ≠ 0`
+ *   ⇒ **A6 恒红，且红得没有信息量**（它报的是「软删机制在工作」，不是「码表坏了」）。
+ *
+ * **改后的形状**（三数都在「活记忆域」内数）：
+ * ```
+ * codes    = count(vector_codes vc JOIN memories m ON m.id = vc.memory_id WHERE m.deleted = 0)
+ * members  = count(vector_cell_members vcm JOIN memories m ON m.id = vcm.memory_id WHERE m.deleted = 0)
+ * memories = count(memories WHERE deleted = 0 AND embedding IS NOT NULL)   ← 不动
+ * ```
+ * ⚠️ **为什么不是「删掉软删行的桶归属」**（那是修错了地方）：软删**保留**归属与向量是**裁决过的语义**
+ *   （§9.3.2 ②：`restore()` 要能把它恢复回向量路）。为了「让 A6 绿」去删它 ⇒ 恢复之后这条记忆
+ *   **永久进不了向量路**（静默、永久）。⇒ 该改的是**读数口径**，不是数据。
+ * ⚠️ **代价**：`members` / `codes` 现在各带一次 `memories` 主键探针（1M 行 ≈ 每条一次索引定位）。
+ *   这是自检脚本（运维动作），不在召回路径上 ⇒ 可接受。
+ * ⚠️ **R11 之后 `scanned` 与 A6 的「同源偏差」仍然存在**（T04 的 `scanned` 数成员行、含软删成员，
+ *   见 `BucketCandidateScan.scanned`）—— 两件事分开看：A6 查「码表与桶表在**活记忆域**里对齐没」，
+ *   `scanned` 查「这次扫了多少成员行」。用 A1' 负控钉住后者。
+ *
+ * @param db 库句柄
+ * @returns A6 快照（**全部数都在活记忆域内**）
+ */
 export function snapshotConsistency(db: Database.Database): A6Consistency {
   const count = (sql: string): number => (db.prepare(sql).get() as { n: number }).n;
-  const codes = count('SELECT count(*) AS n FROM vector_codes');
-  const members = count('SELECT count(*) AS n FROM vector_cell_members');
+  // ★ R11：`codes` / `members` 都 `JOIN memories` 只数活行 ⇒ 与 `memories` 同域。
+  const codes = count(`
+    SELECT count(*) AS n
+      FROM vector_codes vc
+      JOIN memories m ON m.id = vc.memory_id
+     WHERE m.deleted = 0
+  `);
+  const members = count(`
+    SELECT count(*) AS n
+      FROM vector_cell_members vcm
+      JOIN memories m ON m.id = vcm.memory_id
+     WHERE m.deleted = 0
+  `);
   const memories = count(
     'SELECT count(*) AS n FROM memories WHERE deleted = 0 AND embedding IS NOT NULL',
   );
   // ★ A6 后半句之一：有码、无桶归属（`LEFT JOIN` 判 NULL；**在 SQL 里数**，不拉进 JS）
+  //   ⚠️ **R11：也在活记忆域内判** —— 否则一条软删行的「有码无归属」会污染这个数，
+  //     而那不是 T05 要修的东西（软删行的归属本来就该由 `restore()` 决定）。
   const lonelyCodes = count(`
     SELECT count(*) AS n
       FROM vector_codes vc
+      JOIN memories m ON m.id = vc.memory_id AND m.deleted = 0
       LEFT JOIN vector_cell_members vcm ON vcm.memory_id = vc.memory_id
      WHERE vcm.memory_id IS NULL
   `);
   // ★ A6 后半句之二：同 memory 但 `fine_id` 不同（`JOIN` 走两张表的 `memory_id` 唯一索引）
+  //   ⚠️ **R11：同样在活记忆域内判**（理由同上：软删行的桶归属不参与 A6 的判定）。
   const fineIdDrift = count(`
     SELECT count(*) AS n
       FROM vector_codes vc
+      JOIN memories m ON m.id = vc.memory_id AND m.deleted = 0
       JOIN vector_cell_members vcm ON vcm.memory_id = vc.memory_id
      WHERE vc.fine_id <> vcm.fine_id
   `);
