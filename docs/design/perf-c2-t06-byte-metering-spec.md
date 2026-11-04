@@ -74,7 +74,7 @@
   4. **旧键一个都没改名 / 挪位 / 删除**；
   5. **stdout 四读数并列打印**（旧行数**只许**说「观测值 = … 行」）；
   6. **口径 note 落盘**（含：只计向量载荷 / 是真实搬运量的**下界** / ADR §8.6 的 4.44 MB 是**下界** / H1′ 判的是哪一笔 / 剪枝率分子与 `exactReads` 的等价性前提）。
-  7. ★ **落盘 `note` 的【逐字副本】在 `docs/design/perf-c2-t06-byte-metering-impl-notes.md` §13**（两段 `note`）⇒ ⇒ 由 `.tmp/bench/check-json-note-fidelity.ts` **逐字**守着（⇒ 当前报 true / true）⇒ ⇒ ⚠️ **① §4 那段 JSON 是【结构示意】、不是逐字副本**（带 `{ /* … */ }` 占位符、条目被压缩）⇒ ⇒ ⚠️★ **不许拿 ① §4 去替换 `bench/perf.ts` 的真实 `note` 字符串**（⇒ 会丢掉真实 note 的多项 ⇒ **净损失**；⇒ 且 impl-notes §13 的逐字副本会立刻失配 ⇒ ⇒ **自检脚本立刻报 false**）⇒ ⇒ ★ **改 `note` 字符串 = 改【落盘产物】⇒ 必须同批改 impl-notes §13** ⇒ ⇒ ⚠️ **这条机制已获实战验证**：曾一度报 false（读路径那段在中间失配）⇒ ⇒ **同批更新 impl-notes §13 的读路径 `note` 后即回绿**（⇒ 当前 true / true）⇒ ⇒ ★ **以后任何人改 `note` 字符串，都必须同批改 impl-notes §13**。
+  7. ★ **落盘 `note` 的【逐字副本】在 `docs/design/perf-c2-t06-byte-metering-impl-notes.md` §13**（两段 `note`）⇒ ⇒ 由 `.tmp/bench/check-json-note-fidelity.ts` **逐字**守着（⚠️ **该脚本只在 `.tmp/` 里（gitignored ⇒ 仓库里没有）** ⇒ ⚠️ **`bench/perf.ts` 把「机器凭据」写成 `handover/bench/…`（已提交 · 但那个路径不存在）** ⇒ ⇒ **提交态这道守卫是断的** ⇒ ⇒ ⇒ **待搬进 `scripts/` 并挂进 `verify` 链** ⇒ 当前报 true / true）⇒ ⇒ ⚠️ **① §4 那段 JSON 是【结构示意】、不是逐字副本**（带 `{ /* … */ }` 占位符、条目被压缩）⇒ ⇒ ⚠️★ **不许拿 ① §4 去替换 `bench/perf.ts` 的真实 `note` 字符串**（⇒ 会丢掉真实 note 的多项 ⇒ **净损失**；⇒ 且 impl-notes §13 的逐字副本会立刻失配 ⇒ ⇒ **自检脚本立刻报 false**）⇒ ⇒ ★ **改 `note` 字符串 = 改【落盘产物】⇒ 必须同批改 impl-notes §13** ⇒ ⇒ ⚠️ **这条机制已获实战验证**：曾一度报 false（读路径那段在中间失配）⇒ ⇒ **同批更新 impl-notes §13 的读路径 `note` 后即回绿**（⇒ 当前 true / true）⇒ ⇒ ★ **以后任何人改 `note` 字符串，都必须同批改 impl-notes §13**。
 
 ### T06-4 · H1′ / H2′ / 剪枝率 判据改造
 
@@ -129,7 +129,7 @@
 | `unclassifiedRows` | `….breakdown` | number | **必须 0**；> 0 ⇒ 判「口径不完整」（红） |
 | `unclassifiedSqlKinds` | `….breakdown` | string[] | 未登记语句的指纹集合（**打印 + 落盘**） |
 | `pruneRate` | `….breakdown` | `CountSummary` | 每样本 `embeddingCalls ÷ candidateUniverse`（判定取 `max`） |
-| `samplesAligned` | `….breakdown` | boolean | ★ **两种语义、键名与类型都不动**：**写路径** = 两轮（轮 A 计时 / 轮 B 计量）的 `candidateUniverse` 逐样本相等；**读路径** = （逐样本）计数器实测桶成员行 === `route()` 命中桶推算的成员数之和（`bucketMemberRows` === `bucketMemberRowsDerived`）⇒ ⚠️ 读路径**不许**用 `bucketMemberRows === candidateUniverse`（★ **原因 = 【来源不同】**：计数器 `search()` 侧实测 vs 外层 `route()` 侧的 `COUNT(DISTINCT memory_id)` ⇒ 互比会掩盖真正的失配 ⇒ 详见 ① §2 断言 1d 理由③） |
+| `samplesAligned` | `….breakdown` | boolean | ★ **两种语义、键名与类型都不动**：**写路径** = 两轮（轮 A 计时 / 轮 B 计量）的 `candidateUniverse` 逐样本相等；**读路径** = （逐样本）计数器实测桶成员行 === `route()` 命中桶推算的成员数之和（`bucketMemberRows` === `bucketMemberRowsDerived`）⇒ ⚠️ 读路径**不许**用 `bucketMemberRows === candidateUniverse`（★ **原因 = 【来源不同】**：计数器 `search()` 侧实测 vs 外层 `route()` 侧的 `COUNT(DISTINCT memory_id)` ⇒ 互比会掩盖真正的失配 ⇒ 详见 ① §2 断言 1d 理由③）⇒ ⇒ ★★ **这条禁令的【可验证形态】= 【接线层】按【来源】验**（★ **不是**判定层的数值比较 ⇒ 判定层按数值验**恒假** ⇒ **必红** ⇒ **不许**那样写） |
 | `basis` / `note` | `…` | string | **口径说明（必须落盘）** |
 
 ### 10.2 分类器契约（`bench/lib/byteSources.ts`）
@@ -170,7 +170,7 @@
 | **等价性 1c** | `expect(out.exactReads).toBe(scoreOfCalls)`（**tests/unit/prune.test.ts**，直接调 `pruneTopK`） | prune.ts 改了 `exactReads` 的计数口径 |
 | **口径纪律 1c-bench** | `expect(embeddingCalls.max).toBeGreaterThanOrEqual(embeddingExactRows.max)`（⚠️ **不许用 `embeddingRowsRead`**：它是**字节账分子**、含 Q4/Q5 的 survivors 整行 ⇒ 写路径下必然大于 `embeddingCalls` ⇒ 用它比对**恒红**） | 把剪枝率分子换成「返回行数」⇒ **假绿** |
 | **两轮对齐 1d（写路径形态）** | `expect(samplesAligned).toBe(true)` | 两轮看到的不是同一批数据 |
-| **读路径对账 1d（读路径形态）** | 读路径 `samplesAligned` = **（逐样本）计数器实测桶成员行 === `route()` 命中桶推算的成员数之和**（`bucketMemberRows` === `bucketMemberRowsDerived`；⚠️ `bucketMemberRowsDerived` 的类型是 `number | null` ⇒ `null` = 没算 ⇒ **不可判定 ⇒ 判红**，方向纪律：**宁可误红不可假绿**）⇒ 不等即红 | ⚠️ **旧写法恒真**（字节样本数 == 召回毫秒样本数 ⇒ 同一循环体内无条件 `push` ⇒ **永远打不红**）；⚠️ **不许用 `bucketMemberRows === candidateUniverse`**（★ **原因 = 【来源不同】**：计数器 `search()` 侧实测 vs 外层 `route()` 侧的 `COUNT(DISTINCT memory_id)` ⇒ 互比会掩盖「`search()` 内部路由 ≠ 外层 `route()` 路由」这个真正的失配 ⇒ ⇒ **守卫失明**（两批桶成员行数**恰好相等**时 ⇒ **假绿**）⇒ 详见 ① §2 断言 1d 理由③） |
+| **读路径对账 1d（读路径形态）** | 读路径 `samplesAligned` = **（逐样本）计数器实测桶成员行 === `route()` 命中桶推算的成员数之和**（`bucketMemberRows` === `bucketMemberRowsDerived`；⚠️ `bucketMemberRowsDerived` 的类型是 `number | null` ⇒ `null` = 没算 ⇒ **不可判定 ⇒ 判红**，方向纪律：**宁可误红不可假绿**）⇒ 不等即红 | ⚠️ **旧写法恒真**（字节样本数 == 召回毫秒样本数 ⇒ 同一循环体内无条件 `push` ⇒ **永远打不红**）；⚠️ **不许用 `bucketMemberRows === candidateUniverse`**（★ **原因 = 【来源不同】**：计数器 `search()` 侧实测 vs 外层 `route()` 侧的 `COUNT(DISTINCT memory_id)` ⇒ 互比会掩盖「`search()` 内部路由 ≠ 外层 `route()` 路由」这个真正的失配 ⇒ ⇒ **守卫失明**（两批桶成员行数**恰好相等**时 ⇒ **假绿**）⇒ 详见 ① §2 断言 1d 理由③）<br>⚠️ ★★ **可验证形态 = 【接线层】按【来源】验**（★ **不是**判定层按【数值】验 ⇒ 判定层的「数值不等」断言**恒假** ⇒ **必红** ⇒ **不许**那样写）⇒ ⇒ **变异（接线层）**：把 `measured` 与 `derived` 接成**同一列** ⇒ ⇒ 判定层**打不红**（两数组逐位相等 ⇒ 判定仍给 `true`）⇒ ⇒ ⇒ **只有接线层能抓它** ⇒ ⇒ ⇒ **守卫落点**：`tests/bench/t06-prune-rate-wiring.test.ts` 的 **§D**（接线 · 按来源验）+ **§E**（负控 · 把两列人为改不同）⇒ ⇒ ⚠️ **引用只写章节 / 用例名，不许写行号** |
 | **窗口没开大 1e** | `expect(bucketMemberRows).toBe(candidateUniverse)`（**写路径**，零容差；★ **成立原因 = 【同源】** ⇒ 两者量同一个扫描的同一批桶） | 计数窗口罩住了召回探针 / 写入循环内部那次扫描 |
 | **未解析有牙（断言 3）** | 喂 `SELECT id FROM memories` ⇒ `expect(unclassifiedRows).toBeGreaterThan(0)` | 形状登记表漏登记 ⇒ 静默按 0 计 |
 | 剪枝率方向 | 断言 `embeddingCalls ≥ embeddingExactRows`（**调用次数 ≥ `scoreOf` 返回行数**） | 把剪枝率分子换成「返回行数」⇒ **假绿** |
