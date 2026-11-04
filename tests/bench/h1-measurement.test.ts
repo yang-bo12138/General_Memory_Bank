@@ -116,10 +116,15 @@ describe('R6（召回路径）口径加固 · 实测读行数（不再模型化�
       const after = counter.snapshot();
       const measured = after.candidateRows - before.candidateRows;
 
-      // ⚠️ ★ **核心断言**：**当前实现下两者相等**
-      //   ⇒ ⇒ 「口径加固」**不改变门槛数值**（≤ 2,000 行不变）
-      //   ⇒ ⇒ 但它**不再依赖这个等式**（阶段 4 引入桶内 LIMIT 后，实测会降、推算不会）。
-      expect(measured).toBe(derived);
+      // ⚠️ ★ **核心断言（T04 起改口径）**：
+      //   **T04 之前**这一条是 `measured === derived`（「桶内不设 LIMIT ⇒ 全量物化」）。
+      //   **T04 之后**两段式剪枝只物化 survivors ⇒ 实测**必然小于**推算
+      //   （推算模型化的正是「把整个桶读回来」这个**已不存在的实现**）。
+      //   ⇒ 现在的性质是**方向 + 上界**：
+      //     ① 实测 ≤ 推算（剪枝只会读更少，**不可能**读更多）；
+      //     ② 实测 > 0（真的读了东西，不是「两边都空」的真空断言）；
+      //     ③ 判据量仍然取**实测**（`candidateReadRows`）—— 那一条由下一节的门槛测试钉死。
+      expect(measured).toBeLessThanOrEqual(derived);
       expect(measured).toBeGreaterThan(0);
       // ⚠️ **桶成员侧的行读**也要被抓到（⇒ 分类器没把两张表搞混）。
       expect(after.bucketMemberRows - before.bucketMemberRows).toBeGreaterThan(0);
@@ -406,13 +411,14 @@ describe('★ 两条「有牙」的守卫（防「口径被悄悄换掉」）', 
     expect(derived).not.toBeNull();
     expect((derived?.mean ?? 0) - result.candidateReadRows.mean).toBeGreaterThan(0);
 
-    // ⚠️ ★★ **核心断言**：**差的量 = 命中细桶数**（每个命中桶恰好多一条软删成员）
-    //   ⇒ ⇒ **判据量（`candidateReadRows`）取的是「实测」那一侧**
-    //   ⇒ ⇒ **这条断言专打「`candidateReadRows` 取推算值」那个变异**
-    //   （该变异下差值 = 0 ⇒ 与命中细桶数（> 0）不符 ⇒ 必红）。
-    expect((derived?.mean ?? 0) - result.candidateReadRows.mean).toBeCloseTo(
-      result.hitFineBuckets.mean,
-      6,
+    // ⚠️ ★★ **核心断言（T04 起改口径）**：
+    //   **T04 之前**差值恰好 = 命中细桶数（每个命中桶恰好多一条软删成员）。
+    //   **T04 之后**两段式剪枝**又少读了一批**（只读 survivors）⇒ 差值 = 软删成员 + 被剪掉的成员
+    //   ⇒ 性质从「相等」变成「**≥ 命中细桶数**」。
+    //   ⇒ ⇒ 这一条仍然专打「`candidateReadRows` 取推算值」那个变异：
+    //      该变异下差值为 0，而 `hitFineBuckets.mean > 0` ⇒ `0 ≥ n` 不成立 ⇒ **必红**。
+    expect((derived?.mean ?? 0) - result.candidateReadRows.mean).toBeGreaterThanOrEqual(
+      result.hitFineBuckets.mean - 1e-6,
     );
     // ⚠️ **口径声明仍然是「实测」**（⇒ 这一轮计数器是好的 ⇒ 不许退回推算）。
     expect(result.candidateReadRowsBasis.mode).toBe('measured');
@@ -470,8 +476,12 @@ describe('★ 门槛归口（D10）：H1/H2 判写入去重路径，召回同名
     expect(h1[0]).toContain('写入去重路径');
     expect(h2[0]).toContain(String(FORGED_WRITE_ROWS));
     // ⚠️ ★ **反向**：H1/H2 的文案里**不许出现召回路径那个数**（⇒ 判定没读它）。
-    expect(h1[0]).not.toContain(String(base.candidateReadRows.max));
-    expect(h2[0]).not.toContain(String(base.candidateReadRows.max));
+    //   ⚠️ **必须带上单位「 行」再比**：T04 之后 `candidateReadRows.max` 可能小到 20，
+    //   而 H1 文案里**必然**有「（探针 8/20）」——裸数字比对会被这个子串撞上 ⇒ 假红。
+    //   （这不是理论风险：T05 落地当天就是这么红的一次。）
+    const recallRowsText = `${String(base.candidateReadRows.max)} 行`;
+    expect(h1[0]).not.toContain(recallRowsText);
+    expect(h2[0]).not.toContain(recallRowsText);
 
     // ② **把召回路径那个数推到 12,782 那种量级** ⇒ **H1/H2 的结论一个字都不许变**
     //   ⇒ ⇒ 这条专打「H1 又改回读 `candidateReadRows`」那个变异。

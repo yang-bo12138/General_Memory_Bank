@@ -214,11 +214,11 @@ describe('T03 · IVF 端到端 · 门面 → ivf 端口 → CentroidCache → se
       ran: true,
       candidates: DEFAULT_PARAMS.VECTOR_TOPK,
     });
-    // ★ `codesMissing` 的真值 = **命中桶的成员行数**。
-    //   本夹具的探针吃满（`ROUTER_NPROBE_COARSE = 20` / `ROUTER_NPROBE_FINE = 40` ⇒ 全部细桶）
-    //   ⇒ 「命中桶」= 全库的桶 ⇒ 成员行数 = `PER_CLUSTER × 2`（与上面那条前提用例
-    //   `stats().vectorBackend.members` 断言的是同一个数，这里用字面量冻结，不拿被测函数当分母）。
-    expect(result.explain?.routes.vector?.codesMissing).toBe(PER_CLUSTER * 2);
+    // ★ `codesMissing` 的真值 = **命中桶内「有成员、无码」的行数**。
+    //   ⚠️ **T05 之后这里是 0**：`assignBucket()` 现在会在写归属的**同一事务**里把码行一起写掉
+    //   ⇒ 本夹具每一行都有码（T04 时期是「一行码都没有 ⇒ 等于成员数」，那个口径已作废）。
+    //   ⇒ 钉 0 仍然有意义：它证明「码是**写路径自己铺的**」，不依赖 `pnpm codes:backfill`。
+    expect(result.explain?.routes.vector?.codesMissing).toBe(0);
     // ── 文本路为空（上下文与正文汉字集不相交）⇒ 每条 hit 都只能来自向量路 ──
     expect(result.hits.length).toBeGreaterThan(0);
     expect(result.hits.every((hit) => hit.fromText === false)).toBe(true);
@@ -415,12 +415,12 @@ describe('T03 · 成对反例 ② · 同一世界：`ivf`（已训练、探针�
       });
       expect(routeOf(viaIvf)).toEqual(routeOf(viaFlat));
       expect(viaIvf.explain?.routes.vector.ran).toBe(true);
-      // ★ **第三个字段不能就这么被丢掉**（T04 收尾）：它不是「两边相同」，而是
-      //   「**两边各有确定值**」—— 本夹具**没有任何码行**（T05 未落地），探针吃满
-      //   ⇒ ivf 的命中桶 = 全部细桶 ⇒ 它 = 成员数 = `PER_CLUSTER × 2`；
-      //   而 flat 的路由只回 `__flat_all__`（没有桶的概念）⇒ 恒 0。
-      //   ⇒ 逐字钉死；否则这个字段在本文件里等于**没人看**（放宽成 `routeOf` 就把它丢了）。
-      expect(viaIvf.explain?.routes.vector.codesMissing).toBe(PER_CLUSTER * 2);
+      // ★ **第三个字段不能就这么被丢掉**：它不是「两边相同」，而是「**两边各有确定值**」——
+      //   ⚠️ **T05 之后两边都是 0**：`assignBucket()` 同事务写码 ⇒ 本夹具每行都有码；
+      //   而 flat 的路由只回 `__flat_all__`（没有桶的概念）⇒ 本来就恒 0。
+      //   ⇒ 两行都钉死（而不是放宽成 `routeOf` 把它丢掉）：
+      //     一旦有人在 ivf 路径上把码写漏，它会从 0 变成「命中桶成员数」⇒ 立刻红。
+      expect(viaIvf.explain?.routes.vector.codesMissing).toBe(0);
       expect(viaFlat.explain?.routes.vector.codesMissing).toBe(0);
 
       // ── ① id 序列逐位相同（顺序也一致：同一个 compareHits 全序）──

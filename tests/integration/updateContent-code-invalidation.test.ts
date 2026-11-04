@@ -61,6 +61,7 @@ import { cosineOf } from '../../src/store/dedupCandidates.js';
 import { EventWriter } from '../../src/store/events.js';
 import { type UpdateContentStore, updateContent } from '../../src/store/updateContent.js';
 import { MemoryLogger } from '../../src/util/log.js';
+import { assignBucket, unassignBucket } from '../../src/vector/bucketAssign.js';
 import { CentroidCache, type IvfCentroidModel, vectorToBlob } from '../../src/vector/centroids.js';
 import { normalizeNumbers } from '../../src/vector/dot.js';
 import {
@@ -131,6 +132,40 @@ function memberBucketOf(db: Database.Database, id: string): string | null {
     | { fine_id: string }
     | undefined;
   return row?.fine_id ?? null;
+}
+
+/** 读某个 id 的码字节（`null` = 没有码行）。**这是「码到底有没有换」的唯一硬证据**。 */
+function readCodeBytes(db: Database.Database, id: string): Buffer | null {
+  const row = db.prepare('SELECT code FROM vector_codes WHERE memory_id = ?').get(id) as
+    | { code: Buffer }
+    | undefined;
+  return row === undefined ? null : Buffer.from(row.code);
+}
+
+/** 读某个 id 的 `eps`（`null` = 没有码行）。 */
+function readEps(db: Database.Database, id: string): number | null {
+  const row = db.prepare('SELECT eps FROM vector_codes WHERE memory_id = ?').get(id) as
+    | { eps: number }
+    | undefined;
+  return row === undefined ? null : row.eps;
+}
+
+/** 一条向量「应当」编出来的码字节（与生产同一个编码器 ⇒ 不是第二份实现）。 */
+function encodeOf(vector: Float32Array): Buffer {
+  return Buffer.from(codeToBlob(encodeVector(vector).code));
+}
+
+/** 在**写事务内**跑一段（`assignBucket` / `unassignBucket` 会断言「必须在事务里」）。 */
+function inTx<T>(db: Database.Database, body: () => T): T {
+  db.exec('BEGIN IMMEDIATE;');
+  try {
+    const result = body();
+    db.exec('COMMIT;');
+    return result;
+  } catch (error) {
+    db.exec('ROLLBACK;');
+    throw error;
+  }
 }
 
 /**
@@ -297,8 +332,8 @@ function changeTargetVector(world: World, query: Float32Array): readonly string[
   return routeFineBuckets(world.model, query, 1, 2);
 }
 
-describe('T04 收尾 · `updateContent()` 改向量 ⇒ 码行失效（同桶 ⇒ 过期上界）', () => {
-  it('★ ① 新向量落在**同一个细桶**时：该行的码行必须被删掉（fail-open 降级）', () => {
+describe('T04 收尾 → T05 · `updateContent()` 改向量 ⇒ 码行必须**按新向量重编码**（同桶 ⇒ 过期上界）', () => {
+  it('★ ① 新向量落在**同一个细桶**时：码行仍在，但**码字节与 eps 必须换成新向量的**', () => {
     const world = buildWorld();
     const query = axisVector(1); // = 目标行的**新**向量
 
@@ -308,9 +343,10 @@ describe('T04 收尾 · `updateContent()` 改向量 ⇒ 码行失效（同桶 �
     expect(assignFineBucket(world.model, query, P.ROUTER_NPROBE_COARSE)).toBe(world.fineId);
     // ② 目标行此刻**有码**（码是按旧向量编的 ⇒ 一旦留着就是过期上界）
     expect(countCodes(world.db, TARGET)).toBe(1);
+    const codeBefore = readCodeBytes(world.db, TARGET);
     // ③ 目标行在桶里 ⇒ 它是候选宇宙的成员（不是「反正也不会被扫到」）
     expect(memberBucketOf(world.db, TARGET)).toBe(world.fineId);
-    // ④ 命中桶里此刻**一条无码行都没有**（改完之后 `codesMissing` 从 0 变 1 ⇒ 可见）
+    // ④ 命中桶里此刻**一条无码行都没有**
     const before = routeFineBuckets(world.model, query, 1, 2);
     expect(before).toContain(world.fineId);
     expect(countUncodedCandidates(world.db, before)).toBe(0);
@@ -318,14 +354,21 @@ describe('T04 收尾 · `updateContent()` 改向量 ⇒ 码行失效（同桶 �
     // ══════════ 改正文 + 换向量（新旧向量余弦 = 0，但同桶）══════════
     const hitBuckets = changeTargetVector(world, query);
 
-    // ★ ① 码行**被删掉**（本轮的修法：fail-open 降级，不重编码）
-    expect(countCodes(world.db, TARGET)).toBe(0);
-    // ★ 桶归属**没变**（同桶）⇒ 「靠 `fine_id` 漂移兜底」这条路在这里根本不存在，
-    //   也就是说：**只有删码**才能让该行退出剪枝（这正是本用例存在的理由）
+    // ★ ① **码行仍在**（T05：码与成员同生同死 —— 不再靠「删掉让它过期」）
+    expect(countCodes(world.db, TARGET)).toBe(1);
+    // ★ ② **码字节换了**（换成新向量的码）⇒ 上界重新成立。
+    //   这一条是整条链的核心：`fine_id` 没变、行数没变，**只有字节能证明它被重编码了**。
+    const codeAfter = readCodeBytes(world.db, TARGET);
+    expect(codeAfter).not.toBeNull();
+    expect(codeAfter?.equals(codeBefore as Buffer)).toBe(false);
+    expect(codeAfter).toEqual(encodeOf(query));
+    // ★ ③ `eps` 也必须是新向量的误差（不是旧值照抄）
+    expect(readEps(world.db, TARGET)).toBeCloseTo(encodeVector(query).eps, 10);
+    // ★ 桶归属**没变**（同桶）⇒ 「靠 `fine_id` 漂移兜底」这条路在这里根本不存在
     expect(memberBucketOf(world.db, TARGET)).toBe(world.fineId);
-    // ★ 该行变成「无码」⇒ `codesMissing` 从 0 变 1（**可观测**：降级不是静默的）
-    expect(countUncodedCandidates(world.db, hitBuckets)).toBe(1);
-    // ★ 其余行的码**一行都没被误删**
+    // ★ 该行**没有变成无码**（`codesMissing` 保持 0 —— T05 之后不再有「降级」这个中间态）
+    expect(countUncodedCandidates(world.db, hitBuckets)).toBe(0);
+    // ★ 其余行的码**一行都没被误动**
     let codedOthers = 0;
     for (const id of world.ids) {
       if (id !== TARGET) {
@@ -337,7 +380,7 @@ describe('T04 收尾 · `updateContent()` 改向量 ⇒ 码行失效（同桶 �
     world.db.close();
   });
 
-  it('★ ② 删码之后：读路径 / 写路径与「全量精确参照」**逐位相同**（无码 ⇒ 兜底 ⇒ 不漏）', () => {
+  it('★ ② 重编码之后：读路径 / 写路径与「全量精确参照」**逐位相同**（上界重新成立 ⇒ 不漏）', () => {
     const world = buildWorld();
     const query = axisVector(1);
     changeTargetVector(world, query);
@@ -387,8 +430,116 @@ describe('T04 收尾 · `updateContent()` 改向量 ⇒ 码行失效（同桶 �
     ]);
     // ── `scanned` = 候选宇宙（成员数），与码表状态无关 ⇒ 两边相同 ──
     expect(writePruned.scanned).toBe(writeHead.scanned);
-    // ── `uncoded` 如实 +1（目标行现在是唯一一条无码行）──
-    expect(writePruned.uncoded).toBe(1);
+    // ── T05：目标行**已被重编码** ⇒ 不再有无码行（`uncoded = 0`；T04 收尾时这里曾是 1）──
+    expect(writePruned.uncoded).toBe(0);
+
+    world.db.close();
+  });
+
+  it('★ ③ 反证：把码**改回旧向量的码**（模拟「没重编码」）⇒ 剪枝与精确参照**出现差异**', () => {
+    // ⚠️ 这条是「T05 不是可选项」的证据：它不测实现，测**省略实现的后果**。
+    //   做法：正常改完向量（码已被重编码）之后，**手工把码写回旧向量的码** ——
+    //   这正是 T05 之前那个世界的状态（`fine_id` 对得上、行数对得上、只有字节是旧的）。
+    const world = buildWorld();
+    const query = axisVector(1);
+    changeTargetVector(world, query);
+
+    // 把目标行的码换成「旧向量」的码（`axisVector(0)` 是它的旧向量）
+    const stale = encodeVector(axisVector(0));
+    world.db
+      .prepare('UPDATE vector_codes SET code = ?, scale = ?, eps = ? WHERE memory_id = ?')
+      .run(codeToBlob(stale.code), stale.scale, stale.eps, TARGET);
+
+    const pruned = makeBackend(world, true);
+    const exact = makeBackend(world, false);
+
+    // 至少有一档 k 上，pruned 与 exact **不一样**（漏掉/换掉了本该第 1 名的目标行）
+    let mismatched = 0;
+    for (const k of [1, 2, 3]) {
+      const prunedIds = pruned.search(query, k).map((hit) => hit.id);
+      const exactIds = exact.search(query, k).map((hit) => hit.id);
+      if (prunedIds.join(',') !== exactIds.join(',')) {
+        mismatched += 1;
+      }
+    }
+    // ★ 期望 ≥ 1（旧码的 `upper` 把真第 1 名排到了后面）；若为 0 说明这条反证失效 ⇒ 本用例失败
+    expect(mismatched).toBeGreaterThanOrEqual(1);
+    // 负控：全量精确参照里目标行**确实是第 1 名**（否则上面的差异可能来自别处）
+    expect(exact.search(query, 1).map((hit) => hit.id)).toEqual([TARGET]);
+
+    world.db.close();
+  });
+
+  // ════════════════════════════════════════════════════════════════════════
+  // T05：码行的维护收在 `assignBucket` / `unassignBucket`（唯一收敛点）
+  // ════════════════════════════════════════════════════════════════════════
+
+  it('★ ④ 换桶：码行的 `fine_id` 跟着搬，码字节**不变**（同一向量 ⇒ 不必重算），且每 memory 恰 1 行', () => {
+    const world = buildWorld();
+    const vector = world.vectors.get(TARGET) as Float32Array;
+    const bytesBefore = readCodeBytes(world.db, TARGET);
+
+    // 搬到一个**别的**细桶（直接给 `assignBucket` 一个指向另一个桶的向量）
+    const result = inTx(world.db, () => assignBucket(world.store.buckets, TARGET, axisVector(2)));
+    expect(result.assigned).toBe(true);
+    expect(result.fineId).toBe(FINE_OTHER);
+    expect(result.changed).toBe(true);
+
+    // ★ 两张表**同进同退**
+    expect(memberBucketOf(world.db, TARGET)).toBe(FINE_OTHER);
+    const codeFineId = (
+      world.db.prepare('SELECT fine_id FROM vector_codes WHERE memory_id = ?').get(TARGET) as {
+        fine_id: string;
+      }
+    ).fine_id;
+    expect(codeFineId).toBe(FINE_OTHER);
+    // ★ 码字节按**新传进来的向量**算（这里是 `axisVector(2)`，不是原来的 `vector`）
+    expect(readCodeBytes(world.db, TARGET)).toEqual(encodeOf(axisVector(2)));
+    expect(readCodeBytes(world.db, TARGET)?.equals(bytesBefore as Buffer)).toBe(false);
+    // ★ 恒 1 行（不是「新旧各一条」）
+    expect(countCodes(world.db, TARGET)).toBe(1);
+
+    // 负控：`vector`（旧向量）**不再**是码的依据 —— 用它重算应当**对不上**
+    expect(readCodeBytes(world.db, TARGET)?.equals(encodeOf(vector) as Buffer)).toBe(false);
+
+    world.db.close();
+  });
+
+  it('★ ⑤ 退桶：`unassignBucket()` 同一事务里把码行也删掉（不留孤儿码行）', () => {
+    const world = buildWorld();
+    expect(countCodes(world.db, TARGET)).toBe(1);
+
+    inTx(world.db, () => unassignBucket(world.store.buckets, TARGET));
+
+    expect(memberBucketOf(world.db, TARGET)).toBeNull();
+    expect(countCodes(world.db, TARGET)).toBe(0); // ★ 孤儿码行 = 0
+    // 其余行一行都没被误动
+    let coded = 0;
+    for (const id of world.ids) {
+      coded += countCodes(world.db, id);
+    }
+    expect(coded).toBe(world.ids.length - 1);
+
+    world.db.close();
+  });
+
+  it('★ ⑥ 分桶未训练：`assignBucket()` 早退（`assigned=false`）但**必须删码行**（fail-open，不留过期上界）', () => {
+    const world = buildWorld();
+    expect(countCodes(world.db, TARGET)).toBe(1);
+
+    const untrained = {
+      db: world.db,
+      centroids: () => ({ coarse: [], fine: [] }),
+      nprobeCoarse: P.ROUTER_NPROBE_COARSE,
+    };
+    const result = inTx(world.db, () => assignBucket(untrained, TARGET, axisVector(1)));
+
+    expect(result.assigned).toBe(false);
+    expect(result.fineId).toBeNull();
+    // ★ 码行被删（留着旧码 = 上界不再是上界，而 `fine_id` 两边一致 ⇒ A6 查不出）
+    expect(countCodes(world.db, TARGET)).toBe(0);
+    // ⚠️ 已有归属**不动**（§4.15.3 的早退语义没变：模型为空 ≠ 把归属清掉）
+    expect(memberBucketOf(world.db, TARGET)).toBe(world.fineId);
 
     world.db.close();
   });
