@@ -19,7 +19,13 @@
  *   最坏情形：**命中桶内全是软删成员** ⇒ 「返回行数」= 0 ⇒ 剪枝率 0% ⇒ **假绿**。
  *   ⇒ ⇒ 分子必须取**偏大**的那一个（调用次数）⇒ 门槛才是**严**的。
  *
- * ⚠️ ★★★★ **本文件只新增、不改任何既有文件**：
+ * ⚠️ ★★★★ **本文件还含「登记 2 / 3」两条接线守卫**（读路径 `samplesAligned` 的接线）：
+ *   · **登记 3**：接线**不许**拿 `candidateUniverse` 当「实测桶成员行」；
+ *   · **登记 2**：接线**不许**自比较（「实测」与「推算」必须取自**不同的列**）。
+ *   ⇒ ⇒ 两者都用**「同值不同源」**的形态验（见 §D 的注释：schema 的唯一索引让两列**数值相同**
+ *   ⇒ ⇒ 只能按**来源**验 ⇒ ⇒ 只能靠「把另一列改不同 ⇒ 接线喂了谁就露馅」）。
+ *
+ * ⚠️ ★★★★★ **本文件只新增、不改任何既有文件**：
  *   · `src/**` **零改动**（硬边界）；
  *   · `bench/**` **零改动**（工程师地盘）；
  *   · 白调用场景**只动本文件自己新建的临时库**（`mkdtempSync` ⇒ 零并发风险）。
@@ -38,7 +44,9 @@ import {
   type CountSummary,
   type PerfResult,
   type VectorByteReads,
+  type VectorByteSample,
   measurePerf,
+  readSamplesAlignedInputs,
   toCountSummary,
 } from '../../bench/perf.js';
 import { DEFAULT_PARAMS } from '../../src/core/params.js';
@@ -346,5 +354,199 @@ describe('§C · 负控：断言的鉴别力（纯函数 · 喂两组不同数�
     expect(pruneRateDistribution(withWhiteCall, 'calls')).not.toEqual(
       pruneRateDistribution(withWhiteCall, 'rows'),
     );
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §D · 登记 2 / 3：读路径 `samplesAligned` 的【接线】守卫
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * ★ **造一个最小的 `VectorByteSample`**（登记 2/3 的夹具）。
+ *
+ * ⚠️ ★★ **为什么必须「人为把两列改不同」**（本组守卫的全部要害）：
+ *   schema 上 `vector_cell_members.memory_id` 有唯一索引
+ *   （`schema/001_schema_v2.sql:335`）⇒ **一条记忆只属一个细桶**
+ *   ⇒ ⇒ 同一批桶内 `COUNT(DISTINCT memory_id)` **恒等于** `COUNT(*)`
+ *   ⇒ ⇒ **`candidateUniverse` 与 `bucketMemberRows` 在真实数据上【数值必然相同】**
+ *   ⇒ ⇒ 「这两个量确实不是同一个东西」这种**按数值**的断言**在真实数据上恒假**
+ *   ⇒ ⇒ ★ **只能按【来源】验**：**把另一列改不同** ⇒ 若接线喂错了列 ⇒ 立刻露馅。
+ *
+ * @param overrides 要覆盖的字段（其余给默认值）
+ * @returns 一个字段齐全的 `VectorByteSample`（**不绕类型** ⇒ 全字段都填）
+ */
+function makeSample(overrides: Partial<VectorByteSample> = {}): VectorByteSample {
+  return {
+    memoryRowsRead: 0,
+    codeRowsRead: 0,
+    bytesRead: 0,
+    candidateUniverse: 941,
+    codeBytes: 0,
+    embeddingBytes: 0,
+    contentBytes: 0,
+    embeddingRowsRead: 0,
+    embeddingExactRows: 0,
+    embeddingCalls: 0,
+    narrowRowsRead: 0,
+    bucketMemberRows: 941,
+    bucketMemberRowsDerived: 941,
+    badCodeRows: 0,
+    unclassifiedRows: 0,
+    unclassifiedSqlKinds: [],
+    legacyCandidateRows: 0,
+    legacyCodeRows: 0,
+    ...overrides,
+  };
+}
+
+/**
+ * ★★ **守卫判定（纯函数 · 守卫与负控【共用同一份判定逻辑】）**。
+ *
+ * ⚠️ ★★ **为什么把判定抽成纯函数**（负控要靠它才能落地）：
+ *   负控要证明「喂坏数据 ⇒ 判定能分辨」⇒ ⇒ 必须有一个**可喂数据**的判定函数
+ *   ⇒ ⇒ **守卫与负控共用它** ⇒ ⇒ 负控才真正证明「这条守卫有牙」
+ *   ⇒ ⇒ ★ **全程不需要改 `bench/perf.ts`**（⇒ 并发零风险）。
+ *
+ * @param measured 接线产出的「实测桶成员行」数组
+ * @param samples 对应的逐样本
+ * @returns 逐位判定：是否**每一项**都取自 `bucketMemberRows` 那一列
+ */
+function measuredIsFromBucketMemberRows(
+  measured: readonly number[],
+  samples: readonly VectorByteSample[],
+): boolean {
+  return (
+    measured.length === samples.length &&
+    samples.every((sample, index) => measured[index] === sample.bucketMemberRows)
+  );
+}
+
+/**
+ * ★★ **守卫判定（纯函数 · 登记 2）**：`derived` 是否**每一项**都取自
+ * `bucketMemberRowsDerived` 那一列（⇒ ⇒ **不是**自比较）。
+ *
+ * @param derived 接线产出的「推算桶成员行」数组
+ * @param samples 对应的逐样本
+ * @returns 逐位判定：是否**每一项**都取自 `bucketMemberRowsDerived` 那一列
+ */
+function derivedIsFromBucketMemberRowsDerived(
+  derived: readonly (number | null)[],
+  samples: readonly VectorByteSample[],
+): boolean {
+  return (
+    derived.length === samples.length &&
+    samples.every((sample, index) => derived[index] === sample.bucketMemberRowsDerived)
+  );
+}
+
+describe('§D · 登记 2 / 3：读路径 `samplesAligned` 的接线（按【来源】验，不按【数值】验）', () => {
+  it('★ 登记 3：`measured` 必须取自 `bucketMemberRows`（**不许**用 `candidateUniverse`）', () => {
+    // ⚠️ ★ **夹具的关键**：把 `candidateUniverse` 改成与 `bucketMemberRows` **不同**
+    //   ⇒ ⇒ 若接线喂的是 `candidateUniverse` ⇒ `measured` 就会变成 7 ⇒ 断言立刻红。
+    const sample = makeSample({ candidateUniverse: 7, bucketMemberRows: 941 });
+    // ⚠️ **前提**：两列现在数值不同 ⇒ 这个夹具才有鉴别力（否则换列也看不出来）。
+    expect(sample.candidateUniverse).not.toBe(sample.bucketMemberRows);
+
+    const inputs = readSamplesAlignedInputs([sample]);
+    // ★ **核心断言**：`measured` 逐位等于 `bucketMemberRows`（⇒ 它看的是**那一列**）。
+    expect(inputs.measured[0]).toBe(sample.bucketMemberRows);
+    // ★ **反向断言**：`measured` **不是** `candidateUniverse` 那一列。
+    expect(inputs.measured[0]).not.toBe(sample.candidateUniverse);
+    // ★ **同一条判定逻辑**（与 §E 负控共用 ⇒ 负控才真能证明本条有牙）。
+    expect(measuredIsFromBucketMemberRows(inputs.measured, [sample])).toBe(true);
+  });
+
+  it('★ 登记 2：`derived` 必须取自 `bucketMemberRowsDerived`（**不许**自比较）', () => {
+    // ⚠️ ★ **夹具的关键**：把 `bucketMemberRowsDerived` 改成与 `bucketMemberRows` **不同**
+    //   ⇒ ⇒ 若接线改成「拿自己跟自己比」（`derived` 也取 `bucketMemberRows`）⇒ 断言立刻红。
+    const sample = makeSample({ bucketMemberRows: 941, bucketMemberRowsDerived: 7 });
+    // ⚠️ **前提**：两列现在数值不同 ⇒ 自比较的变异才露馅。
+    expect(sample.bucketMemberRowsDerived).not.toBe(sample.bucketMemberRows);
+
+    const inputs = readSamplesAlignedInputs([sample]);
+    // ★ **核心断言**：`derived` 逐位等于 `bucketMemberRowsDerived`（⇒ 它看的是**那一列**）。
+    expect(inputs.derived[0]).toBe(sample.bucketMemberRowsDerived);
+    // ★ **反向断言**：`derived` **不是** `bucketMemberRows` 那一列（⇒ 不是自比较）。
+    expect(inputs.derived[0]).not.toBe(sample.bucketMemberRows);
+    // ★ **同一条判定逻辑**（与 §E 负控共用 ⇒ 负控才真能证明本条有牙）。
+    expect(derivedIsFromBucketMemberRowsDerived(inputs.derived, [sample])).toBe(true);
+  });
+
+  it('★ 两个数组必须取自【不同的列】（⇒ `measured` ≠ `derived` ⇒ 接线不是自比较）', () => {
+    // ⚠️ 两列数值不同 ⇒ 两个数组的元素也必须不同 ⇒ ⇒ 接线喂了不同的列。
+    const sample = makeSample({ bucketMemberRows: 941, bucketMemberRowsDerived: 7 });
+    const inputs = readSamplesAlignedInputs([sample]);
+    expect(inputs.measured[0]).not.toBe(inputs.derived[0]);
+  });
+
+  it('★ 逐样本配对：两个数组长度相同、顺序一一对应', () => {
+    const samples = [
+      makeSample({ bucketMemberRows: 10, bucketMemberRowsDerived: 11, candidateUniverse: 12 }),
+      makeSample({ bucketMemberRows: 20, bucketMemberRowsDerived: 21, candidateUniverse: 22 }),
+    ];
+    const inputs = readSamplesAlignedInputs(samples);
+    expect(inputs.measured).toEqual([10, 20]);
+    expect(inputs.derived).toEqual([11, 21]);
+  });
+
+  it('★ `null`（= 没算 ⇒ 不可判定）必须原样透传（判定逻辑在 `readSamplesAlignedOf()` 里）', () => {
+    const inputs = readSamplesAlignedInputs([makeSample({ bucketMemberRowsDerived: null })]);
+    expect(inputs.derived[0]).toBeNull();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §E · 登记 2 / 3 的负控（纯函数 · 喂两组不同数据 · **不碰 `bench/perf.ts`**）
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('§E · 登记 2 / 3 的负控：判定逻辑能分辨「喂对列」与「喂错列」', () => {
+  it('★ 登记 3 的判定：喂 `candidateUniverse` 的数组 ⇒ 必须判为「不是 `bucketMemberRows` 那一列」', () => {
+    // ⚠️ ★ **两组数据**：同一份样本，**只有 `measured` 的来源不同**。
+    const sample = makeSample({ candidateUniverse: 7, bucketMemberRows: 941 });
+    // ⚠️ ① 喂对列（真接线的产出）⇒ 判定必须通过。
+    const good = readSamplesAlignedInputs([sample]);
+    expect(measuredIsFromBucketMemberRows(good.measured, [sample])).toBe(true);
+    // ⚠️ ② 喂错列（变异体的产出：`measured` 取自 `candidateUniverse`）⇒ 判定必须**拒绝**。
+    //   ⇒ ⇒ **这证明 §D 的登记 3 断言有牙**（不是恒绿守卫）。
+    const bad: readonly number[] = [sample.candidateUniverse];
+    expect(measuredIsFromBucketMemberRows(bad, [sample])).toBe(false);
+    // ⚠️ ★ **顺带证明「按数值」验不可行**（登记 3 的根因）：
+    //   在**两列数值相同**的真实数据上，喂错列与喂对列**完全无法区分**
+    //   ⇒ ⇒ 这就是 §D 必须「人为把两列改不同」的原因。
+    const same = makeSample({ candidateUniverse: 941, bucketMemberRows: 941 });
+    expect(measuredIsFromBucketMemberRows([same.candidateUniverse], [same])).toBe(true);
+  });
+
+  it('★ 登记 2 的判定：喂自比较的数组 ⇒ 必须判为「不是 `bucketMemberRowsDerived` 那一列」', () => {
+    // ⚠️ ★ **两组数据**：同一份样本，**只有 `derived` 的来源不同**。
+    const sample = makeSample({ bucketMemberRows: 941, bucketMemberRowsDerived: 7 });
+    // ⚠️ ① 喂对列（真接线的产出）⇒ 判定必须通过。
+    const good = readSamplesAlignedInputs([sample]);
+    expect(derivedIsFromBucketMemberRowsDerived(good.derived, [sample])).toBe(true);
+    // ⚠️ ② 喂错列（自比较的变异体：`derived` 取自 `bucketMemberRows`）⇒ 判定必须**拒绝**。
+    //   ⇒ ⇒ **这证明 §D 的登记 2 断言有牙**（不是恒绿守卫）。
+    const bad: readonly (number | null)[] = [sample.bucketMemberRows];
+    expect(derivedIsFromBucketMemberRowsDerived(bad, [sample])).toBe(false);
+    // ⚠️ ★ **顺带证明「按数值」验不可行**（登记 2 的根因）：
+    //   在**两列数值相同**的真实数据上，自比较与真接线**完全无法区分**
+    //   ⇒ ⇒ 这就是 §D 必须「人为把两列改不同」的原因。
+    const same = makeSample({ bucketMemberRows: 941, bucketMemberRowsDerived: 941 });
+    expect(derivedIsFromBucketMemberRowsDerived([same.bucketMemberRows], [same])).toBe(true);
+  });
+
+  it('★ 逐样本：只要【有一个样本】喂错列 ⇒ 整体判定必须拒绝（⇒ 不是「只看第一个」）', () => {
+    const samples = [
+      makeSample({ bucketMemberRows: 10, bucketMemberRowsDerived: 11, candidateUniverse: 12 }),
+      makeSample({ bucketMemberRows: 20, bucketMemberRowsDerived: 21, candidateUniverse: 22 }),
+    ];
+    // ⚠️ 喂对列 ⇒ 通过。
+    expect(
+      measuredIsFromBucketMemberRows(readSamplesAlignedInputs(samples).measured, samples),
+    ).toBe(true);
+    // ⚠️ ★ **只有第 2 个样本**喂错列 ⇒ 必须**整体拒绝**（⇒ 守卫是逐样本的）。
+    const oneBad: readonly number[] = [12, 22];
+    expect(measuredIsFromBucketMemberRows(oneBad, samples)).toBe(false);
+    // ⚠️ ★ 长度不一致 ⇒ 也必须拒绝（⇒ 两个数组必须逐样本配对）。
+    expect(measuredIsFromBucketMemberRows([12], samples)).toBe(false);
   });
 });
