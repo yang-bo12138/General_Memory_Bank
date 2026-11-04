@@ -254,7 +254,15 @@ describe('页缓存状态标注（冷 / 热 / 未知 —— 可标注，不可�
       const info = parsePageCacheState(state);
       // ⚠️ ★ **旁证必须落在 note 里**（⇒ 读 JSON 的人能自证「这一档是怎么判的」）。
       expect(info.note).toContain('顺序读吞吐');
-      expect(info.note).toContain('166 MB/s');
+      // ⚠️ ★★ **旁证必须指向 `storageMedia` 那块盘的「名义带宽」，且不许写死具体盘速**（2026-11-04 改）：
+      //   旧版在这里断言 `toContain('166 MB/s')` —— 那是**一台 SATA HDD 的实测值**，
+      //   而同一份 JSON 的 `storageMedia` 早已是 `SSD | NVMe | WD Blue SN570` ⇒
+      //   **落盘的 note 与落盘的介质字段自相矛盾**（基线自己说谎，且会被后人引用）。
+      //   ⇒ 现在断言的是**方法**（比名义带宽）与**不许写死**这条纪律，而不是某一个数字。
+      expect(info.note).toContain('名义顺序读带宽');
+      expect(info.note).toContain('storageMedia');
+      expect(info.note).toMatch(/刻意不写具体盘速/);
+      expect(info.note).not.toMatch(/\d{2,4}\s*MB\/s/);
       // ⚠️ **但它仍然只是「声明」**（⇒ 语义不许被旁证改成「测量」）。
       expect(info.declared).toBe(true);
       expect(info.note).toContain('由跑的人声明');

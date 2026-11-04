@@ -1,0 +1,89 @@
+{
+  "corpusSize": 10000,
+  "samples": 200,
+  "warmupRounds": 5,
+  "flatVectorLatency": {
+    "count": 200,
+    "minMs": 105.7214,
+    "p50Ms": 108.6268,
+    "p90Ms": 111.2343,
+    "p95Ms": 113.0844,
+    "p99Ms": 115.1283,
+    "maxMs": 116.1911,
+    "meanMs": 109.15551199999999
+  },
+  "recallLatency": {
+    "count": 200,
+    "minMs": 2.9085,
+    "p50Ms": 5.7907,
+    "p90Ms": 6.119,
+    "p95Ms": 6.3235,
+    "p99Ms": 8.3626,
+    "maxMs": 9.0123,
+    "meanMs": 5.724292999999997
+  },
+  "vectorShare": 0.9501714596399253,
+  "reference": 0.8,
+  "shareDelta": 0.1501714596399253,
+  "recallVectorPath": {
+    "samples": 200,
+    "latency": {
+      "count": 200,
+      "minMs": 72.7626,
+      "p50Ms": 93.3125,
+      "p90Ms": 97.2316,
+      "p95Ms": 98.3332,
+      "p99Ms": 99.433,
+      "maxMs": 102.2442,
+      "meanMs": 91.604231
+    },
+    "p99Ms": 99.433,
+    "meanMs": 91.604231,
+    "oldPathMeanMs": 5.332998500000006,
+    "meanDeltaMs": 86.2712325,
+    "vectorShareFromDelta": 0.9417821814365758,
+    "probe": {
+      "ran": true,
+      "candidates": 20,
+      "mode": "flat_explicit",
+      "note": "① **存在性证据**（只跑 1 次、取第一条查询）⇒ 不是统计量，耗时不计入任何 P99；② `ran=true` ⇒ 该次召回的 `explain.routes.vector.ran === true`⇒ 向量路**真的在 `recall()` 内部执行了**（不是「传了向量但被入口条件挡掉」）；③ `ran=false` ⇒ 该次召回**向量路整路缺席**，原因看 `mode`：`flat_auto`（库规模 < `ROUTER_MIN_TRAINING` ⇒ 全表精确点积）/ `absent`（过了门槛但桶未训练）/ `flat_explicit`（调用方显式选了 flat）；④ ⚠️ `mode` 与 `ran` 是**两个观测面**（`stats()` 说「后端处于哪一态」，`explain` 说「这一次跑没跑」）⇒ 若 `mode=ivf` 而 `ran=false`，说明**入口条件另有拦口**（如查询向量不合法被丢弃）⇒ **必须查**，不能当成「偶然」；⑤ ⚠️ `diagnostics: true`（**不是** `explain: true`）⇒ 探针**不写** `recall` 事件⇒ 不污染被测库的写放大。"
+    },
+    "note": "① **new-path 档** = `VECTOR_ROUTER=flat` 的 store 上 `recall({ context, queryEmbedding, now })`（四态判定 ⇒ `flat_explicit`）⇒ **向量路真的在召回内部跑了**，走**全表精确点积**；② **对照基线 `oldPathMeanMs` 是同一次运行、同一个 store 上不传向量**的召回均值⇒ 差值是「只差传不传向量」这一个变量（不用原有 `recallLatency`：那是另一个 store 实例的量）；③ 两档**背靠背跑、按查询序号轮换先后**（偶数 old 先 / 奇数 new 先）⇒ 对称掉「后跑者得利」；④ `vectorShareFromDelta` = `meanDeltaMs ÷ meanMs` ⇒ flat 路线下向量路在**整条召回**里的占比（§12 那条「≥80%」证据的**直接可测形态**）；⚠️ **可能为负**（噪声 / 页缓存状态）⇒ 照实落盘、不钳 0；⑤ ⚠️ **本档与原「向量路耗时占比」(`vectorShare`) 不是同一条数**：`vectorShare` 的分子是`flatTopK()` 的**手工扫描**（不含文本路 / 图谱路 / 打分 / 排序），本档是**整条召回**；⑥ `probe` 复用 `bench/perf.ts` 的 `probeVectorPathOfRecall()`（一份口径）⇒ `ran=true` 才证明「向量路真在召回里跑」，只靠耗时差区分不了「跑了但很快」与「没跑」。"
+  },
+  "note": "这是「改造前」的前置测量（证据，不是验收条件）；「改造后」的分桶路线占比见 bench/perf.ts 的 vectorRouteShare。★ 自 2026-11-02 起本文件有两个档：原有档（flatVectorLatency / recallLatency / vectorShare ⇒ 手工组装的全表扫描 + 不传向量的召回）与 new-path 档（recallVectorPath ⇒ VECTOR_ROUTER=flat 的 store 上传向量的召回，向量路真在 recall 内部跑）；两档口径不同（扫描本身 vs 整条召回），不许合成一个数。",
+  "benchNow": 1749873600000,
+  "machine": {
+    "platform": "win32-x64",
+    "node": "v22.22.2",
+    "cpuModel": "AMD Ryzen 7 2700 Eight-Core Processor          ",
+    "cpuCount": 16,
+    "totalMemoryBytes": 17120718848,
+    "freeMemoryBytes": 9954918400,
+    "usedMemoryBytes": 7165800448,
+    "totalDiskBytes": 1000203087872,
+    "freeDiskBytes": 860265467904,
+    "storageMedia": {
+      "mediaClass": "SSD",
+      "source": "powershell:Get-PhysicalDisk",
+      "detected": true,
+      "detail": "SSD | NVMe | WD Blue SN570 1TB SSD"
+    }
+  },
+  "phases": {
+    "loadMs": 2207.0629,
+    "trainMs": 41664.7009,
+    "trainReadAndKmeansMs": null,
+    "trainMigrateMs": null,
+    "rssBeforeTrainBytes": 222302208,
+    "peakRssBytes": 388878336,
+    "sampledPeakRssBytes": 388681728,
+    "peakRss": {
+      "kernelPeakBytes": 388878336,
+      "sampledPeakBytes": 388681728,
+      "sampleCount": 666,
+      "workerActive": true
+    },
+    "fineCells": 6710,
+    "members": 10000
+  }
+}
