@@ -300,12 +300,34 @@ export function collectVectorCandidates(
   // ⚠️ **中心模型只从库里读**（`buckets.centroids()` ⇒ 走 `CentroidCache` 的真实加载路径）
   //   ⇒ 重训之后必须让缓存失效（那是 `MemoryStore` 的责任，§4.15.5）。
   const model = context.buckets.centroids();
+  // ⚠️ ★ **C′ 档 T04（两段式可证剪枝）**：扫描改成「先读码算上界、只对可能入选的行读原向量」。
+  //   三个实参都是**必填口径**（规格 §5.1.4 / §5.1.1 纪律②）：
+  //   · `threshold` = **本层**的合并门槛（`setParams()` 可改它 ⇒ 不许用 `DEFAULT_PARAMS` 顶）；
+  //   · `k` = **本层**的候选上限（下游 `slice(0, VECTOR_TOPK)` 用的是同一个数）；
+  //   · `scoreOf` = **余弦的唯一实现**（本文件的 `cosineOf`）。它刻意由**调用方**注入：
+  //     剪枝原语不自己算点积（否则就是第三套口径），而本层是唯一同时持有
+  //     `cosineOf` 与库句柄的地方 —— 放进向量层会与 `dedupCandidates → ivf` 形成反向依赖。
+  const oneEmbedding = db.prepare(
+    'SELECT embedding FROM memories WHERE id = ? AND deleted = 0 AND embedding IS NOT NULL',
+  );
   const scan = scanBucketCandidates(
     db,
     model,
     vector,
     params.ROUTER_NPROBE_WRITE_COARSE,
     params.ROUTER_NPROBE_WRITE_FINE,
+    {
+      threshold: params.DEDUP_COS_MIN,
+      k: params.VECTOR_TOPK,
+      scoreOf: (id: string): number | null => {
+        const row = oneEmbedding.get(id) as { embedding: Buffer } | undefined;
+        if (row === undefined) {
+          // 软删 / 无向量 ⇒ 不在候选宇宙（与 HEAD 的 `rows` 口径一致：`deleted = 0 AND embedding NOT NULL`）
+          return null;
+        }
+        return cosineOf(vector, blobToVector(row.embedding));
+      },
+    },
   );
   if (scan.rows.length === 0) {
     return { candidates: [], scanned: scan.scanned, fineIds: scan.fineIds };

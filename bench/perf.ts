@@ -15,13 +15,33 @@
  *     （flat 路线下向量路占绝对多数 ⇒ §12 的「≥80%」那条），
  *     而**改造后**的口径是「向量路在一次召回里占多少」⇒ **分母是 recall 全程**。
  *
- * ⚠️ **本脚本测的「向量路」是「生产后端被单独调用」的耗时**，
- *   **不是**「recall 内部真的走了向量路」的耗时
- *   ⇒ 因为**本仓库当前的 `recall()` 尚未接线向量路**
- *   （`src/store/recall.ts` 步骤 2c 仍写着「本阶段整路缺席」）
- *   ⇒ **这一点必须在报告里写明**，否则「向量路占比」会被读成「流水线内的占比」
- *   ⇒ **实际流水线里的占比 = 本脚本测的向量路耗时 / (recall 耗时 + 向量路耗时)**，
- *   因为接线后向量路是**额外**的一段（它不在现在的 recall 里）。
+ * ⚠️ ★★★ **本脚本测两个「召回档」**（2026-11-02 补：`recall()` 已接线向量路，`96568eb`）：
+ *   · **old-path 档** = `store.recall({ context, now })` —— **不传 `queryEmbedding`**
+ *     ⇒ 向量路**整段不执行**（`src/store/recall.ts` 步骤 2c 的入口条件是「有向量 ∧ 有端口」）
+ *     ⇒ 它就是「**接线之前**」的召回形状 ⇒ **这是对照组，结构与键名一个都不许改**
+ *     （改掉 = **永久丢失**「接线前后快慢」的唯一对照）；
+ *   · **new-path 档** = `store.recall({ context, queryEmbedding, now })`
+ *     ⇒ 向量路**真的在召回内部跑**（采样前由一次性 `diagnostics` 探针证实
+ *     `explain.routes.vector.ran === true`，探针结果落盘）。
+ *   ⇒ **落盘键名**（不复用、不并列重名）：
+ *     · old-path ⇒ `recallLatency` / `recallP99Ms`（**原有键，原样不动**）；
+ *     · new-path ⇒ `recallVectorPath`（**新键**，内含 `latency` / `p99Ms` / `meanMs` /
+ *       `oldPathMeanMs` / `meanDeltaMs` / `probe`）。
+ *   ⇒ **文件头这一句就是键名的权威说明**：`recall*` = old-path，`recallVectorPath` = new-path。
+ *
+ * ⚠️ ★★ **「向量扫描本身」与「整条召回」是两条不同的数（绝不混成一个）**：
+ *   · `vectorRouteLatency` / `vectorRouteP99Ms` / `candidateReadRows` / `hitFineBuckets`
+ *     —— **直接调 `backend.route()` + `backend.search()`** 量出来的
+ *     ⇒ 它回答「**向量扫描（含路由）这一段自己花多少**」，
+ *     **不含**文本路 / 图谱路 / 打分 / 排序 ⇒ **它不是召回读数**（落盘另有 `vectorScanNote` 声明）；
+ *   · `recallVectorPath`（new-path 档）—— **整条召回**（向量路在里面）
+ *     ⇒ 它回答「**一次召回花多少**」。
+ *   ⇒ ⇒ 「向量路在一次召回里占多少」的正确算法是
+ *     `vectorRouteLatency.meanMs ÷ recallVectorPath.latency.meanMs`（**同一次运行内**比），
+ *     已作为推导值落盘在 `recallVectorPath.vectorScanShareOfNewPath`。
+ *   ⚠️ **为什么仍保留「独立跑一遍向量扫描」这种写法**：bench **不改 `src/**`**
+ *     ⇒ 无法在 `recall()` 内部插桩 ⇒ **分档归因只能靠独立跑一遍**
+ *     ⇒ 保留它，但**口径必须落盘**（`vectorScanNote`）⇒ 读的人不会把它当召回读数。
  *
  * ⚠️ **预热轮次与首次 IO**（口径必须写死，否则 P99 没有可判定性）：
  *   · **预热** = 前 N 次调用**不计入**统计（V8 的 JIT 优化 + SQLite 页缓存 +
@@ -44,10 +64,12 @@
  *
  * ⚠️ ★★★ **2026-11-02 架构师重新定档：硬门槛从「毫秒」改成「计数」**（v2.1 勘误）
  *   —— **本文件按新口径实现**：
- *   · **H1（硬门槛 · 归 P2）**：**向量路单次查询的候选读取行数 ≤ 2,000 行**
+ *   · **H1（硬门槛 · 归 P2）**：**写入去重路径**单次写入的**候选读取行数 ≤ 2,000 行**
+ *     （探针写死为写入路径那一组：`ROUTER_NPROBE_WRITE_COARSE=8` / `ROUTER_NPROBE_WRITE_FINE=20`）
  *     ⇒ **纯计数 ⇒ 与存储介质无关** ⇒ 「2,000」是 P2 自己在写入路径上已写死的数
  *       （§4.9 步骤 3a2「候选 ≤ 2000」）⇒ **同一个库、同一个量、同一个被考核方**。
- *   · **H2（硬门槛 · 与 H1 同义的规模无关写法）**：**候选读取行数 ÷ 库规模 ≤ 0.2%**。
+ *   · **H2（硬门槛 · 与 H1 同义的规模无关写法）**：
+ *     **写入去重路径的候选读取行数 ÷ 库规模 ≤ 0.2%**。
  *   · **R1（参考线）**：向量路 P99（绝对毫秒）⇒ **按介质分档记录**，**不判 P2**。
  *   ⇒ ⇒ **为什么毫秒数必须降级为观测值**：
  *     `向量路耗时 ≈ 候选行数 × 每行读成本` ⇒ **「每行读多快」由介质 + 页缓存决定**
@@ -56,21 +78,40 @@
  *   ⇒ ⇒ **所以落盘 JSON 必须带上「存储介质类别」与「每行读成本」**
  *     （否则**换一块盘，判据的含义会静默改变**）。
  *
+ * ⚠️ ★★★ **2026-11-03 架构师归口：H1/H2 的考核主体 = 「写入去重路径」**
+ *   （`DECISIONS.md` D10 · `DESIGN-v2-errata.md` §11.8）—— **本文件此前是「同一件事两套词」**：
+ *   · **改前（错的口径）**：H1/H2 直接拿 `candidateReadRows`（**召回探针 20/50** 采的量）去撞
+ *     **写入路径**的门槛 2,000 ⇒ 一个**召回侧**的量冒充「写入路径超了 6.39 倍」；
+ *   · **改后（现在的口径）**：H1/H2 的**唯一**判据量 = `writeSegments.vectorCandidateRows`
+ *     （**写入探针 8/20** · 拿的是 `collectVectorCandidates()` 里生产 SQL 实际返回的行数）；
+ *     **召回路径的同名量** `candidateReadRows` ⇒ **另立 R6（`RECALL_VEC_ROWS`）**，
+ *     **只观测 · 不设门槛 · 不判红绿**。
+ *   ⇒ ⚠️ ⚠️ **归口 ≠ 达标**：1M 实测里 **H1 = 5,521 行（门槛的 2.76 倍 ⇒ 仍红）**、
+ *     **R6 = 12,782 行（相对 2,000 行是 6.39 倍 ⇒ 读数仍然红）**
+ *     ⇒ **6.39 倍没有变小，它换了主语**；「R6 没有门槛可判」**绝不等于**「R6 达标」。
+ *   ⇒ ⇒ 门槛**数值与判定方式一个都没改**（仍 ≤ 2,000 行 / ≤ 0.2% · 仍判定取 `max`）
+ *     ⇒ 这次改的是**主语**（谁被考核），不是门槛 ⇒ 所以 `THRESHOLDS` 里的**键名与数值原样保留**
+ *     （改名会让同一个门槛在两份 JSON / 两个脚本里叫两个名字 ⇒ 正是本轮要消灭的「两套词」）。
+ *
  * ⚠️ ★ **本文件新增的四件事**（各自的口径写在对应函数的头注释里）：
- *   ① **候选读取行数**（H1/H2 的判据本身）——**bench 侧统计**，**不改 `src/**`**：
+ *   ① **候选读取行数**（★ 现在的身份：**R6 的观测值** —— H1/H2 的判据量见 ③）——**bench 侧统计**，**不改 `src/**`**：
  *     ⚠️ ★ **2026-11-02 架构师裁决的「口径加固」** —— **取数来源从「推算」换成「实测」**：
- *     · **实测口径（现在的判据量）** = **生产 SQL 实际物化的候选行数**
+ *     · **实测口径（★ R6 现在的取数）** = **生产 SQL 实际物化的候选行数**
  *       （`memories` 表 ⇒ 与写入路径那个「候选 ≤ 2000」**同一口径**）
  *       ⇒ 由 **bench 侧的行读计数器**（`bench/lib/harness.ts` 的 `installRowReadCounter()`）
  *         统计**生产代码真正跑的那条 SQL** ⇒ ⇒ **对任何实现都成立**
  *         （阶段 4 引入「桶内 LIMIT」/「两段式读」⇒ 这个数**会跟着降** ⇒ 不再有假红）；
- *     · **推算口径（只作对照，不再判 H1）** = 命中细桶的成员数之和
+ *     · **推算口径（只作对照，**不判任何门槛**）** = 命中细桶的成员数之和
  *       （`IvfVectorBackend.route()` ＋ `countBucketMembers()`）
  *       ⇒ ⚠️ **它模型化了「桶内不设 LIMIT」这个实现** ⇒ **阶段 4 引入桶内 LIMIT 后它不会跟着降**
- *       ⇒ ⇒ **不许用它判 H1**（但保留它 ⇒ 读的人能看见「实测 vs 推算」的差）。
- *   ② **每行读成本（µs/行）**——**推导值**（向量路均耗时 ÷ 候选读取行数均值），
+ *       ⇒ ⇒ **不许用它判任何门槛**（但保留它 ⇒ 读的人能看见「实测 vs 推算」的差）。
+ *     ⚠️ ★★ **它跑的是「召回探针 20/50」那一路** ⇒ ⇒ **它是 R6 的量，不是 H1 的量**
+ *       （H1 的量在 `writeSegments.vectorCandidateRows`，见 ③）。
+ *   ② **每行读成本（µs/行）**——**推导值**（向量路均耗时 ÷ 候选读取行数均值，
+ *     ★ 这里的「候选读取行数」是**召回路径那一组（R6）**，因为分子同样是召回路径的耗时），
  *     **不是直接测量值** ⇒ 落盘时必须这么标。
  *   ③ **写入路径的分段计时**——「FTS5 + 索引维护」vs「向量候选扫描（P2 的代码）」。
+ *     ⇒ ★ **`writeSegments.vectorCandidateRows` 就是 H1/H2 的判据量**（写入探针 8/20 · 实测）。
  *   ④ **页缓存状态（冷 / 热 / 未知）**——⚠️ **Windows 没有公开 API 能报「这个库有多少在页缓存里」**
  *     ⇒ ⇒ **只能「可标注」不能「可测量」** ⇒ 由 **跑的人声明**（`--cache-state=cold|warm|unknown`）
  *     ⇒ **缺省 `unknown`**（**不许猜**）⇒ 落盘进 JSON ⇒ **让机器能读出这个档位**。
@@ -91,7 +132,12 @@ import { countBucketMembers } from '../src/vector/bucketAssign.js';
 import { loadCentroidModel } from '../src/vector/centroids.js';
 import { normalizeNumbers } from '../src/vector/dot.js';
 import { IvfVectorBackend } from '../src/vector/ivf.js';
-import { type CorpusOptions, DEFAULT_CORPUS_OPTIONS, generateQueries } from './corpus.js';
+import {
+  type BenchQuery,
+  type CorpusOptions,
+  DEFAULT_CORPUS_OPTIONS,
+  generateQueries,
+} from './corpus.js';
 import { embedText } from './embedder.js';
 import { prepareBench } from './lib/db.js';
 import {
@@ -125,7 +171,16 @@ export const THRESHOLDS = {
   /** 向量路占总耗时的上限（比例，0~1）。 */
   vectorRouteShare: 0.2,
   /**
-   * ★ **H1（硬门槛 · 归 P2）**：向量路单次查询的**候选读取行数**上限（行）。
+   * ★ **H1（硬门槛 · 归 P2）**：**写入去重路径**的单次**候选读取行数**上限（行）。
+   *
+   * ⚠️ ★★★ **考核主体 = 写入去重路径**（2026-11-03 归口 · `DECISIONS.md` D10）：
+   *   判据量 = **`writeSegments.vectorCandidateRows.max`**
+   *   （探针 `ROUTER_NPROBE_WRITE_COARSE=8` / `ROUTER_NPROBE_WRITE_FINE=20`）；
+   *   ⇒ ⚠️ **不是** `candidateReadRows` —— 那是**召回探针 20/50** 采的量，
+   *     它的身份是 **R6（`RECALL_VEC_ROWS`）观测值：不设门槛、不判红绿**。
+   *   ⇒ ⚠️ **为什么键名不改**：读旧 JSON / 旧脚本的人靠这个名字对账
+   *     ⇒ 改名 = 让**同一个门槛**在两份 JSON 里叫两个名字 ⇒ 那正是本轮要消灭的「两套词」
+   *     ⇒ **数值与键名一律原样保留，只把「它约束的是谁」写进注释与判定处**。
    *
    * ⚠️ **纯计数 ⇒ 与存储介质无关**（2026-11-02 架构师重新定档）：
    *   旧的「向量路 P99 ≤ 20ms」把「这台机器的磁盘有多快」写进了硬门槛
@@ -135,9 +190,12 @@ export const THRESHOLDS = {
    */
   candidateReadRowsMax: 2000,
   /**
-   * ★ **H2（硬门槛 · 与 H1 同义的规模无关写法）**：候选读取行数 ÷ 库规模的上限（比例）。
+   * ★ **H2（硬门槛 · 与 H1 同义的规模无关写法）**：
+   * **写入去重路径**的候选读取行数 ÷ 库规模的上限（比例）。
    *
    * ⚠️ 1M ⇒ ≤ 2,000 行；10M ⇒ ≤ 20,000 行 ⇒ **与库规模解耦**。
+   * ⚠️ **主语与 H1 完全相同**（写入去重路径 · 探针 8/20）⇒ 两者是**同一个量的两种写法**，
+   *   不是一个量在召回侧、一个量在写入侧。
    */
   candidateReadRowsRatioMax: 0.002,
 } as const;
@@ -149,9 +207,12 @@ export const WARMUP_ROUNDS = 20;
  * ★ **一组「计数」的分布**（候选读取行数 / 命中桶数）。
  *
  * ⚠️ **为什么计数也要有分布而不是只有一个数**：
- *   H1 的判据是「**单次查询**的候选读取行数 ≤ 2,000」⇒ 「单次」⇒ **每一次**都要满足
+ *   **H1 的判据是「单次写入的候选读取行数 ≤ 2,000」⇒ 「单次」⇒ 每一次都要满足**
  *   ⇒ ⇒ **判定取 `max`**（最严口径）⇒ 而 `mean` / `p50` / `p99` 一并落盘
  *   ⇒ **读的人可以自己换成别的口径复算**（不用重跑一次百万级）。
+ * ⚠️ **本类型同时用于两组量**（H1 的写入路径组 / R6 的召回路径组）
+ *   ⇒ 两组**探针配置不同**（8/20 vs 20/50）⇒ ⇒ **不可混读、不可比大小**
+ *   （见文件头 2026-11-03 归口那一段）。
  */
 export interface CountSummary {
   /** 样本数（**必须一起报** ⇒ 0 个样本 ⇒ 这个分布不可判定）。 */
@@ -164,18 +225,23 @@ export interface CountSummary {
 }
 
 /**
- * ★ **H1 的口径声明**（**必须落盘** ⇒ 读 JSON 的人**不会**把「推算」误读成「实测」）。
+ * ★ **R6（`RECALL_VEC_ROWS`）的口径声明**（**必须落盘** ⇒ 读 JSON 的人**不会**把
+ * 「推算」误读成「实测」）。
  *
  * ⚠️ ★ **为什么必须有它**（2026-11-02 架构师裁决）：
  *   「⚠️ **别让读 JSON 的人误以为它是实测。**」
  * ⇒ ⇒ **口径模式（`mode`）是显式的一个字段**，不是一个「读的人自己该知道」的隐含约定。
+ *
+ * ⚠️ ★★ **2026-11-03 归口之后，它声明的是「R6 那个量」的口径** —— **不是 H1 的**：
+ *   H1/H2 的判据量在 `writeSegments.vectorCandidateRows`（写入探针 8/20，行数就是生产 SQL
+ *   实际返回的行数 ⇒ **不存「推算」这种备选**）⇒ ⇒ 本类型**不参与任何红/绿判定**。
  */
 export interface CandidateReadRowsBasis {
   /**
    * 口径模式：
    * · `'measured'` = **实测**：生产 SQL **实际物化**的行数（bench 侧行读计数器）；
    * · `'derived'` = **推算**：按「命中桶成员数之和」算出来的
-   *   （⚠️ **它模型化了「桶内不设 LIMIT」这个实现** ⇒ **不可用它判 H1**）。
+   *   （⚠️ **它模型化了「桶内不设 LIMIT」这个实现** ⇒ **不可用它判任何门槛**）。
    */
   readonly mode: 'measured' | 'derived';
   /** 口径说明（**必须落盘** ⇒ 读的人不用猜）。 */
@@ -184,13 +250,13 @@ export interface CandidateReadRowsBasis {
    * **对照用**：同一次测量里的「推算值」（命中细桶的成员数之和）。
    *
    * ⚠️ **它模型化了「桶内不设 LIMIT」** ⇒ 阶段 4 引入桶内 LIMIT 后**它不会跟着降**
-   * ⇒ ⇒ **保留它是为了让「实测 vs 推算」的差可见**，**不是**拿它判 H1。
+   * ⇒ ⇒ **保留它是为了让「实测 vs 推算」的差可见**，**不是**拿它判门槛。
    */
   readonly derivedCrossCheck: CountSummary | null;
   /**
    * **附加信息**：桶成员侧（`vector_cell_members`）**实际读到**的行数。
    *
-   * ⚠️ **不判 H1**（H1 判的是**候选行**，与写入路径那个「候选 ≤ 2000」同一口径）。
+   * ⚠️ **不判任何门槛**（H1 判的是**写入路径的候选行**；R6 判的是观测值）。
    */
   readonly bucketMemberRowsRead: CountSummary | null;
 }
@@ -213,7 +279,19 @@ export interface CandidateReadRowsBasis {
 export interface WriteSegmentSummary {
   /** 向量候选扫描段（**P2 的代码**）：**独立实测**的分布。 */
   readonly vectorCandidateScan: LatencyDistribution;
-  /** 向量候选扫描段的**候选行数**（= 命中桶里被扫过的行数；§4.9 步骤 3a2 的「候选 ≤ 2000」）。 */
+  /**
+   * ★ **H1 / H2 的判据量（唯一）**：**写入去重路径**的**候选读取行数**的分布。
+   *
+   * ⚠️ ★★★ **口径（2026-11-03 归口 · `DECISIONS.md` D10）**：
+   *   探针 = **写入路径那一组**（`ROUTER_NPROBE_WRITE_COARSE=8` / `ROUTER_NPROBE_WRITE_FINE=20`）；
+   *   取数 = `collectVectorCandidates()` 里**生产 SQL 实际返回的行数**（`scan.scanned`）
+   *   ⇒ ⇒ **这就是 §4.9 步骤 3a2 的「候选 ≤ 2000」同一口径** ⇒ **同一个库、同一个量、同一个被考核方**。
+   * ⚠️ **为什么它就是「实测」而不再有 `derived` 备选**：
+   *   `scanned` 本身就是「这条生产 SQL 返回了几行」——**它就是行数本身**，
+   *   不存在「按桶成员数推算」的第二条取数路径 ⇒ 没有兜底、也没有「口径被悄悄换掉」的空间。
+   * ⚠️ **代价**：它衡量的是「这一段扫描的候选面」，
+   *   **不含**「扫描 + 逐条算 cos + 排序」的其余成本 ⇒ 那些在 `vectorCandidateScan`（耗时）里。
+   */
   readonly vectorCandidateRows: CountSummary;
   /** 写入总耗时（**实测**；就是 P99 用的那批样本）。 */
   readonly writeTotal: LatencyDistribution;
@@ -225,12 +303,101 @@ export interface WriteSegmentSummary {
   readonly note: string;
 }
 
+/**
+ * ★ **new-path 档的一次性探针**（回答「向量路在召回里到底跑没跑」）。
+ *
+ * ⚠️ **为什么必须有它**（没有它，new-path 档的数字不可辩护）：
+ *   `recall()` 的向量路有两个入口条件（**有 `queryEmbedding`  ∧  **端口可装配**）
+ *   ⇒ 传了向量**仍可能整路缺席**（库规模 < 门槛 ⇒ `flat_auto` 走 flat；
+ *   或 ≥ 门槛但桶未训练 ⇒ `absent` ⇒ 端口为 `null`）
+ *   ⇒ **只看耗时差无法区分「向量路跑了但很快」与「向量路根本没跑」**
+ *   ⇒ ⇒ 探针用 `diagnostics: true` 读 `explain.routes.vector` ⇒ **落盘成证据**。
+ *
+ * ⚠️ **探针跑在计时之外**（`diagnostics` 会多算一次 recall，且它本身有开销）
+ *   ⇒ 它的耗时**不进任何 P99 样本**。
+ */
+export interface VectorPathProbe {
+  /** 向量路**跑没跑**（`explain.routes.vector.ran`）。 */
+  readonly ran: boolean;
+  /** 向量路本次产出的**候选条数**（`explain.routes.vector.candidates`；`ran=false` ⇒ 0）。 */
+  readonly candidates: number;
+  /**
+   * 后端**四态模式**（`stats().vectorBackend.mode`）：
+   * `'ivf'` / `'flat_explicit'` / `'flat_auto'` / `'absent'` / `'unknown'`。
+   *
+   * ⚠️ **为什么要把模式一起落盘**：同样是 new-path 档，
+   *   `mode='ivf'` 与 `mode='flat_auto'` 是**两条完全不同的性能故事**
+   *   （后者 = 全表精确点积 ⇒ 百万级上必然慢）⇒ 不写模式 ⇒ 读的人会把 flat 的慢
+   *   读成「接线本身慢」。
+   * ⚠️ `'unknown'` = 读 `stats()` 抛错 ⇒ **不猜**（`stats()` 是观测面 ⇒ 它坏掉不该弄死测量）。
+   */
+  readonly mode: string;
+  /** 口径说明（**必须落盘** ⇒ 读的人知道这是探针，不是测量样本）。 */
+  readonly note: string;
+}
+
+/**
+ * ★ **new-path 档（传 `queryEmbedding` 的召回）的读数** —— 与 old-path 档**并列落盘**。
+ *
+ * ⚠️ **键名纪律**：本对象用**新键** `recallVectorPath`；old-path 档继续用原有的
+ *   `recallLatency` / `recallP99Ms` / `recallSamples`
+ *   ⇒ ⇒ 有脚本 / 文档在读旧键（`docs/baseline/*.json`）⇒ **旧键一个都不许改名或挪位**。
+ */
+export interface RecallVectorPathSummary {
+  /** new-path 档的样本数（**必须与 old-path 同批查询**；0 ⇒ 本档缺席）。 */
+  readonly samples: number;
+  /** new-path 档的耗时分布（**整条召回**，含向量路）。 */
+  readonly latency: LatencyDistribution;
+  /** new-path 档 P99（毫秒；便于与 old-path 的 `recallP99Ms` 并排读）。 */
+  readonly p99Ms: number;
+  /** new-path 档均值（毫秒）。 */
+  readonly meanMs: number;
+  /** old-path 档均值（毫秒）——**同一次运行内**量与它比 ⇒ 读的人不必自己回算。 */
+  readonly oldPathMeanMs: number;
+  /** `meanMs − oldPathMeanMs`（毫秒；**正数 = 接线后更慢**）。 */
+  readonly meanDeltaMs: number;
+  /**
+   * 「向量扫描本身」占 new-path 整条召回的**均值比例**（0~1；**推导值**）。
+   *
+   * ⚠️ **分子与分母来自同一次运行**（`vectorRouteLatency.meanMs` ÷ 本档 `meanMs`）
+   *   ⇒ 这条推导才有意义；⚠️ 两者**不是同一次调用**（向量扫描是独立跑的一遍）
+   *   ⇒ 它只能当归因的量级参考，**不是**精确拆分。
+   * ⚠️ `null` ⇒ new-path 均值为 0（本档缺席）⇒ **不是「占比为 0」**。
+   */
+  readonly vectorScanShareOfNewPath: number | null;
+  /**
+   * **一次性探针**（采样**之后**、计时窗口**之外**跑；`diagnostics: true`）。
+   *
+   * ⚠️ **为什么放在采样之后**：探针要回答「刚刚那批样本里向量路跑没跑」
+   *   ⇒ 先跑探针再采样 ⇒ 探针可能**自己**把页缓存 / 端口装配预热掉 ⇒
+   *   两档读数都被它改变；放在采样之后 ⇒ 它**碰不到**任何已落盘的样本。
+   */
+  readonly probe: VectorPathProbe;
+  /** 口径说明（**必须落盘**）。 */
+  readonly note: string;
+}
+
 /** 一次 P99 测量的结果。 */
 export interface PerfResult {
   /** 语料规模（**实测**）。 */
   readonly corpusSize: number;
   /** recall 的样本数（**报告必须写明**）。 */
   readonly recallSamples: number;
+  /**
+   * ★ **new-path 档（传 `queryEmbedding` 的召回）** —— 与 old-path 档并列。
+   *
+   * ⚠️ **old-path 档在 `recallLatency` / `recallP99Ms` / `recallSamples`**（原有键，未改）
+   *   ⇒ 本字段是**新增的对照档**，不是替换。
+   */
+  readonly recallVectorPath: RecallVectorPathSummary;
+  /**
+   * ★ **「向量扫描」口径声明**（`vectorRoute*` / `candidateReadRows` 那几块的口径）。
+   *
+   * ⚠️ **必须落盘**：`vectorRouteLatency` 是「直接调 `backend.search()`」的耗时
+   *   ⇒ 它**不含**文本路 / 图谱路 / 打分 / 排序 ⇒ **它不是召回读数**
+   *   ⇒ 不声明，读的人会把它与 `recallVectorPath` 混成一个数。
+   */
+  readonly vectorScanNote: string;
   /** 写入的样本数。 */
   readonly writeSamples: number;
   /** ★ **第一条被计入统计的写入耗时**（毫秒）—— 冷启动是否已被预热掉的证据。 */
@@ -239,7 +406,12 @@ export interface PerfResult {
   readonly vectorRouteSamples: number;
   /** 预热轮次（**不计入统计**）。 */
   readonly warmupRounds: number;
-  /** recall P99（毫秒）。 */
+  /**
+   * recall P99（毫秒）—— ★ **old-path 档**（不传 `queryEmbedding` ⇒ 向量路整段不执行）。
+   *
+   * ⚠️ **这是对照组**（接线前的形状）⇒ 键名保持原样，**不许改**。
+   *   new-path 档见 `recallVectorPath.p99Ms`。
+   */
   readonly recallP99Ms: number;
   /** 写入 P99（毫秒）。 */
   readonly writeP99Ms: number;
@@ -248,19 +420,23 @@ export interface PerfResult {
   /** 向量路占总耗时（0~1）。 */
   readonly vectorRouteShare: number;
   /**
-   * ★ **H1 的量**：向量路单次查询的**候选读取行数**的分布。
+   * ★ **R6（`RECALL_VEC_ROWS`）的观测值**：**召回路径**（探针 20/50）的**候选读取行数**的分布。
    *
-   * ⚠️ ★ **口径（2026-11-02 架构师裁决的「口径加固」）** = **生产 SQL 实际物化的候选行数**
-   *   （`memories` 表 ⇒ 与写入路径那个「候选 ≤ 2000」**同一口径**）
-   *   ⇒ 由 **bench 侧的行读计数器**实测 ⇒ ⇒ **对任何实现都成立**
-   *   （**不再模型化「桶内不设 LIMIT」这个实现** ⇒ 阶段 4 引入桶内 LIMIT / 两段式读 ⇒ 这个数会跟着降）。
+   * ⚠️ ★★★ **2026-11-03 归口之前它被当成 H1 的判据量 ⇒ 那是错的**（详见文件头）：
+   *   它是**召回探针 20/50** 采的量，而门槛 2,000 的出处是**写入探针 8/20**
+   *   ⇒ 拿一个召回侧的量去撞写入侧的线 ⇒ 把「桶倾斜 + 探针错位」混报成「写入路径超了 6.39 倍」。
+   * ⇒ ⇒ **现在它只观测、不设门槛、不判红绿**（`checkPerf()` 一个字都不引用它）。
+   * ⚠️ ⚠️ **但「没有门槛可判」绝不等于「达标」**：1M 实测 max = **12,782 行**
+   *   = 门槛 2,000 行的 **6.39 倍** ⇒ **读数仍然红**，只是**它的主语是召回路径**。
    * ⚠️ **口径细节见 `candidateReadRowsBasis`**（**必须落盘** ⇒ 读的人不会误读）。
+   * ⚠️ **键名不改**（读旧 JSON 的脚本靠它对账）⇒ 只把「它是 R6」写进这里与 `gateRegrouping`。
    */
   readonly candidateReadRows: CountSummary;
   /**
-   * ★ **H1 的口径声明**（**实测还是推算** ⇒ 读 JSON 的人不会误读）。
+   * ★ **R6 的口径声明**（**实测还是推算** ⇒ 读 JSON 的人不会误读）。
    *
    * ⚠️ **必须在落盘的 JSON 里**（与 `candidateReadRows` 并排）⇒ **不许假装它是实测**。
+   * ⚠️ ★ **它不参与任何红/绿判定**（2026-11-03 归口）⇒ H1/H2 的口径见 `writeSegments`。
    */
   readonly candidateReadRowsBasis: CandidateReadRowsBasis;
   /** 每次查询命中的**细桶数**的分布（探针口径的可核对证据）。 */
@@ -271,12 +447,15 @@ export interface PerfResult {
    * ⚠️ **推导式**：`向量路均耗时(ms) × 1000 ÷ 候选读取行数均值`
    *   ⇒ 它把「路由 + 点积 + 行读」**全部**摊到候选行上 ⇒
    *   **不是**纯粹的「磁盘读一行要多久」⇒ 读它的时候要记住这一点。
+   * ⚠️ **分子分母必须同属「召回路径」**（分子 = `vectorRouteLatency`（召回探针 20/50 的扫描），
+   *   分母 = `candidateReadRows.mean`（同一路 ⇒ **R6 那一组**））⇒ **不许拿 H1 的写入路径行数当分母**
+   *   （那会把两个探针配置混成一个比值 ⇒ 这正是 2026-11-03 归口要消灭的那类错位）。
    * ⚠️ **`null` ⇒ 候选行数为 0**（分桶尚未训练 ⇒ 向量路整体缺席）⇒ 不是「成本为 0」。
    */
   readonly perRowReadCostUs: number | null;
   /** ★ **写入路径的分段计时**（见 `WriteSegmentSummary` 的口径说明）。 */
   readonly writeSegments: WriteSegmentSummary;
-  /** recall 的耗时分布。 */
+  /** recall 的耗时分布 —— ★ **old-path 档**（不传 `queryEmbedding`）；new-path 见 `recallVectorPath.latency`。 */
   readonly recallLatency: LatencyDistribution;
   /** 写入的耗时分布。 */
   readonly writeLatency: LatencyDistribution;
@@ -315,6 +494,178 @@ export function toDistribution(samples: readonly number[]): LatencyDistribution 
     maxMs: summary.maxMs,
     meanMs: summary.meanMs,
   };
+}
+
+/**
+ * ★ **「向量扫描本身」的口径声明** —— 落盘字段 `vectorScanNote`。
+ *
+ * ⚠️ **为什么必须是一段落盘的文字**（而不是只写在文件头注释里）：
+ *   文件头注释**不会随 JSON 一起走**（`docs/baseline/*.json` 会被单独读、单独引用）
+ *   ⇒ 只在文件头声明 ⇒ 读 JSON 的人**看不到这条边界** ⇒ 必然把
+ *   `vectorRouteLatency`（向量扫描）读成「召回耗时」⇒ 两条数被混成一个结论。
+ *   ⇒ ⇒ 口径**跟着数据走**：声明必须是 JSON 的一个字段。
+ */
+export const VECTOR_SCAN_NOTE: string =
+  '① ★ **本段（`vectorRouteLatency` / `vectorRouteP99Ms` / `vectorRouteSamples` / ' +
+  '`candidateReadRows` / `hitFineBuckets` / `perRowReadCostUs`）测的是「向量扫描本身」**：' +
+  '它**直接调** `IvfVectorBackend.route()` + `search()`（**绕过 `recall()`**）' +
+  '⇒ 量的是「**向量扫描（含路由 + 闸门过滤）这一段自己花多少**」，' +
+  '**不含**文本路 / 图谱路 / 五路打分 / 侧抑制 / 排序 ⇒ ⇒ **它不是召回读数**；' +
+  '② **它回答的问题与 new-path 档不同**：它对应文档里的 **R6 / `RECALL_VEC_ROWS`** 口径 ' +
+  '（「向量扫描这一步要读多少行、多重」），而 `recallVectorPath`（new-path 档）' +
+  '回答「**一次召回总共多重**」⇒ **两条数回答两个不同问题，绝不可互换、不可相加**；' +
+  '③ 「向量路在一次召回里占多少」只能用 **同一次运行内**的推导值 ' +
+  '`recallVectorPath.vectorScanShareOfNewPath`（= 本段 `meanMs` ÷ new-path 档 `meanMs`）' +
+  '—— 那两个数来自同一次运行，但**不是同一次调用**（见 ④）；' +
+  '④ ⚠️ **为什么保留「独立跑一遍向量扫描」而不在 `recall()` 内部插桩**：' +
+  'bench **不改 `src/**`**（本轮纪律）⇒ 拿不到召回内部的段计时 ⇒ 分档归因只剩' +
+  '「独立跑一遍」这一条路 ⇒ ⇒ 保留它；代价是**分子（扫描）与分母（整条召回）不是同一次调用**' +
+  '⇒ 该比例**只作归因的量级参考**，**不是精确拆分**（精确拆分要在 `src/store/recall.ts` 里加观测点）。';
+
+/**
+ * ★ **门槛归口的落盘声明**（JSON 字段 `gateRegrouping`）—— 2026-11-03 的 `D10` 裁决。
+ *
+ * ⚠️ **为什么必须是一个 JSON 字段**（而不是只写在文件头注释里）：
+ *   `docs/baseline/*.json` 会被单独读、单独引用、单独贴进报告
+ *   ⇒ 只在文件头声明 ⇒ 读 JSON 的人**看不到这条边界** ⇒ 必然把
+ *   `candidateReadRows`（**召回**路径）当成 H1 的判据量 ⇒ **两套词又回来了**。
+ *   ⇒ ⇒ 口径**跟着数据走**。
+ *
+ * ⚠️ **为什么键名一个都不改**（`candidateReadRows` / `vectorCandidateRows` / `thresholds.*`）：
+ *   有脚本 / 文档在读旧 JSON 的旧键 ⇒ 改名 = 让**同一个量**在两个版本里叫两个名字
+ *   ⇒ ⇒ 本轮新增**说明字段**，不动**数据字段**（数据字段的语义由本字段解释）。
+ */
+export interface GateRegrouping {
+  /** 归口裁决的日期（ISO 日期串）。 */
+  readonly decidedAt: string;
+  /** 裁决编号（`docs/design/DECISIONS.md`）。 */
+  readonly decision: string;
+  /** 正文出处（含节号 ⇒ 读的人能一次读到原文）。 */
+  readonly source: string;
+  /** **H1 / H2 的判据量**（JSON 里的路径写法 ⇒ 机器可读）。 */
+  readonly h1h2Quantity: string;
+  /** **H1 / H2 的考核主体**（探针配置一起写死 ⇒ 不会「同一个量两套探针」）。 */
+  readonly h1h2Subject: string;
+  /** **R6 的量**（召回路径的同名量 ⇒ 现在是观测值）。 */
+  readonly r6Quantity: string;
+  /** **R6 的性质**（一句话：不设门槛、不判红绿 ⇒ **但不是达标**）。 */
+  readonly r6Status: string;
+  /** 口径说明（**必须落盘** ⇒ 读 JSON 的人不用猜，也不会混读）。 */
+  readonly note: string;
+}
+
+/**
+ * ★ **门槛归口的落盘声明**（`D10` · 2026-11-03）—— 写进每一份 perf JSON。
+ *
+ * ⚠️ **三条必须同时在场**（少一条就足够让人读错）：
+ *   ① 归口的**日期与出处**；② **H1/H2 判哪一块**；③ **`candidateReadRows` 是 R6 观测值**。
+ */
+export const GATE_REGROUPING: GateRegrouping = {
+  decidedAt: '2026-11-03',
+  decision: 'D10（H1 归口拆分）',
+  source: 'docs/design/DESIGN-v2-errata.md §11.8 勘误 ⑫ / docs/design/DECISIONS.md 的 D10',
+  h1h2Quantity: 'writeSegments.vectorCandidateRows（判定取 max）',
+  h1h2Subject:
+    '写入去重路径（探针 ROUTER_NPROBE_WRITE_COARSE=8 / ROUTER_NPROBE_WRITE_FINE=20）；' +
+    '门槛 ≤ 2000 行 / ≤ 0.2% 与判定方式（取 max）一个都没改',
+  r6Quantity:
+    'candidateReadRows（召回路径 · 探针 ROUTER_NPROBE_COARSE=20 / ROUTER_NPROBE_FINE=50）',
+  r6Status: '观测值：本轮不设门槛、不判红绿',
+  note:
+    '① **2026-11-03 归口**（`D10`）：H1/H2 的考核主体收窄到「**写入去重路径**」——' +
+    '门槛 2,000 行的出处本来就是写入路径（§4.9 步骤 3a2 的「候选 ≤ 2000」）' +
+    '⇒ ⇒ 判据量与门槛**同源**；' +
+    '② **H1/H2 的判据量 = `writeSegments.vectorCandidateRows`**' +
+    '（写入探针 8/20 · 取的是生产 SQL 实际返回的行数 ⇒ 实测，无「推算」备选）；' +
+    '③ ⚠️ **`candidateReadRows` = R6（`RECALL_VEC_ROWS`）的观测值**（召回探针 20/50），' +
+    '**不设门槛、不判红绿** ⇒ ⇒ **但「没有门槛可判」绝不等于「达标」**：' +
+    '1M 实测里它的 max = 12,782 行 = 门槛 2,000 行的 **6.39 倍** ⇒ **读数仍然红**，' +
+    '只是它**不再冒充「写入路径超了 6.39 倍」**；' +
+    '④ ⚠️ **两组量的探针配置不同**（8/20 vs 20/50）⇒ **不可混读、不可比大小**' +
+    '（「2.76 倍」与「6.39 倍」是**两个不同的量各自有数**，不是一个数在改善）；' +
+    '⑤ ⚠️ **归口 ≠ 达标**：H1 在 1M 实测里是 5,521 行 = 门槛的 **2.76 倍 ⇒ 仍红**' +
+    '⇒ 这次改的是**主语**，不是门槛。',
+};
+
+/**
+ * ★ **new-path 档的一次性探针**：证实「传了 `queryEmbedding` 之后向量路真的在
+ * `recall()` 内部跑了」。
+ *
+ * ⚠️ **为什么需要它**（没有它，new-path 档的读数不可辩护）：见 `VectorPathProbe` 的说明
+ *   —— 传了向量**仍可能整路缺席**（库小 ⇒ `flat_auto`；桶未训练 ⇒ `absent`）
+ *   ⇒ **只看耗时差无法区分「向量路跑了但很快」与「向量路根本没跑」**。
+ *
+ * ⚠️ **只跑一次**（第一条查询）⇒ 它是**存在性证据**，不是统计量
+ *   ⇒ 它的耗时**不进任何 P99 样本**（`diagnostics: true` 本身有开销）。
+ *   ⚠️ 用 `diagnostics` 而**不是** `explain`：前者**不写** `recall` 事件
+ *   ⇒ 探针不会污染被测库（`explain` 会写一条事件 ⇒ 多一次写放大）。
+ *
+ * @param store 生产门面（**与计时用的是同一个实例** ⇒ 状态一致）
+ * @param queries 查询集（取第 0 条；**空集 ⇒ 探针无从执行**）
+ * @param queryVectors **已经转成 `number[]`** 的查询向量（与计时用的是同一批）
+ * @returns 探针结果（**永不抛错** ⇒ 观测面坏掉不该弄死测量）
+ */
+export function probeVectorPathOfRecall(
+  store: MemoryStore,
+  queries: readonly BenchQuery[],
+  queryVectors: readonly number[][],
+): VectorPathProbe {
+  // ① **先取后端四态模式**：它不依赖 `recall()` 成功与否 ⇒ 即使探针跑挂也能落盘。
+  //    ⚠️ `stats()` 抛错 ⇒ `'unknown'`（**不猜**；`stats()` 是观测面）。
+  let mode = 'unknown';
+  try {
+    mode = store.stats(BENCH_NOW).vectorBackend.mode;
+  } catch {
+    mode = 'unknown';
+  }
+
+  const query = queries[0];
+  const queryVector = queryVectors[0];
+  if (query === undefined || queryVector === undefined) {
+    return {
+      ran: false,
+      candidates: 0,
+      mode,
+      note:
+        '⚠️ 本轮**没有查询**（`--queries=0`）⇒ 探针无从执行 ⇒ `ran=false` 是**未测**，' +
+        '**不代表**向量路缺席。',
+    };
+  }
+
+  // ② **真的调一次带向量的召回**（`diagnostics: true` ⇒ 只读诊断、不记事件）。
+  let ran = false;
+  let candidates = 0;
+  let note: string;
+  try {
+    const result = store.recall({
+      context: query.context,
+      queryEmbedding: queryVector,
+      now: BENCH_NOW,
+      diagnostics: true,
+    });
+    const vectorRoute = result.explain?.routes.vector;
+    ran = vectorRoute?.ran === true;
+    candidates = vectorRoute?.candidates ?? 0;
+    note =
+      '① **存在性证据**（只跑 1 次、取第一条查询）⇒ 不是统计量，耗时不计入任何 P99；' +
+      '② `ran=true` ⇒ 该次召回的 `explain.routes.vector.ran === true`' +
+      '⇒ 向量路**真的在 `recall()` 内部执行了**（不是「传了向量但被入口条件挡掉」）；' +
+      '③ `ran=false` ⇒ 该次召回**向量路整路缺席**，原因看 `mode`：' +
+      '`flat_auto`（库规模 < `ROUTER_MIN_TRAINING` ⇒ 全表精确点积）/ ' +
+      '`absent`（过了门槛但桶未训练）/ `flat_explicit`（调用方显式选了 flat）；' +
+      '④ ⚠️ `mode` 与 `ran` 是**两个观测面**（`stats()` 说「后端处于哪一态」，' +
+      '`explain` 说「这一次跑没跑」）⇒ 若 `mode=ivf` 而 `ran=false`，说明**入口条件另有拦口**' +
+      '（如查询向量不合法被丢弃）⇒ **必须查**，不能当成「偶然」；' +
+      '⑤ ⚠️ `diagnostics: true`（**不是** `explain: true`）⇒ 探针**不写** `recall` 事件' +
+      '⇒ 不污染被测库的写放大。';
+  } catch (error) {
+    // ⚠️ **探针自己跑挂 ≠ 向量路缺席**：这两件事必须分开说，否则读数会被误判。
+    note =
+      `⚠️ 探针本身抛错（${error instanceof Error ? error.message : String(error)}）⇒ ` +
+      '这一条**不是**「向量路缺席」的证据，它只说明**探针跑挂了**' +
+      '⇒ new-path 档的耗时读数仍有效，但「向量路跑没跑」**未证实**。';
+  }
+  return { ran, candidates, mode, note };
 }
 
 /**
@@ -371,16 +722,22 @@ export function measurePerf(
   });
 
   const recallSamples: number[] = [];
+  // ★ **new-path 档的样本**（传 `queryEmbedding` ⇒ 向量路在召回内部真的跑）。
+  const recallVectorSamples: number[] = [];
   const writeSamples: number[] = [];
   const vectorRouteSamples: number[] = [];
-  // ★ **H1 的两个计数样本**（候选读取行数 / 命中细桶数）。
+  // ★ **R6（召回路径）的两个计数样本**（候选读取行数 / 命中细桶数）
+  //   ⚠️ 2026-11-03 归口之后：**这两个数不再参与任何红/绿判定**（H1/H2 判的是写入路径，
+  //   见下方的 `writeVectorScanRowSamples`）⇒ 它们仍然采样、仍然落盘 ⇒ **只当观测值**。
   const candidateRowSamples: number[] = [];
   const hitBucketSamples: number[] = [];
   // ★ **推算口径的对照样本**（命中细桶的成员数之和 ⇒ **模型化了「桶内不设 LIMIT」**）。
   const candidateRowDerivedSamples: number[] = [];
-  // ★ **桶成员侧的行读样本**（附加信息；不判 H1）。
+  // ★ **桶成员侧的行读样本**（附加信息；**不判任何门槛**）。
   const bucketMemberRowSamples: number[] = [];
   // ★ **写入路径的分段计时**：向量候选扫描段的样本（P2 的代码）。
+  //   ⚠️ ★★★ `writeVectorScanRowSamples` 就是 **H1/H2 的判据量**（2026-11-03 归口）：
+  //   写入探针 8/20 ⇒ 与门槛 2,000 的出处**同源**（§4.9 步骤 3a2）。
   const writeVectorScanSamples: number[] = [];
   const writeVectorScanRowSamples: number[] = [];
 
@@ -412,6 +769,18 @@ export function measurePerf(
   //   ⇒ 不预热 ⇒ **P99 = max = 第一次写入**（实测：首次写 245ms，后续写 ~4ms）
   //   ⇒ 那个数测的是「冷启动」，不是「写入 P99」。
   //   ⇒ 预热写用**独立正文**（不与语料重复 ⇒ 不触发合并路径 ⇒ 测的仍是「新建」）。
+  //
+  // ★★ **new-path 档的查询向量必须在计时之外先转好**：
+  //   ⚠️ `bench/corpus.ts` 的 `BenchQuery.embedding` 是 **`Float32Array`**，
+  //   而 `RecallOptions.queryEmbedding` 要的是 **`number[]`** ⇒ **必须先 `Array.from()`**：
+  //   · **不许 `as` 强转**：`Float32Array` 与 `number[]` 不是同一类对象，
+  //     强转只是把错误推迟到运行时；而 `normalizeQueryEmbedding()` 按下标读时
+  //     TypedArray **碰巧也能读** ⇒ 这类错误会**静默**通过（`Array.isArray()` 才是判据，
+  //     强转骗不过它，但骗得过「先跑起来看看」）⇒ ⇒ 早晚在换实现时炸；
+  //   · **也不许在计时窗口里转**：转换是**调用方**的成本（生产里向量由调用方算好再传进来），
+  //     计入就污染 P99 ⇒ ⇒ 一次转好，两档共用。
+  const queryVectors: number[][] = queries.map((query) => Array.from(query.embedding));
+
   for (let round = 0; round < WARMUP_ROUNDS; round += 1) {
     const query = queries[round % Math.max(1, queries.length)];
     if (query !== undefined) {
@@ -423,6 +792,13 @@ export function measurePerf(
       backend.search(query.embedding, DEFAULT_PARAMS.VECTOR_TOPK);
     }
     store.recall({ context: '预热', now: BENCH_NOW });
+    // ★ **new-path 档也要预热**（同一条理由：JIT + 页缓存 + 后端对象的首次分配
+    //   + 四态判定的首次 count）⇒ 不预热 ⇒ new-path 的 P99 会被「第一轮的冷启动」主导
+    //   ⇒ 那时两档的差是「预热差」而不是「接线差」。
+    const warmVector = queryVectors[round % Math.max(1, queryVectors.length)];
+    if (warmVector !== undefined) {
+      store.recall({ context: '预热', queryEmbedding: warmVector, now: BENCH_NOW });
+    }
     const warmContent = `预热写入第${round}条、独立的正文、不与语料重复`;
     store.write({
       content: warmContent,
@@ -431,25 +807,67 @@ export function measurePerf(
     });
   }
 
-  // ── recall（**生产的 `MemoryStore.recall()`**）──
-  for (const query of queries) {
-    const start = process.hrtime.bigint();
-    store.recall({ context: query.context, now: BENCH_NOW });
-    const end = process.hrtime.bigint();
-    recallSamples.push(Number(end - start) / 1_000_000);
+  // ── recall · **两档并列测**（old-path = 生产的 `MemoryStore.recall()`，不传向量）──
+  // ★ old-path 档：`store.recall({ context, now })` —— **这一行是接线前的形状，原样保留**
+  //   （删它就永久丢失对照组 ⇒ 「接线前后快慢」再也测不出来）。
+  // ★ new-path 档：`store.recall({ context, queryEmbedding, now })` —— 向量路在召回内部跑。
+  //
+  // ⚠️ ★ **两档在同一轮里背靠背跑，且**按查询序号**轮换先后顺序**（偶数 old 先 / 奇数 new 先）：
+  //   · **为什么背靠背**（而不是「先跑完 200 条 old、再跑 200 条 new」）：中间隔几分钟，
+  //     页缓存 / SQLite 的 WAL 检查点 / 后台合并都可能变化 ⇒ 两档就不是同一条时间线上的数；
+  //   · **为什么必须轮换顺序**：先跑的那一档要**替后跑的那一档**装载页缓存
+  //     ⇒ 固定顺序 ⇒ 后跑的一档被系统性优待（读数偏乐观）⇒ 而本档要回答的正是「这两档谁快」
+  //     ⇒ ⇒ 顺序偏置必须**对称掉**（各占一半）⇒ 剩下的差才可辩护。
+  //   · **代价（诚实记）**：new-path 档的召回会顺带把文本路 / 图谱路的缓存也带热
+  //     （两档共用同一条文本路）⇒ 两档的差里含「向量路之外的热身差异」；
+  //     但这条差异**方向固定且远小于向量路本身**，且 old-path 档的绝对读数不受影响。
+  for (let index = 0; index < queries.length; index += 1) {
+    const query = queries[index];
+    if (query === undefined) {
+      continue;
+    }
+    const queryVector = queryVectors[index] ?? [];
+    /** old-path 档的一次采样（**不传 `queryEmbedding`** ⇒ 向量路整段不执行）。 */
+    const sampleOldPath = (): void => {
+      const start = process.hrtime.bigint();
+      store.recall({ context: query.context, now: BENCH_NOW });
+      const end = process.hrtime.bigint();
+      recallSamples.push(Number(end - start) / 1_000_000);
+    };
+    /** new-path 档的一次采样（**传 `queryEmbedding`** ⇒ 向量路在召回内部跑）。 */
+    const sampleNewPath = (): void => {
+      const start = process.hrtime.bigint();
+      store.recall({ context: query.context, queryEmbedding: queryVector, now: BENCH_NOW });
+      const end = process.hrtime.bigint();
+      recallVectorSamples.push(Number(end - start) / 1_000_000);
+    };
+    if (index % 2 === 1) {
+      // 奇数轮：new-path 先跑（对称掉「后跑者得利」）。
+      sampleNewPath();
+      sampleOldPath();
+    } else {
+      // 偶数轮：old-path 先跑（对照组不因新档的改动而系统性变慢）。
+      sampleOldPath();
+      sampleNewPath();
+    }
   }
 
+  // ★ **一次性探针（采样之后、计时窗口之外）**：证实「new-path 档里向量路真的跑了」。
+  //   ⚠️ **为什么不放在采样之前**：探针自己会装载页缓存 / 装配端口 ⇒ 放前面会**改变**
+  //   两档的采样条件（尤其 old-path 档）⇒ ⇒ 放后面，它碰不到任何已落盘的样本。
+  const vectorPathProbe = probeVectorPathOfRecall(store, queries, queryVectors);
+
   // ── 向量路（**生产后端**：route + search）──
-  // ⚠️ ★ **候选读取行数的统计口径**（H1 的判据）：
-  //   ⚠️ ★ **2026-11-02 口径加固：取数来源 = 「实测」**（不再是「推算」）：
+  // ⚠️ ★★★ **这一段采的量 = R6（`RECALL_VEC_ROWS`）的观测值**（**不是 H1 的判据量**）：
+  //   · 探针是**召回那一组**（`ROUTER_NPROBE_COARSE=20` / `ROUTER_NPROBE_FINE=50`）；
+  //   · 2026-11-03 归口之后**它不参与任何红/绿判定** ⇒ ✅ 只落盘、只打印。
   //   ① `route()` 给出**命中的细桶 id**（生产后端的公开 API ⇒ 拿到的就是
   //      `search()` 内部用的那批桶 ⇒ 路由是确定性的 ⇒ 两次必然一致）；
   //   ② ★ **实测**：`search()` 内部的生产 SQL **实际物化**了多少**候选行**
-  //      （`memories` 表 ⇒ 与写入路径那个「候选 ≤ 2000」同一口径）
-  //      ⇒ 由**行读计数器**统计 ⇒ ⇒ **不再模型化「桶内不设 LIMIT」这个实现**；
+  //      ⇒ 由**行读计数器**统计 ⇒ 与「H1 的写入路径那个数」**是两条不同的数**（探针不同）；
   //   ③ **推算**（只作对照）：命中细桶的成员数之和
   //      （= 「桶内全量精确点积」要读的行数；桶内**不设 LIMIT**，§4.15.3）
-  //      ⇒ ⚠️ **它模型化了实现** ⇒ 阶段 4 引入桶内 LIMIT 后**它不会跟着降** ⇒ **不判 H1**。
+  //      ⇒ ⚠️ **它模型化了实现** ⇒ 阶段 4 引入桶内 LIMIT 后**它不会跟着降** ⇒ **不判任何门槛**。
   for (const query of queries) {
     const start = process.hrtime.bigint();
     const fineIds = backend.route(
@@ -467,7 +885,7 @@ export function measurePerf(
     rowCounter.stop();
     const after = rowCounter.snapshot();
     vectorRouteSamples.push(Number(end - start) / 1_000_000);
-    // ★ **实测**：生产 SQL 实际物化的候选行数（H1 的判据量）。
+    // ★ **实测**：生产 SQL 实际物化的候选行数（**R6 的观测值** ⇒ 不判门槛）。
     candidateRowSamples.push(after.candidateRows - before.candidateRows);
     bucketMemberRowSamples.push(after.bucketMemberRows - before.bucketMemberRows);
     // ★ **推算**（对照用）：命中细桶的成员数之和。
@@ -539,7 +957,40 @@ export function measurePerf(
   const vectorRouteShare =
     recallMean + vectorMean === 0 ? 0 : vectorMean / (recallMean + vectorMean);
 
-  // ── ★ **候选读取行数（H1/H2 的判据）** ──
+  // ── ★ **new-path 档（传 `queryEmbedding`）的读数** ──
+  // ⚠️ **与 old-path 档并列落盘**（old-path 的键原样不动）。
+  const recallVectorLatency = toDistribution(recallVectorSamples);
+  const recallVectorPath: RecallVectorPathSummary = {
+    samples: recallVectorSamples.length,
+    latency: recallVectorLatency,
+    p99Ms: recallVectorLatency.p99Ms,
+    meanMs: recallVectorLatency.meanMs,
+    oldPathMeanMs: recallMean,
+    meanDeltaMs: recallVectorLatency.meanMs - recallMean,
+    vectorScanShareOfNewPath:
+      recallVectorLatency.meanMs > 0 ? vectorMean / recallVectorLatency.meanMs : null,
+    probe: vectorPathProbe,
+    note:
+      '① **new-path 档** = `store.recall({ context, queryEmbedding, now })`' +
+      '⇒ `queryEmbedding` 取自 `query.embedding`，且**用 `Array.from()` 真转成 `number[]`**' +
+      '（`bench/corpus.ts` 给的是 `Float32Array`；`as` 强转不算转换）⇒ 转换在**计时之外**做；' +
+      '② **old-path 档 = 本文件原有的 `recallLatency` / `recallP99Ms`**（不传 `queryEmbedding`' +
+      ' ⇒ 向量路整段不执行）⇒ **两档同一批查询、同一次运行、同一条时间线**；' +
+      '③ **两档背靠背跑，且按查询序号轮换先后顺序**（偶数 old 先 / 奇数 new 先）' +
+      '⇒ 先跑者替后跑者装载页缓存 ⇒ 固定顺序会让后跑的一档偏乐观 ⇒ 顺序偏置必须对称掉；' +
+      '④ `meanDeltaMs` = new-path 均值 − old-path 均值（**正数 = 接线后更慢**，单位毫秒）；' +
+      '⑤ `vectorScanShareOfNewPath` = **向量扫描本身**（`vectorRouteLatency.meanMs`）÷ 本档均值' +
+      '—— **推导值**，分子分母**不是同一次调用**（扫描是独立跑的一遍）⇒ 只作量级参考；' +
+      '⑥ `probe` = **一次性探针**（`diagnostics: true`，跑在采样**之后**、计时窗口**之外**）：' +
+      '`ran=false` ⇒ **本轮向量路整路缺席**（`mode` 会说明是 `flat_auto` 还是 `absent`）' +
+      '⇒ 那时 `meanDeltaMs` **不能**读成「向量路的成本」；' +
+      '⑦ ⚠️ **本档不参与 `checkPerf` 的门槛判定**：门槛（recall P99 ≤ 200ms）是**架构师裁决**的口径，' +
+      '工程师不能把旧门槛悄悄顺延到一个新口径上 ⇒ 本档先**只落盘观测值**；' +
+      '要不要给它定门槛，由架构师裁决。',
+  };
+
+  // ── ★ **候选读取行数（★ 2026-11-03 归口后 = R6 的观测值，不判门槛）** ──
+  //   ⚠️ **H1/H2 的判据量不在这里**：它在 `writeSegments.vectorCandidateRows`（写入探针 8/20）。
   const candidateReadRowsMeasured = toCountSummary(candidateRowSamples);
   const candidateReadRowsDerived = toCountSummary(candidateRowDerivedSamples);
   const hitFineBuckets = toCountSummary(hitBucketSamples);
@@ -557,16 +1008,19 @@ export function measurePerf(
     mode: measuredLooksBroken ? 'derived' : 'measured',
     note: measuredLooksBroken
       ? '⚠️ **本轮退回「推算口径」**（行读计数器没抓到候选行 ⇒ 装桩失败 / 生产 SQL 变了）' +
-        '⇒ **判据量 = 命中细桶的成员数之和** ⇒ ⚠️ **它模型化了「桶内不设 LIMIT」这个实现**' +
-        '⇒ ⇒ **阶段 4 引入桶内 LIMIT 后它不会跟着降** ⇒ ⇒ **这条要修好行读计数器才作数**。'
-      : '① **mode = "measured"**（★ 2026-11-02 口径加固）：判据量 = **生产 SQL 实际物化的候选行数**' +
-        '（`memories` 表 ⇒ 与写入路径那个「候选 ≤ 2000」**同一口径**）' +
-        '⇒ 由 **bench 侧的行读计数器**统计**生产代码真正跑的那条 SQL**' +
-        '⇒ ⇒ **不再模型化「桶内不设 LIMIT」这个实现** ⇒ **阶段 4 引入桶内 LIMIT / 两段式读 ⇒ 这个数会跟着降**' +
-        '⇒ ⇒ **判据对任何实现都成立**（不会再出现「实现降了、判据却还红」的假红）；' +
+        '⇒ **R6 的取数 = 命中细桶的成员数之和** ⇒ ⚠️ **它模型化了「桶内不设 LIMIT」这个实现**' +
+        '⇒ ⇒ **阶段 4 引入桶内 LIMIT 后它不会跟着降** ⇒ ⇒ **这条要修好行读计数器才作数**；' +
+        '⚠️ **它不影响 H1/H2**（H1/H2 判的是 `writeSegments.vectorCandidateRows` ⇒ 不用这个计数器）。'
+      : '① **mode = "measured"**（★ 2026-11-02 口径加固）：R6 的取数 = **生产 SQL 实际物化的候选行数**' +
+        '（由 **bench 侧的行读计数器**统计**生产代码真正跑的那条 SQL**）' +
+        '⇒ ⇒ **不再模型化「桶内不设 LIMIT」这个实现** ⇒ **阶段 4 引入桶内 LIMIT / 两段式读 ⇒ 这个数会跟着降**；' +
         '② **derivedCrossCheck = 推算值**（命中细桶的成员数之和）—— ⚠️ **它模型化了「桶内不设 LIMIT」**' +
-        '⇒ **阶段 4 引入桶内 LIMIT 后它不会跟着降** ⇒ ⇒ **只作对照，不判 H1**；' +
-        '③ **bucketMemberRowsRead = 桶成员侧的行读**（`vector_cell_members`）—— **附加信息**，不判 H1。',
+        '⇒ **阶段 4 引入桶内 LIMIT 后它不会跟着降** ⇒ ⇒ **只作对照，不判任何门槛**；' +
+        '③ **bucketMemberRowsRead = 桶成员侧的行读**（`vector_cell_members`）—— **附加信息**，不判任何门槛；' +
+        '④ ⚠️ ★★ **2026-11-03 归口：本块（`candidateReadRows`）的身份 = R6（`RECALL_VEC_ROWS`）观测值**' +
+        '（**召回探针 20/50**）⇒ **不设门槛、不判红绿**；**H1/H2 的判据量是 `writeSegments.vectorCandidateRows`**' +
+        '（**写入探针 8/20** · 与门槛 2,000 的出处同源）⇒ ⇒ **两块不可混读、不可比大小**；' +
+        '⚠️ **「没有门槛可判」不等于「达标」**：1M 实测里本块 max = 12,782 行 = 门槛 2,000 行的 6.39 倍 ⇒ **读数仍然红**。',
     derivedCrossCheck: candidateReadRowsDerived,
     bucketMemberRowsRead: toCountSummary(bucketMemberRowSamples),
   };
@@ -606,6 +1060,8 @@ export function measurePerf(
   return {
     corpusSize: options.size,
     recallSamples: recallSamples.length,
+    recallVectorPath,
+    vectorScanNote: VECTOR_SCAN_NOTE,
     writeSamples: writeSamples.length,
     firstWriteMs,
     vectorRouteSamples: vectorRouteSamples.length,
@@ -700,38 +1156,51 @@ export function checkPerf(result: PerfResult): string[] {
     );
   }
 
-  // ⚠️ ★★★ **H1（硬门槛 · 归 P2 · 2026-11-02 重新定档 + 同日口径加固）** ───
-  //   **向量路单次查询的候选读取行数 ≤ 2,000 行** ⇒ **纯计数 ⇒ 与介质无关**。
-  // ⚠️ **判定口径 = 样本的 `max`**（「**单次**查询」⇒ 每一次都要满足 ⇒ 最严口径）
+  // ⚠️ ★★★ **H1（硬门槛 · 归 P2 · 2026-11-02 重新定档 · 2026-11-03 归口）** ───
+  //   **写入去重路径的单次候选读取行数 ≤ 2,000 行** ⇒ **纯计数 ⇒ 与介质无关**。
+  // ⚠️ ★★★ **改前 / 改后（这就是本次归口的全部内容）**：
+  //   · **改前**：`result.candidateReadRows.max`（**召回探针 20/50**）去撞**写入侧**的 2,000
+  //     ⇒ 一个召回侧的量冒充「写入路径超了 6.39 倍」；
+  //   · **改后**：`result.writeSegments.vectorCandidateRows.max`（**写入探针 8/20**）
+  //     ⇒ 与门槛 2,000 的出处（§4.9 步骤 3a2）**同源** ⇒ **同一个库、同一个量、同一个被考核方**。
+  // ⚠️ **判定口径 = 样本的 `max`**（「**单次**」⇒ 每一次都要满足 ⇒ 最严口径）
   //   ⇒ 而 `mean` / `p50` / `p99` 一并落盘 ⇒ **换口径不用重跑百万级**。
-  // ⚠️ ★ **口径加固（2026-11-02）**：判据量现在是**实测**（生产 SQL 实际物化的候选行数）
-  //   ⇒ ⇒ **不再模型化「桶内不设 LIMIT」** ⇒ 阶段 4 引入桶内 LIMIT / 两段式读 ⇒ 这个数会跟着降
-  //   ⇒ ⇒ **判据对任何实现都成立**（不会再有「实现降了、判据却还红」的假红）。
-  // ⚠️ **但若本轮退回推算口径**（行读计数器没抓到 ⇒ `mode === 'derived'`）
-  //   ⇒ ⇒ **这条判定就是「模型化实现」的那个数** ⇒ **必须显式写进违规清单**（不许假装它是实测）。
+  // ⚠️ **为什么这里不再有「实测 / 推算」二选一**：写入路径的判据量是
+  //   `scanBucketCandidates()` 返回的 `scanned`（= 那条生产 SQL 返回了几行）
+  //   ⇒ **它就是行数本身** ⇒ 没有第二条取数路径 ⇒ 也就不存在「口径被悄悄换掉」的兜底分支。
+  const h1Rows = result.writeSegments.vectorCandidateRows;
   const h1BasisNote =
-    result.candidateReadRowsBasis.mode === 'measured'
-      ? '口径：实测（生产 SQL 实际物化的候选行数）'
-      : '⚠️ 口径：**推算**（模型化了「桶内不设 LIMIT」⇒ 阶段 4 引入桶内 LIMIT 后不会跟着降）';
-  if (result.candidateReadRows.count === 0) {
-    failures.push('候选读取行数的样本数为 0 ⇒ H1 是真空通过（必须有样本）');
-  } else if (result.candidateReadRows.max > THRESHOLDS.candidateReadRowsMax) {
+    '口径：实测（写入去重路径的生产 SQL 实际返回的行数）；' +
+    '判据量 = writeSegments.vectorCandidateRows（写入探针 8/20，与门槛 2,000 的出处同源）';
+  if (h1Rows.count === 0) {
     failures.push(
-      `候选读取行数（H1）${result.candidateReadRows.max} 行 > ${THRESHOLDS.candidateReadRowsMax} 行` +
-        `（判定取 max；均值 ${result.candidateReadRows.mean.toFixed(1)} 行、` +
-        `p99 ${result.candidateReadRows.p99} 行、样本 ${result.candidateReadRows.count}；${h1BasisNote}）`,
+      `写入去重路径（探针 8/20）候选读取行数（H1）的样本数为 0 ⇒ H1 是真空通过（必须有样本；${h1BasisNote}）`,
+    );
+  } else if (h1Rows.max > THRESHOLDS.candidateReadRowsMax) {
+    failures.push(
+      `写入去重路径（探针 8/20）候选读取行数（H1）${h1Rows.max} 行 > ` +
+        `${THRESHOLDS.candidateReadRowsMax} 行` +
+        `（判定取 max；均值 ${h1Rows.mean.toFixed(1)} 行、` +
+        `p99 ${h1Rows.p99} 行、样本 ${h1Rows.count}；${h1BasisNote}）`,
+    );
+  } else if (h1Rows.max === 0) {
+    // ⚠️ **恒为 0 也是真空通过**（不是「0 行 ⇒ 达标」）：写入路径的候选恒为 0
+    //   ⇒ 只可能是「分桶未训练 / 向量路在写入路径整路缺席」⇒ 那说明**这一轮没测到这个量**。
+    failures.push(
+      '写入去重路径（探针 8/20）候选读取行数（H1）恒为 0 ⇒ 向量路在写入路径整路缺席 ' +
+        `⇒ H1 是真空通过（不是「0 行 ⇒ 达标」；${h1BasisNote}）`,
     );
   }
 
-  // ⚠️ ★ **H2（与 H1 同义的规模无关写法）**：候选读取行数 ÷ 库规模 ≤ 0.2%
+  // ⚠️ ★ **H2（与 H1 同义的规模无关写法）**：**写入去重路径**的候选读取行数 ÷ 库规模 ≤ 0.2%
   //   ⇒ 1M ⇒ ≤ 2,000 行；10M ⇒ ≤ 20,000 行。
-  const candidateRatio =
-    result.corpusSize > 0 ? result.candidateReadRows.max / result.corpusSize : 0;
-  if (result.candidateReadRows.count > 0 && candidateRatio > THRESHOLDS.candidateReadRowsRatioMax) {
+  // ⚠️ **主语与 H1 完全相同**（同一个量、同一批样本、同一个探针配置）⇒ 两者必须同时红/同时绿。
+  const candidateRatio = result.corpusSize > 0 ? h1Rows.max / result.corpusSize : 0;
+  if (h1Rows.count > 0 && candidateRatio > THRESHOLDS.candidateReadRowsRatioMax) {
     failures.push(
-      `候选读取行数 ÷ 库规模（H2）${(candidateRatio * 100).toFixed(4)}% > ` +
+      `写入去重路径（探针 8/20）候选读取行数 ÷ 库规模（H2）${(candidateRatio * 100).toFixed(4)}% > ` +
         `${(THRESHOLDS.candidateReadRowsRatioMax * 100).toFixed(1)}%` +
-        `（${result.candidateReadRows.max} 行 / 库规模 ${result.corpusSize}）`,
+        `（${h1Rows.max} 行 / 库规模 ${result.corpusSize}；判据量 = writeSegments.vectorCandidateRows）`,
     );
   }
 
@@ -741,6 +1210,40 @@ export function checkPerf(result: PerfResult): string[] {
     failures.push('样本数为 0 ⇒ P99 是真空通过（必须有样本）');
   }
   return failures;
+}
+
+/**
+ * ★ **R6（`RECALL_VEC_ROWS`）的观测行** —— **只打印 / 只落盘，不判红绿**。
+ *
+ * ⚠️ ★★★ **为什么它必须是「一行文字」而不是 `checkPerf()` 的一条 failure**：
+ *   `checkPerf()` 的返回值是**门槛清单**（空 = 全部达标）⇒ 把 R6 塞进去
+ *   ⇒ 要么**判它红**（但它没有门槛 ⇒ 判红是在编一条不存在的线）、
+ *   要么**判它绿**（⇒ 那是更坏的错：**12,782 行 = 2,000 行的 6.39 倍**会被读成「达标」）。
+ *   ⇒ ⇒ **第三条路：不给它结论**，只给**读数 + 一句「它仍然红，只是没有门槛可判」**。
+ *
+ * ⚠️ ★ **为什么文字里必须出现「6.39 倍」这类比较**（不能只报 `max`）：
+ *   只报「12,782 行」而不说它与 2,000 的关系 ⇒ 读的人会以为「既然不判红绿，那大概没问题」
+ *   ⇒ ⇒ **必须把「仍然红」写在同一个句子里**，且说明**这条门槛不属于它**。
+ *
+ * @param result 测量结果
+ * @returns 一行说明（**不含任何「达标」结论**）
+ */
+export function formatRecallVecRowsObservation(result: PerfResult): string {
+  const rows = result.candidateReadRows;
+  const gate = THRESHOLDS.candidateReadRowsMax;
+  const multiple = gate > 0 ? rows.max / gate : 0;
+  const conclusion =
+    rows.max > gate
+      ? `⚠ 它仍然红：${rows.max} 行 = ${gate} 行的 ${multiple.toFixed(2)} 倍 ` +
+        '—— 但这个倍数**没有变小**，只是这条量**不再冒充「写入路径」**' +
+        '（门槛 2,000 归的是写入去重路径 ⇒ H1/H2）' +
+        ' ⇒ ⇒ **不是「达标」，也不是「不再是问题」**'
+      : `⚠ 低于 ${gate} 行只说明「这一轮读数不大」，` +
+        '**不构成任何门槛结论**（它没有门槛可判 ⇒ 既不算红也不算绿）';
+  return (
+    `R6 召回路径向量扫描量（RECALL_VEC_ROWS）= ${rows.max} 行` +
+    `（均值 ${rows.mean.toFixed(1)}；**观测值，不设门槛、不判红绿**；探针 20/50）；${conclusion}`
+  );
 }
 
 /** 主流程（**独立可跑**：`pnpm exec tsx bench/perf.ts`）。 */
@@ -771,7 +1274,7 @@ function main(): void {
   const options: CorpusOptions = { ...DEFAULT_CORPUS_OPTIONS, size: scale, seed };
   // ⚠️ **机器信息在开始时采集**（不是结束时）：
   //   “运行开始时还有多少可用内存”才是“这个规模跑得动”的证据。
-  const machine = machineInfo();
+  const machine = machineInfo(dbPath);
   process.stdout.write(
     `P99 测量：语料 ${scale} 条 / 查询 ${queryCount} 条 / 写入 ${writeCount} 条 / 库 ${dbPath}\n`,
   );
@@ -794,6 +1297,10 @@ function main(): void {
   const store = new MemoryStore({ dbPath });
   const result = measurePerf(db, store, options, queryCount, writeCount);
   const failures = checkPerf(result);
+  // ★ **H1/H2 的判据量**（2026-11-03 归口：**写入去重路径**；不是 `candidateReadRows`）。
+  const h1Rows = result.writeSegments.vectorCandidateRows;
+  // ★ **R6 的观测行**（**不判红绿** ⇒ 单独算一次 ⇒ 控制台与「未达标清单」用**同一段文字**）。
+  const r6Observation = formatRecallVecRowsObservation(result);
   // ⚠️ ★ **存储介质类别**（判据的介质解耦落点）—— 探测失败 ⇒ `'unknown'`（**不抛错**）。
   const storageMedia: StorageMediaInfo = machine.storageMedia;
 
@@ -802,19 +1309,36 @@ function main(): void {
     trainedCells: prepared.fineCells,
     trainedMembers: prepared.members,
     thresholds: THRESHOLDS,
+    // ⚠️ ★★★ **门槛归口的声明**（2026-11-03 · `D10`）⇒ **必须与数据一起落盘**：
+    //   ① H1/H2 的判据量 = `writeSegments.vectorCandidateRows`（写入探针 8/20）；
+    //   ② `candidateReadRows` = R6（`RECALL_VEC_ROWS`）观测值 ⇒ **不判门槛**；
+    //   ③ 「没有门槛可判」**不等于**「达标」。
+    //   ⚠️ **它是新增的说明字段** ⇒ **数据字段（`candidateReadRows` / `writeSegments`）一个都没改名**
+    //   ⇒ 读旧 JSON 的脚本不受影响（旧 JSON 里没有这个字段 ⇒ 按「归口前」读即可）。
+    gateRegrouping: GATE_REGROUPING,
+    // ⚠️ ★★★ **两个召回档并列落盘**（键名不复用 ⇒ 读的人不会把两档混成一个数）：
+    //   · `recallP99Ms` / `recallLatency` / `recallSamples` ⇒ **old-path 档**（原有键，**一个都没改**
+    //     ⇒ `tests/bench/bench-smoke.test.ts` 与 `docs/baseline/README.md` 读的就是它们）；
+    //   · `recallVectorPath` ⇒ **new-path 档**（**新键**，含 `latency` / `p99Ms` / `meanMs` /
+    //     `oldPathMeanMs` / `meanDeltaMs` / `vectorScanShareOfNewPath` / `probe`）。
+    recallVectorPath: result.recallVectorPath,
+    // ⚠️ ★ **「向量扫描本身」的口径声明**（跟数据一起走 ⇒ 读 JSON 的人看得到边界）。
+    vectorScanNote: result.vectorScanNote,
     recallP99Ms: result.recallP99Ms,
     writeP99Ms: result.writeP99Ms,
     firstWriteMs: result.firstWriteMs,
     vectorRouteP99Ms: result.vectorRouteP99Ms,
     vectorRouteShare: result.vectorRouteShare,
-    // ⚠️ ★★★ **H1 / H2 的判据本身（纯计数）** ───
+    // ⚠️ ★★★ **R6 的观测值**（**召回路径** · 探针 20/50）—— **键名不改**（读旧 JSON 的脚本靠它对账），
+    //   但它的身份已按 `gateRegrouping` 改成「观测值：不设门槛、不判红绿」⇒ **H1/H2 不再引用它**。
     candidateReadRows: result.candidateReadRows,
-    // ⚠️ ★★★ **H1 的口径声明**（★ 实测还是推算 ⇒ **读 JSON 的人不许误读**）。
+    // ⚠️ ★★★ **R6 的口径声明**（★ 实测还是推算 ⇒ **读 JSON 的人不许误读**）。
     candidateReadRowsBasis: result.candidateReadRowsBasis,
     hitFineBuckets: result.hitFineBuckets,
     // ⚠️ ★ **每行读成本（µs/行）—— 推导值，不是直接测量值**。
     perRowReadCostUs: result.perRowReadCostUs,
-    // ⚠️ ★ **写入路径的分段计时**（见 `writeSegments.note` 的口径说明）。
+    // ⚠️ ★★★ **写入路径的分段计时**（见 `writeSegments.note` 的口径说明）
+    //   ⇒ ⇒ **其中 `vectorCandidateRows` 就是 H1/H2 的判据量**（写入探针 8/20）。
     writeSegments: result.writeSegments,
     // ⚠️ ★ **存储介质类别**（HDD / SSD / NVMe / `unknown`）——「换一块盘 ⇒ 判据含义静默改变」的防线。
     storageMedia,
@@ -831,17 +1355,30 @@ function main(): void {
   });
 
   process.stdout.write(
-    `  recall P99 = ${result.recallP99Ms.toFixed(3)}ms（门槛 ${THRESHOLDS.recallP99Ms}ms，样本 ${result.recallSamples}）\n` +
+    `  recall P99（old-path · 不传向量）= ${result.recallP99Ms.toFixed(3)}ms（门槛 ${THRESHOLDS.recallP99Ms}ms，样本 ${result.recallSamples}）\n` +
+      `  recall P99（new-path · 传向量）= ${result.recallVectorPath.p99Ms.toFixed(3)}ms（**只观测、不判门槛**，样本 ${result.recallVectorPath.samples}）\n` +
+      `    ★ 两档均值差 = ${result.recallVectorPath.meanDeltaMs.toFixed(3)}ms` +
+      `（new ${result.recallVectorPath.meanMs.toFixed(3)}ms − old ${result.recallVectorPath.oldPathMeanMs.toFixed(3)}ms；正数 = 接线后更慢）\n` +
+      `    ★ new-path 探针：向量路 ran = ${result.recallVectorPath.probe.ran}（mode = ${result.recallVectorPath.probe.mode}，` +
+      `候选 ${result.recallVectorPath.probe.candidates} 条）\n` +
+      `    ★ 向量扫描占 new-path 整条召回 = ${result.recallVectorPath.vectorScanShareOfNewPath === null ? '**未测到**' : `${(result.recallVectorPath.vectorScanShareOfNewPath * 100).toFixed(2)}%`}（推导值）\n` +
       `  写入 P99 = ${result.writeP99Ms.toFixed(3)}ms（门槛 ${THRESHOLDS.writeP99Ms}ms，样本 ${result.writeSamples}）\n` +
-      `  向量路 P99 = ${result.vectorRouteP99Ms.toFixed(3)}ms（门槛 ${THRESHOLDS.vectorRouteP99Ms}ms，样本 ${result.vectorRouteSamples}）\n` +
+      `  向量扫描本身 P99 = ${result.vectorRouteP99Ms.toFixed(3)}ms（门槛 ${THRESHOLDS.vectorRouteP99Ms}ms，样本 ${result.vectorRouteSamples}）` +
+      '（⚠️ **直接调 backend.route()+search()** ⇒ 不是召回读数，见 vectorScanNote）\n' +
       `  向量路占总耗时 = ${(result.vectorRouteShare * 100).toFixed(2)}%（门槛 ≤ ${(THRESHOLDS.vectorRouteShare * 100).toFixed(0)}%）\n` +
-      `  ★ H1 候选读取行数 = ${result.candidateReadRows.max} 行（判定取 max；均值 ${result.candidateReadRows.mean.toFixed(1)} 行，` +
-      `门槛 ≤ ${THRESHOLDS.candidateReadRowsMax} 行，样本 ${result.candidateReadRows.count}）\n` +
-      `    ★ H1 口径 = **${result.candidateReadRowsBasis.mode === 'measured' ? '实测（生产 SQL 实际物化的候选行数）' : '⚠ 推算（模型化了「桶内不设 LIMIT」）'}**` +
-      `（对照推算值 max = ${result.candidateReadRowsBasis.derivedCrossCheck?.max ?? 0} 行）\n` +
-      '  ★ H2 候选行数 ÷ 库规模 = ' +
-      `${(result.corpusSize > 0 ? (result.candidateReadRows.max / result.corpusSize) * 100 : 0).toFixed(4)}%` +
+      `  ★ H1 候选读取行数（**写入去重路径** · 探针 8/20）= ${h1Rows.max} 行` +
+      `（判定取 max；均值 ${h1Rows.mean.toFixed(1)} 行，` +
+      `门槛 ≤ ${THRESHOLDS.candidateReadRowsMax} 行，样本 ${h1Rows.count}）\n` +
+      '    ★ H1 口径 = **实测（写入去重路径的生产 SQL 实际返回的行数）**' +
+      '（判据量 = writeSegments.vectorCandidateRows；1M 实测 5,521 行 = 门槛的 2.76 倍 ⇒ 仍红）\n' +
+      '  ★ H2 候选行数 ÷ 库规模（**写入去重路径** · 探针 8/20）= ' +
+      `${(result.corpusSize > 0 ? (h1Rows.max / result.corpusSize) * 100 : 0).toFixed(4)}%` +
       `（门槛 ≤ ${(THRESHOLDS.candidateReadRowsRatioMax * 100).toFixed(1)}%）\n` +
+      `  ★ ${r6Observation}\n` +
+      '    ★ R6 口径 = ' +
+      `**${result.candidateReadRowsBasis.mode === 'measured' ? '实测（召回路径的生产 SQL 实际物化的候选行数）' : '⚠ 推算（模型化了「桶内不设 LIMIT」）'}**` +
+      `（对照推算值 max = ${result.candidateReadRowsBasis.derivedCrossCheck?.max ?? 0} 行；` +
+      '⚠️ **它不参与任何红/绿判定**）\n' +
       '  ★ 每行读成本 = ' +
       `${result.perRowReadCostUs === null ? '**未测到**' : `${result.perRowReadCostUs.toFixed(3)} µs/行`}` +
       `（推导值；介质 ${storageMedia.mediaClass}${storageMedia.detected ? '' : '（**未探测到**）'}）\n` +
@@ -861,9 +1398,19 @@ function main(): void {
       process.stderr.write(`    ${failure}\n`);
     }
     process.stderr.write('  ⇒ 这些是**软阈值**（共享机器上的参考线）⇒ 记录实测值，不判失败。\n');
-    return;
+  } else {
+    process.stdout.write('\n✓ 性能门槛全部达标（H1/H2 判的是**写入去重路径** · 探针 8/20）\n');
   }
-  process.stdout.write('\n✓ 性能门槛全部达标\n');
+  // ⚠️ ★★★ **R6 必须在这里也出现一次**（哪怕它不判红绿）：
+  //   把「观测值」藏在 stdout 的横幅里 ⇒ 读 stderr 的人（CI、只看未达标清单的人）
+  //   会以为「清单里没有 R6 ⇒ R6 没问题」⇒ ⇒ **那正是本轮要消灭的误读**
+  //   ⇒ 所以它**既不进门槛清单，也不省略**：单列一节，并写明「不判红绿」与「仍然红」。
+  process.stderr.write(
+    '\n⚠ 观测值（**不判红绿 · 非门槛**）：\n' +
+      `    ${r6Observation}\n` +
+      '  ⇒ 它与 H1/H2 是**两条不同的量**（探针 20/50 vs 8/20）⇒ **不可混读、不可比大小**；\n' +
+      '  ⇒ 「没有门槛可判」**不等于**「达标」（见 JSON 的 gateRegrouping 字段）。\n',
+  );
 }
 
 const invokedDirectly =

@@ -90,16 +90,41 @@ const SEVEN_DAYS_MS = 7 * 86_400_000;
  *
  * ⚠️ ★ 第 3 条的判据是「**存在可用的细桶**」，**不是**「曾经调用过 `rebuildVectorBuckets()`」——
  *   后者在训练失败时会**说谎**（调用过、桶是空的）。
+ *
+ * @param db 库句柄
+ * @param params 生效参数（`VECTOR_ROUTER` / `ROUTER_MIN_TRAINING`）
+ * @param known 可选：调用方**已确认**「已删且有向量的行数 ≥ `ROUTER_MIN_TRAINING`」
+ *              ⇒ **跳过那次 COUNT**。不传 ⇒ 与引入该参数之前的行为**完全一致**（逐字相同）。
+ *              ⚠️ **只允许「已过门槛」这一个方向的记忆**：反向（记住「没过」）会让
+ *                 一个长大后的库**永远**留在 flat ⇒ 每次召回全表精确点积
+ *                 ⇒ 延迟门槛被静默击穿（而且「库大了反而更慢」这个症状
+ *                    会被误读成「数据分布变了」）。
+ *              ⚠️ **为什么需要它**：召回路径每次都要判一次四态 ⇒ 不跳过一次 COUNT 的代价是
+ *                 `deleted = 0 AND embedding IS NOT NULL` 的**全表计数**（百万级就是几十毫秒）
+ *                 ⇒ 而「过了门槛」这件事一旦成立就**不会回头**（除非调用方删库重写）
+ *                 ⇒ 记一个 sticky 位是安全的；记「没过」则不安全（见上一条）。
  */
-export function resolveVectorBackendMode(db: Database.Database, params: Params): VectorBackendMode {
+export function resolveVectorBackendMode(
+  db: Database.Database,
+  params: Params,
+  known?: { readonly embeddedAtLeastThreshold?: boolean },
+): VectorBackendMode {
   if (params.VECTOR_ROUTER === 'flat') {
     return 'flat_explicit';
   }
-  const embedded = (
-    db
-      .prepare('SELECT count(*) AS n FROM memories WHERE deleted = 0 AND embedding IS NOT NULL')
-      .get() as { n: number }
-  ).n;
+  // ⚠️ **两个方向的判据都必须落在同一个变量上**（`embedded < ROUTER_MIN_TRAINING`）：
+  //   跳过 COUNT 时直接给一个「必然 ≥ 门槛」的值（门槛本身），而不是把后面的分支
+  //   另写一遍 ⇒ 两个分支的结论不可能分叉。
+  const embedded =
+    known?.embeddedAtLeastThreshold === true
+      ? params.ROUTER_MIN_TRAINING
+      : (
+          db
+            .prepare(
+              'SELECT count(*) AS n FROM memories WHERE deleted = 0 AND embedding IS NOT NULL',
+            )
+            .get() as { n: number }
+        ).n;
   if (embedded < params.ROUTER_MIN_TRAINING) {
     return 'flat_auto';
   }

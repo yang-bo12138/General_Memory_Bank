@@ -547,9 +547,12 @@ describe('P2-T03-a · 静态断言：桶归属只有一个写入点', () => {
     );
 
     // ② 反过来：把写入点删掉 ⇒ 命中数变 0 ⇒ 闸门也会判红
+    //   ⚠️ **T04 收尾**：扫描器现在同时守**码表**（`vector_codes`，见 `clearCodeRow()`）
+    //     ⇒ 过滤时必须把**两张表**一起滤掉，否则本负控会因为「桶表滤干净了、码表还留着」
+    //     而永远 > 0（那是把负控写成恒真，不是闸门坏了）。
     const withoutWrite = stripCommentLines(source)
       .split('\n')
-      .filter((line) => !/\bvector_cell_members\b/.test(line))
+      .filter((line) => !/\b(vector_cell_members|vector_codes)\b/.test(line))
       .join('\n');
     expect(findMembershipWriteSites(withoutWrite)).toHaveLength(0);
 

@@ -38,15 +38,19 @@
  *        ⇒ **用相似度废掉了遗忘曲线**（本库两个核心卖点互相抵消）。
  *   ② **向量只进入 `score`，不改变任何准入判定**：它排的是名次，不是资格。
  *
- * ⚠️ **本阶段向量路「整路缺席」，不是「向量分全 0」那种降级**（§4.6 步骤 2c 原话）：
- *   阶段 2 才有向量后端与两级分桶 ⇒ 本文件**整路不执行**，
- *   `explain.routes.vector.ran` 恒为 `false`，事件里的 `vectorUsed` 恒为 `false`。
+ * ⚠️ **步骤 2c（向量路）已接线，但 `queryEmbedding` 是它的唯一开关**（阶段 5 · P2-T10）：
+ *   `queryEmbedding === undefined` **或** 端口缺席（`store.vector === undefined`）⇒ **整段不执行**
+ *   （不是「进去之后返回空」）⇒ `explain.routes.vector.ran` 恒 `false`、事件里的 `vectorUsed`
+ *   恒 `false`、每条 `fromVector` 恒 `false`、`cos` 恒 `null`、`vectorPart` 恒 `0`。
  *   ⚠️ 这与「向量路跑了、但某条候选没有向量」是**两种不同的处境**：
  *     前者是**缺项**，后者是**真实的 0 分**。
  *     ⇒ 缺项判定必须靠 `fromVector`（per-hit）+ `routes.vector.ran`（call 级），
  *       **不能靠 `cos`**（`cos` 把三种语义压成一个值，单看它判定不了缺项）。
+ *   ⚠️ **「不传 ⇒ 行为一位都不变」是本阶段最硬的验收前提**（设计 D2）：
+ *     全仓库没有任何既有宿主传 `queryEmbedding` ⇒ 上面的「不执行」就是**现状本身**。
  *   ⚠️ 因此本文件**不引用任何分桶相关的表名** —— 守住 ADR-16 的「替换点收敛在一处」承诺：
- *     换向量后端实现时不必重写整段流水线。
+ *     换向量后端实现时不必重写整段流水线（后端由 `src/store/vectorPort.ts` 装配，
+ *     本文件只认 `VectorBackend` 契约的 `route()` / `search()` 两个方法）。
  *
  * ⚠️ **参数纪律**：所有阈值与上限一律取自 `DEFAULT_PARAMS`（60 项，不增不删）。
  *   唯三处**刻意硬编码**的量写在下面的「字面量」块里 —— 它们是 §4.6 / §6 的**设计稿字面量**，
@@ -75,6 +79,7 @@ import { MemoryError } from '../core/errors.js';
 import type { RecallEventPayload } from '../core/events.types.js';
 import { resolveFlags } from '../core/flags.js';
 import type { Params } from '../core/params.js';
+import { VECTOR_OVERFETCH_FACTOR } from '../core/params.js';
 import {
   type Bm25Candidate,
   type CoarseGateWindow,
@@ -90,10 +95,14 @@ import {
 } from '../core/scoring.js';
 import { buildMatchQuery } from '../core/tokenize.js';
 import { inhibitCandidates, loadInhibitionFacts } from '../neuron/inhibit.js';
+import type { VectorFilter } from '../vector/backend.js';
+import { countUncodedCandidates } from '../vector/ivf.js';
+import { normalizeQueryEmbedding } from '../vector/query.js';
 import { type DiffusedItem, diffuse } from './diffuse.js';
 import type { EventWriter } from './events.js';
 import { type MemoryView, get } from './get.js';
 import { touch } from './touch.js';
+import type { RecallVectorPort } from './vectorPort.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 〇、§4.6 / §6 的设计稿字面量（**刻意不进参数表**）
@@ -136,7 +145,7 @@ const MAX_TOP_N = 8;
 // 一、对外类型
 // ═══════════════════════════════════════════════════════════════════════════
 
-/** `recall` 所需的上下文（库句柄 + 生效参数 + 事件写入器）。 */
+/** `recall` 所需的上下文（库句柄 + 生效参数 + 事件写入器 + **可选**向量端口）。 */
 export interface RecallStore {
   /** 库句柄。 */
   db: Database.Database;
@@ -144,6 +153,19 @@ export interface RecallStore {
   params: Params;
   /** 事件写入器（`explain === true` 时记一条 `recall` 事件）。 */
   events: EventWriter;
+  /**
+   * 向量端口（**可选**）。
+   *
+   * ⚠️ **不传 = 向量路整路缺席**（与接线之前的行为逐字一致）
+   *   ⇒ 手工构造 `RecallStore` 的测试**不受影响**（它们连这个字段都不需要知道）。
+   * ⚠️ **`exactOptionalPropertyTypes: true`** ⇒ 装配时**必须**用条件展开
+   *   `...(port === null ? {} : { vector: port })`；
+   *   写 `{ vector: undefined }` 在类型上就是**另一件事**（「有这个属性且值为 undefined」
+   *   与「没有这个属性」不同），而它会被类型系统拦下 ⇒ 别用 `as any` 绕过（RK-9）。
+   * ⚠️ **谁装配**：`MemoryStore` 在每次 `recall` 时现场装配（D1），
+   *   本文件**不构造后端**（表名与中心模型都不在流水线里看见）。
+   */
+  vector?: RecallVectorPort;
 }
 
 /**
@@ -158,12 +180,19 @@ export interface RecallOptions {
   /** 取前 N 条（默认 `RECALL_TOP_N`，内部限制 `1~8`）。 */
   topN?: number;
   /**
-   * 查询向量。
+   * 查询向量（**未归一化**：库内会用写入路径的同一个入口 `normalizeNumbers` 归一化）。
    *
-   * ⚠️ **本阶段整条向量路缺席**（阶段 2 才有向量后端）⇒ 本字段**当前不产生任何效果**，
-   *   `explain.routes.vector.ran` 恒为 `false`、事件的 `vectorUsed` 恒为 `false`。
+   * ★ **本字段是向量路的唯一开关**（设计 D2）：不传 ⇒ 步骤 2c **整段不执行**
+   *   ⇒ `explain.routes.vector.ran` 为 `false`、事件的 `vectorUsed` 为 `false`、
+   *     每条 hit 的 `fromVector` 为 `false`、`breakdown.cos` 为 `null`、`vectorPart` 为 `0`
+   *   —— 与接线之前**逐字段相同**。
    *   ⚠️ **这不是「降级成向量分全 0」**：整路缺席与「跑了但没命中」是两种处境，
    *     缺项判定必须靠 `fromVector` + `routes.vector.ran`，**不能靠 `cos`**。
+   * ⚠️ **门面不代算**（`MemoryConfig.embedder` 只给 `write` 用）：要走向量路就**显式传**。
+   *   理由：代算会让「配了 embedder 的宿主」**突然**开始走向量路 —— 那是一次行为变更，
+   *   必须与向量路接线**分开验收**（否则「不传 ⇒ 零影响」这条证明会被自己破坏）。
+   * ⚠️ **维度必须是 `EMBED_DIM`**（否则抛 `INVALID_INPUT`，不静默不走向量路）：
+   *   维度不同意味着两侧不在同一个向量空间 ⇒ 算出来的 cos 是「无意义的合法数字」。
    */
   queryEmbedding?: number[];
   /**
@@ -237,7 +266,7 @@ export interface RecallOptions {
 export interface RecallBreakdown {
   /** `0.30 × intensity`。 */
   intensityPart: number;
-  /** `0.25 × vectorSim`；本阶段向量路缺席 ⇒ 恒为 0。 */
+  /** `0.25 × vectorSim`；`vectorSim = cos ?? 0`（不传 `queryEmbedding` ⇒ 恒为 0）。 */
   vectorPart: number;
   /** `0.20 × normBm25`。 */
   textPart: number;
@@ -255,7 +284,11 @@ export interface RecallBreakdown {
   /**
    * 本次的语义余弦（**原始证据**，不是加权后的分项）。
    *
-   * ⚠️ 本阶段向量路缺席 ⇒ 恒为 `null`。
+   * ⚠️ `null` 有三种来源（所以它**判定不了缺项**）：
+   *   ① 本次没传 `queryEmbedding`（整路缺席）；
+   *   ② 传了但端口缺席 / 分桶未训练（整路缺席）；
+   *   ③ 跑了，但这**一条**没有进向量候选（不是它最近的那些 / `cos < VECTOR_MIN_COS` / 被强度精筛剔掉）。
+   *   ⇒ 区分它们只能靠 `fromVector`（per-hit）+ `routes.vector.ran`（call 级）。
    */
   cos: number | null;
 }
@@ -277,7 +310,7 @@ export interface Hit extends MemoryView {
   breakdown?: RecallBreakdown;
   /** 本条是否由**文本路**召回。 */
   fromText: boolean;
-  /** 本条是否由**向量路**召回（本阶段恒为 `false`）。 */
+  /** 本条是否由**向量路**召回（不传 `queryEmbedding` ⇒ 恒为 `false`；与 `ran` 分属两个层级）。 */
   fromVector: boolean;
   /** 本条是否由**图谱路**召回。 */
   fromGraph: boolean;
@@ -304,12 +337,40 @@ export interface RecallRouteInfo {
   candidates: number;
 }
 
+/**
+ * **向量路**的运行情况（= `RecallRouteInfo` + 一个只属于向量路的读数）。
+ *
+ * ★ **为什么用子接口，而不是给 `RecallRouteInfo` 加一个可选字段**（C′ 档 §5.1.9）：
+ *   加可选字段会**污染** `text` / `graph` —— 它们不产这个数，却会被允许存在
+ *   ⇒ 下一个人会去填它，而填什么都是编的。
+ *   ⇒ 子接口把「只有向量路才有这个数」写成**类型**。
+ *
+ * ⚠️ 这是一次**加法式破缺**：对 `routes.vector` 做严格相等（`toEqual({ran, candidates})`）
+ *   的断言会变红 ⇒ 改成 `toMatchObject` 或补字段即可，**不是回归**（§5.1.9 已预告）。
+ */
+export interface RecallVectorRouteInfo extends RecallRouteInfo {
+  /**
+   * 本次**命中桶内「有成员、无码」的行数**（`> 0` = **码没铺满**）。
+   *
+   * · **它是上界**：数的是桶内「有成员、无码行」的行，**不施加**行级谓词
+   *   （`excludeIds` / 时间窗 / 软删）—— 软删成员保留桶归属，因此也会让它 `> 0`；
+   * · **它不是错误、不是门槛、不抛错**（C′ 档 §7.1.2 ④）：做成阈值/告警
+   *   ⇒「回填还没跑完的库」直接不可用，而那正是本档要支持的处境；
+   * · **谁该关心**：① 运维 —— 回填跑完没有（终态应为 0，除软删）；
+   *   ② 工程师 —— 码行的写入点漏了吗（漏了它会随写入单调上涨）。
+   * · ⚠️ **它数不出「码过期」**（`updateContent()` 改了向量但码没重编 ⇒ 码还行、`fine_id` 也对
+   *   ⇒ 这个数是 0）⇒ 那条依赖 T05（在 `assignBucket` 里重编码）来关闭。
+   * · **只在 `explain` / `diagnostics` 时计算** ⇒ 正常召回**零成本**。
+   */
+  codesMissing: number;
+}
+
 /** 一次调用的**级**诊断（§6 的 `explain`）。 */
 export interface RecallExplain {
   /** 三条路各自的运行情况。 */
   routes: {
     text: RecallRouteInfo;
-    vector: RecallRouteInfo;
+    vector: RecallVectorRouteInfo;
     graph: RecallRouteInfo;
   };
   /**
@@ -391,7 +452,7 @@ interface MergedCandidate {
   created_at: number;
   /** 词法分（文本路命中时非空）。 */
   rawBm25: number | null;
-  /** 语义分（向量路缺席 ⇒ 恒为 `null`）。 */
+  /** 语义分（向量路没命中这一条时为 `null`；**只由向量路填**，不取 max / 不平均，D4）。 */
   cos: number | null;
   fromText: boolean;
   fromVector: boolean;
@@ -754,33 +815,280 @@ function collectGraphCandidates(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 四之二、步骤 2c：向量路（阶段 5 · P2-T10）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * 回表补齐的 SQL（`VectorHit` 只有 `{id, score}`，D3）。
+ *
+ * ⚠️ **只带 `deleted = 0`，不带时间窗**（D3-b）：时间窗的唯一实现是
+ *   `backend.search()` 的 `filter`（由 `coarseGateWindow()` 独家算出）
+ *   ⇒ 在这里再写一次 `last_access >= ?` 就是**同一个闸门的第二份实现**
+ *   ⇒ 两份口径一旦有一个改了而另一个没改，向量路与文本路/图谱路的时间窗就会**悄悄不同宽**
+ *     （而且两份都是「正确代码」，代码审查看不出来）—— 正是铁律①要防的事。
+ * ⚠️ **不 SELECT `embedding`**：≤60 行 × 3KB = 180KB/次的纯搬运
+ *   （与本文件既有 SQL「只 SELECT 需要的列」同源纪律）。
+ * ⚠️ **也不带强度精筛**：`intensity` 不是存储列（要对每行自己的
+ *   `stability × pin_factor` 做 `exp`）⇒ 它只能在 JS 里做，而且必须在取行**之后**。
+ *
+ * ⚠️ **遍历顺序必须取自 `hits`，不是取自本 SQL 的返回顺序**（RK-2）：
+ *   `IN (…)` 的返回次序**未定义** ⇒ 若按它遍历再截断，「同一查询两次结果不同」。
+ *   ⇒ 本 SQL 的结果只装进 `Map`，遍历在 `collectVectorCandidates()` 里按 `hits` 走。
+ *
+ * ⚠️ **导出仅供静态断言**（`tests/integration/recall-vector-path.test.ts` 要逐字检查
+ *   「WHERE 里没有 `last_access`」「整条没有 `embedding`」）——
+ *   它是**模块内部**的名字，不在 `src/index.ts` 的公共面上（§6 的公开面不变）。
+ */
+export const VECTOR_ENRICH_SQL = `SELECT id,
+       stability,
+       pin_factor,
+       last_access,
+       created_at
+  FROM memories
+ WHERE id IN ({MEMBER_IDS}) AND deleted = 0`;
+
+/** 回表 SQL 里 id 占位符的形式（与 `COARSE_PLACEHOLDER` 同一套「名字即契约」纪律）。 */
+const VECTOR_ENRICH_PLACEHOLDER = '{MEMBER_IDS}';
+
+/**
+ * 步骤 2c 的产物。
+ *
+ * ⚠️ **`ran` 与 `rows.length` 是两件事**（D5 的四行表）：
+ *   `ran === true && rows.length === 0` 是**合法且常见**的处境（跑了，但一条都没进候选）
+ *   ⇒ 它正是「向量路没跑」与「跑了但没命中」唯一可区分的地方。
+ */
+export interface VectorRouteResult {
+  /** 本次这一路**跑没跑**（判据：有端口 ∧ 有 `queryEmbedding` ∧ `route()` 返回非空桶集）。 */
+  ran: boolean;
+  /** 精筛 + slice 之后、**去重之前**的候选（顺序 = `search()` 的 cos 降序）。 */
+  rows: Array<CandidateRow & { cos: number }>;
+  /**
+   * 命中桶内「有成员、无码」的行数（C′ 档 §5.1.9 的 `codesMissing`）。
+   *
+   * ⚠️ **只在调用方要求诊断（`withVectorDiagnostics`）时才计算** ⇒ 正常召回**零成本**、
+   *   这个字段**缺省不存在**（不是 0）——「没算」与「算了是 0」是两件事，别混。
+   */
+  codesMissing?: number;
+}
+
+/**
+ * 向量过滤器（**只从 `coarseGateWindow()` 抄**，不自己算）。
+ *
+ * ⚠️ **`excludeIds` 一个都不传**（RK-4）：它的语义是**排除集**
+ *   （§4.7 的扩散语义：「排除本次已入 topN 的记忆」），**不是白名单**、
+ *   **也不是「文本路已命中的黑名单」**。
+ *   ⇒ 若把文本路命中的 id 塞进去，三路合并的前提就被破坏
+ *     （同一个 id **永远**进不了向量路）⇒ 融合打分退化成「每条只带一个证据」
+ *     ⇒ **分数全部偏低，而且看起来都正常**。
+ *   ⇒ 召回步骤 2c 只传 `timeFloor` / `pinnedTimeFloor` 两个键
+ *     （`enabled === false` 时**一个键都不传**：`{ timeFloor: 0 }` 对负时间戳仍是个筛子）。
+ */
+function vectorFilterOf(coarse: CoarseGateWindow): VectorFilter {
+  if (!coarse.enabled) {
+    return {};
+  }
+  return {
+    timeFloor: coarse.coarseCutoff,
+    pinnedTimeFloor: coarse.coarseCutoffPinned,
+  };
+}
+
+/** 回表补齐后的行（**没有** `raw_bm25`：向量路不产生词法证据）。 */
+type VectorEnrichedRow = Omit<CandidateRow, 'raw_bm25'>;
+
+/**
+ * 按 id 批量取行（**只取打分与合并需要的那五列**，不含 `embedding`）。
+ *
+ * @param db 库句柄
+ * @param ids 候选 id（≤ `VECTOR_TOPK × VECTOR_OVERFETCH_FACTOR` = 60 个 ⇒ 一次查询足够，
+ *            远低于 SQLite 的绑定变量上限，无需分块）
+ * @returns id → 行（**顺序无关**：调用方按 `hits` 的顺序取）
+ */
+function loadVectorCandidateRows(
+  db: Database.Database,
+  ids: readonly string[],
+): Map<string, VectorEnrichedRow> {
+  const byId = new Map<string, VectorEnrichedRow>();
+  if (ids.length === 0) {
+    return byId;
+  }
+  const placeholders = ids.map(() => '?').join(', ');
+  const rows = db
+    .prepare(VECTOR_ENRICH_SQL.replace(VECTOR_ENRICH_PLACEHOLDER, placeholders))
+    .all(...ids) as VectorEnrichedRow[];
+  for (const row of rows) {
+    byId.set(row.id, row);
+  }
+  return byId;
+}
+
+/**
+ * 步骤 2c：向量路（§4.6 步骤 2c）。
+ *
+ * ★ **闸门三段的确切先后**（D3，**不可换**，逐条给理由）：
+ * ```
+ * ①  queryEmbedding → normalizeQueryEmbedding()        （double 域归一化，与写入路径同一入口）
+ * ②  port = store.vector                              （四态判定已在装配时完成；null = 整路缺席）
+ * ③  fineIds = backend.route(query, NPROBE_COARSE, NPROBE_FINE)
+ *        空 ⇒ 整路缺席（ran = false），**不调 search**
+ * ④  filter = coarseGateWindow(params, now, includeArchived)  → VectorFilter
+ * ⑤  hits = backend.search(query, VECTOR_TOPK × VECTOR_OVERFETCH_FACTOR, filter)
+ *        后端在此**应用**时间窗，**不**做强度精筛、**不**做 cos 阈值
+ * ⑥  应用层三道过滤（顺序写死）：cos ≥ VECTOR_MIN_COS → intensity > archiveLine → slice(0, TOPK)
+ * ⑦  交给 mergeCandidates（三路合并，向量路排最后）
+ * ```
+ * · **时间窗必须在 `search()` 之前**：它由 `coarseGateWindow()` 独家计算
+ *   ⇒ 向量路的窗口与文本路/图谱路 SQL 里绑的 `@coarseCutoff` / `@coarseCutoffPinned`
+ *   **是同一对数**。若向量路另算一份且算宽了，一条早已淡忘的记忆会从向量路溜回来
+ *   —— 正是铁律①要防的「用相似度废掉遗忘曲线」，而且**不报错**。
+ * · **强度精筛必须在 `search()` 之后**：`intensity` 不是存储列、`VectorFilter` 里也没有它。
+ * · **⑥ 的三道顺序不能换**：先按 cos 滤掉弱相关、再按强度滤掉归档、**最后**截断。
+ *   若先按强度截断 ⇒ 会把 cos 更高但已归档的候选切掉，**挤掉本该保留的次优项**
+ *   （把「cos 次高但活着」的那条挤出去 ⇒ 召回质量静默下降）。
+ * · **`includeArchived === true` 是两件事**（不是一件）：④ 的粗筛**整体取消**
+ *   （归档记忆进得了向量候选）**且** ⑥ 的强度精筛**不执行**（`archiveLine === null`）。
+ *   只做一件 ⇒ 「显式查询归档层」在向量路上只生效一半（铁律①要求三路一视同仁）。
+ *
+ * ⚠️ **纯读**：只发 `SELECT`（`route`/`search` 也不写库）⇒ 与 `recall` 的「不写库」口径一致。
+ *
+ * @param store 库句柄 + 生效参数 + 端口
+ * @param port 已装配的向量端口（**调用方保证它存在**：入口条件在 `collectScoredCandidates`）
+ * @param queryRaw 查询向量原文（**未归一化**）
+ * @param includeArchived 是否显式查询归档层
+ * @param archiveLine 精筛阈值（`null` = 归档模式 ⇒ **整体不判强度**）
+ * @param now 注入时钟
+ * @param withDiagnostics 是否计算 `codesMissing`（**只在 `explain` / `diagnostics` 时为真**）
+ * @returns 步骤 2c 的战果（`ran` + 精筛截断后的候选 + 可选的 `codesMissing`）
+ * @throws {MemoryError} code = `INVALID_INPUT`（`queryEmbedding` 维度不符 / 含 NaN·Inf / 零向量）
+ */
+function collectVectorCandidates(
+  store: RecallStore,
+  port: RecallVectorPort,
+  queryRaw: readonly number[],
+  includeArchived: boolean,
+  archiveLine: number | null,
+  now: number,
+  withDiagnostics: boolean,
+): VectorRouteResult {
+  const db = store.db;
+  const params = store.params;
+
+  // ── ① 归一化（唯一入口；与写入路径同一个浮点口径，RK-3）──
+  const query = normalizeQueryEmbedding(queryRaw, params.EMBED_DIM);
+
+  // ── ② 路由：先回答「去哪找」（不含行）──
+  const fineIds = port.backend.route(query, params.ROUTER_NPROBE_COARSE, params.ROUTER_NPROBE_FINE);
+  // ⚠️ **空桶集 ⇒ 整路缺席**（未训练 / 空库）—— 不是「跑了但没命中」：
+  //   `ran` 的判据写死为「有 port ∧ 有 queryEmbedding ∧ route() 非空」（D5）。
+  //   ⚠️ 此时**不调 `search()`**：它内部会再路由一次（拿到的仍是空），纯浪费一次查询。
+  if (fineIds.length === 0) {
+    return withDiagnostics ? { ran: false, rows: [], codesMissing: 0 } : { ran: false, rows: [] };
+  }
+
+  // ── ③④ 时间窗（唯一计算处）→ 过滤器 ──
+  const filter = vectorFilterOf(coarseGateWindow(params, now, includeArchived));
+
+  // ── ★ 诊断读数：**命中桶内「有成员、无码」的行数**（C′ 档 §5.1.9）──
+  //   ⚠️ **只在 `explain` / `diagnostics` 时算**（一次桶表区间扫 + 每行一次唯一索引探针）
+  //     ⇒ 正常召回**零成本**。
+  //   ⚠️ **放在 `search()` 之前**：它数的是「这次检索的桶集里有多少行没用上码」，
+  //     与「最终命中几条」无关（`hits = 0` 时它照样有意义）。
+  //   ⚠️ **它不是错误、不是门槛**：`> 0` = 码没铺满（回填未完成 / 某条路径漏了维护）。
+  const codesMissing = withDiagnostics ? countUncodedCandidates(db, fineIds) : undefined;
+
+  // ── ⑤ 检索（后端应用时间窗；**不做** cos 阈值与强度精筛）──
+  const hits = port.backend.search(query, params.VECTOR_TOPK * VECTOR_OVERFETCH_FACTOR, filter);
+  // ⚠️ **`ran` 仍是 true**：路由通了、检索也执行了，只是桶里没有东西（或全被时间窗挡掉）
+  //   ⇒ 这是 D5 的 C 行，与 A/B 行（整路缺席）**必须能区分开**。
+  if (hits.length === 0) {
+    return codesMissing === undefined
+      ? { ran: true, rows: [] }
+      : { ran: true, rows: [], codesMissing };
+  }
+
+  // ── ⑥ 回表补齐（`VectorHit` 只有 id + score，D3）──
+  const enriched = loadVectorCandidateRows(
+    db,
+    hits.map((hit) => hit.id),
+  );
+
+  // ── ⑥ 三道过滤，顺序写死（见函数头）──
+  const rows: Array<CandidateRow & { cos: number }> = [];
+  for (const hit of hits) {
+    // ⚠️ **遍历顺序取自 `hits`**（cos 降序、同分按 id 升序），**不是** SQL 的返回顺序（RK-2）。
+    // ① cos 阈值：低于它**不进候选**（不是「得 0 分」—— 它连 `explain.routes.vector.candidates`
+    //   都不计，否则「向量路给了几条」这个数会包含一堆永远不会打分的条目）。
+    if (!(hit.score >= params.VECTOR_MIN_COS)) {
+      continue;
+    }
+    const row = enriched.get(hit.id);
+    // ⚠️ 查不到 ⇒ 这一行在 `search()` 之后被删了（同一进程内的并发写）。
+    //   理论上罕见，但**不补零、不猜**：跳过它（`deleted = 0` 是回表 SQL 的口径）。
+    if (row === undefined) {
+      continue;
+    }
+    // ② 强度精筛（`archiveLine === null` ⇒ 归档模式 ⇒ 整段不执行，三路一致）
+    if (archiveLine !== null) {
+      const intensityValue = intensity(
+        { stability: row.stability, pin_factor: row.pin_factor, last_access: row.last_access },
+        now,
+      );
+      if (!passesIntensityFilter(intensityValue, archiveLine)) {
+        continue;
+      }
+    }
+    // ③ 追加（`raw_bm25: null` —— 向量路不产生词法证据）
+    rows.push({ ...row, raw_bm25: null, cos: hit.score });
+    // ③ 截断（= `slice(0, VECTOR_TOPK)`；放在循环尾部 ⇒ 与「先收集再 slice」逐位相同，
+    //   但不必把 60 条都物化进结果数组）
+    if (rows.length >= params.VECTOR_TOPK) {
+      break;
+    }
+  }
+  return codesMissing === undefined ? { ran: true, rows } : { ran: true, rows, codesMissing };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 五、步骤 2.5：候选去重合并
 // ═══════════════════════════════════════════════════════════════════════════
 
-// TODO(P2): 候选去重本该是「三路共用」的共享点（向量路接上后同一 id 会被三路各捞一次），
-// 应收敛到公共层（如 `src/core/scoring.ts`）；阶段 1 向量路整路缺席、只有两路 ⇒ 本阶段结构不动，只留欠账。
+// ⚠️ **那条 `TODO(P2)` 已在阶段 5 的 P2-T10 清偿**：向量路接上之后，同一个 id 被三路各捞一次
+// 是**常态**（一段讲张三的正文，既命中 FTS、又有张三实体、又与查询语义相近）
+// ⇒ 去重收敛到本文件**一处**（签名从两参数扩到三路）。
+// ⚠️ **为什么不搬进 `src/core/scoring.ts`**：那个文件的自述边界是「**分数公式的唯一出处**」，
+//   它认识的概念只有「因子」「权重」「bm25 候选」「图谱打标」；
+//   把「候选 id 集合合并 + 来源标记保留」搬进去 ⇒ 它同时承担「打分」与「候选构造」两件事，
+//   而本步**一个分数都不产生**（它只保证「同一条记忆不占两个 topN 名额、
+//   不重复喂给 `medianBm25` 样本」）。
+//   代价（诚实记）：本文件长 ~15 行；换来的是「`scoring.ts` 只管算分」这条边界不破。
 /**
  * 步骤 2.5：按 `memory_id` 去重，同一个 id 只留一条。
  *
  * ⚠️ **各路分数各自独立保留，不合并、不取平均**（§4.6 步骤 2.5）：
  *   `raw_bm25` 记词法分、`cos` 记语义分——它们是两个不同维度的证据，
  *   合并成一个数就再也拆不开了（`breakdown` 也就没法解释）。
+ *   ⚠️ 同一 id 在向量候选集里**至多一条**（后端返回的 id 唯一）⇒「取 max」是个**不存在的选择**。
  * ⚠️ **三个来源标记都保留**（`fromText` / `fromVector` / `fromGraph`）：
  *   它们**只为排障与 `explain` 展示，不参与任何计算**。
  * ⚠️ **`graphProximity` 不在本步判定**：统一在步骤 3 按「实体交集」计算
  *   （在本步打标 ⇒ 一条「只被文本路召回但实体确实相交」的候选拿不到 1.0）。
+ * ⚠️ **插入顺序 `text → graph → vector`（向量路排在最后）**（D4）：
+ *   合并用 `Map` 的首次出现顺序 ⇒ 把新来源**追加在尾部**，现有两路候选的相对次序
+ *   **完全不变**（零影响的负控因此更好写、也更好读）。
  *
  * @param textRows 文本路候选
  * @param graphRows 图谱路候选
+ * @param vectorRows 向量路候选（带 `cos`；**顺序 = `search()` 的 cos 降序**）
  * @returns 去重后的候选列表（**保持首次出现顺序**，便于断言与排障）
  */
 function mergeCandidates(
   textRows: readonly CandidateRow[],
   graphRows: readonly CandidateRow[],
+  vectorRows: readonly (CandidateRow & { cos: number })[],
 ): MergedCandidate[] {
   const byId = new Map<string, MergedCandidate>();
 
-  const upsert = (row: CandidateRow, source: 'text' | 'graph'): void => {
+  const upsert = (row: CandidateRow, source: 'text' | 'graph' | 'vector', cos: number): void => {
     const existing = byId.get(row.id);
     if (existing === undefined) {
       byId.set(row.id, {
@@ -790,9 +1098,10 @@ function mergeCandidates(
         last_access: row.last_access,
         created_at: row.created_at,
         rawBm25: row.raw_bm25,
-        cos: null,
+        // ⚠️ 只有向量路能给出 `cos`；另外两路传进来的是 `null`（占位，不参与合并）。
+        cos: source === 'vector' ? cos : null,
         fromText: source === 'text',
-        fromVector: false,
+        fromVector: source === 'vector',
         fromGraph: source === 'graph',
       });
       return;
@@ -806,14 +1115,27 @@ function mergeCandidates(
       }
       return;
     }
+    if (source === 'vector') {
+      // ⚠️ **同样只补不覆盖**：`cos` 的唯一来源是向量路，但「先到者优先」这条规则
+      //   仍要写出来 —— 否则将来有人给向量路加第二个来源时，这一行会静默变成「后者胜」。
+      existing.fromVector = true;
+      if (existing.cos === null) {
+        existing.cos = cos;
+      }
+      return;
+    }
     existing.fromGraph = true;
   };
 
   for (const row of textRows) {
-    upsert(row, 'text');
+    upsert(row, 'text', 0);
   }
   for (const row of graphRows) {
-    upsert(row, 'graph');
+    upsert(row, 'graph', 0);
+  }
+  // ⚠️ **向量路排在最后**（D4）：现有两路候选的相对次序因此**完全不变**。
+  for (const row of vectorRows) {
+    upsert(row, 'vector', row.cos);
   }
   return [...byId.values()];
 }
@@ -827,8 +1149,11 @@ function mergeCandidates(
  *
  * ⚠️ **五项权重与 sigmoid 斜率一律来自 `scoring.ts`**：本文件**不重复实现**任何打分公式
  *   （重复实现 = 两份规则会漂移）。
- * ⚠️ **`vectorSim` 本阶段恒为 0**：向量路**整路缺席** ⇒ §4.6 步骤 3 的
- *   「无 queryVec ⇒ 全体候选一律 0」生效；**缺项**记 0，**不重算分母**。
+ * ⚠️ **`vectorSim = cos ?? 0`**（§4.6 步骤 3 的缺项规则）：
+ *   `cos === null` 的行（向量路没给它候选）**缺项记 0、不重算分母**（权重和恒为 1.0）
+ *   ⇒ 没有向量的候选理论最高分 **0.75** —— 这是 §4.6 明写的代价，不是 bug。
+ *   ⚠️ **不传 `queryEmbedding` 时全体的 `cos` 都是 `null`** ⇒ `vectorSim` 恒为 0
+ *     ⇒ 与接线之前**逐位相同**（D2 的第 1 层：取值来源替换，不是逻辑分支）。
  * ⚠️ **`graphProximity` 按「实体交集」判定，不按「候选来自哪条路」判定**：
  *   图路候选有 `LIMIT 100`，一条记忆完全可能与上下文实体有交集、
  *   却因最近使用排在第 100 名之外而没进图路候选——它同时是文本路的高相关命中，
@@ -876,10 +1201,12 @@ function scoreCandidates(
     const graphProximityValue = graphProximity.get(candidate.id) ?? 0;
     const recencyValue = recency(candidate.created_at, params, now);
 
-    // ⚠️ **向量路整路缺席 ⇒ `vectorSim` 恒为 0**（§4.6 步骤 3 的缺项规则）。
+    // ⚠️ **`vectorSim = cos ?? 0`**（缺项记 0、不重算分母）。
+    //   不传 `queryEmbedding` ⇒ `cos` 恒 `null` ⇒ 这一行退化成原来的字面量 `0`
+    //   （D2 第 1 层：这是**取值来源替换**，不是逻辑分支）。
     const { score } = fuseScore({
       intensity: intensityValue,
-      vectorSim: 0,
+      vectorSim: candidate.cos ?? 0,
       normBm25: normBm25Value,
       graphProximity: graphProximityValue,
       recency: recencyValue,
@@ -939,6 +1266,21 @@ export interface CandidatePipelineInput {
   includeArchived: boolean;
   /** 注入时钟（C37）。 */
   now: number;
+  /**
+   * 查询向量原文（**未归一化**；`undefined` ⇒ 步骤 2c **整段不执行**，D2）。
+   *
+   * ⚠️ **它是向量路的唯一开关**：`recall` 与 `inhibitionTrace` 都把它原样传进来
+   *   ⇒ 「诊断工具看到的分数」与「生产实际发生的分数」在**同一个输入**下逐位相同（D8）。
+   */
+  queryEmbedding?: number[];
+  /**
+   * 是否顺带算**向量路的诊断读数**（`codesMissing`，C′ 档 §5.1.9）。
+   *
+   * ⚠️ **缺省 `false` ⇒ 一次额外的桶表聚合都不发**（正常召回零成本）。
+   *   只有 `recall()` 在 `explain || diagnostics` 时才传 `true`；
+   *   `inhibitionTrace()` 等诊断工具**不传**（它们不产出 `explain.routes`）。
+   */
+  withVectorDiagnostics?: boolean;
 }
 
 /** 共用流水线的产物（步骤 3 的候选 + 诊断所需的计数）。 */
@@ -951,6 +1293,14 @@ export interface CandidatePipeline {
   text: TextRouteResult;
   /** 图谱路的候选条数（`explain` 的判据）。 */
   graphCount: number;
+  /**
+   * 步骤 2c 的战果（`explain.routes.vector` 与事件 `vectorUsed` 的**唯一**判据来源）。
+   *
+   * ⚠️ **事件里的 `vectorUsed` 直接取 `vector.ran`**（不另立判据）：C36
+   *   「同一件事不得有两套词」——若两边各算一遍，它们迟早会一个说 true 一个说 false，
+   *   而**没有任何测试会红**。
+   */
+  vector: VectorRouteResult;
 }
 
 /**
@@ -996,15 +1346,32 @@ export function collectScoredCandidates(
     archiveLine,
     input.now,
   );
-  // ⚠️ 步骤 2c（向量路）：**本阶段整路缺席** —— 不是「向量分全 0」那种降级。
+  // ── 步骤 2c：向量路（阶段 5 · P2-T10）──
+  // ⚠️ **入口条件是两个都为真**（D2 第 1 层）：有查询向量 **且** 有端口。
+  //   两个都为假时**不进入**这个函数（不是「进去之后返回空」）⇒ 缺省路径连一次
+  //   `normalizeQueryEmbedding()` / `route()` 的调用都不会发生。
+  //   ⇒ 于是 `vector` 的缺省值必须与接线之前**逐字段相同**：`{ ran: false, rows: [] }`。
+  const port = store.vector;
+  const vector: VectorRouteResult =
+    input.queryEmbedding === undefined || port === undefined
+      ? { ran: false, rows: [] }
+      : collectVectorCandidates(
+          store,
+          port,
+          input.queryEmbedding,
+          input.includeArchived,
+          archiveLine,
+          input.now,
+          input.withVectorDiagnostics === true,
+        );
 
-  // ── 步骤 2.5：候选去重合并 ──
-  const candidates = mergeCandidates(text.rows, graph);
+  // ── 步骤 2.5：候选去重合并（三路；向量路排最后，D4）──
+  const candidates = mergeCandidates(text.rows, graph, vector.rows);
 
   // ── 步骤 3：融合打分 ──
   const scored = scoreCandidates(db, candidates, contextEntityIds, text.route, params, input.now);
 
-  return { scored, contextEntityIds, text, graphCount: graph.length };
+  return { scored, contextEntityIds, text, graphCount: graph.length, vector };
 }
 
 /**
@@ -1061,6 +1428,12 @@ export function recall(store: RecallStore, options: RecallOptions): RecallResult
     entityNames: options.entityNames,
     includeArchived,
     now: at,
+    // ⚠️ **`exactOptionalPropertyTypes` ⇒ 条件展开**：显式写 `queryEmbedding: undefined`
+    //   与「没有这个属性」是**两件事**（后者才是「没传」）。
+    ...(options.queryEmbedding === undefined ? {} : { queryEmbedding: options.queryEmbedding }),
+    // ⚠️ **诊断读数只在要 `explain` / `diagnostics` 时才算**（C′ 档 §5.1.9）：
+    //   `codesMissing` 要发一次桶表聚合 ⇒ 正常召回不为它付任何成本。
+    withVectorDiagnostics: withBreakdown,
   });
   const scored = pipeline.scored;
   const contextEntityIds = pipeline.contextEntityIds;
@@ -1133,7 +1506,10 @@ export function recall(store: RecallStore, options: RecallOptions): RecallResult
         // ⚠️ **权重一律取自 `scoring.ts`**（本文件不持有第二份权重表：
         //   两份权重必然漂移，而漂移不会报错、只会让排序静默变形）。
         intensityPart: SCORE_WEIGHTS.intensity * candidate.intensityValue,
-        vectorPart: SCORE_WEIGHTS.vectorSim * 0,
+        // ⚠️ **`cos ?? 0` 与 `scoreCandidates()` 里的 `vectorSim` 是同一个式子**：
+        //   两处都写 `?? 0`（而不是在这里判 `cos === null`）⇒ 「五柱之和 == score」
+        //   这条恒等式在 `cos` 取任何值时都成立（包括 `null`）。
+        vectorPart: SCORE_WEIGHTS.vectorSim * (candidate.cos ?? 0),
         textPart: SCORE_WEIGHTS.normBm25 * candidate.normBm25Value,
         graphPart: SCORE_WEIGHTS.graphProximity * candidate.graphProximityValue,
         recencyPart: SCORE_WEIGHTS.recency * candidate.recencyValue,
@@ -1202,7 +1578,9 @@ export function recall(store: RecallStore, options: RecallOptions): RecallResult
       diffuseArchived,
       // ⚠️ **恒带该键**（§4.6 步骤 4）：事后复盘「这次为什么没命中」时，
       //   第一个要排除的就是「向量路根本没跑」——而这个事实在正文与 `scores` 里都看不出来。
-      vectorUsed: false,
+      // ⚠️ **直接取 `pipeline.vector.ran`**，不重新判一遍（C36：同一件事不得有两套词）：
+      //   「事件的 `vectorUsed`」与「`explain.routes.vector.ran`」必须是**同一个事实**。
+      vectorUsed: pipeline.vector.ran,
       // ⚠️ **键恒在**（不省略）：抑制挤掉的候选 id（D 桶）⇒ 事后可对账「谁被挤掉了」。
       //   ⚠️ **溢出候选不在这里**（它们根本没参与评估，§4.13.3）。
       suppressedIds: suppressed.map((item) => item.id),
@@ -1230,8 +1608,21 @@ export function recall(store: RecallStore, options: RecallOptions): RecallResult
       routes: {
         // ⚠️ `ran=false` = 本次文本路**整体不执行**（单字拉丁字母分支）。
         text: { ran: text.route !== 'none', candidates: text.rows.length },
-        // ⚠️ 本阶段向量路**整路缺席** ⇒ `ran=false`、`candidates=0`。
-        vector: { ran: false, candidates: 0 },
+        // ⚠️ **两个数都来自步骤 2c 的实际战果**（不是重新判一遍）：
+        //   `ran` = 有端口 ∧ 有 `queryEmbedding` ∧ `route()` 非空；
+        //   `candidates` = **精筛 + slice 之后、去重之前**的条数（与文本路同口径）。
+        //   ⚠️ `candidates === 0` 时读的人**分不出**「跑到 60 条但被闸门砍光」与
+        //     「桶里本来就没东西」—— 这是**已知且可接受**的代价（D3-b）：
+        //     复盘要问的第一个问题（「向量路到底跑没跑」）已由 `ran` 回答。
+        // ⚠️ △ **T04 的加法式破缺**：`routes.vector` 多了第三个字段 `codesMissing`
+        //   （`RecallVectorRouteInfo`，C′ 档 §5.1.9）⇒ 对 `routes.vector` 做**严格相等**
+        //   的断言会变红，改成 `toMatchObject` 即可（不是回归）。
+        //   ⚠️ `?? 0` 只在「没算」时兜底；`explain` 存在 ⇒ `withBreakdown === true` ⇒ 一定算过。
+        vector: {
+          ran: pipeline.vector.ran,
+          candidates: pipeline.vector.rows.length,
+          codesMissing: pipeline.vector.codesMissing ?? 0,
+        },
         // ⚠️ `ran=false` = 本次没有解析出任何实体。
         graph: { ran: contextEntityIds.length > 0, candidates: pipeline.graphCount },
       },

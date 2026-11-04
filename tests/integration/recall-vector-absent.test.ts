@@ -18,6 +18,7 @@ import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
+import { DEFAULT_PARAMS } from '../../src/core/params.js';
 import { MemoryStore } from '../../src/store/MemoryStore.js';
 
 /** 建一个**没有 embedder** 的临时库，写入一条带实体的记忆。 */
@@ -76,6 +77,83 @@ describe('T03 补强 · 库侧：未配 embedder 时 `vectorPart` 恒为 0（不
           breakdown.recencyPart;
         expect(Math.abs(sum - hit.score)).toBeLessThanOrEqual(1e-9);
       }
+    } finally {
+      store.close();
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// T03 补强（阶段 5 · P2-T10）：**B 行**（整路缺席）与 **A 行**（不传）逐字段相同
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * ★ **为什么这一组必须存在**（设计 D5 的处境表）：
+ *   A 行（不传 `queryEmbedding`）与 B 行（传了，但向量路整路缺席）在**行为产物上必须一致**——
+ *   都是 `ran=false` / `candidates=0` / 每条 `fromVector=false` / `cos=null` / `vectorPart=0`。
+ *   ⇒ 而「一致」这件事**只能靠逐字段比**：只断言几个标志的话，
+ *     「B 行其实悄悄走了 flat」这种错**看不出来**（分数只差 0.25 × cos，看起来仍是合法数字）。
+ *
+ * ⚠️ 本组与文件头那两条断言**不是同一件事**：那两条说的是「没配 embedder ⇒ 向量分恒 0」；
+ *   本组说的是「**传了**向量但整路缺席 ⇒ 与不传完全一样」。两者共用「缺项」这个结论，
+ *   但走的是不同分支（前者连端口都不装配，后者装配了但 `mode='absent'`）。
+ */
+describe('T03 补强 · B 行：过门槛但分桶未训练（`absent`）⇒ 传了向量与不传**逐字段相同**', () => {
+  /** 建一个**过了建桶门槛但没有细桶**的库（`mode='absent'`）。 */
+  function createAbsentStore(): MemoryStore {
+    const dataDir = mkdtempSync(join(tmpdir(), 'memory-ocean-recall-absent-mode-'));
+    // ⚠️ 门槛压到 2 条：`ROUTER_MIN_TRAINING` 是**参数**（§5），压它不改变被测逻辑；
+    //   默认 10000 条在测试里不可行。`'auto'` + 过门槛 + 无细桶 ⇒ `absent`（不是 flat_auto）。
+    const store = new MemoryStore({
+      dbPath: join(dataDir, 'memory.db'),
+      params: { VECTOR_ROUTER: 'auto', ROUTER_MIN_TRAINING: 2 },
+    });
+    store.write({ content: '张三住在北京', embedding: unitEmbedding(0), now: 1_700_000_000_000 });
+    store.write({ content: '张三每天喝茶', embedding: unitEmbedding(1), now: 1_700_000_000_000 });
+    return store;
+  }
+
+  /** 只在一个轴上为 1 的 768 维向量（`EMBED_DIM` 由参数表决定）。 */
+  function unitEmbedding(axis: number): number[] {
+    const vector = new Array<number>(DEFAULT_PARAMS.EMBED_DIM).fill(0);
+    vector[axis] = 1;
+    return vector;
+  }
+
+  it("★ `mode==='absent'` ⇒ 传了向量也 `ran=false`，且 `hits` / `suppressed` / `diffused` 与**不传**逐字段相同", () => {
+    const store = createAbsentStore();
+    try {
+      // ── 前提自检：这一库确实是 `absent`（不是 flat_auto、也不是 ivf）──
+      const mode = store.stats(1_700_000_000_000).vectorBackend.mode;
+      expect(mode).toBe('absent');
+
+      const context = '张三住在哪里';
+      const plain = store.recall({ context, explain: true, now: 1_700_000_000_000 });
+      const withVector = store.recall({
+        context,
+        explain: true,
+        now: 1_700_000_000_000,
+        queryEmbedding: unitEmbedding(0),
+      });
+
+      // ── 分母不为 0（否则下面的「相同」是空转）──
+      expect(plain.hits.length).toBeGreaterThanOrEqual(1);
+      // ── B 行的五个字段（与 A 行**同值**）──
+      // ⚠️ 整路缺席 ⇒ `codesMissing` 同样是**确定值 0**（桶集为空）⇒ 逐字段钉死（`toEqual`）。
+      expect(withVector.explain?.routes.vector).toEqual({
+        ran: false,
+        candidates: 0,
+        codesMissing: 0,
+      });
+      for (const hit of withVector.hits) {
+        expect(hit.fromVector).toBe(false);
+        expect(hit.breakdown?.cos).toBeNull();
+        expect(hit.breakdown?.vectorPart).toBe(0);
+      }
+      // ── **逐字段相同**（这一条才是「B 行 ≡ A 行」的证明）──
+      expect(withVector.hits).toEqual(plain.hits);
+      expect(withVector.suppressed).toEqual(plain.suppressed);
+      expect(withVector.diffused).toEqual(plain.diffused);
     } finally {
       store.close();
     }

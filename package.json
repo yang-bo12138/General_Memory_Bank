@@ -39,7 +39,9 @@
     "audit:negative-control": "tsx scripts/audit-tier-qualifiers.negative-control.ts",
     "verify": "pnpm run typecheck && pnpm run lint && pnpm run test && pnpm run check:params && pnpm run check:payload-keys && pnpm run check:clock && pnpm run check:anchor && pnpm run check:bucket-write && pnpm run check:contract-ids && pnpm run check:doc-counts && pnpm run check:clamp && pnpm run audit:tier-qualifiers && pnpm run audit:two-layer && pnpm run audit:negative-control",
     "ci": "pnpm run verify",
-    "check:doc-counts": "tsx scripts/check-doc-counts.ts"
+    "check:doc-counts": "tsx scripts/check-doc-counts.ts",
+    "migrate": "tsx scripts/migrate.ts",
+    "codes:backfill": "tsx scripts/backfill-codes.ts"
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3"

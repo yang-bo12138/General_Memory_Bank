@@ -1,0 +1,207 @@
+{
+  "corpusSize": 10000,
+  "trainedCells": 6710,
+  "trainedMembers": 10000,
+  "thresholds": {
+    "recallP99Ms": 200,
+    "writeP99Ms": 5,
+    "vectorRouteP99Ms": 20,
+    "vectorRouteShare": 0.2,
+    "candidateReadRowsMax": 2000,
+    "candidateReadRowsRatioMax": 0.002
+  },
+  "gateRegrouping": {
+    "decidedAt": "2026-11-03",
+    "decision": "D10（H1 归口拆分）",
+    "source": "docs/design/DESIGN-v2-errata.md §11.8 勘误 ⑫ / docs/design/DECISIONS.md 的 D10",
+    "h1h2Quantity": "writeSegments.vectorCandidateRows（判定取 max）",
+    "h1h2Subject": "写入去重路径（探针 ROUTER_NPROBE_WRITE_COARSE=8 / ROUTER_NPROBE_WRITE_FINE=20）；门槛 ≤ 2000 行 / ≤ 0.2% 与判定方式（取 max）一个都没改",
+    "r6Quantity": "candidateReadRows（召回路径 · 探针 ROUTER_NPROBE_COARSE=20 / ROUTER_NPROBE_FINE=50）",
+    "r6Status": "观测值：本轮不设门槛、不判红绿",
+    "note": "① **2026-11-03 归口**（`D10`）：H1/H2 的考核主体收窄到「**写入去重路径**」——门槛 2,000 行的出处本来就是写入路径（§4.9 步骤 3a2 的「候选 ≤ 2000」）⇒ ⇒ 判据量与门槛**同源**；② **H1/H2 的判据量 = `writeSegments.vectorCandidateRows`**（写入探针 8/20 · 取的是生产 SQL 实际返回的行数 ⇒ 实测，无「推算」备选）；③ ⚠️ **`candidateReadRows` = R6（`RECALL_VEC_ROWS`）的观测值**（召回探针 20/50），**不设门槛、不判红绿** ⇒ ⇒ **但「没有门槛可判」绝不等于「达标」**：1M 实测里它的 max = 12,782 行 = 门槛 2,000 行的 **6.39 倍** ⇒ **读数仍然红**，只是它**不再冒充「写入路径超了 6.39 倍」**；④ ⚠️ **两组量的探针配置不同**（8/20 vs 20/50）⇒ **不可混读、不可比大小**（「2.76 倍」与「6.39 倍」是**两个不同的量各自有数**，不是一个数在改善）；⑤ ⚠️ **归口 ≠ 达标**：H1 在 1M 实测里是 5,521 行 = 门槛的 **2.76 倍 ⇒ 仍红**⇒ 这次改的是**主语**，不是门槛。"
+  },
+  "recallVectorPath": {
+    "samples": 200,
+    "latency": {
+      "count": 200,
+      "minMs": 6.5766,
+      "p50Ms": 11.5235,
+      "p90Ms": 12.4039,
+      "p95Ms": 13.1156,
+      "p99Ms": 13.8814,
+      "maxMs": 14.703,
+      "meanMs": 11.377909500000005
+    },
+    "p99Ms": 13.8814,
+    "meanMs": 11.377909500000005,
+    "oldPathMeanMs": 5.509498000000003,
+    "meanDeltaMs": 5.8684115000000014,
+    "vectorScanShareOfNewPath": 0.3244356531399723,
+    "probe": {
+      "ran": true,
+      "candidates": 20,
+      "mode": "ivf",
+      "note": "① **存在性证据**（只跑 1 次、取第一条查询）⇒ 不是统计量，耗时不计入任何 P99；② `ran=true` ⇒ 该次召回的 `explain.routes.vector.ran === true`⇒ 向量路**真的在 `recall()` 内部执行了**（不是「传了向量但被入口条件挡掉」）；③ `ran=false` ⇒ 该次召回**向量路整路缺席**，原因看 `mode`：`flat_auto`（库规模 < `ROUTER_MIN_TRAINING` ⇒ 全表精确点积）/ `absent`（过了门槛但桶未训练）/ `flat_explicit`（调用方显式选了 flat）；④ ⚠️ `mode` 与 `ran` 是**两个观测面**（`stats()` 说「后端处于哪一态」，`explain` 说「这一次跑没跑」）⇒ 若 `mode=ivf` 而 `ran=false`，说明**入口条件另有拦口**（如查询向量不合法被丢弃）⇒ **必须查**，不能当成「偶然」；⑤ ⚠️ `diagnostics: true`（**不是** `explain: true`）⇒ 探针**不写** `recall` 事件⇒ 不污染被测库的写放大。"
+    },
+    "note": "① **new-path 档** = `store.recall({ context, queryEmbedding, now })`⇒ `queryEmbedding` 取自 `query.embedding`，且**用 `Array.from()` 真转成 `number[]`**（`bench/corpus.ts` 给的是 `Float32Array`；`as` 强转不算转换）⇒ 转换在**计时之外**做；② **old-path 档 = 本文件原有的 `recallLatency` / `recallP99Ms`**（不传 `queryEmbedding` ⇒ 向量路整段不执行）⇒ **两档同一批查询、同一次运行、同一条时间线**；③ **两档背靠背跑，且按查询序号轮换先后顺序**（偶数 old 先 / 奇数 new 先）⇒ 先跑者替后跑者装载页缓存 ⇒ 固定顺序会让后跑的一档偏乐观 ⇒ 顺序偏置必须对称掉；④ `meanDeltaMs` = new-path 均值 − old-path 均值（**正数 = 接线后更慢**，单位毫秒）；⑤ `vectorScanShareOfNewPath` = **向量扫描本身**（`vectorRouteLatency.meanMs`）÷ 本档均值—— **推导值**，分子分母**不是同一次调用**（扫描是独立跑的一遍）⇒ 只作量级参考；⑥ `probe` = **一次性探针**（`diagnostics: true`，跑在采样**之后**、计时窗口**之外**）：`ran=false` ⇒ **本轮向量路整路缺席**（`mode` 会说明是 `flat_auto` 还是 `absent`）⇒ 那时 `meanDeltaMs` **不能**读成「向量路的成本」；⑦ ⚠️ **本档不参与 `checkPerf` 的门槛判定**：门槛（recall P99 ≤ 200ms）是**架构师裁决**的口径，工程师不能把旧门槛悄悄顺延到一个新口径上 ⇒ 本档先**只落盘观测值**；要不要给它定门槛，由架构师裁决。"
+  },
+  "vectorScanNote": "① ★ **本段（`vectorRouteLatency` / `vectorRouteP99Ms` / `vectorRouteSamples` / `candidateReadRows` / `hitFineBuckets` / `perRowReadCostUs`）测的是「向量扫描本身」**：它**直接调** `IvfVectorBackend.route()` + `search()`（**绕过 `recall()`**）⇒ 量的是「**向量扫描（含路由 + 闸门过滤）这一段自己花多少**」，**不含**文本路 / 图谱路 / 五路打分 / 侧抑制 / 排序 ⇒ ⇒ **它不是召回读数**；② **它回答的问题与 new-path 档不同**：它对应文档里的 **R6 / `RECALL_VEC_ROWS`** 口径 （「向量扫描这一步要读多少行、多重」），而 `recallVectorPath`（new-path 档）回答「**一次召回总共多重**」⇒ **两条数回答两个不同问题，绝不可互换、不可相加**；③ 「向量路在一次召回里占多少」只能用 **同一次运行内**的推导值 `recallVectorPath.vectorScanShareOfNewPath`（= 本段 `meanMs` ÷ new-path 档 `meanMs`）—— 那两个数来自同一次运行，但**不是同一次调用**（见 ④）；④ ⚠️ **为什么保留「独立跑一遍向量扫描」而不在 `recall()` 内部插桩**：bench **不改 `src/**`**（本轮纪律）⇒ 拿不到召回内部的段计时 ⇒ 分档归因只剩「独立跑一遍」这一条路 ⇒ ⇒ 保留它；代价是**分子（扫描）与分母（整条召回）不是同一次调用**⇒ 该比例**只作归因的量级参考**，**不是精确拆分**（精确拆分要在 `src/store/recall.ts` 里加观测点）。",
+  "recallP99Ms": 7.5487,
+  "writeP99Ms": 16.3103,
+  "firstWriteMs": 3.7617,
+  "vectorRouteP99Ms": 4.9269,
+  "vectorRouteShare": 0.40119993728872616,
+  "candidateReadRows": {
+    "count": 200,
+    "min": 50,
+    "mean": 60.835,
+    "p50": 54,
+    "p99": 112,
+    "max": 137
+  },
+  "candidateReadRowsBasis": {
+    "mode": "measured",
+    "note": "① **mode = \"measured\"**（★ 2026-11-02 口径加固）：R6 的取数 = **生产 SQL 实际物化的候选行数**（由 **bench 侧的行读计数器**统计**生产代码真正跑的那条 SQL**）⇒ ⇒ **不再模型化「桶内不设 LIMIT」这个实现** ⇒ **阶段 4 引入桶内 LIMIT / 两段式读 ⇒ 这个数会跟着降**；② **derivedCrossCheck = 推算值**（命中细桶的成员数之和）—— ⚠️ **它模型化了「桶内不设 LIMIT」**⇒ **阶段 4 引入桶内 LIMIT 后它不会跟着降** ⇒ ⇒ **只作对照，不判任何门槛**；③ **bucketMemberRowsRead = 桶成员侧的行读**（`vector_cell_members`）—— **附加信息**，不判任何门槛；④ ⚠️ ★★ **2026-11-03 归口：本块（`candidateReadRows`）的身份 = R6（`RECALL_VEC_ROWS`）观测值**（**召回探针 20/50**）⇒ **不设门槛、不判红绿**；**H1/H2 的判据量是 `writeSegments.vectorCandidateRows`**（**写入探针 8/20** · 与门槛 2,000 的出处同源）⇒ ⇒ **两块不可混读、不可比大小**；⚠️ **「没有门槛可判」不等于「达标」**：1M 实测里本块 max = 12,782 行 = 门槛 2,000 行的 6.39 倍 ⇒ **读数仍然红**。",
+    "derivedCrossCheck": {
+      "count": 200,
+      "min": 50,
+      "mean": 60.835,
+      "p50": 54,
+      "p99": 112,
+      "max": 137
+    },
+    "bucketMemberRowsRead": {
+      "count": 200,
+      "min": 50,
+      "mean": 60.835,
+      "p50": 54,
+      "p99": 112,
+      "max": 137
+    }
+  },
+  "hitFineBuckets": {
+    "count": 200,
+    "min": 50,
+    "mean": 50,
+    "p50": 50,
+    "p99": 50,
+    "max": 50
+  },
+  "perRowReadCostUs": 60.678877291033075,
+  "writeSegments": {
+    "vectorCandidateScan": {
+      "count": 200,
+      "minMs": 0.8679,
+      "p50Ms": 1.19,
+      "p90Ms": 1.4246,
+      "p95Ms": 1.5916,
+      "p99Ms": 1.9738,
+      "maxMs": 5.63,
+      "meanMs": 1.23134
+    },
+    "vectorCandidateRows": {
+      "count": 200,
+      "min": 20,
+      "mean": 35.375,
+      "p50": 33,
+      "p99": 75,
+      "max": 95
+    },
+    "writeTotal": {
+      "count": 200,
+      "minMs": 3.1164,
+      "p50Ms": 3.8689,
+      "p90Ms": 4.6069,
+      "p95Ms": 4.9582,
+      "p99Ms": 16.3103,
+      "maxMs": 21.9678,
+      "meanMs": 4.247977000000002
+    },
+    "otherMeanMs": 3.016637000000002,
+    "otherMeanShare": 0.7101349654200106,
+    "note": "① vectorCandidateScan = **独立实测段**（单独调用生产的那条向量候选扫描路径 `collectVectorCandidates()` ⇒ 内部就是 `src/vector/ivf.ts` 的 `scanBucketCandidates()`；**不是**从写入总耗时里切出来的 ⇒ 与写入那一次**不是同一次调用**）；② otherMeanMs / otherMeanShare = **推导值段**（写入总耗时均值 − 向量扫描段均值）⇒ 其余段 = 「FTS5 + 索引维护 + 合并判定 + 事件写入」；③ ⚠️⚠️ **「① + ② ≠ 写入总耗时」**（**读这两个数时必须知道**）：两段**不是同一次写入里的两段** ⇒ ① 跑在**写入循环之后**的**单独一轮**里 ⇒ 那时库里已经多了本轮写入的 N 条记忆 ⇒ 候选面更大一点、页缓存状态也不同 ⇒ ⇒ **① 与 ② 相加没有「等于写入总耗时」的含义** ⇒ **只能当归因的量级参考**，**不是精确拆分** ⇒ 若要精确拆分，必须在 `src/store/write.ts` 里加一个只读观测点；⚠️ 另：otherMeanMs **可能为负** ⇒ 说明「独立实测的扫描段」比「整次写入」还贵 （页缓存状态不同）⇒ 同样不可当精确拆分。"
+  },
+  "storageMedia": {
+    "mediaClass": "SSD",
+    "source": "powershell:Get-PhysicalDisk",
+    "detected": true,
+    "detail": "SSD | NVMe | WD Blue SN570 1TB SSD"
+  },
+  "pageCacheState": {
+    "state": "warm",
+    "source": "cli:--cache-state",
+    "declared": true,
+    "note": "⚠ **由跑的人声明**（不是仪器测量值 —— Windows 没有公开 API 能报「这个库有多少在页缓存里」）⇒ 本档的毫秒数**只能与同档比较**。⚠️ **判档的可复算旁证（不是仪器）**：**先测一下顺序读吞吐**（同一块盘、同一个文件、固定偏移读一段固定大小，报 MB/s）⇒ 与 `storageMedia` 里那块盘的**名义顺序读带宽**对比：**明显低于名义值 ⇒ 随机读要落盘 ⇒ 偏冷**；**接近或高于名义值 ⇒ 页缓存命中率高 ⇒ 偏热**。⚠️ **本字段仍是「声明」不是「测量」**（Windows 没有公开 API 能报「这个库有多少在页缓存里」）⇒ 判档必须连这条旁证一起看；⚠️ **换机器请用自己的盘速重算这个对照**（本段**刻意不写具体盘速**：写死一个数，换一块盘就变成假话）。"
+  },
+  "warmupRounds": 20,
+  "recallLatency": {
+    "count": 200,
+    "minMs": 2.7683,
+    "p50Ms": 5.5635,
+    "p90Ms": 5.9204,
+    "p95Ms": 6.1323,
+    "p99Ms": 7.5487,
+    "maxMs": 10.1164,
+    "meanMs": 5.509498000000003
+  },
+  "writeLatency": {
+    "count": 200,
+    "minMs": 3.1164,
+    "p50Ms": 3.8689,
+    "p90Ms": 4.6069,
+    "p95Ms": 4.9582,
+    "p99Ms": 16.3103,
+    "maxMs": 21.9678,
+    "meanMs": 4.247977000000002
+  },
+  "vectorRouteLatency": {
+    "count": 200,
+    "minMs": 2.2596,
+    "p50Ms": 3.6855,
+    "p90Ms": 4.2519,
+    "p95Ms": 4.5527,
+    "p99Ms": 4.9269,
+    "maxMs": 4.9775,
+    "meanMs": 3.6913995000000015
+  },
+  "failures": [
+    "写入 P99 16.310ms > 5ms（样本 200、预热 20）",
+    "向量路占总耗时 40.12% > 20%",
+    "写入去重路径（探针 8/20）候选读取行数 ÷ 库规模（H2）0.9500% > 0.2%（95 行 / 库规模 10000；判据量 = writeSegments.vectorCandidateRows）"
+  ],
+  "benchNow": 1749873600000,
+  "machine": {
+    "platform": "win32-x64",
+    "node": "v22.22.2",
+    "cpuModel": "AMD Ryzen 7 2700 Eight-Core Processor          ",
+    "cpuCount": 16,
+    "totalMemoryBytes": 17120718848,
+    "freeMemoryBytes": 9792098304,
+    "usedMemoryBytes": 7328620544,
+    "totalDiskBytes": 1000203087872,
+    "freeDiskBytes": 860265508864,
+    "storageMedia": {
+      "mediaClass": "SSD",
+      "source": "powershell:Get-PhysicalDisk",
+      "detected": true,
+      "detail": "SSD | NVMe | WD Blue SN570 1TB SSD"
+    }
+  },
+  "phases": {
+    "loadMs": 2331.1121,
+    "trainMs": 41306.1643,
+    "trainReadAndKmeansMs": null,
+    "trainMigrateMs": null,
+    "rssBeforeTrainBytes": 222081024,
+    "peakRssBytes": 388100096,
+    "sampledPeakRssBytes": 388079616,
+    "peakRss": {
+      "kernelPeakBytes": 388100096,
+      "sampledPeakBytes": 388079616,
+      "sampleCount": 664,
+      "workerActive": true
+    },
+    "fineCells": 6710,
+    "members": 10000
+  }
+}

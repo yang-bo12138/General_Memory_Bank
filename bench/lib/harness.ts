@@ -718,19 +718,22 @@ export interface PageCacheStateInfo {
  *   ⇒ ⇒ **本段只是给出「怎么判断自己该声明哪一档」的可复算旁证**
  *   ⇒ ⇒ **不改变「缺省 unknown、不许猜」这条纪律**。
  *
- * ⚠️ ★ **旁证的来源**（工程师-7 在 2026-11-01 23:43 的补测里实测）：
- *   **顺序读吞吐 ≈ 166 MB/s**（≈ **机械盘速度** ⇒ SATA HDD 的量级）
- *   ⇒ ⇒ 页缓存只命中了 **~0.55 GB**（4.23 GiB 的库**装不下**）
- *   ⇒ ⇒ ⇒ **随机读路径基本没命中缓存** ⇒ ⇒ **这就是「冷盘档」的物理含义**。
+ * ⚠️ ★ **本段不写任何具体盘速**（2026-11-04 改）：
+ *   旧版在这里写死「本机 2026-11-01 冷盘档实测 ≈ 166 MB/s（≈ 机械盘速度）」⇒
+ *   **换到 NVMe 档之后，这句话与同一份 JSON 里的 `storageMedia` 直接矛盾**
+ *   （一边写 `SSD | NVMe | WD Blue SN570`，一边写「本机是 SATA HDD」）⇒
+ *   而 `note` 是**落盘、会被后人引用的字段** ⇒ 写死机器相关的数 = 让基线自己说谎。
+ *   ⇒ 现在只给**方法**：拿顺序读吞吐与 `storageMedia` 那块盘的**名义带宽**比。
  *
- * ⚠️ **换机器必须用自己的盘速重算这个对照**（⇒ 本段带机器相关性）。
+ * ⚠️ **换机器必须用自己的盘速重算这个对照** ⇒ 所以对照值只能由读的人现算，不能由代码写死。
  */
 const PAGE_CACHE_STATE_CROSS_CHECK =
-  '⚠️ **判档的可复算旁证（不是仪器）**：**先测一下顺序读吞吐** ⇒ ' +
-  '⚠️ 本机 2026-11-01 冷盘档实测 ≈ **166 MB/s**（≈ 机械盘速度）' +
-  '⇒ 页缓存只命中 **~0.55 GB**（4.23 GiB 的库装不下）⇒ ⇒ **随机读路径基本没命中缓存**' +
-  '⇒ ⇒ **「顺序读吞吐接近本机盘速」⇒ 多半是冷盘档**' +
-  '（⚠️ 本机是 SATA HDD ⇒ **换机器请用自己的盘速重算这个对照**）。';
+  '⚠️ **判档的可复算旁证（不是仪器）**：**先测一下顺序读吞吐**（同一块盘、同一个文件、' +
+  '固定偏移读一段固定大小，报 MB/s）⇒ 与 `storageMedia` 里那块盘的**名义顺序读带宽**对比：' +
+  '**明显低于名义值 ⇒ 随机读要落盘 ⇒ 偏冷**；**接近或高于名义值 ⇒ 页缓存命中率高 ⇒ 偏热**。' +
+  '⚠️ **本字段仍是「声明」不是「测量」**（Windows 没有公开 API 能报「这个库有多少在页缓存里」）' +
+  '⇒ 判档必须连这条旁证一起看；⚠️ **换机器请用自己的盘速重算这个对照**' +
+  '（本段**刻意不写具体盘速**：写死一个数，换一块盘就变成假话）。';
 
 /**
  * 解析 `--cache-state` 参数（**缺省 `unknown`**；**非法值 ⇒ 报错**，不静默钳制）。
@@ -1145,9 +1148,14 @@ function diskInfo(): { totalDiskBytes: number; freeDiskBytes: number } {
 /**
  * 采集机器环境。
  *
+ * @param storageTargetPath 判定**存储介质**用的路径（**传库文件路径**）。
+ *   ⚠️ **不传会退回 `process.cwd()` 所在盘**，而当库放在**另一个盘**上时，那会把介质**标错**：
+ *   例：库在 NVMe `E:`、cwd 在机械盘 `D:` ⇒ 旧实现记成 `HDD`
+ *   ⇒ 而「每行读成本（µs/行）」这条推论**完全依赖这个标签** ⇒ 标签错，读成本就不可解释。
+ *   （2026-11-03 修正：原实现无参，等价于「永远报 cwd 的盘」。）
  * @returns 机器环境快照
  */
-export function machineInfo(): MachineInfo {
+export function machineInfo(storageTargetPath?: string): MachineInfo {
   const cpus = cpus_();
   const totalMemoryBytes = totalmem();
   const freeMemoryBytes = freemem();
@@ -1163,7 +1171,8 @@ export function machineInfo(): MachineInfo {
     totalDiskBytes: disk.totalDiskBytes,
     freeDiskBytes: disk.freeDiskBytes,
     // ⚠️ **介质探测失败不抛错**（`detectStorageMedia` 内部全吞）⇒ 这一行不会让 bench 挂掉。
-    storageMedia: detectStorageMedia(),
+    // ⚠️ **按库文件所在的盘判介质**（不传 ⇒ 退回 cwd 的盘 ⇒ 库放在别的盘时会标错）。
+    storageMedia: detectStorageMedia(storageTargetPath),
   };
 }
 

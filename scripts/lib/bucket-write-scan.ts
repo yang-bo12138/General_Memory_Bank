@@ -44,9 +44,16 @@ export function stripCommentLines(source: string): string {
 }
 
 /**
- * 扫出**真正写** `vector_cell_members` 的位置（裸 `INSERT` / `UPDATE` / `DELETE FROM`）。
+ * 扫出**真正写**「桶表 / 码表」的位置（裸 `INSERT` / `UPDATE` / `DELETE FROM`）。
  *
- * ⚠️ **只认写、不认读**：`SELECT ... FROM vector_cell_members` 是合法的。
+ * ★ **T04 收尾（2026-11-05）把码表也纳入**：`vector_codes` 与 `vector_cell_members`
+ *   是同一族的**派生数据**（都由向量算出来），两类写入都必须只有一个家
+ *   ——`src/vector/bucketAssign.ts`（`assignBucket` / `unassignBucket` / `clearCodeRow`）。
+ *   ⚠️ 为什么不新开一个扫描器：同一件事不得有两套实现（C36）——
+ *     两份正则迟早漂移，而漂移的那一份会**静默失效**（就是这条纪律要防的东西）。
+ *
+ * ⚠️ **只认写、不认读**：`SELECT ... FROM vector_cell_members` / `... FROM vector_codes`
+ *   是合法的（`src/vector/ivf.ts` 的桶内检索与取码就在读它们）。
  * ⚠️ **认 `INSERT OR REPLACE`**：那也是裸写（§4.15.5 明写它**不能**替代
  *   「先 DELETE 再 INSERT」⇒ 写点必须被扫出来）。
  *
@@ -56,7 +63,7 @@ export function stripCommentLines(source: string): string {
 export function findMembershipWriteSites(source: string): number[] {
   const code = stripCommentLines(source);
   const pattern =
-    /\b(?:INSERT\s+(?:OR\s+\w+\s+)?INTO|UPDATE|DELETE\s+FROM)\s+vector_cell_members\b/gi;
+    /\b(?:INSERT\s+(?:OR\s+\w+\s+)?INTO|UPDATE|DELETE\s+FROM)\s+(?:vector_cell_members|vector_codes)\b/gi;
   const sites: number[] = [];
   let match = pattern.exec(code);
   while (match !== null) {

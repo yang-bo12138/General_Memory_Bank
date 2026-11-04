@@ -86,7 +86,12 @@ import {
   verifyIntegrityReport,
 } from './maintain.js';
 import { pin as pinImpl, unpin as unpinImpl } from './pin.js';
-import { type RecallOptions, type RecallResult, recall as recallImpl } from './recall.js';
+import {
+  type RecallOptions,
+  type RecallResult,
+  type RecallStore,
+  recall as recallImpl,
+} from './recall.js';
 import { type RestoreOptions, restore as restoreImpl } from './restore.js';
 import {
   type SetParamsResult,
@@ -98,6 +103,7 @@ import { type MemoryStats, stats as statsImpl } from './stats.js';
 import { type SweepOptions, type SweepResult, sweep as sweepImpl } from './sweep.js';
 import { type TouchOptions, type TouchOutcome, touch as touchImpl } from './touch.js';
 import { type UpdateContentStore, updateContent as updateContentImpl } from './updateContent.js';
+import { type VectorPortDeps, resolveRecallVectorPort } from './vectorPort.js';
 import { type WriteInput, type WriteResult, type WriteStore, write as writeImpl } from './write.js';
 /**
  * 门面的构造配置 —— DESIGN-v2.md §6 的 `MemoryConfig`。
@@ -260,6 +266,27 @@ export class MemoryStore {
   #closed = false;
 
   /**
+   * 「本实例已确认过建桶门槛」的 **sticky 位**（阶段 5 · P2-T10，设计 D1 / §3 的 `known` 参数）。
+   *
+   * ⚠️ **只记「已过门槛」这一个方向**：反向（记住「没过」）会让一个**长大后的库
+   *   永远留在 flat** ⇒ 每次召回全表精确点积 ⇒ 延迟门槛被静默击穿
+   *   （症状「库大了反而更慢」还会被误读成「数据分布变了」）。
+   * ⚠️ **它的唯一用途是跳过四态判定里那次 COUNT**（`deleted = 0 AND embedding IS NOT NULL`
+   *   的全表计数；百万级就是几十毫秒/次），**不影响任何结论**
+   *   ⇒ 带与不带 `known` 在同一个库上返回**同一个字面量**（T01 有断言钉住）。
+   */
+  #embeddedThresholdCrossed = false;
+
+  /**
+   * 向量端口的装配依赖（阶段 5 · P2-T10）。
+   *
+   * ⚠️ **它只提供「中心模型」与「门槛记忆」两样东西**，不持任何缓存：
+   *   中心模型仍由 `#centroids` 这个**唯一实例**提供 ⇒ `reload()` 仍是唯一的失效点
+   *   （本设计不新增可忘的地方，RK-5）。
+   */
+  readonly #vectorDeps: VectorPortDeps;
+
+  /**
    * 构造一个门面实例。
    *
    * ⚠️ **构造期做的四件事**（都不是业务逻辑，是「把依赖接上」）：
@@ -310,6 +337,17 @@ export class MemoryStore {
     //   ⇒ 中心模型**只从库里读**（`CentroidCache` ⇒ 走真实的加载路径）
     //   ⇒ 库里没有桶 ⇒ `assignBucket` 返回「没入桶」而**不抛错**（库仍可写）。
     this.#centroids = new CentroidCache(db);
+
+    // ⚠️ **向量端口的装配依赖**（阶段 5 · P2-T10）：
+    //   · `centroids` 是闭包（不是模型快照）⇒ 每次路由取一次 ⇒ 重训后的 `reload()` 立刻可见；
+    //   · 门槛 sticky 位只有一个方向（见字段注释），**只用来省一次 COUNT**。
+    this.#vectorDeps = {
+      centroids: () => this.#centroids.model(),
+      embeddedAtLeastThreshold: () => this.#embeddedThresholdCrossed,
+      markEmbeddedAtLeastThreshold: () => {
+        this.#embeddedThresholdCrossed = true;
+      },
+    };
 
     // ⚠️ **桶归属上下文**（§9.3.0 的唯一写入点）：
     //   写入路径改 `embedding` 时**同事务**同步桶归属（§9.3.2 ①）。
@@ -374,11 +412,39 @@ export class MemoryStore {
    *     而**不是**「库替你去库里找实体」。
    *   ⇒ 两个都传 ⇒ 抛 `INVALID_INPUT`（互斥，§4.6 步骤 1）。
    *
-   * @param options 召回选项（`context` 必填）
+   * @param options 召回选项（`context` 必填；`queryEmbedding` 是向量路的唯一开关）
    * @returns §6 的 `RecallResult`（`hits` / `explain?` / `suppressed` / `diffused`）
    */
   recall(options: RecallOptions): RecallResult {
-    return recallImpl(this.#context, options);
+    return recallImpl(this.#recallContextOf(options.queryEmbedding), options);
+  }
+
+  /**
+   * 装配本次召回用的上下文（**条件装配**：只有真的要走向量路时才碰后端）。
+   *
+   * ★ **为什么只在 `queryEmbedding !== undefined` 时才装配端口**（对 D1「每次 recall 现场装配」的
+   *   精确读法 —— 「每次」是相对于「每实例缓存一次」说的，不是「连不用的调用也要装」）：
+   *   装配本身要过一次四态判定（`resolveVectorBackendMode`）⇒ 在 `'auto'` 模式下
+   *   那是一次 `deleted = 0 AND embedding IS NOT NULL` 的**全表 COUNT**。
+   *   ⇒ 若对**所有** recall 都装配，就等于给每一个「根本不需要向量」的既有宿主
+   *     每次召回加一次全表计数（而且 sticky 位只能救「已过门槛」那一半；
+   *     小库永远在 `flat_auto` ⇒ **每次都数**）。
+   *   ⇒ 那正好与 D2 的最硬前提（「不传 ⇒ 行为一位都不变」）对立，而且是**测不出来**的那种变。
+   *   ⇒ 决法：**不传向量就不装配**（连四态判定都不做）⇒ 缺省路径的查询序列与接线前**逐条相同**。
+   *   ⚠️ 代价（诚实记）：这与 D1 字面上的「每次 recall 时装配」有一处细微差别，
+   *     已在上报里如实登记，等架构师裁决是否要改成无条件装配。
+   *
+   * @param queryEmbedding 本次传入的查询向量（`undefined` ⇒ 不装配，走「向量路整路缺席」）
+   * @returns 带（或不带）`vector` 字段的 `RecallStore`
+   */
+  #recallContextOf(queryEmbedding: number[] | undefined): RecallStore {
+    if (queryEmbedding === undefined) {
+      // ⚠️ **连 `vector` 这个键都不出现**（`exactOptionalPropertyTypes`：`{ vector: undefined }`
+      //   与「没有这个属性」是两件事，RK-9）。
+      return this.#context;
+    }
+    const port = resolveRecallVectorPort(this.#db, this.#context.params, this.#vectorDeps);
+    return port === null ? this.#context : { ...this.#context, vector: port };
   }
 
   /**
@@ -540,14 +606,17 @@ export class MemoryStore {
    *     而那个实现内部走的是 `recall.ts` 的共用流水线 `collectScoredCandidates()`
    *     ⇒ `baseScore` 与 `recall` 的 `Hit.score` **逐位相同**是**结构上**保证的。
    *
-   * ⚠️ **签名与 §6 逐字一致**：`context` 必填、`options` 可选（只带 `now`）。
+   * ⚠️ **签名与 §6 逐字一致**：`context` 必填、`options` 可选。
+   *   `options` 里新增的 `queryEmbedding` 是**可选**字段（阶段 5 · D8）⇒ 方法名与方法数不变。
    *
    * @param context 召回上下文（与 `recall` 完全相同的入参）
-   * @param options 可选（注入时钟）
+   * @param options 可选（注入时钟 + 查询向量；**必须与那一次 recall 传同一条**）
    * @returns §6 的 `{ candidates, selected }`
    */
   inhibitionTrace(context: string, options?: InhibitionTraceOptions): InhibitionTraceResult {
-    return inhibitionTraceImpl(this.#context, context, options);
+    // ⚠️ **与 `recall` 用同一个装配函数**：两边同传一条向量时，`baseScore` 与 `Hit.score`
+    //   逐位相等是**结构上**保证的（同一段流水线 + 同一个端口构造口径）。
+    return inhibitionTraceImpl(this.#recallContextOf(options?.queryEmbedding), context, options);
   }
 
   /**
