@@ -126,7 +126,7 @@ return exact 转数组（cos 降序、同分 id 升序）
 |---|---|---|---|---|
 | **T01** | 码表 DDL（**增量表**） | ✅ **已落地**：`schema/001_schema_v2.sql` + `schema/002_migration_v1_to_v2.sql` 各一段（带 `IF NOT EXISTS`）；运行时副本 `src/db/schema.sql.ts` 同步生成；`src/core/schema.ts` 加 `VECTOR_CODES_SQL`；`src/db/migrate.ts` 加 `ensureVectorCodesTable()` 并挂进 `ensureSchema()` 的三个分支 | — | `tests/unit/vector-codes-schema.test.ts` **6 条**：不在指纹表 / 形状对 / 两处 DDL 不漂移 / 存量库可补建 / 幂等 / 只读侧容忍缺表 |
 | **T02** | 编码器 + 上界单测 | ✅ **已落地**：`src/vector/quantize.ts`（`encodeVector` / `approxDot` / `upperBound` / `decodeVector` / `codeToBlob` / `blobToCode`）；`tests/unit/quantize.test.ts` **8 条** | — | **A3 / A4 绿**（10 万对零破界；eps 是真误差） |
-| **T03** | 回填脚本（分批、可断点） | `scripts/backfill-codes.ts`（新）；`package.json` 加 `codes:backfill` | T01 T02 | 1M 行回填完成；**A6** 绿；中断后重跑幂等 |
+| **T03** | 回填脚本（分批、可断点） | ✅ **已落地（2026-11-04）**：`scripts/backfill-codes.ts`（`pnpm codes:backfill`）；`tests/integration/backfill-codes.test.ts`（**26 条**） | T01 T02 | 1M 回填完成（**1,000,000 / 73.42s / 库 +944.2 MB**）；**A6** 绿；中断后重跑幂等（`encoded=0`） |
 | **T04** | 读取路径两段化 | `src/vector/ivf.ts`（`search()` / `scanBucketCandidates()`）；`src/vector/prune.ts`（新）；`IvfVectorBackendOptions.prune?: boolean`（缺省 `true`） | T01 T02 | **A1 / A2 / A7** 绿（`prune=false` 与 HEAD 逐位一致） |
 | **T05** | 写入路径维护码行（同事务） | `src/vector/bucketAssign.ts`（`assignBucket` / `unassignBucket` 里 delete+insert 码行）；`src/store/write.ts` 的调用点 | T01 T02 | **A6** 绿（换桶后 `fine_id` 集合相等） |
 | **T06** | bench 计数口径 + H1′ 判据 | `bench/lib/harness.ts:977 classifyReadKind()`（认 `vector_codes`，并**按 SQL 分别累计字节**）；`bench/perf.ts`（落盘 `bytesRead` / `codeRowsRead` / `memoryRowsRead` / `candidateUniverse`；H1′ 判字节） | T04 T05 | **A5** 绿；三读数并列落盘 |
@@ -178,6 +178,9 @@ return exact 转数组（cos 降序、同分 id 升序）
 | **R5** | 存储 +784 MB | 已知、接受（`memories.embedding` 的 3 GB 仍在，暂不删 —— 删了就产生不可逆点） |
 | **R6** | 双表一致性（码表 vs 桶表） | A6 + 「同事务写」；`bucketAssign` 已是 delete+insert 形状，码行跟着搬 |
 | **R7** | 中位延迟变好但**尾延迟**变差（survivors 分布的长尾） | 出关条件④：报告 `bytesRead` 与 `survivors` 的 p50/**p99/max**，不只看 mean |
+| **R8** | ★ **`embedding` 被改而码没重编 ⇒ 上界在代数上不再成立**（`eps` 是「旧向量」的误差）⇒ 剪枝会**真的漏召回**，而且**任何 SQL 自检都查不出**（码表与桶表可以对得整整齐齐） | ⚠️ **T04 之前必须定**。**现状（实测，2026-11-04）**：`grep "SET embedding" src/` **为空** ⇒ **没有任何生产路径会改 `embedding`** ⇒ 今天这件事只可能由**人手工改库**造成。<br>⚠️ **本轮没有加任何 DB 层守卫**（没加触发器、没加写路径检查）⇒ 一旦将来有人加一条 `updateEmbedding`，码会**静默过期**。<br>⇒ 定策略时二选一：**①** 明文禁止改 `embedding`（要改 = 重编该行码，同事务）；**②** 加触发器 `AFTER UPDATE OF embedding … RAISE(ABORT)` 逼调用方走显式重编接口。<br>⇒ **`--force` 重跑一次回填就能修复整库**（码只由 `embedding` 决定）⇒ 这是本档唯一「坏了也能自愈」的性质。 |
+| **R9** | ★ **换桶不同步码行 ⇒ T04 静默漏召回**（`fine_id` 留在旧桶 ⇒ 按桶取码取不到） | ⚠️ **这是 T05 的验收判据**（不是「顺手做的事」）。**T03 已把检测落地**：`snapshotConsistency()` 现在数 `lonelyCodes` 与 `fineIdDrift`，A6 判定 = `mismatch===0 && lonelyCodes===0 && fineIdDrift===0`，不一致**非零退出**。<br>⚠️ **QA 实测把它抓出来过一次**：`--force` 走 `INSERT OR REPLACE`、而 `members.fine_id` 已被改 ⇒ 码行留在旧桶，**而当时的自检 exit 0 并打印「码表 == 桶表」** ⇒ 片上有洞的绿。已修（自检补齐 A6 后半句）。 |
+| **R10** | `INSERT OR REPLACE` 在 `vector_cell_members` 上触发 `memories` 的 `ON DELETE CASCADE`（REPLACE = delete + insert）⇒ **误用 REPLACE 会静默删掉码行与桶归属** | 既有行为，不是本档引入。**已实测**（QA 造夹具时踩到：6 行 → 0 行）。⇒ 纪律：**改桶只能用 `UPDATE` 或「先 DELETE 再 INSERT」的显式形状**（`bucketAssign` 就是这么写的），**禁止** `INSERT OR REPLACE`。 |
 
 > ⚠️ **★ 2026-11-04 09:2x 全量重采后的基线订正（只改「倍数」，不改「方向」）**：
 > 本档所有收益估算原先按 `perRowReadCostUs = 35.491 µs/行`（`unknown` 档）推出；
