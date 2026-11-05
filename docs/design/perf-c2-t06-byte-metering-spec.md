@@ -81,11 +81,11 @@
 * **源文件**：`bench/perf.ts`（改）、`tests/bench/h1-measurement.test.ts`（改）、`tests/bench/bench-smoke.test.ts`（改，可能）
 * **依赖**：**T06-3**
 * **验收标准**：
-  1. **H1′**：`bytesRead.max > 6,144,000 B` ⇒ 判红（标签 **`（H1′）`**）；判定取 `max`；
-  2. **H2′**：`bytesRead.max ÷ (库规模 × 3,072 B) > 0.2%` ⇒ 判红（标签 **`（H2′）`**）；
+  1. **H1′**：`bytesRead.max > 6,144,000 B` ⇒ 判红（标签 **`（H1′）`**）；判定取 `max`；⇒ ⇒ ★ **只判【写路径】**（bench 的『写入扫描独立实测段』=`writeSegments.vectorByteReads`）⇒ ⇒ **读路径的 `vectorRouteByteReads` 是观测值、不参与红绿**（⇒ ⇒ 读路径实测 `bytesRead.max` 已超这条门槛 ⇒ ⇒ 若误把它纳入判据**当场就是红** ⇒ ⇒ ⇒ 详见 ① §4 盲区登记与 ① §5 判据处置）；
+  2. **H2′**：`bytesRead.max ÷ (库规模 × 3,072 B) > 0.2%` ⇒ 判红（标签 **`（H2′）`**）；⇒ ⇒ ★ **路径限定同第 1 条（只判写路径）**；
   3. **剪枝率**：`（PRUNE_RATE）`、阈值 0.15、分子 = **`embeddingCalls`（`get()` 调用次数）**；
   4. **旧行数判据不再进 `failures`**，但 **`candidateReadRowsMax` / `candidateReadRowsRatioMax` 两个常量键名与数值一个都不许删**；
-  5. **真空通过 / 不可判定守卫**（全部判红）：`bytesRead.count === 0` / `bytesRead.max === 0` / `unclassifiedRows > 0` / `badCodeRows > 0` / `samplesAligned === false`；
+  5. **真空通过 / 不可判定守卫**（全部判红）：`bytesRead.count === 0` / `bytesRead.max === 0` / `unclassifiedRows > 0` / `badCodeRows > 0` / `samplesAligned === false`；⇒ ⇒ ★ **同第 1 条：判的是【被判定的那份】`bytesRead` ⇒ ⇒ 按现行口径 = 写路径**（读路径不判红绿 ⇒ ⇒ 别把它一并判成红）；
   6. ⚠️ **断言 5（过滤串失效守卫 · 有牙）** —— **旧的过滤串 `（H1）` / `（H2）` 必须一个都匹配不上任何违规行** ⇒ 若它们仍能匹配 ⇒ 判「**过滤串失效**」⇒ **判红**。⇒ **写法（两头锁死）**：① **故意造一条**带**旧标签** `（H1）` 的违规行 ⇒ 断言它**不**进 `failures`；② 再造一条带**新标签** `（H1′）` 的违规行 ⇒ 断言它**确实**进 `failures` ⇒ ⇒ 改名这件事**有牙**（旧串**全部**换成 `（H1′）` / `（H2′）` / `（PRUNE_RATE）`，旧串**不许**留着当「宽松匹配」）；且用**伪造 `bytesRead.max`** 验证「判定真的读了字节那个字段」；
   7. **`formatRecallVecRowsObservation()` 的措辞**同步改（「2,000 行」已是历史口径 ⇒ 不许再叫它「门槛」）。
 
@@ -174,7 +174,7 @@
 | **窗口没开大 1e** | `expect(bucketMemberRows).toBe(candidateUniverse)`（**写路径**，零容差；★ **成立原因 = 【同源】** ⇒ 两者量同一个扫描的同一批桶） | 计数窗口罩住了召回探针 / 写入循环内部那次扫描 |
 | **未解析有牙（断言 3）** | 喂 `SELECT id FROM memories` ⇒ `expect(unclassifiedRows).toBeGreaterThan(0)` | 形状登记表漏登记 ⇒ 静默按 0 计 |
 | 剪枝率方向 | 断言 `embeddingCalls ≥ embeddingExactRows`（**调用次数 ≥ `scoreOf` 返回行数**） | 把剪枝率分子换成「返回行数」⇒ **假绿** |
-| 真空通过 | `bytesRead.count === 0` / `max === 0` ⇒ 判红 | 把「没测到」读成「达标」 |
+| 真空通过 | `bytesRead.count === 0` / `max === 0` ⇒ 判红（★ **判的是【被判定的那份】⇒ 现行口径 = 写路径**；读路径不判红绿） | 把「没测到」读成「达标」 |
 | 旧判据已废 | `checkPerf()` 的 failures 里**不出现** `（H1）`/`（H2）`（旧标签） | 把旧行数判据偷偷留着 |
 | **零 src 改动（断言 4）** | `git diff --stat src/` 为空 | 顺手改了 `src/**`（含注释） |
 | ★ **过滤串失效守卫（断言 5）** | 造一条**旧标签**（`（H1）`）的违规行 ⇒ `expect(failures).not.toContain(...)`；造一条**新标签**（`（H1′）`）的违规行 ⇒ `expect(failures).toContain(...)` | 过滤串没改 ⇒ 旧断言**恒绿 = 没牙** |
