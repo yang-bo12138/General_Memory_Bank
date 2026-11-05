@@ -186,12 +186,12 @@ const OLD_WORDING_TAIL = '了 2 行';
 /* ── 类型 ── */
 
 /** 豁免类别（`undefined` ⇒ ⇒ 该命中是**违例**）。 */
-type Allowance =
+export type Allowance =
   | { readonly kind: 'quoted'; readonly quote: string }
   | { readonly kind: 'feature-phrase'; readonly phrase: string };
 
 /** 一处命中（违例或豁免）。 */
-interface Occurrence {
+export interface Occurrence {
   /** 相对扫描根的文件路径（`/` 分隔）。 */
   readonly file: string;
   /** 行号（1 起）。 */
@@ -360,6 +360,28 @@ function scanLine(line: string, file: string, lineNo: number, inSelf: boolean): 
     }
   }
   return out;
+}
+
+/**
+ * **对外导出的判定入口** —— 把一行文本里的旧措辞命中分类（【断言】/【引述】/【释义】）。
+ *
+ * ★ **为什么导这一层、而不是只导「怎么切段」的手段**：
+ *   下游脚本（例如跨载体措辞锚点守卫）要的是**判定**（这一处命中算不算违规），
+ *   不是**手段**（怎么按引号切段）⇒ ⇒ 若只导手段 ⇒ ⇒ 下游就得自己重写一遍豁免规则
+ *   ⇒ ⇒ **两份判定会漂** ⇒ ⇒ 所以这里导的是**带豁免判定的整层**。
+ *
+ * ★ **判定实现只有一份**：本函数只是内部扫描用的 `scanLine()` 的薄包装 ⇒ ⇒
+ *   「是断言还是引述/释义」这条判据**不存在第二份实现** ⇒ ⇒ 改一处 ⇒ ⇒ 两处都生效。
+ *
+ * ★ **单向依赖**：本文件**导出**、下游**import** ⇒ ⇒ **绝不能反向**（否则成环）。
+ *
+ * @param line 整行文本
+ * @param file 相对路径（写进报告）
+ * @param lineNo 行号（1 起）
+ * @returns 命中列表（含豁免理由；`allowance === undefined` ⇒ 该命中是违例）
+ */
+export function classifyLine(line: string, file: string, lineNo: number): Occurrence[] {
+  return scanLine(line, file, lineNo, false);
 }
 
 /**
