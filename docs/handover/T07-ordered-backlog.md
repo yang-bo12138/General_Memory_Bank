@@ -346,11 +346,11 @@ export function readSamplesAlignedInputs(samples: readonly VectorByteSample[]): 
 
 | 项 | 事实 | 结论 |
 |---|---|---|
-| **磁盘空间** | `D:` 剩 **801 GB 可用**；百万级库 ≈ 3 GB（embedding）+ **784 MB**（码表，设计稿 `:100`） | ✅ **空间充裕** |
+| **磁盘空间** | `D:` 剩 **801 GB 可用**（★ **2026-11-05 复核 = 784.6 GB 可用** · 146.9 GB 已用 · ★ **且 D: = Disk 1 = ST1000DM010 那块 HDD** ⇒ ★ **跑 bench 的盘其实是 E:（NVMe）**）；百万级库 ≈ 3 GB（embedding）+ **784 MB**（码表，设计稿 `:100`） | ✅ **空间充裕** |
 | **既有百万级基线** | `perf-1000000*.json` 共 4 份 ⇒ **全部** `vectorByteReads` 缺失（`has vectorByteReads = False`） | ★ **确实必须重采**（T06 之前采的） |
 | **既有基线的 `vectorCandidateRows.max`** | **5,521** ⇒ 与 ① §4 的 1M 示例**逐位吻合** | ✅ QA 的外推模型可信 |
 | **采集命令** | `pnpm exec tsx bench/perf.ts --scale=1000000 --cache-state=cold\|warm [--force-rebuild] [--out=…]` | — |
-| **冷档的物理限制** | ★ `--cache-state=cold` **只是「声明」**（`bench/perf.ts:116`：「只能「可标注」不能「可测量」」）⇒ ⇒ **严格冷档需装 `EmptyStandbyList` / `RAMMap`** | ⚠️ **这是 P1-a 唯一的物理前置** |
+| **冷档的物理限制** | ★ `--cache-state=cold` **只是「声明」**（`bench/perf.ts:116`：「只能「可标注」不能「可测量」」）⇒ ⇒ **严格冷档需装 `EmptyStandbyList` / `RAMMap`**<br>★ ★★ **2026-11-05 追加核实（★ 比上面那条更关键）**：★ **装工具只是【必要条件】、不是【充分条件】** —— ★ bench 的采集形态是 **20 轮预热 + 200 样本**（`bench/perf.ts:254` `WARMUP_ROUNDS = 20`）⇒ ⇒ **它自己就会把热桶焐热** ⇒ ⇒ **⇒ 装了工具【也】产不出严格冷档**（★ `docs/baseline/README.md:1158` 原文同款：「「冷」只可能描述前几十次调用」）⇒ ⇒ ★ **真门槛 = 改采集方法**（★ 清缓存后只跑 1~2 次即计时 ⇒ ⇒ **那是单点读数、不是分布** ⇒ ⇒ 与 bench 现有输出**不同形** ⇒ ⇒ 又一轮工程 + 一次重采） | ⚠️ **这是 P1-a 唯一的物理前置** · ★ **且严格冷档【不改变任何判红绿的结论】**（★ H1′ 与介质/页缓存无关 · ★ ③ 已红且冷档更红 · ★ 毫秒四条已裁为参考线）⇒ ⇒ ★ **其价值 = 只补「毫秒参考线」分档表的一个缺档** ⇒ ⇒ ★ **完整处置与判读见 `docs/handover/T07-cold-tier-and-disk-health-runbook.md`** |
 | **既有基线的档位** | `perf-1000000-vector-wired-nvme-**warm**` ⇒ **热档**；冷档基线**不存在** | ⇒ ⇒ **冷档要新建** |
 
 ### ★ P1-a 的**耗时来源**（侦察结论 ⇒ ⇒ 排期时要知道）
