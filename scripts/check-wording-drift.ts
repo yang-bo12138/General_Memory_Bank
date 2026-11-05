@@ -1050,6 +1050,45 @@ function runSelfTest(): number {
       }
     }
 
+    /* ── 类 B 阈值【真实样本校准】（★ 「阈值是拍的」⇒ ⇒ 用仓库里真实存在的释义形态校准）── */
+    {
+      const work = join(tmpRoot, 'case-classb-calibration');
+      cpSync(pristine, work, { recursive: true });
+      // ★ 两条都用**仓库里真实存在的释义形态**（「旧措辞」的真实含义是「【至多】2 行」），
+      // ★ 只改**间隔字数** ⇒ ⇒ 40 ⇒ 豁免 / 41 ⇒ 判红 ⇒ ⇒ **阈值从「拍的」变成「校准过的」**。
+      const buildLine = (gap: number): string => {
+        const hit = `实测精确分${OLD_WORDING_HEAD}${OLD_WORDING_TAIL}`;
+        const filler = '·'.repeat(gap);
+        return `- ★ 校准夹具（间隔 ${gap} 字）：${hit}${filler}${FEATURE_PHRASE}「【至多】2 行」`;
+      };
+      const path = join(work, ADR_FILE);
+      const inserted = appendLine(path, buildLine(40)) && appendLine(path, buildLine(41));
+      if (!inserted) {
+        failures += 1;
+        process.stdout.write('✗ 类 B 阈值校准 ⇒ **夹具没生效**（没能插进副本）⇒ 夹具无效\n');
+      } else {
+        const report = scanTree(work, DEFAULT_MAX_ALLOWED);
+        const violated = report.violations.find(
+          (item) => item.snippet === `${OLD_WORDING_HEAD}${OLD_WORDING_TAIL}`,
+        );
+        const exempted = report.allowed.find((item) => item.allowance?.kind === 'feature-phrase');
+        const distance =
+          exempted?.allowance?.kind === 'feature-phrase' ? exempted.allowance.distance : -1;
+        if (violated !== undefined && exempted !== undefined && distance === 40) {
+          process.stdout.write(
+            '✅ 类 B 阈值校准：间隔 40 字 ⇒ 豁免（★ **报告出来的距离 = 40**）· 间隔 41 字 ⇒ 判红' +
+              '（★ 阈值有真实样本校准，不再是拍的）\n',
+          );
+        } else {
+          failures += 1;
+          process.stdout.write(
+            `✗ 类 B 阈值校准 ⇒ 违例 ${violated === undefined ? '缺' : '在'} / 豁免 ${exempted === undefined ? '缺' : '在'}` +
+              ` / 报告距离 = ${distance}（期望 40）⇒ ⇒ 阈值边界没被钉住 ⇒ 必须修\n`,
+          );
+        }
+      }
+    }
+
     /* ── 形态判定自测（★ 新导出 `classifySnippet` 的契约证明）── */
     {
       const wording = `${OLD_WORDING_HEAD}${OLD_WORDING_TAIL}`;
