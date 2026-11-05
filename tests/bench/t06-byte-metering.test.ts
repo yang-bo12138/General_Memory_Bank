@@ -375,6 +375,51 @@ function lyingStaleReadPathPhraseLines(source: string): readonly number[] {
 }
 
 /**
+ * ★★★ **方向守卫**：note 必须把 ADR §8.6 那个 `4.44 MB` 说成
+ *   **【偏高的估计】、不是【下界】**。
+ *
+ * ⚠️ ★★★ **为什么必须钉【方向】**（本仓库的老坑：恒绿守卫）：
+ *   老措辞是「`4.44 MB` 也是【下界】⇒ ⇒ **实测大于它是预期、不是回归**」；
+ *   而 **2026-11-05 百万级实测 `bytesRead.max` = 4,065,792 B 〔低于〕它 8~13%**
+ *   ⇒ ⇒ 若它真是【下界】⇒ ⇒ 「实测低于它」就该算回归 ⇒ ⇒ 老措辞把方向说反了
+ *   ⇒ ⇒ 工程师已改成「**【偏高的估计】、不是【下界】**」（写路径 = 实测低于它属预期）。
+ *   ⇒ ⇒ 而 `toContain('4.44 MB')` 在**方向翻转之后照样是绿的** ⇒ ⇒ 恒绿 ⇒ 必须钉方向。
+ *
+ * ⚠️ ★ **为什么是「纯函数 + 可单独喂数据」**：
+ *   ⇒ ⇒ 负控可以直接喂「旧措辞」⇒ ⇒ **不必碰 `bench/perf.ts`**（零并发风险）
+ *   ⇒ ⇒ 且守卫本身**可被证明不是恒绿**（负控台有真实红输出）。
+ *
+ * @param note 被检查的落盘 note 文本
+ */
+function expectNoteStates4_44MbAsHighBias(note: string): void {
+  expect(note).toContain('4.44 MB');
+  expect(note).toContain('偏高的估计');
+  expect(note).not.toContain('4.44 MB 也是【下界】');
+  // ⚠️ ★ **加固**：抹掉反引号后再查一次 ⇒ ⇒ 挡住「给 `4.44 MB` 加个反引号就绕过」的写法
+  //   （★ 老措辞**没有**反引号、新措辞**有** ⇒ ⇒ 只查原文的话 ⇒ 加个反引号即可蒙混过关）。
+  expect(note.replaceAll('`', '')).not.toContain('4.44 MB 也是【下界】');
+}
+
+/**
+ * ★ **把方向守卫的「拒绝理由」取出来**（**负控台专用**）。
+ *
+ * ⚠️ ★ **为什么不让守卫直接抛**（而是把消息取出来）：
+ *   负控要证明的是「**旧措辞必须被拒**」⇒ ⇒ 还想知道它**被哪一条**拒的
+ *   ⇒ ⇒ **消息文本本身就是「拒绝理由」**。
+ *
+ * @param note 被喂进去的 note 文本
+ * @returns 守卫抛出的错误消息（**守卫没抛 ⇒ 本函数自己抛 ⇒ 恒绿守卫当场露馅**）
+ */
+function rejectionMessageOfDirectionGuard(note: string): string {
+  try {
+    expectNoteStates4_44MbAsHighBias(note);
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+  throw new Error('★★ 方向守卫竟然【没有】拒掉这段 note ⇒ ⇒ 守卫恒绿 ⇒ 必须修');
+}
+
+/**
  * 录下**这段时间里实际 `prepare` 过的 SQL 文本**。
  *
  * ⚠️ ★ **为什么录「真实跑过的那条」而不是抄一份 SQL 文本进断言**：
@@ -1372,21 +1417,34 @@ describe('T06 · E：口径断言与落盘结构', () => {
     const result = measurePerf(db.db, store, options, 5, 5);
     const note = result.writeSegments.vectorByteReads.note;
     // ① 只计向量载荷。
-    expect(note).toContain('向量载荷');
+    // ⚠️ ★ **必须钉住【带限定词的完整短语】而不是裸的「向量载荷」** ⇒ ⇒
+    //   note 里 ④ 还有一句「⇒ ⇒ **H1′ 不是「一次真实写入的总字节预算」**（它只是**向量载荷**这一项）」
+    //   ⇒ ⇒ 裸的 `toContain('向量载荷')` 会被那句**否定句**满足 ⇒ ⇒ 恒绿。
+    expect(note).toContain('向量载荷字节');
     // ② 是真实搬运量的**下界** ⇒ 判据偏严、不会假绿。
-    expect(note).toContain('下界');
-    // ③ ADR §8.6 那个 4.44 MB 也是**下界**（实测大于它不是回归）。
-    expect(note).toContain('4.44 MB');
-    expect(note).toContain('下界');
+    // ⚠️ ★ **必须钉住【这一整句】而不是裸的「下界」二字** ⇒ ⇒ 否则 ③ 里那句
+    //   「不是【下界】」就能白喂它 ⇒ ⇒ 裸 `toContain('下界')` 变成恒绿守卫。
+    expect(note).toContain('真实搬运量的【下界】');
+    // ③ ADR §8.6 那个 `4.44 MB` 是【偏高的估计】、不是【下界】
+    //    （★ 2026-11-05 百万级实测 4,065,792 B 低于它 8~13% ⇒ 实测低于它属预期、不是回归）。
+    // ★ 【方向纪律】：必须断言【它是「偏高的估计」】⇒ ⇒
+    //   若有人把 note 改回「下界 ⇒ 实测大于它属预期」⇒ ⇒ 本断言立刻红。
+    expectNoteStates4_44MbAsHighBias(note);
     // ④ H1′ 判的是**哪一笔**（写入扫描独立实测段 · 不是 `store.write()` 内部那一笔）。
-    expect(note).toContain('H1′');
-    expect(note).toContain('collectVectorCandidates');
+    // ⚠️ ★ 同理：note 里有一句「⇒ ⇒ **H1′ 不是「一次真实写入的总字节预算」**」⇒ ⇒
+    //   裸的 `toContain('H1′')` 会被那句**否定句**满足 ⇒ ⇒ 必须钉住 ③ 的那句问句。
+    expect(note).toContain('H1′ 判的是哪一笔');
+    // ⚠️ ★ 同理：`collectVectorCandidates` 在 note 里出现两次 ⇒ ⇒ 另一处是
+    //   「⇒ 那一笔**不单独落盘**（已被 `writeTotal` 的计时覆盖）」⇒ ⇒ 钉住 ③ 的那句。
+    expect(note).toContain('`collectVectorCandidates()` 那一笔');
     // ⑤ 剪枝率分子与 `exactReads` 的**等价性前提**（只在两段式分支成立）。
     expect(note).toContain('exactReads');
     expect(note).toContain('两段式');
-    // ⑥ 计时口径（写路径 = 两轮制 ⇒ 计量在计时窗口之外 ⇒ 与历史基线逐位可比）。
+    // ⑥ 计时口径（写路径 = 两轮制 ⇒ 计量与计时**分处两轮** ⇒ 与历史基线逐位可比）。
     expect(note).toContain('两轮');
-    expect(note).toContain('计时窗口');
+    // ⚠️ ★ 同理：「计时窗口」在 note 里出现两次 ⇒ ⇒ 另一处是 ⑥ 的
+    //   「**读路径的字节累加与行读计数同处一个计时窗口**」⇒ ⇒ 钉住 ⑤ 的那句。
+    expect(note).toContain('同一个计时窗口');
     // ⚠️ ★ **旧行数判据已降级**（note 里必须写明它不再是判据）。
     expect(note).toContain('降级');
     db.db.close();
@@ -1406,7 +1464,88 @@ describe('T06 · E：口径断言与落盘结构', () => {
     expect(note).toContain('< 1%');
     // ⚠️ ★ **读路径不判门槛**（判据量在写路径那侧）。
     expect(note).toContain('不判门槛');
+    // ★ 【方向纪律】读路径 note 里也有一句**同款**的 4.44 MB 方向句
+    //   ⇒ ⇒ 同样必须钉住方向（写路径那句被钉住 ⇒ 不代表读路径那句也被钉住）。
+    expectNoteStates4_44MbAsHighBias(note);
     db.db.close();
+  });
+
+  it('★ 负控：方向守卫必须【拒掉】旧措辞（纯函数喂数据 ⇒ 不碰 `bench/perf.ts`）', () => {
+    // ⚠️ ★★ **为什么这条是「负控」而不是「又一条断言」**：
+    //   上面两条守卫是**用真 note 喂**的 ⇒ ⇒ 它们有可能因为「真 note 里恰好也有那句话」而恒绿
+    //   ⇒ ⇒ 这里**故意喂旧措辞** ⇒ ⇒ 守卫【必须拒】⇒ ⇒ 证明它有牙。
+    //
+    // ⚠️ ★ **旧措辞逐字取自 2026-11-05 之前的 `bench/perf.ts`**（方向说反的那一句）：
+    //   '② ⚠️ ★ **ADR §8.6 那个 4.44 MB 也是【下界】**（它是按「码 768 B/行 + 精确分 3 KB/行」估的）'
+
+    // ① 旧措辞**原样**（它把 4.44 MB 说成了【下界】、没说「偏高的估计」）。
+    const oldWordingNote = [
+      '① ★ **口径**：`bytesRead` = **向量载荷字节** ⇒ ⇒ **是真实搬运量的【下界】**；',
+      '② ⚠️ ★ **ADR §8.6 那个 4.44 MB 也是【下界】**（它是按「码 768 B/行 + 精确分 3 KB/行」估的）',
+      '⇒ ⇒ **实测大于它是预期、不是回归**（口径更严）；',
+    ].join('');
+    // ⚠️ ★ **前置**：这段旧措辞确实含被禁的那半句 ⇒ ⇒ 否则下面的负控是空转。
+    expect(oldWordingNote).toContain('4.44 MB 也是【下界】');
+    // ⚠️ ★ **它必须被拒**（拒它的理由：它没说「偏高的估计」）。
+    expect(rejectionMessageOfDirectionGuard(oldWordingNote)).toContain('偏高的估计');
+
+    // ② ★ **自相矛盾**（两种方向都写了）⇒ ⇒ 这一条专门证明**第三条断言有牙**
+    //   （`not.toContain('4.44 MB 也是【下界】')` ⇒ ⇒ 拒它的正是那一条）。
+    const contradictoryNote =
+      '② 那个 4.44 MB 是【偏高的估计】、不是【下界】；④ 但 4.44 MB 也是【下界】；';
+    expect(rejectionMessageOfDirectionGuard(contradictoryNote)).toContain(
+      "not to contain '4.44 MB 也是【下界】'",
+    );
+
+    // ③ ★ **加反引号绕过**（老措辞**没有**反引号、新措辞**有** ⇒ ⇒ 只查原文的话加个反引号就能蒙混过关）
+    //   ⇒ ⇒ 必须由【抹掉反引号后再查】那条兜住。
+    const backtickedNote = '② 那个 `4.44 MB` 是【偏高的估计】；④ 旧账本里 `4.44 MB` 也是【下界】；';
+    // ⚠️ ★ **前置**：原文里【查不到】那半句（⇒ ⇒ 裸的那条会漏）⇒ ⇒ 反引号确实能绕过它。
+    expect(backtickedNote).not.toContain('4.44 MB 也是【下界】');
+    expect(rejectionMessageOfDirectionGuard(backtickedNote)).toContain(
+      "not to contain '4.44 MB 也是【下界】'",
+    );
+  });
+
+  it('★ 负控：读路径的旧措辞样本必须【逐字取自读路径的真 note】⇒ ⇒ 且必须被方向守卫拒掉', () => {
+    // ⚠️ ★★ **为什么读路径必须【另配一份】样本**（不能拿写路径那份顶）：
+    //   写路径旧措辞的 ② 是「…（它是按「码 768 B/行 + 精确分 3 KB/行」估的）⇒ ⇒ 实测大于它是预期…」；
+    //   读路径旧措辞的 ② 是「… ⇒ ⇒ **实测大于它是预期、不是回归**（口径更严）；」
+    //   ⇒ ⇒ 两者**不是同一句** ⇒ ⇒ 拿写路径的样本喂读路径的守卫 ⇒ ⇒ **那是凑数、不是负控**。
+    //
+    // ⚠️ ★ **本样本逐字取自 `git show HEAD:bench/perf.ts` 的【读路径】note**（2026-11-05 之前那版）。
+    const oldReadPathWording = [
+      '① ★ **口径**：`bytesRead` = **向量载荷字节**（码 BLOB + embedding BLOB 的**实测** `byteLength` 之和；',
+      '**恒等式** `bytesRead = codeBytes + embeddingBytes`，零容差）；**不含**正文 / 标量 / 成员标识 / SQLite 行头与页开销 ',
+      '⇒ ⇒ **是真实搬运量的【下界】⇒ 判据偏严、不会假绿**（口径 §1.3 裁决 A）；',
+      '② ⚠️ ★ **ADR §8.6 那个 4.44 MB 也是【下界】** ⇒ ⇒ **实测大于它是预期、不是回归**（口径更严）；',
+      '③ ★ **读路径**：无 Q4（survivors 的 `embedding` 只读一次）⇒ 字节构成 = 码字节 + `scoreOf` 的向量字节；',
+    ].join('');
+
+    // ⚠️ ★ **前置 1**：这份样本确实含被禁的那半句 ⇒ ⇒ 否则下面的负控是空转。
+    expect(oldReadPathWording).toContain('4.44 MB 也是【下界】');
+    // ⚠️ ★ **前置 2**：它**必须带读路径独有的那句**（③）⇒ ⇒ 而**不带**写路径独有的那句
+    //   （★ 「码 768 B/行 + 精确分 3 KB/行」是写路径 ② 的括号）⇒ ⇒ **证明它不是写路径样本顶包的**。
+    expect(oldReadPathWording).toContain('无 Q4（survivors 的 `embedding` 只读一次）');
+    expect(oldReadPathWording).not.toContain('码 768 B/行 + 精确分 3 KB/行');
+    // ⚠️ ★ **它必须被方向守卫拒掉**（拒它的理由：它没说「偏高的估计」）。
+    expect(rejectionMessageOfDirectionGuard(oldReadPathWording)).toContain('偏高的估计');
+
+    // ⚠️ ★★ **读路径形状的「矛盾版」**（两个方向同时写）⇒ ⇒ 专门证明**第三条断言**
+    //   （`not.toContain('4.44 MB 也是【下界】')`）在**读路径形状**上也有牙
+    //   ⇒ ⇒ （只靠第 2 行的话，一个既写「偏高的估计」又写「4.44 MB 也是【下界】」的 note 会蒙混过关）。
+    const contradictoryReadPathWording = [
+      '① ★ **口径**：`bytesRead` = **向量载荷字节** ⇒ ⇒ **是真实搬运量的【下界】**；',
+      '② ⚠️ ★ **ADR §8.6 那个 `4.44 MB` 是【偏高的估计】、不是【下界】**',
+      '（它按「每轮 64 次精确重排 × 3,072 B」估 ⇒ 而**读路径**把命中候选的 embedding 也读了一遍）；',
+      '④ 但旧账本里 4.44 MB 也是【下界】；',
+      '⑤ ★ **读路径**：无 Q4（survivors 的 `embedding` 只读一次）⇒ 字节构成 = 码字节 + `scoreOf` 的向量字节；',
+    ].join('');
+    // ⚠️ ★ **前置 3**：它确实是**读路径形状**（带读路径独有的那句解释）⇒ ⇒ 不是拿写路径样本顶包的。
+    expect(contradictoryReadPathWording).toContain('而**读路径**把命中候选的 embedding 也读了一遍');
+    expect(rejectionMessageOfDirectionGuard(contradictoryReadPathWording)).toContain(
+      "not to contain '4.44 MB 也是【下界】'",
+    );
   });
 
   it('★ 剪枝率 = `embeddingCalls ÷ candidateUniverse`（判定取 max）且阈值常量在', () => {

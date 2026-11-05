@@ -73,7 +73,7 @@
   3. **`breakdown` 含 `contentBytes`**（Q4 正文）⇒ 「下界差多少」可见；且含 `codeBytes` / `embeddingBytes` / `embeddingRowsRead` / **`embeddingExactRows`（★ **第 13 项**（= 使清单达到 **13** 项的那一项；⚠️ **在 ① §4 的 JSON 清单里排在第 5 位** ⇒ ⇒ 按【位置】读会读错）· `scoreOf` 返回了行的次数）** / `embeddingCalls` / `narrowRowsRead` / `bucketMemberRows` / `badCodeRows` / `unclassifiedRows` / `unclassifiedSqlKinds` / `pruneRate` / `samplesAligned`；
   4. **旧键一个都没改名 / 挪位 / 删除**；
   5. **stdout 四读数并列打印**（旧行数**只许**说「观测值 = … 行」）；
-  6. **口径 note 落盘**（含：只计向量载荷 / 是真实搬运量的**下界** / ADR §8.6 的 4.44 MB 是**下界** / H1′ 判的是哪一笔 / 剪枝率分子与 `exactReads` 的等价性前提）。
+  6. **口径 note 落盘**（含：只计向量载荷 / 是真实搬运量的**下界** / ADR §8.6 的 4.44 MB 是**偏高的估计** / H1′ 判的是哪一笔 / 剪枝率分子与 `exactReads` 的等价性前提）。
   7. ★ **落盘 `note` 的【逐字副本】在 `docs/design/perf-c2-t06-byte-metering-impl-notes.md` §13**（两段 `note`）⇒ ⇒ 由 `.tmp/bench/check-json-note-fidelity.ts` **逐字**守着（⚠️ **该脚本只在 `.tmp/` 里（gitignored ⇒ 仓库里没有）** ⇒ ⚠️ **`bench/perf.ts` 把「机器凭据」写成 `handover/bench/…`（已提交 · 但那个路径不存在）** ⇒ ⇒ **提交态这道守卫是断的** ⇒ ⇒ ⇒ **待搬进 `scripts/` 并挂进 `verify` 链** ⇒ 当前报 true / true）⇒ ⇒ ⚠️ **① §4 那段 JSON 是【结构示意】、不是逐字副本**（带 `{ /* … */ }` 占位符、条目被压缩）⇒ ⇒ ⚠️★ **不许拿 ① §4 去替换 `bench/perf.ts` 的真实 `note` 字符串**（⇒ 会丢掉真实 note 的多项 ⇒ **净损失**；⇒ 且 impl-notes §13 的逐字副本会立刻失配 ⇒ ⇒ **自检脚本立刻报 false**）⇒ ⇒ ★ **改 `note` 字符串 = 改【落盘产物】⇒ 必须同批改 impl-notes §13** ⇒ ⇒ ⚠️ **这条机制已获实战验证**：曾一度报 false（读路径那段在中间失配）⇒ ⇒ **同批更新 impl-notes §13 的读路径 `note` 后即回绿**（⇒ 当前 true / true）⇒ ⇒ ★ **以后任何人改 `note` 字符串，都必须同批改 impl-notes §13**。
 
 ### T06-4 · H1′ / H2′ / 剪枝率 判据改造
