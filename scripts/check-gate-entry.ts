@@ -28,11 +28,12 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 /**
- * ★ **写死的期望值**：门禁必须串起的 **14 条子命令**（C31 的分母）。
+ * ★ **写死的期望值**：门禁必须串起的 **16 条子命令**（C31 的分母）。
  *
- * ⚠️ 这 14 条是「阶段 0 的全部验收门禁 + F-08 ③ 的静态守卫 + P2 的两个新门禁
- *   + **阶段 3 收官的 3 条文档审计**（`audit:*` ⇒ 2026-11-02 接门禁）」：
- *   类型检查 → 代码风格 → 单元测试 → 8 条契约脚本 → 3 条文档审计。
+ * ⚠️ 这 16 条是「阶段 0 的全部验收门禁 + F-08 ③ 的静态守卫 + P2 的两个新门禁
+ *   + **阶段 3 收官的 3 条文档审计**（`audit:*` ⇒ 2026-11-02 接门禁）
+ *   + **T07 阶段 3 接门禁的 2 条**（2026-11-05 ⇒ ★ **用户授权改 CI 行为**）：
+ *   类型检查 → 代码风格 → 单元测试 → 9 条契约脚本 → 3 条文档审计 → 2 条 T07 守卫。
  *   改这个数组等于改「门禁是什么」，必须是一次**显式**的改动。
  *
  * ⚠️ **3 条 `audit:*` 为什么也算门禁**（它们判的不是代码，是**文档里的数**）：
@@ -43,6 +44,26 @@ import { fileURLToPath } from 'node:url';
  *     而这正是本仓库反复踩过的坑（`stage3-progress.md` §十三.9）⇒ ⇒ **所以它们必须挡在门口**。
  *   ⚠️ **代价**：门禁从 11 段变成 14 段，`README.md` / `scripts/README.md` 里写死的段数
  *     必须同步 ⇒ ⇒ 那些数字**也是分母**（改了链不改字 ⇒ 文档与门禁不一致）。
+ *
+ * ⚠️ ★★ **2026-11-05 · T07 阶段 3：14 → 16 段（★ 用户授权改 CI 行为）**：
+ *   · **进链 2 条**：`check:benchmark-numbers`（★ **同一批实测数跨 5 个载体逐位相等**
+ *     + ★ **出关条件的状态两侧一致** ⇒ ⇒ **此前它在 CI 上是结构性零覆盖**
+ *     ⇒ ⇒ `ci.yml` 只跑 `verify`、它又不在 `verify` 链里、`tests/**` 也没 import 它
+ *     ⇒ ⇒ **没有任何机器会跑它** ⇒ ⇒ 「同一批数各说各话」只能靠人记得手跑）
+ *     + `check:mermaid-copies`（★ 仓库**原本没有任何 mermaid 校验** ⇒ 图写坏了 `verify` 照样绿
+ *     ⇒ ⇒ 它是唯一防线）；
+ *   · **保持链外 5 条**（★ 逐条有理由 ⇒ **不是「不重要」，是「时机未到」**）：
+ *     `check:wording-drift`（★ 豁免上限 8 = 基线 6 + 余量 2 ⇒ **再正常演化 2 处就误报**
+ *       ⇒ 进链 = 给 CI 埋雷 ⇒ ⇒ **等余量 ≥6 再进**）·
+ *     `check:json-note`（★ 判据是逐字节相等 ⇒ 误报 = 真的没同批改 ⇒ ★ **本轮暂不进**
+ *       ⇒ 理由：它与 `check:benchmark-numbers` 有**单向依赖**（后者 import 前者的判定入口
+ *       ⇒ ⇒ **同时进链会让「改一个波及两个」的风险面变大** ⇒ ⇒ 建议下一轮单独裁决）·
+ *     `check:credential-hygiene`（★ 误报面高：330 条凭据 / 4 条豁免规则 / 边界密）·
+ *     `check:line-endings`（★ **语义与 CI 相反**：它防 Windows 开发机 ⇒ CI 是 ubuntu ⇒ 恒绿
+ *       ⇒ 进链 = 零收益 + 一个恒绿段）·
+ *     `check:backlog-ledger`（★ 读 backlog ⇒ 台账改版就误报）；
+ *   · ★ **F16（「门禁是写死的 14 段链，不许新增段」）已被本轮打破**（★ 此前阶段 3 就打破过一次：
+ *     11 → 14 段 ⇒ ⇒ **F16 早已不是现行约束** ⇒ ⇒ 已订正 `docs/design/p5-vector-path-design.md`）。
  *
  * ⚠️ **加一条门禁就必须同步改这个数组**（否则 `check:contract-ids` 内联调用本模块时
  *   会以「多出 / 缺少」的形式把门禁链卡红）⇒ 这是 C31「分母写死」的必然代价，
@@ -60,9 +81,11 @@ export const EXPECTED_GATE_COMMANDS: readonly string[] = [
   'check:contract-ids',
   'check:doc-counts',
   'check:clamp',
+  'check:benchmark-numbers',
   'audit:tier-qualifiers',
   'audit:two-layer',
   'audit:negative-control',
+  'check:mermaid-copies',
 ];
 
 /**

@@ -601,34 +601,90 @@ function readLines(path: string): { readonly lineNo: number; readonly text: stri
 }
 
 /**
- * ★ 提取一行里【「出关条件」标记之后】的**第一个状态 emoji**。
+ * ★★ **状态 emoji 所在的那个「格」在哪（★ 2026-11-05 修的两条真盲区）**：
+ *   ★ 两类载体的**状态格位置不同** ⇒ ⇒ **必须按【格】定位、不能按【整行】扫**：
+ *   · **状态表行**（`> | ④ | 条件 | ✅ **… | 依据 |`）⇒ **状态在第 3 格**（`[3]`）
+ *     ⇒ ⇒ **按列切出来**（见 `statusTableCell`）⇒ ⇒ ★ **整行扫会漏**（下面两条实证）；
+ *   · **R 行**（`| **R7** | 风险 | 出关条件④：… ✅ … |`）⇒ **状态在标记之后**。
  *
- * ★ **为什么要限定「之后」**：★ R7 那一行里有 5 个 `✅`（★ 后 4 个在字节账验算的上下文里）⇒ ⇒
- * ★ ⇒ 全行扫会取到错的 ⇒ ⇒ **位置本身是判据的一部分**。
+ * ⚠️ ★★★ **两条真盲区（★ 都是实测发现的 · 都是「防假绿」的那条维度）**：
+ *   ① **整行扫状态 ⇒ 状态表那一格漂移看不见**：
+ *      ★ 原实现对状态表侧也用「整行 + 取第一个 emoji」⇒ ⇒ **那一行的说明文字里带着别的 ✅**
+ *      ⇒ ⇒ 取到的不是状态格里的那个 ⇒ ⇒ **实测：把状态表④ 的 ✅ 改成 ⏳
+ *      ⇒ ⇒ 守卫仍报「状态维度 8 侧一致」✅** ⇒ ⇒ **漏它 = 假绿**；
+ *   ② **整行扫引用 ⇒ 「依据」列改了也抓不住**：
+ *      ★ 原实现对**整行**做 `includes('R7 行')` ⇒ ⇒ 而**同一行别处**（★ 阶段 1 补的限定说明）
+ *      ⇒ ⇒ 也提到「R7 行」⇒ ⇒ **把依据列改成 R9 行后仍为 true** ⇒ ⇒ **引用链检查完全失效**
+ *      ⇒ ⇒ ★ **⇒ 状态格取 `[3]`、依据列取 `[4]` ⇒ ⇒ 两处都按【格】定位**。
  *
- * @returns 状态 emoji；★ 找不到 ⇒ `undefined`
+ * ⚠️ ★ **为什么 F16 已被打破（本轮 14 → 16 段）**：★ 见 `docs/design/p5-vector-path-design.md`
+ *   的 F16 行（★ 已订正）⇒ ⇒ 「不许新增段」早已不是现行约束。
  */
-function extractStateEmoji(line: string): (typeof STATUS_EMOJI)[number] | undefined {
-  const marker = line.indexOf('出关条件');
-  const scope = marker >= 0 ? line.slice(marker) : line;
-  for (const emoji of STATUS_EMOJI) {
-    const at = scope.indexOf(emoji);
-    if (at >= 0) {
-      // ★ 「第一个」= 在 scope 里位置最靠前的那一个（★ 三种 emoji 混在一起时也要取最靠前的）
-      const first = Math.min(
-        ...STATUS_EMOJI.map((candidate) => {
-          const found = scope.indexOf(candidate);
-          return found >= 0 ? found : Number.POSITIVE_INFINITY;
-        }),
-      );
-      return scope[first] as (typeof STATUS_EMOJI)[number];
-    }
-  }
-  return undefined;
+type ScopeSide = 'after-marker';
+
+/**
+ * ★★ **取「状态表行」的一格（★ 按【列】定位 · 不按【整行】定位）**。
+ *
+ * ⚠️ ★★★ **为什么必须按列（★ 一条真盲区的实证 · 2026-11-05）**：
+ *   状态表行的形状是 `> | ④ | 条件 | 状态 | 依据 |` ⇒ ⇒ **按 `|` 切分后**：
+ *   · `[1]` = 条件编号　· `[2]` = 条件文字　· `[3]` = **状态格**　· `[4]` = **依据列**
+ *   ⇒ ⇒ ★ 而原实现对**整行**做 `includes(...)` ⇒ ⇒ **同一行里别处提到同一个 R 行也会算数**
+ *   ⇒ ⇒ ★ **实测盲区**：状态表④ 的**说明文字里**也写了「R7 行」（★ 阶段 1 补的限定说明）
+ *   ⇒ ⇒ ⇒ 于是把「依据」列的 `R7 行` 改成 `R9 行` 后 ⇒ **`includes('R7 行')` 仍为 true**
+ *   ⇒ ⇒ ⇒ **引用链检查【完全失效】**（★ 而它的负控当场抓到了这一点 ⇒ 负控有效 ✅）
+ *   ⇒ ⇒ ⇒ ★ **⇒ 所以：状态格取 `[3]`、依据列取 `[4]` ⇒ ⇒ 「依据列不再引用那个 R 行」必被抓住**。
+ *
+ * @param line 整行
+ * @param index 列号（★ 3 = 状态格 · 4 = 依据列）
+ * @returns 该格的文本（★ 越界 ⇒ 空串）
+ */
+function statusTableCell(line: string, index: number): string {
+  const cells = line.split('|');
+  return (cells[index] ?? '').trim();
 }
 
 /**
- * ★ 提取一行里【「出关条件」标记之后】的**全部状态 emoji**（★ **集合** · 不只是第一个）。
+ * ★ 取出一行里属于某个 scope 的文本。
+ *
+ * @param line 整行
+ * @param side scope 取哪一侧（★ 状态表 = 标记之前 · R 行 = 标记之后）
+ * @returns scope 文本
+ */
+function scopeOf(line: string, side: ScopeSide): string {
+  const marker = line.indexOf('出关条件');
+  if (marker < 0) {
+    return line;
+  }
+  return side === 'after-marker' ? line.slice(marker) : line.slice(0, marker);
+}
+
+/**
+ * ★ 提取一行里某个 scope 内的**第一个状态 emoji**。
+ *
+ * ★ **为什么要限定 scope**：★ R7 那一行里有 5 个 `✅`（★ 后 4 个在字节账验算的上下文里）⇒ ⇒
+ * ★ ⇒ 全行扫会取到错的 ⇒ ⇒ **位置本身是判据的一部分**。
+ *
+ * @param line 整行
+ * @param side scope 取哪一侧（★ 状态表 = 标记之前 · R 行 = 标记之后）
+ * @returns 状态 emoji；★ 找不到 ⇒ `undefined`
+ */
+function extractStateEmoji(
+  line: string,
+  side: ScopeSide = 'after-marker',
+): (typeof STATUS_EMOJI)[number] | undefined {
+  const scope = scopeOf(line, side);
+  // ★ 「第一个」= 在 scope 里位置最靠前的那一个（★ 三种 emoji 混在一起时也要取最靠前的）
+  const first = Math.min(
+    ...STATUS_EMOJI.map((candidate) => {
+      const found = scope.indexOf(candidate);
+      return found >= 0 ? found : Number.POSITIVE_INFINITY;
+    }),
+  );
+  return Number.isFinite(first) ? (scope[first] as (typeof STATUS_EMOJI)[number]) : undefined;
+}
+
+/**
+ * ★ 提取一行里某个 scope 内的**全部状态 emoji**（★ **集合** · 不只是第一个）。
  *
  * ★★ **为什么要集合**：★ `extractStateEmoji` 只取**最靠前的**那一个 ⇒ ⇒
  *   ⇒ **同一行里出现第二种状态 emoji 时，那一个漂移【看不见】**
@@ -637,11 +693,15 @@ function extractStateEmoji(line: string): (typeof STATUS_EMOJI)[number] | undefi
  *   ⇒ ⇒ ⇒ ★ 而这里**没有第二层兜底**（★ emoji 漂移与「旧措辞」那条守卫无关）
  *   ⇒ ⇒ ⇒ ★ ⇒ 所以这一处**必须**按集合判。
  *
+ * @param line 整行
+ * @param side scope 取哪一侧（★ 状态表 = 标记之前 · R 行 = 标记之后）
  * @returns 出现过的**全部不同**状态 emoji（★ 顺序 = `STATUS_EMOJI` 的顺序）
  */
-function extractStateEmojis(line: string): (typeof STATUS_EMOJI)[number][] {
-  const marker = line.indexOf('出关条件');
-  const scope = marker >= 0 ? line.slice(marker) : line;
+function extractStateEmojis(
+  line: string,
+  side: ScopeSide = 'after-marker',
+): (typeof STATUS_EMOJI)[number][] {
+  const scope = scopeOf(line, side);
   const found: (typeof STATUS_EMOJI)[number][] = [];
   for (const emoji of STATUS_EMOJI) {
     if (scope.includes(emoji) && !found.includes(emoji)) {
@@ -804,7 +864,17 @@ function checkStatus(root: string): StatusReport {
     if (tableHit === undefined) {
       continue; // 载体定位失败已经报过
     }
-    if (!tableHit.text.includes(spec.tableRef)) {
+    // ⚠️ ★★★ **只看「依据」列的【开头】那一句（★ 2026-11-05 修的真盲区）**
+    //   —— ★ **不再对整行 / 整格做 `includes`**
+    //   ⇒ ⇒ 否则**同一格后半段的说明文字里**提到同一个 R 行也会算数
+    //   ⇒ ⇒ ★ **实测盲区**：状态表④ 的依据格里，除了开头的「R7 行 ·」，**后面还写着**
+    //   ⇒ ⇒ 「⇒ R7 行的完整结论是…」（★ 阶段 1 补的限定说明）
+    //   ⇒ ⇒ ⇒ 于是把**开头**的 `R7 行` 改成 `R9 行` 后 ⇒ **`includes('R7 行')` 仍为 true**
+    //   ⇒ ⇒ ⇒ **引用链检查【完全失效】**（★ 而它的负控当场抓到了这一点 ⇒ 负控有效 ✅）
+    //   ⇒ ⇒ ⇒ ★ **⇒ 所以：只看依据列的【第一句】（★ 「R7 行 ·」那个位置）**
+    const basisCell = statusTableCell(tableHit.text, 4);
+    const basisHead = basisCell.split('·')[0] ?? '';
+    if (!basisHead.includes(spec.tableRef)) {
       issues.push({
         category: CATEGORY_STATUS_REF,
         detail:
@@ -844,19 +914,26 @@ function checkStatus(root: string): StatusReport {
       // 载体定位失败已经报过 ⇒ 这里不重复报
       continue;
     }
-    const tableState = extractStateEmoji(tableHit.text);
-    const gateState = extractStateEmoji(gateHit.text);
+    // ★★★ ★ **scope 按载体类型分别取**（★ 2026-11-05 修的真盲区）：
+    //   · **状态表行** ⇒ 状态在**第 3 格**（`> | ④ | 条件 | 状态 | 依据 |` 的 `[3]`）
+    //   · **R 行**     ⇒ 状态格在标记**之后** ⇒ ⇒ `after-marker`
+    //   ★ 原来的实现对**两类都用「标记之后」+「整行 includes」** ⇒ ⇒ **状态表那一格漂移看不见**
+    //     （★ 实测漏过：把状态表④ 的 ✅ 改成 ⏳ ⇒ 守卫仍报「8 侧一致」✅）。
+    const tableState = extractStateEmoji(statusTableCell(tableHit.text, 3), 'after-marker');
+    const gateState = extractStateEmoji(gateHit.text, 'after-marker');
     const tableWhere = `${spec.tableCarrier}（${CARRIER_BY_ID.get(spec.tableCarrier)?.file ?? '?'}:${tableHit.lineNo}）`;
     const gateWhere = `${spec.gateCarrier}（${CARRIER_BY_ID.get(spec.gateCarrier)?.file ?? '?'}:${gateHit.lineNo}）`;
 
-    for (const [where, text, state] of [
-      [tableWhere, tableHit.text, tableState],
-      [gateWhere, gateHit.text, gateState],
+    for (const [where, text, state, side] of [
+      // ★ 状态表侧扫【状态格 `[3]`】⇒ ⇒ 「同一格里有两种状态」才判自相矛盾
+      //   （★ 扫整行会误报：④ 那一行的说明文字里就带着别的 ✅ ⇒ ⇒ ★ 必须按格扫）
+      [tableWhere, statusTableCell(tableHit.text, 3), tableState, 'after-marker'],
+      [gateWhere, gateHit.text, gateState, 'after-marker'],
     ] as const) {
       comparisons += 1;
       // ★★★ ★★★ **同一行里出现【多种】状态 emoji ⇒ ⇒ 那一行自相矛盾 ⇒ ⇒ 必须红**
       //   ★ 「取最靠前的那个」只看得见第一个 ⇒ ⇒ 第二个漂移不可见（★ 已实测过这个盲区）
-      const all = extractStateEmojis(text);
+      const all = extractStateEmojis(text, side);
       if (all.length > 1) {
         issues.push({
           category: CATEGORY_STATUS_MULTI,
@@ -871,7 +948,7 @@ function checkStatus(root: string): StatusReport {
           category: CATEGORY_STATUS_MISSING,
           detail:
             `${where} · 条件「${spec.label}」⇒ 该格**读不出状态 emoji**` +
-            '（★ 状态 = ✅ / ⏳ / ❌；★ 要从「出关条件」标记之后开始找）',
+            '（★ 状态 = ✅ / ⏳ / ❌；★ 状态表侧从「出关条件」标记**之前**找、R 行侧从**之后**找）',
         });
         continue;
       }
@@ -1209,8 +1286,10 @@ const NEGATIVE_CONTROLS: readonly Mutation[] = [
     expect: CATEGORY_STATUS_REF,
     dimension: 'status',
     file: 'docs/design/perf-c2-admissible-two-stage.md',
-    from: '| ✅ **以替代口径达成** | R7 行 ·',
-    to: '| ✅ **以替代口径达成** | R9 行 ·',
+    // ⚠️ ★ **2026-11-05 订正**：★ 阶段 1 给状态表④ 补了「（★ **带限定**）」⇒ ⇒ **本夹具的
+    //   `from` 曾因此失效**（⇒ 自测报「夹具没生效」）⇒ ⇒ ⇒ **夹具必须跟着正文走**（★ 纪律）。
+    from: '| ✅ **以替代口径达成**（★ **带限定**） | R7 行 ·',
+    to: '| ✅ **以替代口径达成**（★ **带限定**） | R9 行 ·',
   },
   {
     name: '负控 K · 把 R7 行里的条件编号改成另一个（★ 编号对不上）',
@@ -1235,6 +1314,20 @@ const NEGATIVE_CONTROLS: readonly Mutation[] = [
     file: 'docs/design/perf-c2-admissible-two-stage.md',
     from: '**3,348.48 B** **逐位相等** ✅；',
     to: '**3,348.48 B** **逐位相等** ❌；',
+  },
+  {
+    // ★★★ **负控 P · 2026-11-05 · 专钉「状态表侧的 scope」那条盲区** ★★★
+    //   ★ **背景**：原实现对**两类载体都用「出关条件标记之后」**作 scope
+    //   ⇒ ⇒ 而**状态表行的状态格在标记【之前】**（第 3 格 vs 标记在「依据」列）
+    //   ⇒ ⇒ **状态表那一格漂移时，守卫【看不见】**（★ 实测：把状态表④ 的 ✅ 改成 ⏳
+    //   ⇒ ⇒ 守卫仍报「状态维度 8 侧一致」✅ ⇒ ⇒ **而它正是「防假绿」的那条维度**）
+    //   ⇒ ⇒ 本负控**专门**盯「状态表那一格」漂移 ⇒ ⇒ 防止有人把 scope 改回统一取法。
+    name: '负控 P · 把状态表④的状态从 ✅ 改成 ⏳（★ 状态表侧漂移 ⇒ ⇒ 必须抓）',
+    expect: CATEGORY_STATUS_CONFLICT,
+    dimension: 'status',
+    file: 'docs/design/perf-c2-admissible-two-stage.md',
+    from: '| ④ | 报告 `bytesRead` 与 `survivors` 的 p50/p99/max | ✅ **以替代口径达成**',
+    to: '| ④ | 报告 `bytesRead` 与 `survivors` 的 p50/p99/max | ⏳ **以替代口径达成**',
   },
 ];
 

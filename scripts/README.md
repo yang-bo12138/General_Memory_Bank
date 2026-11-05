@@ -8,7 +8,7 @@
 
 | 命令                                   | 是什么                                              | 是不是门禁 |
 | -------------------------------------- | --------------------------------------------------- | ---------- |
-| **`pnpm run verify`**                  | **门禁本体**：14 条子命令串成一条链                 | ✅ 是       |
+| **`pnpm run verify`**                  | **门禁本体**：16 条子命令串成一条链                 | ✅ 是       |
 | `pnpm run ci`                          | **别名**，内容恰好等于 `pnpm run verify`            | ✅ 是       |
 | `pnpm ci` / `npm ci`（**不带 `run`**） | **包管理器的内建命令**（clean install）             | ❌ **不是** |
 
@@ -20,7 +20,7 @@
 > ⇒ **规范入口是 `pnpm run verify`**（`verify` 不是任何包管理器的内建命令名 ⇒ 不会被遮蔽）。
 > ⇒ 这条纪律由 `scripts/check-gate-entry.ts` **机器可检**（见下表第 6 行）：
 > 它断言 `scripts.ci` 的内容**恰好**是 `pnpm run verify`，
-> 且 `scripts.verify` 串起的 14 条子命令**逐名**齐全、每一段都写成 `pnpm run <名>`。
+> 且 `scripts.verify` 串起的 16 条子命令**逐名**齐全、每一段都写成 `pnpm run <名>`。
 > 有人把 `ci` 改回一串别的命令、或从 `verify` 上摘掉某条门禁 ⇒ 门禁当场失败。
 
 ## 门禁脚本
@@ -40,7 +40,7 @@
 它是 `check-contract-ids.ts` 的一部分（被内联调用），也可单独跑
 （`pnpm exec tsx scripts/check-gate-entry.ts`）。
 
-全部串在 **`pnpm run verify`** 里（typecheck → lint → test → 8 个契约门禁 → 3 条文档审计），
+全部串在 **`pnpm run verify`** 里（typecheck → lint → test → 9 个契约门禁 → 3 条文档审计 → 2 条 T07 守卫），
 任一失败 ⇒ 退出码非 0。`pnpm run ci` 是它的别名。
 
 > ⚠️ GitHub Actions 的工作流在 `.github/workflows/ci.yml`：
@@ -71,7 +71,7 @@
 
 ---
 
-## 文档审计（**2026-11-02 起 = 门禁的第 12~14 段**）
+## 文档审计（**2026-11-02 起 = 门禁的第 13~15 段** · ★ 2026-11-05 起第 12 段是 `check:benchmark-numbers`）
 
 > ★ **这三条已经不是「可复跑但不算数」的旁路脚本了**：它们在 `pnpm run verify` 的链上，
 > 红了就**阻断合并**。它们判的不是代码，而是**文档里的数字有没有被写成会误导人的样子**
@@ -126,7 +126,7 @@ node --import tsx scripts/audit-tier-qualifiers.ts path/to/README.md
 | 条 | 内容 | 现状 |
 | --- | --- | --- |
 | ① | 导出纯函数、CLI 只是薄壳 | ✅ `auditTierQualifiers` / `renderAudit` · `auditTwoLayers` / `renderAudit` · `runNegativeControls` / `renderNegativeControlReport` |
-| ② | 串进 `package.json` 的 `verify` 链 | ✅ 第 12~14 段（`audit:tier-qualifiers` / `audit:two-layer` / `audit:negative-control`）⇒ ★ `EXPECTED_GATE_COMMANDS` 同步 11 → **14**（C31：分母写死） |
+| ② | 串进 `package.json` 的 `verify` 链 | ✅ 第 13~15 段（`audit:tier-qualifiers` / `audit:two-layer` / `audit:negative-control`）⇒ ★ `EXPECTED_GATE_COMMANDS` 同步 11 → **14**（C31：分母写死）⇒ ⇒ ★ **2026-11-05 T07 阶段 3 再同步 14 → 16**（★ 加了 `check:benchmark-numbers`（第 12 段）+ `check:mermaid-copies`（第 16 段）⇒ ⇒ ★ **审计三条顺移成 13~15**） |
 | ③ | `tests/contracts/` 里**含反例**的单测 | ✅ 三个文件：`tier-qualifier-audit.test.ts` · `two-layer-audit.test.ts` · `audit-negative-control.test.ts` |
 | ④ | 在本 README 登记 | ✅ 上面那张门禁表 |
 
