@@ -29,6 +29,7 @@
  */
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -142,7 +143,7 @@ function assert(condition: boolean, message: string): void {
 /** 自测主体（★ 必须有负控 ⇒ 不许是恒绿守卫）。 */
 export function runSelfTest(): number {
   process.stdout.write('── check-line-endings · 自测 ──\n');
-  const fixtureRoot = join(REPO_ROOT, '..', `.qa-line-endings-selftest-${process.pid}`);
+  const fixtureRoot = join(tmpdir(), `qa-line-endings-selftest-${process.pid}`);
   try {
     rmSync(fixtureRoot, { recursive: true, force: true });
     mkdirSync(fixtureRoot, { recursive: true });
