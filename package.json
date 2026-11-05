@@ -47,7 +47,8 @@
     "ci": "pnpm run verify",
     "check:doc-counts": "tsx scripts/check-doc-counts.ts",
     "migrate": "tsx scripts/migrate.ts",
-    "codes:backfill": "tsx scripts/backfill-codes.ts"
+    "codes:backfill": "tsx scripts/backfill-codes.ts",
+    "report:codewidth-table": "tsx scripts/report-codewidth-table.ts"
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3"

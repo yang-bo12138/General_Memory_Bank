@@ -154,15 +154,21 @@ node --import tsx scripts/audit-tier-qualifiers.ts path/to/README.md
 | `scripts/backup.ts` | `VACUUM INTO` 备份 + `integrity_check` + **登记尺寸与 sha256** + 按份数轮转 | 定期；★ **硬删之前必须先跑一次**（`coacts.coact_count` 不可重建） |
 | `scripts/restore-checklist.md` | 恢复 runbook（三条硬规则 / 六步恢复 / 四项自检 / 最短排障路径） | 出事时 |
 | `bench/regression/weights.ts` | 打分权重的**排序回归**（只比 id 序列，不比分数） | 改 `recall` 打分链路前后 |
+| `scripts/report-codewidth-table.ts` | ★ **出关条件② 的证据产出器**：「码宽 ↔ ε ↔ 剪枝率 ↔ 延迟」四列表（★ ε 从采集库的 `vector_codes.eps` 统计 ⇒ **零采集成本**；★ 剪枝率与延迟从 `docs/evidence/t07-warm.json` 读）⇒ ⇒ 另给**字节侧临界值**（★ 换成更窄的码后，**进精排行数**涨到多少就不再划算 ⇒ ★ 替代「拍脑袋」） | ★ **要那 5.5 GB 采集库**（`.tmp/bench/perf-1000000.db`）⇒ ⇒ **选码宽前 / 加一个候选码宽档之后** |
 
 ```bash
 pnpm exec tsx scripts/backup.ts --db data/ocean.db --out-dir backup
 pnpm exec tsx bench/regression/weights.ts            # 比对；不一致 ⇒ exit 1
 pnpm exec tsx bench/regression/weights.ts --capture  # 重新采集 golden
+pnpm exec tsx scripts/report-codewidth-table.ts       # 四列表（人读）
+pnpm exec tsx scripts/report-codewidth-table.ts --json        # 四列表（机器读）
+pnpm exec tsx scripts/report-codewidth-table.ts --self-test   # 只跑自测
 ```
 
 ⚠️ **它们刻意不进 `verify`**：备份要真实库文件、回归要跑十几秒建库 ⇒
 放进每次门禁只会让「本地全绿」变慢，而**不会**多拦下什么（与三条文档审计不同，那三条是纯文本判定）。
+★ **`report-codewidth-table` 还有一条更硬的理由**：★ 它要**本机那 5.5 GB 采集库** ⇒ ⇒ **CI 上没有那个库**
+⇒ ⇒ 进链 = **CI 恒红** ⇒ ⇒ **零收益 + 一段永远红的门禁** ⇒ ⇒ **它只能链外手动跑**。
 
 ## C25~C37 对照表
 
