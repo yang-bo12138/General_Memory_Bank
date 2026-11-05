@@ -1,11 +1,12 @@
 /**
  * **P99 测量** —— P2-T08 的性能门槛（DEVELOPMENT-PLAN.md 行 2032~2040）。
  *
- * ⚠️ **测的是哪三条**：
- *   · **recall P99**（门槛 ≤ 200ms）：走**生产的 `MemoryStore.recall()`**；
- *   · **写入 P99**（门槛 ≤ 5ms）：走**生产的 `MemoryStore.write()`**；
- *   · **向量路 P99**（门槛 ≤ 20ms）与**向量路占总耗时 ≤ 20%**：
+ * ⚠️ **测的是哪三条**（★ **毫秒类四条 = 参考线 · 不判红绿** —— ADR §8.6 裁决 ⑤ · 2026-11-05）：
+ *   · **recall P99**（★ 参考线 ≤ 200ms）：走**生产的 `MemoryStore.recall()`**；
+ *   · **写入 P99**（★ 参考线 ≤ 5ms）：走**生产的 `MemoryStore.write()`**；
+ *   · **向量路 P99**（★ 参考线 ≤ 20ms）与**向量路占总耗时 ≤ 20%**（★ 参考线）：
  *     走**生产的 `IvfVectorBackend` 的 `route()` + `search()`**。
+ *   ⇒ ⇒ ★ **唯一判红绿的性能判据是 H1′ 字节口径**（见下）；★ 这四条仍逐档落盘、只是不判红绿。
  *
  * ⚠️ ★ **「向量路占总耗时」的分母是什么**（口径必须写死）：
  *   **分母 = recall 全程耗时**（含文本路 + 图谱路 + 向量路 + 打分 + 排序）。
@@ -163,13 +164,22 @@ import { enforceBenchScale } from './lib/scale.js';
 
 /** 性能门槛（§7.1 的验收行，**写死在此 ⇒ 报告与断言同源**）。 */
 export const THRESHOLDS = {
-  /** recall P99 上限（毫秒）。 */
+  // ⚠️ ★★★ **下面四条 = 【参考线】· 不判红绿（★ ADR §8.6 裁决 ⑤ · 2026-11-05 架构师归口）** ───
+  //   ★ **它们【一个都不删】**（★ 与旧 H1/H2 常量同一款纪律：★ **删常量 = 制造「同一个门槛两个名字」
+  //   的镜像问题**）⇒ ⇒ ★ **留着 + 在这里标注为参考线** ⇒ ⇒ ★ 读的人知道它是什么、不是什么。
+  //   ★ **它们也不进 `failures`**（★ `failures` = 「失败项」⇒ ⇒ **参考线不是失败**）⇒ ⇒
+  //   **它们作为观测值继续逐档落盘**（`recallLatency` / `writeLatency` / `vectorRouteLatency` /
+  //   `recallVectorPath.latency`）⇒ ⇒ ★ **零信息损失**。
+  //   ★ **记录方式必须带「介质 × 页缓存状态」**（★ 计划稿 R1 原文就是这个要求）⇒ ⇒ ★
+  //   **一条不带档位的毫秒线 = 随机器变的话**（★ 实测：同机同语料、仅介质不同 ⇒
+  //   old-path p99 **14.6 倍**、含向量路 p99 **23.1 倍**）。
+  /** recall P99 上限（毫秒）★ **参考线**（R4 不含向量路 · R3 含向量路 · 不判红绿））。 */
   recallP99Ms: 200,
-  /** 写入 P99 上限（毫秒）。 */
+  /** 写入 P99 上限（毫秒）★ **参考线**（R5 · 不判红绿）。 */
   writeP99Ms: 5,
-  /** 向量路 P99 上限（毫秒）。 */
+  /** 向量路 P99 上限（毫秒）★ **参考线**（R1 · 不判红绿）。 */
   vectorRouteP99Ms: 20,
-  /** 向量路占总耗时的上限（比例，0~1）。 */
+  /** 向量路占总耗时的上限（比例，0~1）★ **参考线**（R2 · 计划稿原文「暂不可判定」· 不判红绿）。 */
   vectorRouteShare: 0.2,
   /**
    * ★ **H1（硬门槛 · 归 P2）**：**写入去重路径**的单次**候选读取行数**上限（行）。
@@ -1505,7 +1515,8 @@ export function measurePerf(
       '⇒ ⇒ **字节读数与毫秒数来自【同一个计时窗口】**；' +
       '⑥ ⚠️ ★ **读路径的字节累加与行读计数同处一个计时窗口** ⇒ 逐行字节计算的微小开销落在 ' +
       '`vectorRouteP99Ms` 里 ⇒ 与历史基线是**同量级而非逐位**；' +
-      '但相对每行 3 KB 的读取开销**可忽略（< 1%）** ⇒ **判门槛的 `vectorRouteP99Ms` 不受影响**；' +
+      '但相对每行 3 KB 的读取开销**可忽略（< 1%）** ⇒ **`vectorRouteP99Ms` 的读数不受影响**' +
+      '（★ 2026-11-05 ADR §8.6 裁决 ⑤：它已是【参考线】· 不判红绿）；' +
       '⑦ **旧行数判据已降级为并列观测**（`writeSegments.vectorCandidateRows` 仍落盘、仍打印，' +
       '但**不再进 `failures`** ⇒ 字节口径下它已不是判据；阈值常量一个都没删）。',
   );
@@ -1536,7 +1547,8 @@ export function measurePerf(
       '⑦ ★ **计时口径**：**读路径 = 单轮**（计数器**装着且在计数** + 计时 ⇒ **与 HEAD 逐字同形**）' +
       '⇒ ⇒ **字节读数与毫秒数来自【同一个计时窗口】** ⇒ **字节与毫秒天然同源**；' +
       '⚠️ ★ **因此**：`vectorRouteP99Ms` 与历史基线是**同量级而非逐位**（逐行字节计算的微小开销落在窗口里）' +
-      '⇒ 但相对每行 3 KB 的读取开销**可忽略（< 1%）** ⇒ **判门槛的 `vectorRouteP99Ms` 不受影响**；' +
+      '⇒ 但相对每行 3 KB 的读取开销**可忽略（< 1%）** ⇒ **`vectorRouteP99Ms` 的读数不受影响**' +
+      '（★ 2026-11-05 ADR §8.6 裁决 ⑤：它已是【参考线】· 不判红绿）；' +
       '⑧ ★★ **读路径的对账量（口径裁决落地 #1）**：`samplesAligned` = ' +
       '**实测桶成员行**（计数器认领的「成员来源」行数 = `search()` 真正扫的桶）' +
       '**逐样本等于** **推算桶成员行**（`route()` 命中的桶各自 `countBucketMembers()` 之和）' +
@@ -1902,30 +1914,29 @@ function buildVectorByteReads(
 export function checkPerf(result: PerfResult): string[] {
   const failures: string[] = [];
 
-  if (result.recallP99Ms > THRESHOLDS.recallP99Ms) {
-    failures.push(
-      `recall P99 ${result.recallP99Ms.toFixed(3)}ms > ${THRESHOLDS.recallP99Ms}ms` +
-        `（样本 ${result.recallSamples}、预热 ${result.warmupRounds}）`,
-    );
-  }
-  if (result.writeP99Ms > THRESHOLDS.writeP99Ms) {
-    failures.push(
-      `写入 P99 ${result.writeP99Ms.toFixed(3)}ms > ${THRESHOLDS.writeP99Ms}ms` +
-        `（样本 ${result.writeSamples}、预热 ${result.warmupRounds}）`,
-    );
-  }
-  if (result.vectorRouteP99Ms > THRESHOLDS.vectorRouteP99Ms) {
-    failures.push(
-      `向量路 P99 ${result.vectorRouteP99Ms.toFixed(3)}ms > ${THRESHOLDS.vectorRouteP99Ms}ms` +
-        `（样本 ${result.vectorRouteSamples}、预热 ${result.warmupRounds}）`,
-    );
-  }
-  if (result.vectorRouteShare > THRESHOLDS.vectorRouteShare) {
-    failures.push(
-      `向量路占总耗时 ${(result.vectorRouteShare * 100).toFixed(2)}% > ` +
-        `${(THRESHOLDS.vectorRouteShare * 100).toFixed(0)}%`,
-    );
-  }
+  // ⚠️ ★★★ **毫秒类四条 = 【参考线】· 不进 `failures`（★ ADR §8.6 裁决 ⑤ · 2026-11-05 归口）** ───
+  //   ★ **裁定**：这四条**全部是参考线**、**没有一条能单独当门槛** ⇒ ⇒ **理由三条（逐条可核）**：
+  //   · **① 介质依赖是数量级的** ⇒ ★ **同机同语料、仅介质不同**：old-path p99 **78.62ms（NVMe）**
+  //     vs **1150.00ms（HDD）** = **14.6 倍**；含向量路 p99 **370.12ms vs 8549.75ms** = **23.1 倍**
+  //     ⇒ ⇒ ★ **一条不带介质档位的毫秒门槛 = 随机器变的话**；
+  //   · **② 其中两条的口径本身还没定** ⇒ ★ `vectorRouteShare`（R2）计划稿原文就是「**暂不可判定**」
+  //     ⇒ ⇒ ★ `recallP99Ms` 有 R3（含向量路）/ R4（不含）**两个口径**；
+  //   · **③ 与现行判据主语不同** ⇒ ★ 现行唯一判红绿的性能判据是 **H1′ 字节口径**（判**写入去重路径**）
+  //     ⇒ ⇒ ★ 毫秒四条量的是**延迟**、其中三条量的是**召回端 / 占比** ⇒ ⇒ **并进去 = 换主语**。
+  //
+  //   ★ **为什么必须移出 `failures`（★ 字段名的诚实性）**：`failures` 字面意思是「失败项」
+  //   ⇒ ⇒ **而参考线不是失败** ⇒ ⇒ 留着就**那个字段名在撒谎** ⇒ ⇒ ★ **这正是本项目反复治的病**。
+  //
+  //   ★ **零信息损失**：★ 这四条的**分布字段本来就逐档落盘**（`recallLatency` / `writeLatency` /
+  //   `vectorRouteLatency` / `recallVectorPath.latency`）⇒ ⇒ ★ **一个都没少** ⇒ ⇒ ★ **红线仍在**
+  //   ⇒ ⇒ ★ **读 JSON 的人照样看得出「这次是不是慢了」** ⇒ ⇒ ★ **不靠 `failures` 也能判断**。
+  //
+  //   ★ **阈值常量一个都不删**（★ 与旧 H1/H2 常量同一款纪律：★ **删常量 = 制造「同一个门槛两个名字」
+  //   的镜像问题**）⇒ ⇒ 它们仍在 `THRESHOLDS` 里、并在注释里明确标注为【参考线】。
+  //
+  //   ⚠️ ★ **注意口径未变的部分**：★ `recallP99Ms` 的 R4（不含向量路）**与本函数判的量同源**
+  //   ⇒ ⇒ ★ 但它**仍是参考线** ⇒ ⇒ ★ **不许因为「它算得出来」就把它升成门槛**（★ 那要 ① 先裁）。
+  //   ⇒ ⇒ ★ **故此处【不再有任何毫秒判据】** ⇒ ⇒ ★ `failures` 里剩下的**全是字节判据**（★ 唯一判据族）。
 
   // ⚠️ ★★★ **H1′（字节 · 唯一判据 · T06 · 口径 §5）** ───
   //   **写入去重路径的单次向量载荷字节 ≤ 6,144,000 B**（= 2,000 行 × 3,072 B）
@@ -2194,17 +2205,17 @@ function main(): void {
   });
 
   process.stdout.write(
-    `  recall P99（old-path · 不传向量）= ${result.recallP99Ms.toFixed(3)}ms（门槛 ${THRESHOLDS.recallP99Ms}ms，样本 ${result.recallSamples}）\n` +
+    `  recall P99（old-path · 不传向量）= ${result.recallP99Ms.toFixed(3)}ms（★ 参考线 ${THRESHOLDS.recallP99Ms}ms · 不判红绿，样本 ${result.recallSamples}）\n` +
       `  recall P99（new-path · 传向量）= ${result.recallVectorPath.p99Ms.toFixed(3)}ms（**只观测、不判门槛**，样本 ${result.recallVectorPath.samples}）\n` +
       `    ★ 两档均值差 = ${result.recallVectorPath.meanDeltaMs.toFixed(3)}ms` +
       `（new ${result.recallVectorPath.meanMs.toFixed(3)}ms − old ${result.recallVectorPath.oldPathMeanMs.toFixed(3)}ms；正数 = 接线后更慢）\n` +
       `    ★ new-path 探针：向量路 ran = ${result.recallVectorPath.probe.ran}（mode = ${result.recallVectorPath.probe.mode}，` +
       `候选 ${result.recallVectorPath.probe.candidates} 条）\n` +
       `    ★ 向量扫描占 new-path 整条召回 = ${result.recallVectorPath.vectorScanShareOfNewPath === null ? '**未测到**' : `${(result.recallVectorPath.vectorScanShareOfNewPath * 100).toFixed(2)}%`}（推导值）\n` +
-      `  写入 P99 = ${result.writeP99Ms.toFixed(3)}ms（门槛 ${THRESHOLDS.writeP99Ms}ms，样本 ${result.writeSamples}）\n` +
-      `  向量扫描本身 P99 = ${result.vectorRouteP99Ms.toFixed(3)}ms（门槛 ${THRESHOLDS.vectorRouteP99Ms}ms，样本 ${result.vectorRouteSamples}）` +
+      `  写入 P99 = ${result.writeP99Ms.toFixed(3)}ms（★ 参考线 ${THRESHOLDS.writeP99Ms}ms · 不判红绿，样本 ${result.writeSamples}）\n` +
+      `  向量扫描本身 P99 = ${result.vectorRouteP99Ms.toFixed(3)}ms（★ 参考线 ${THRESHOLDS.vectorRouteP99Ms}ms · 不判红绿，样本 ${result.vectorRouteSamples}）` +
       '（⚠️ **直接调 backend.route()+search()** ⇒ 不是召回读数，见 vectorScanNote）\n' +
-      `  向量路占总耗时 = ${(result.vectorRouteShare * 100).toFixed(2)}%（门槛 ≤ ${(THRESHOLDS.vectorRouteShare * 100).toFixed(0)}%）\n` +
+      `  向量路占总耗时 = ${(result.vectorRouteShare * 100).toFixed(2)}%（★ 参考线 ≤ ${(THRESHOLDS.vectorRouteShare * 100).toFixed(0)}% · 不判红绿）\n` +
       `  ★★ H1′ 向量载荷字节（**写入去重路径** · 探针 8/20）= ${h1Bytes.max} B` +
       `（判定取 max；均值 ${h1Bytes.mean.toFixed(1)} B、p99 ${h1Bytes.p99} B，` +
       `门槛 ≤ ${THRESHOLDS.bytesReadMax} B，样本 ${h1Bytes.count}）\n` +
@@ -2244,13 +2255,23 @@ function main(): void {
   );
 
   if (failures.length > 0) {
-    process.stderr.write(`\n⚠ 性能门槛未达标（${failures.length} 条）：\n`);
+    // ⚠️ ★★★ **2026-11-05 · ADR §8.6 裁决 ⑤ 之后**：★ `failures` 里【只剩字节判据】（★ 唯一判据族）
+    //   ⇒ ⇒ ★ **毫秒类四条已是【参考线】· 不再进这个清单**（★ 它们仍逐档落盘）
+    //   ⇒ ⇒ ★ **⇒ 所以这里的措辞必须是【判据未达标】而不是【性能门槛未达标】**
+    //   ⇒ ⇒ ⇒ ★ （★ 否则就重犯「参考线被说成门槛」那个病）
+    process.stderr.write(`\n⚠ 判据未达标（${failures.length} 条 · 字节口径 · 唯一判据族）：\n`);
     for (const failure of failures) {
       process.stderr.write(`    ${failure}\n`);
     }
-    process.stderr.write('  ⇒ 这些是**软阈值**（共享机器上的参考线）⇒ 记录实测值，不判失败。\n');
+    process.stderr.write(
+      '  ⇒ 这些是**真判据**的越线项（★ H1′ 字节口径）⇒ 记录实测值，不判成功。\n' +
+        '  ⇒ ★ **毫秒类四条（R1~R5）是参考线** ⇒ **不进这个清单**、仍逐档落盘（★ ADR §8.6 裁决 ⑤）。\n',
+    );
   } else {
-    process.stdout.write('\n✓ 性能门槛全部达标（H1/H2 判的是**写入去重路径** · 探针 8/20）\n');
+    process.stdout.write(
+      '\n✓ 判据全部达标（★ H1′ 字节口径 · 判的是**写入去重路径** · 探针 8/20）\n' +
+        '  ⇒ ★ **毫秒类四条（R1~R5）是参考线** ⇒ 仍落盘、不判红绿（★ ADR §8.6 裁决 ⑤）。\n',
+    );
   }
   // ⚠️ ★★★ **R6 必须在这里也出现一次**（哪怕它不判红绿）：
   //   把「观测值」藏在 stdout 的横幅里 ⇒ 读 stderr 的人（CI、只看未达标清单的人）
