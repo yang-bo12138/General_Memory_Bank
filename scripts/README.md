@@ -155,7 +155,8 @@ node --import tsx scripts/audit-tier-qualifiers.ts path/to/README.md
 | `scripts/restore-checklist.md` | 恢复 runbook（三条硬规则 / 六步恢复 / 四项自检 / 最短排障路径） | 出事时 |
 | `bench/regression/weights.ts` | 打分权重的**排序回归**（只比 id 序列，不比分数） | 改 `recall` 打分链路前后 |
 | `scripts/report-codewidth-table.ts` | ★ **出关条件② 的证据产出器**：「码宽 ↔ ε ↔ 剪枝率 ↔ 延迟」四列表（★ ε 从采集库的 `vector_codes.eps` 统计 ⇒ **零采集成本**；★ 剪枝率与延迟从 `docs/evidence/t07-warm.json` 读）⇒ ⇒ 另给**字节侧临界值**（★ 换成更窄的码后，**进精排行数**涨到多少就不再划算 ⇒ ★ 替代「拍脑袋」） | ★ **要那 5.5 GB 采集库**（`.tmp/bench/perf-1000000.db`）⇒ ⇒ **选码宽前 / 加一个候选码宽档之后** |
-| `scripts/diagnose-disk-health.ps1` | ★ **D: 盘只读体检**（★ **Windows / PowerShell** · ★ 需管理员 ⇒ ★ 脚本会**自提权**）：★ 物理盘健康 + SMART 计数 + 原始 SMART 字节 + `chkdsk /scan` + 卷映射与空间 + **按 runbook 判读表算出的结论** ⇒ ⇒ 结果落成 `docs/evidence/disk-health.json`（★ 正式凭据）+ 同名 `.txt`（★ 人读副本）⇒ ★ **绝不执行 `/f`、绝不删任何东西** | ★ **怀疑 D: 有坏块时**（★ 对应 `docs/handover/T07-cold-tier-and-disk-health-runbook.md`）|
+| `scripts/diagnose-disk-health.cmd` | ★ **D: 盘只读体检的启动器**（★ **双击即可** · ★ 用 `%~dp0` 解析自身目录 ⇒ ★ **从任何目录跑都行** ⇒ ★ 参数原样透传）⇒ ⇒ 真正的逻辑在 `scripts/diagnose-disk-health.ps1` | ★ **怀疑 D: 有坏块时** |
+| `scripts/diagnose-disk-health.ps1` | ★ **D: 盘只读体检**（★ **Windows / PowerShell** · ★ 需管理员 ⇒ ★ 脚本会**自提权**）：★ 物理盘健康 + SMART 计数 + 原始 SMART 字节 + `chkdsk /scan` + 卷映射与空间 + **按 runbook 判读表算出的结论** ⇒ ⇒ 结果落成 `docs/evidence/disk-health.json`（★ 正式凭据 · **无 BOM 的 UTF-8**）+ 同名 `.txt`（★ 人读副本）⇒ ★ **绝不执行修复参数 `/f`、绝不删任何东西** | ★ **怀疑 D: 有坏块时**（★ 对应 `docs/handover/T07-cold-tier-and-disk-health-runbook.md`）|
 
 ```bash
 pnpm exec tsx scripts/backup.ts --db data/ocean.db --out-dir backup
@@ -165,8 +166,11 @@ pnpm exec tsx scripts/report-codewidth-table.ts       # 四列表（人读）
 pnpm exec tsx scripts/report-codewidth-table.ts --json        # 四列表（机器读）
 pnpm exec tsx scripts/report-codewidth-table.ts --self-test   # 只跑自测
 # ★ D: 盘只读体检（★ 需管理员 ⇒ ★ 会自动弹 UAC 自提权；★ 全程只读）
-powershell -ExecutionPolicy Bypass -File scripts/diagnose-disk-health.ps1
-powershell -ExecutionPolicy Bypass -File scripts/diagnose-disk-health.ps1 -SkipChkdsk   # 跳过全卷扫描（快）
+# ★ ★ 首选：双击 scripts\diagnose-disk-health.cmd（★ 它用 %~dp0 解析自身目录 ⇒ 从任何目录跑都行）
+scripts\diagnose-disk-health.cmd
+scripts\diagnose-disk-health.cmd -SkipChkdsk        # 跳过全卷扫描（快）
+# ★ 或直接跑 .ps1（★ 路径必须是【绝对路径】或【仓库根目录下的相对路径】）
+powershell -ExecutionPolicy Bypass -File "E:\WorkBuddyData\2026-11-02-08-56-53\gmb\scripts\diagnose-disk-health.ps1"
 ```
 
 ⚠️ **它们刻意不进 `verify`**：备份要真实库文件、回归要跑十几秒建库 ⇒

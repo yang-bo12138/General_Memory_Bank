@@ -224,7 +224,7 @@ try {
     foreach ($l in (Get-PSDrive -PSProvider FileSystem)) {
         $partition = Get-Partition -DriveLetter $l.Name -ErrorAction SilentlyContinue
         $report.volumes += [ordered]@{
-            driveLetter = $l.Name
+            driveLetter = "$($l.Name):"
             usedGB = [math]::Round($l.Used / 1GB, 1)
             freeGB = [math]::Round($l.Free / 1GB, 1)
             diskNumber = if ($partition) { $partition.DiskNumber } else { $null }
@@ -325,11 +325,37 @@ Write-Host '★ 本脚本【只读】：没执行 /f、没删任何东西 ⇒ /f
 # ─────────────────────────────────────────────────────────────
 # 落盘（★ 唯一写入 ⇒ 诊断结果成为可复核的凭据）
 # ─────────────────────────────────────────────────────────────
-$report | ConvertTo-Json -Depth 8 | Set-Content -Path $OutFile -Encoding utf8
+# ─────────────────────────────────────────────────────────────
+# 落盘（★ 唯一写入 ⇒ 诊断结果成为可复核的凭据）
+# ─────────────────────────────────────────────────────────────
+# ★★ **必须用「无 BOM 的 UTF-8」**（★ ★ 2026-11-05 实测踩到的坑）：
+#   PS 5.1 的 `Set-Content -Encoding utf8` **会写 BOM** ⇒ ⇒ **Node 的 `JSON.parse` 直接报错**
+#   （★ `SyntaxError: Unexpected token '﻿'`）⇒ ⇒ ★ 而 PowerShell 自己的 `ConvertFrom-Json`
+#   能读 ⇒ ⇒ **⇒ 骗得过自己、骗不过仓库的 TS 工具链** ⇒ ⇒ ★ 必须显式用无 BOM 编码器。
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+$json = $report | ConvertTo-Json -Depth 8
+[System.IO.File]::WriteAllText($OutFile, $json, $utf8NoBom)
+
+# ★★ 落盘自检（★ 证明「机器可读」而不是「我认为它可读」）
+$raw = [System.IO.File]::ReadAllBytes($OutFile)
+$hasBom = ($raw.Length -ge 3 -and $raw[0] -eq 0xEF -and $raw[1] -eq 0xBB -and $raw[2] -eq 0xBF)
+$parsed = $null
+try { $parsed = [System.Text.Encoding]::UTF8.GetString($raw) | ConvertFrom-Json } catch { }
+if ($hasBom -or $null -eq $parsed) {
+    Write-Host '✗ 自检失败：落盘 JSON 不是「无 BOM 的 UTF-8」或不可解析 ⇒ ★ 请把这条报给主理人' -ForegroundColor Red
+    exit 2
+}
+Write-Host '✓ 落盘自检通过：无 BOM 的 UTF-8 · 可被严格解析（★ Node 的 JSON.parse 也能读）' -ForegroundColor Green
+
 Write-Host ("★ 诊断结果已落盘：{0}" -f $OutFile) -ForegroundColor Green
 Write-Host ("★ 人读副本（transcript）：{0}" -f $textOut) -ForegroundColor Green
 Write-Host '  ⇒ 把它交给主理人 ⇒ ★ 可作为仓库凭据提交（★ 里面只有状态与计数、不含序列号）' -ForegroundColor Green
 try { Stop-Transcript | Out-Null } catch { }
+# ★ transcript 转成「无 BOM 的 UTF-8」（★ PS 的 transcript 是 UTF-16LE ⇒ ⇒ 转了才能进 git 当文本看）
+try {
+    $transcriptText = [System.IO.File]::ReadAllText($textOut, [System.Text.Encoding]::Unicode)
+    [System.IO.File]::WriteAllText($textOut, $transcriptText, $utf8NoBom)
+} catch { }
 
 if (-not $NoPause) {
     Write-Host ''

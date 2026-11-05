@@ -76,8 +76,13 @@
 **★ 首选：跑仓库里那个脚本**（★ 它把下面两件事一次跑完、**自动提权**、**全程只读**、**最后直接给结论**）：
 
 ```powershell
-# ★ 不用管理员身份也行 ⇒ ★ 脚本会自己弹 UAC 申请提权
+# ★★★ 首选：双击这个（★ 它用 %~dp0 解析自身目录 ⇒ ★ 从任何目录跑都行 ⇒ ★ 不用管当前工作目录）
+E:\WorkBuddyData\2026-11-02-08-56-53\gmb\scripts\diagnose-disk-health.cmd
+
+# ★ 或在仓库根目录下用相对路径（★ ★ 相对路径【只在仓库根目录下有效】⇒
+#   ★ 不在仓库根目录时会报「-File 形式参数的实际参数 … 不存在」⇒ ⇒ 那就用上面的绝对路径）
 powershell -ExecutionPolicy Bypass -File scripts\diagnose-disk-health.ps1
+
 # ★ 想更快（跳过 chkdsk 全卷扫描）：加 -SkipChkdsk
 powershell -ExecutionPolicy Bypass -File scripts\diagnose-disk-health.ps1 -SkipChkdsk
 ```
