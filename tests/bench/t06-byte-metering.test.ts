@@ -316,14 +316,30 @@ function shapeRowsAgree(window: ShapeWindow): Readonly<Record<string, boolean>> 
 }
 
 /**
- * ★ **已废的读路径口径短语**（**本仓库有前科的那一条**）。
+ * ★★★ **【已废口径】短语表**（**每条都是「本仓库有前科 / 已被裁决禁用」的那一句**）。
  *
- * ⚠️ ★★ **为什么单拎出这一个短语**（不做泛化扫描）：
- *   「读路径的 `samplesAligned` 是什么」这件事在 `bench/perf.ts` 里**说了不止一遍**
- *   ⇒ ⇒ 其中一遍**曾是错的**（这条）⇒ ⇒ 「**注释说谎**」这个坑**已经栽过两次**
- *   ⇒ ⇒ 只钉**有前科**的那一条 ⇒ ⇒ 既能覆盖真风险、又不至于泛化到查不准。
+ * ⚠️ ★★ **为什么是「已废口径清单」而不是「判据量清单」**（★ 2026-11-05 裁决 · 阶段1 §13 第 11 条订正）：
+ *   本条守卫最初想做成「**凡写某判据量的注释必须同时给出它的算法**」
+ *   ⇒ ⇒ ★ **那个方向被否掉了**（★ 会引入两个更坏的问题）：
+ *   · **假阳性爆炸** ⇒ `bench/perf.ts` 有 13 个 `breakdown` 字段 + 4 个顶层读数
+ *     ⇒ `candidateUniverse` 在注释里出现约 20 处、`samplesAligned` 约 10 处
+ *     ⇒ ⇒ 判定点数十~上百 ⇒ ⇒ 漏白名单就假红 ⇒ ⇒ 团队随后加白名单 ⇒ ⇒ **等于没有检查**
+ *     ⇒ ⇒ ★ **本仓库已被咬过一次**（`audit-two-layer` 收窄范围前是 ~76 个假阳性）；
+ *   · **「算法」不可机检** ⇒ ⇒ 只能退化成关键词白名单 ⇒ ⇒ **词表 = 第二个真相源**
+ *     ⇒ ⇒ ★ 本仓库治过这个病（手写的 `.d.mts` 声明被删，就是为了消灭它）。
+ *   ⇒ ⇒ ★ **所以：沿用【否定式】、只扩「已废口径」短语表 + 扩扫描范围**
+ *   ⇒ ⇒ ★ **否定式天然低假阳性**（专钉「已废口径复活」）⇒ ⇒ **这是它的优势，别丢**。
  */
-const STALE_READ_PATH_PHRASE = '字节样本数 == 计时样本数';
+const STALE_READ_PATH_PHRASES: readonly string[] = [
+  // ★ ① 读路径 `samplesAligned` 的旧口径（★ 本仓库有前科的那一条 · 原文曾挂在判红守卫上却永远打不红）。
+  '字节样本数 == 计时样本数',
+  // ★ ② 读路径对账量的**禁用写法**（★ §6.12 裁决 9 的禁令）。
+  //   ⚠️ ★ **它为什么最该加**：裁决 9 的**旧理由已被推翻**（唯一索引 `idx_vcm_memory_unique`
+  //   ⇒ 一记忆只属一个细桶 ⇒ 「`COUNT(DISTINCT)` 会偏小」这个前提在当前 schema 下不成立）
+  //   ⇒ ⇒ **旧理由复活的风险是真的** ⇒ ⇒ 而它一旦复活 = 读路径对账量被换成异源的量
+  //   ⇒ ⇒ **守卫失明** ⇒ ⇒ 所以必须钉住「提到它必须是否定/禁止」。
+  'bucketMemberRows === candidateUniverse',
+];
 
 /**
  * ★ **否定标记**（= 「这条短语是被否定的」的证据）。
@@ -331,15 +347,18 @@ const STALE_READ_PATH_PHRASE = '字节样本数 == 计时样本数';
  * ⚠️ ★ **为什么是「标记词」而不是「精确匹配」**：
  *   否定词可能写在**相邻行**（例：`为什么不能是「…」` 与 `（**那条是恒真的**）` 分两行）
  *   ⇒ ⇒ 扫描时取 **±3 行的窗口**再找标记词。
+ *
+ * ⚠️ ★★ **为什么【按短语分组】**（★ 2026-11-05 补的一条）：
+ *   上面那两条短语的**性质不同** ⇒ ⇒ 需要的否定证据也不同：
+ *   · ① 是**已废口径** ⇒ ⇒ 需要「它已经不对了」这类**认知性否定**；
+ *   · ② 是**禁令** ⇒ ⇒ 需要「不许这么写」这类**规范性否定**。
+ *   ⇒ ⇒ ★ **若共用一张表** ⇒ ⇒ 禁令类短语可能被一句无关的「不是」意外豁免
+ *   ⇒ ⇒ ★ **所以按短语分组、各配各的标记**。
  */
-const STALE_READ_PATH_DENIALS: readonly string[] = [
-  '不是',
-  '恒真',
-  '已废',
-  '换掉',
-  '原先',
-  '为什么不能',
-];
+const STALE_READ_PATH_DENIALS: Readonly<Record<string, readonly string[]>> = {
+  '字节样本数 == 计时样本数': ['不是', '恒真', '已废', '换掉', '原先', '为什么不能'],
+  'bucketMemberRows === candidateUniverse': ['不许', '禁止', '不得', '不能', '已废', '换掉'],
+};
 
 /**
  * ★★★ **「注释说谎」扫描器**（**纯函数** ⇒ 负控台能单独喂数据 ⇒ **它自己也不是恒绿守卫**）。
@@ -350,7 +369,7 @@ const STALE_READ_PATH_DENIALS: readonly string[] = [
  *   ⇒ ⇒ ★ **比代码本身更危险**（代码有类型、有测试；注释什么都没有）
  *   ⇒ ⇒ 把「**凡提到那条已废口径的地方，必须同时否定它**」钉成**机器规则**。
  *
- * ⚠️ ★ **判据**：凡是出现该短语的行，其 **±3 行窗口**里必须出现至少一个**否定标记**
+ * ⚠️ ★ **判据**：凡是出现某条短语的行，其 **±3 行窗口**里必须出现该短语对应的**否定标记**
  *   ⇒ ⇒ 「提到它是为了否定它」= 合规；「提到它却当成现行口径」= **说谎 ⇒ 打红**。
  *
  * @param source 被扫描的源码文本
@@ -361,14 +380,18 @@ function lyingStaleReadPathPhraseLines(source: string): readonly number[] {
   const lying: number[] = [];
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index] ?? '';
-    if (!line.includes(STALE_READ_PATH_PHRASE)) {
-      continue;
-    }
-    // ⚠️ ★ **看上下文窗口（±3 行）**：否定词可能写在相邻行 ⇒ 不许只看本行。
-    const window = lines.slice(Math.max(0, index - 3), index + 4).join('\n');
-    const denied = STALE_READ_PATH_DENIALS.some((marker) => window.includes(marker));
-    if (!denied) {
-      lying.push(index + 1);
+    // ⚠️ ★ **逐条短语过**：每条短语用【它自己的】否定标记表。
+    for (const phrase of STALE_READ_PATH_PHRASES) {
+      if (!line.includes(phrase)) {
+        continue;
+      }
+      // ⚠️ ★ **看上下文窗口（±3 行）**：否定词可能写在相邻行 ⇒ 不许只看本行。
+      const window = lines.slice(Math.max(0, index - 3), index + 4).join('\n');
+      const denials = STALE_READ_PATH_DENIALS[phrase] ?? [];
+      const denied = denials.some((marker) => window.includes(marker));
+      if (!denied) {
+        lying.push(index + 1);
+      }
     }
   }
   return lying;
@@ -1175,13 +1198,23 @@ describe('T06 · E：口径断言与落盘结构', () => {
     expect(readSamplesAlignedOf([], [])).toBe(true);
   });
 
-  it('★ 机器守卫：`bench/perf.ts` 里凡提到「字节样本数 == 计时样本数」的地方 ⇒ **必须同时否定它**（不许出现说谎的注释）', () => {
+  it('★ 机器守卫：凡提到「已废口径短语」的地方 ⇒ **必须同时否定它**（不许出现说谎的注释）', () => {
     // ⚠️ ★★★ **这条是 QA 在 T06 独立验证时登记的**（登记 1）：
     //   「`bench/perf.ts` 里同一件事说多遍、其中一遍是错的」⇒ ⇒ **同一个坑这一轮又踩了一次**
     //   ⇒ ⇒ 本条把「**注释不许说谎**」钉成**机器规则**（而不是靠人记得去读每一遍）。
-    const source = readFileSync(new URL('../../bench/perf.ts', import.meta.url), 'utf8');
-    // ⚠️ ★ **核心**：**没有**「提到却没否定」的处数 ⇒ 空数组（空数组 ⇒ 零处说谎）。
-    expect(lyingStaleReadPathPhraseLines(source)).toEqual([]);
+    // ⚠️ ★★★ **2026-11-05 泛化（阶段 2b）**：① 短语表从 1 条扩到 2 条
+    //   （★ 新增「读路径对账量的禁用写法」⇒ 它的旧理由已被推翻 ⇒ **旧理由复活风险是真的**）
+    //   ② 扫描范围从 1 个文件扩到 **3 个**（★ 「判据量定义处」⇒ 口径说谎最可能发生在这里）。
+    const scannedFiles = [
+      '../../bench/perf.ts',
+      '../../bench/lib/harness.ts',
+      '../../bench/lib/byteSources.ts',
+    ] as const;
+    for (const relativePath of scannedFiles) {
+      const source = readFileSync(new URL(relativePath, import.meta.url), 'utf8');
+      // ⚠️ ★ **核心**：**没有**「提到却没否定」的处数 ⇒ 空数组（空数组 ⇒ 零处说谎）。
+      expect(lyingStaleReadPathPhraseLines(source)).toEqual([]);
+    }
     // ⚠️ ★★★ **负控 ①（证明这个扫描器自己不是恒绿守卫）**：
     //   喂一条「提到却没否定」的文本 ⇒ **必须被抓出来**（行号 = 1）。
     expect(lyingStaleReadPathPhraseLines('// 读路径 = 字节样本数 == 计时样本数')).toEqual([1]);
@@ -1189,6 +1222,22 @@ describe('T06 · E：口径断言与落盘结构', () => {
     expect(
       lyingStaleReadPathPhraseLines('// 为什么不能是「字节样本数 == 计时样本数」：那条恒真'),
     ).toEqual([]);
+    // ⚠️ ★★★ **负控 ③（新短语的那条）**：新短语「提到却没否定」⇒ **必须被抓出来**。
+    expect(
+      lyingStaleReadPathPhraseLines('// 读路径对账量就用 bucketMemberRows === candidateUniverse'),
+    ).toEqual([1]);
+    // ⚠️ ★★★ **负控 ④（新短语的否定形态）**：新短语「提到并禁止」⇒ **不许**被抓。
+    expect(
+      lyingStaleReadPathPhraseLines(
+        '// ⚠️ 不许用 `bucketMemberRows === candidateUniverse`（读路径）',
+      ),
+    ).toEqual([]);
+    // ⚠️ ★★★ **负控 ⑤（★ 按短语分组的必要性）**：**禁令类短语**遇到**认知性否定**不算数
+    //   （★ 「不是」对「不许用」这类禁令【不是】充分的否定证据）
+    //   ⇒ ⇒ **必须被抓出来** ⇒ ⇒ 这条负控证明「分组」不是摆设。
+    expect(
+      lyingStaleReadPathPhraseLines('// bucketMemberRows === candidateUniverse 不是本路径的口径'),
+    ).toEqual([1]);
   });
 
   it('★ 口径张力钉死：写路径 `embeddingRowsRead ≥ embeddingCalls`（**Q4 让字节账分子必然 ≥ 调用数**）', () => {

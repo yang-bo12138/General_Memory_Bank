@@ -39,6 +39,7 @@
     "check:benchmark-numbers": "tsx scripts/check-benchmark-numbers.ts",
     "check:wording-drift": "tsx scripts/check-wording-drift.ts",
     "check:gate-entry": "tsx scripts/check-gate-entry.ts",
+    "check:backlog-ledger": "tsx scripts/check-backlog-ledger.ts",
     "audit:tier-qualifiers": "tsx scripts/audit-tier-qualifiers.ts",
     "audit:two-layer": "tsx scripts/audit-two-layer.ts",
     "audit:negative-control": "tsx scripts/audit-tier-qualifiers.negative-control.ts",
