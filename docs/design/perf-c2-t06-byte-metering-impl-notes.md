@@ -766,7 +766,7 @@ $ grep -n "readSamplesAligned" bench/perf.ts
 | `git diff --stat src/`（★ **必须为空**） | **无任何输出**（`wc -l` = **0**） | ✅ **空** |
 | `pnpm run verify` | 末行 `✅ 全部负控符合预期 ⇒ 审计脚本**有判别力**（不是恒绿守卫）`；`VERIFY_EXIT=0`（整体 2 分 29 秒） | ✅ **exit 0** |
 | `pnpm test`（`verify` 内那一轮） | `Test Files  97 passed (97)` / `Tests  1959 passed (1959)` / `Duration  98.20s` | ✅ **exit 0**（**1959 = 1957 + 本轮新增 2 条**） |
-| `pnpm run check:json-note`（★ 只读自检 · 脚本已进仓库 `scripts/check-json-note-fidelity.ts`） | `JSON note 块数量：2` / `note[0]（1560 字）在 bench/perf.ts 中逐字命中：true` / `note[1]（**1424 字**）在 bench/perf.ts 中逐字命中：true` / `WRITE: true  READ: true` | ✅ **§13 的 JSON 与 `bench/perf.ts` 的 note 逐字一致**（⇒ 它不是手写样例） |
+| `pnpm run check:json-note`（★ 只读自检 · 脚本已进仓库 `scripts/check-json-note-fidelity.ts` · ★ 判据 = **逐字节相等**）| `JSON note 块数量：2` / `note[0]（2077 字）逐字节相等：true（实现侧 2077 字）` / `note[1]（1987 字）逐字节相等：true（实现侧 1987 字）` / `WRITE: true  READ: true` | ✅ **§13 的 JSON 与 `bench/perf.ts` 的 note 逐字节一致**（⇒ 它不是手写样例） |
 | **章节引用消歧**（3 条 `grep -c`） | **0 / 0 / 0**（★ 三条**全部清零** ⇒ 「§N 指向不唯一」的坑已堵死；⚠️ **本行故意不写出那三条 grep 的模式原文** ⇒ ⇒ 否则本行会**命中它自己** ⇒ ⇒ 下一个人复跑会得到 **1** 而不是 **0** ⇒ ⇒ **模式见 §0 的「引用纪律」表**（那里列了哪几种前缀算**作废写法**）⇒ ⇒ 复跑命令：`grep -c "作废前缀1" …` 之类，**自己拼**） |
 
 
