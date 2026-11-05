@@ -73,6 +73,25 @@
 
 ### ② ★ 第一步：**只读诊断**（★ 零风险、零独占、几分钟）
 
+**★ 首选：跑仓库里那个脚本**（★ 它把下面两件事一次跑完、**自动提权**、**全程只读**、**最后直接给结论**）：
+
+```powershell
+# ★ 不用管理员身份也行 ⇒ ★ 脚本会自己弹 UAC 申请提权
+powershell -ExecutionPolicy Bypass -File scripts\diagnose-disk-health.ps1
+# ★ 想更快（跳过 chkdsk 全卷扫描）：加 -SkipChkdsk
+powershell -ExecutionPolicy Bypass -File scripts\diagnose-disk-health.ps1 -SkipChkdsk
+```
+
+⇒ ⇒ ★ **产出两个文件**（★ 都在 `docs/evidence/`）：
+| 产物 | 是什么 |
+|---|---|
+| **`docs/evidence/disk-health.json`** | ★ **正式凭据**（★ 保证 UTF-8）⇒ ⇒ **把它交给主理人**即可提交入库 |
+| `docs/evidence/disk-health.txt` | ★ 人读副本（★ transcript · UTF-16 ⇒ 记事本可直接打开） |
+
+⇒ ⇒ ★ **脚本【绝不】执行 `/f`、绝不删任何东西**（★ 包括 `$RECYCLE.BIN` —— 只报体积）。
+
+**★ 手动版（★ 脚本跑不了时用）**：
+
 **（a）文件系统层：在线扫描（★ 不占卷、可以边用边扫）**
 ```powershell
 # ★ 管理员 PowerShell
