@@ -373,6 +373,8 @@ const CATEGORY_RENDER = '写法不一致（值同、写法不同）';
 const CATEGORY_MISSING = '规范写法缺失';
 const CATEGORY_STATUS_MISSING = '状态字面缺失';
 const CATEGORY_STATUS_CONFLICT = '状态语义冲突（两侧状态 emoji 不同）';
+/** ★ 同一行里出现了【多种】状态 emoji（★ 那就是一句自相矛盾的话）。 */
+const CATEGORY_STATUS_MULTI = '行内出现多种状态 emoji';
 const CATEGORY_STATUS_REF = '状态表与 R 行的引用断裂';
 const CATEGORY_STATUS_LINK = 'R 行与状态表的条件编号对不上';
 
@@ -590,6 +592,30 @@ function extractStateEmoji(line: string): (typeof STATUS_EMOJI)[number] | undefi
 }
 
 /**
+ * ★ 提取一行里【「出关条件」标记之后】的**全部状态 emoji**（★ **集合** · 不只是第一个）。
+ *
+ * ★★ **为什么要集合**：★ `extractStateEmoji` 只取**最靠前的**那一个 ⇒ ⇒
+ *   ⇒ **同一行里出现第二种状态 emoji 时，那一个漂移【看不见】**
+ *   ⇒ ⇒ ★ R7 那一行有 4 个 `✅` ⇒ ⇒ 把**第 2 个**改成 `❌` ⇒ ⇒ 判定仍通过（实测过）
+ *   ⇒ ⇒ ⇒ ★ **「有没有某个标记」不够 ⇒ ⇒「同一处里所有同类标记必须全部一致」才够**
+ *   ⇒ ⇒ ⇒ ★ 而这里**没有第二层兜底**（★ emoji 漂移与「旧措辞」那条守卫无关）
+ *   ⇒ ⇒ ⇒ ★ ⇒ 所以这一处**必须**按集合判。
+ *
+ * @returns 出现过的**全部不同**状态 emoji（★ 顺序 = `STATUS_EMOJI` 的顺序）
+ */
+function extractStateEmojis(line: string): (typeof STATUS_EMOJI)[number][] {
+  const marker = line.indexOf('出关条件');
+  const scope = marker >= 0 ? line.slice(marker) : line;
+  const found: (typeof STATUS_EMOJI)[number][] = [];
+  for (const emoji of STATUS_EMOJI) {
+    if (scope.includes(emoji) && !found.includes(emoji)) {
+      found.push(emoji);
+    }
+  }
+  return found;
+}
+
+/**
  * 跑一遍检查。
  *
  * @param root 仓库根（★ 相对脚本自身 ⇒ 从任何目录跑都能跑；自测时传临时目录）
@@ -787,11 +813,22 @@ function checkStatus(root: string): StatusReport {
     const tableWhere = `${spec.tableCarrier}（${CARRIER_BY_ID.get(spec.tableCarrier)?.file ?? '?'}:${tableHit.lineNo}）`;
     const gateWhere = `${spec.gateCarrier}（${CARRIER_BY_ID.get(spec.gateCarrier)?.file ?? '?'}:${gateHit.lineNo}）`;
 
-    for (const [where, state] of [
-      [tableWhere, tableState],
-      [gateWhere, gateState],
+    for (const [where, text, state] of [
+      [tableWhere, tableHit.text, tableState],
+      [gateWhere, gateHit.text, gateState],
     ] as const) {
       comparisons += 1;
+      // ★★★ ★★★ **同一行里出现【多种】状态 emoji ⇒ ⇒ 那一行自相矛盾 ⇒ ⇒ 必须红**
+      //   ★ 「取最靠前的那个」只看得见第一个 ⇒ ⇒ 第二个漂移不可见（★ 已实测过这个盲区）
+      const all = extractStateEmojis(text);
+      if (all.length > 1) {
+        issues.push({
+          category: CATEGORY_STATUS_MULTI,
+          detail:
+            `${where} · 条件「${spec.label}」⇒ 这一行里出现了**多种**状态 emoji：` +
+            `${all.join('、')} ⇒ ⇒ **同一行自相矛盾**（★ 只看第一个 ⇒ ⇒ 后面的漂移看不见）`,
+        });
+      }
       if (state === undefined) {
         cells.push({ specId: spec.id, carrierId: where, lineNo: 0, state, ok: false });
         issues.push({
@@ -848,8 +885,10 @@ type WordingReport = {
  */
 function checkWording(
   root: string,
-  maxAnchors: number,
+  maxWordingAnchors: number,
+  maxOutreachStatuses: number,
   anchors: readonly WordingAnchor[] = WORDING_ANCHORS,
+  statuses: readonly StatusSpec[] = STATUS_SPECS,
 ): WordingReport {
   const issues: Issue[] = [];
   const cells: WordingCell[] = [];
@@ -977,7 +1016,7 @@ function checkWording(
 
   // ── ③ ★ 清单形状的两道锁（★ 与状态维度共用同一份期望形状）──
   const expectedIds = EXPECTED_ANCHOR_SHAPE.map((entry) => entry.id);
-  const actualIds = [...anchors.map((anchor) => anchor.id), ...STATUS_SPECS.map((spec) => spec.id)];
+  const actualIds = [...anchors.map((anchor) => anchor.id), ...statuses.map((spec) => spec.id)];
   const missing = expectedIds.filter((id) => !actualIds.includes(id));
   const extra = actualIds.filter((id) => !expectedIds.includes(id));
   if (missing.length > 0 || extra.length > 0) {
@@ -998,7 +1037,7 @@ function checkWording(
     if (anchor !== undefined) {
       return anchor.carriers.length;
     }
-    const spec = STATUS_SPECS.find((candidate) => candidate.id === id);
+    const spec = statuses.find((candidate) => candidate.id === id);
     if (spec !== undefined) {
       // ★ 状态规格牵住【两侧】＝ 状态表那一格 + 对应 R 行那一格
       return 2;
@@ -1020,12 +1059,24 @@ function checkWording(
       });
     }
   }
-  if (actualIds.length > maxAnchors) {
+  // ★★★ 锁二 · **两个清单、两个上限**（★ 「两个清单的【合理规模】不同」⇒ ⇒ 一个上限要么太松要么太紧）
+  //   · 措辞锚点清单：默认 4（★ 当前 1 ⇒ 允许再加 3 条）
+  //   · 出关条件状态清单：默认 8（★ 当前 4 ⇒ 允许再加 4 条）
+  //   ⇒ ⇒ **放宽任一上限都必须【显式】传参** ⇒ ⇒ 不许悄悄改常量。
+  if (anchors.length > maxWordingAnchors) {
     issues.push({
       category: CATEGORY_ANCHOR_WIDENED,
       detail:
-        `锚点清单的条目数 ${actualIds.length} 超过上限 ${maxAnchors}` +
-        '（★ 放宽必须**显式**传参 `--max-anchors N` ⇒ ⇒ 不许悄悄改常量）',
+        `措辞锚点清单的条目数 ${anchors.length} 超过上限 ${maxWordingAnchors}` +
+        '（★ 放宽必须**显式**传参 `--max-wording-anchors N` ⇒ ⇒ 不许悄悄改常量）',
+    });
+  }
+  if (statuses.length > maxOutreachStatuses) {
+    issues.push({
+      category: CATEGORY_ANCHOR_WIDENED,
+      detail:
+        `出关条件状态清单的条目数 ${statuses.length} 超过上限 ${maxOutreachStatuses}` +
+        '（★ 放宽必须**显式**传参 `--max-outreach-statuses N` ⇒ ⇒ 不许悄悄改常量）',
     });
   }
 
@@ -1140,6 +1191,14 @@ const NEGATIVE_CONTROLS: readonly Mutation[] = [
     file: 'docs/design/perf-c2-admissible-two-stage.md',
     from: '| ✅ **达成** | R2 行 ·',
     to: '| ✅ **达成** | ·',
+  },
+  {
+    name: '负控 O · 把 R7 行里的**第 2 个** ✅ 改成 ❌（★ 同一行两种状态 ⇒ ⇒ 自相矛盾）',
+    expect: CATEGORY_STATUS_MULTI,
+    dimension: 'status',
+    file: 'docs/design/perf-c2-admissible-two-stage.md',
+    from: '**3,348.48 B** **逐位相等** ✅；',
+    to: '**3,348.48 B** **逐位相等** ❌；',
   },
 ];
 
