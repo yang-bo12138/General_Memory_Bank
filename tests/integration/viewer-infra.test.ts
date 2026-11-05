@@ -171,8 +171,8 @@ describe('T01 · electron 不进 allowBuilds（结构性防线，而非纪律）
 
 describe('T01 · 门禁链形状不变（16 段逐名）', () => {
   it('`scripts.verify` 与 `scripts.ci` 完全合规（16 段逐名 + ci 是别名）', () => {
-    // ⚠️ ★ **分母写死**（C31）⇒ 段数变了这里必须同批改 ⇒ 14 → 16（★ T07 阶段 3 · 用户授权改 CI 行为）
-    expect(EXPECTED_GATE_COMMANDS.length).toBe(16);
+    // ⚠️ ★ **分母写死**（C31）⇒ 段数变了这里必须同批改 ⇒ 14 → 16 → **18**（★ T07 阶段 3 / 阶段 4）
+    expect(EXPECTED_GATE_COMMANDS.length).toBe(18);
     expect(checkGateEntry(readPackageJson())).toEqual([]);
     expect(readPackageJson().scripts?.ci).toBe('pnpm run verify');
   });

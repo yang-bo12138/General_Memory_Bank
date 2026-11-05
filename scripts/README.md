@@ -8,7 +8,7 @@
 
 | 命令                                   | 是什么                                              | 是不是门禁 |
 | -------------------------------------- | --------------------------------------------------- | ---------- |
-| **`pnpm run verify`**                  | **门禁本体**：16 条子命令串成一条链                 | ✅ 是       |
+| **`pnpm run verify`**                  | **门禁本体**：18 条子命令串成一条链                 | ✅ 是       |
 | `pnpm run ci`                          | **别名**，内容恰好等于 `pnpm run verify`            | ✅ 是       |
 | `pnpm ci` / `npm ci`（**不带 `run`**） | **包管理器的内建命令**（clean install）             | ❌ **不是** |
 
@@ -20,7 +20,7 @@
 > ⇒ **规范入口是 `pnpm run verify`**（`verify` 不是任何包管理器的内建命令名 ⇒ 不会被遮蔽）。
 > ⇒ 这条纪律由 `scripts/check-gate-entry.ts` **机器可检**（见下表第 6 行）：
 > 它断言 `scripts.ci` 的内容**恰好**是 `pnpm run verify`，
-> 且 `scripts.verify` 串起的 16 条子命令**逐名**齐全、每一段都写成 `pnpm run <名>`。
+> 且 `scripts.verify` 串起的 18 条子命令**逐名**齐全、每一段都写成 `pnpm run <名>`。
 > 有人把 `ci` 改回一串别的命令、或从 `verify` 上摘掉某条门禁 ⇒ 门禁当场失败。
 
 ## 门禁脚本
@@ -50,16 +50,21 @@
 
 > ★ 这些**不在**上面的 `verify` 链里（★ 链外入口）⇒ ⇒ ⇒ **跑 `pnpm run verify` 【不会】跑它们**
 > ⇒ ⇒ ⇒ ⇒ **凡结论依赖它们的 ⇒ ⇒ 必须手动跑**（★ 或把「跑过它」的留痕写进结论里）。
+>
+> ★ ★ **2026-11-05 更新（T07 阶段 3 / 阶段 4）**：★ 下面表里的 **7 条已有 4 条接进 `verify` 链**
+> （★ `check:benchmark-numbers`（第 12 段）· `check:mermaid-copies`（第 16 段）· `check:json-note`（第 17 段）
+> · `check:wording-drift`（第 18 段）⇒ ⇒ **门禁 14 → 18 段**）⇒ ⇒ ★ **仍在链外的只剩 3 条**
+> ⇒ ⇒ ★ **每行都标了它当前在链上还是链外 + 理由**（★ 逐条有理由 ⇒ **不是「不重要」，是「时机未到」**）。
 
 | 脚本 | 链外入口 | 守什么 | 方向 |
 |---|---|---|---|
-| `scripts/check-json-note-fidelity.ts` | `pnpm run check:json-note` | ★ 文档里的 `note` ↔ `bench/perf.ts` **真正落盘**的那串 **逐字节相等**（★ 判据 = 逐字节 · **不是**归一化）| 正向（必须逐字相同）|
-| `scripts/check-benchmark-numbers.ts` | `pnpm run check:benchmark-numbers` | ★ 同一批数在多个载体里**逐位相等** + ★ 出关条件**状态**两侧一致 + ★ 规范**措辞**在断言形态 | 正向（必须说同一句话）|
-| `scripts/check-wording-drift.ts` | `pnpm run check:wording-drift` | ★ 旧措辞「只读…2 行」**不许以断言形态出现**（★ 全仓负向扫描）| 负向（禁止说错话）|
-| `scripts/check-mermaid-copies.ts` | `pnpm run check:mermaid-copies` | ★ 两份 mermaid 抽取副本 ↔ 权威版**逐字相等**（锚点定位）+ ★ **静态结构体检**（首行 / 末行 / 嵌套围栏 / `%%` 形态 ⇒ ★ 仓库**原本没有任何 mermaid 校验** ⇒ 它是唯一防线）| 正向（副本必须逐字一致）|
-| `scripts/check-credential-hygiene.ts` | `pnpm exec tsx scripts/check-credential-hygiene.ts` | ★ 文档/注释里引用的**机器凭据路径**是否真实存在 + 是否在版本控制内（★ 三档：A 悬空 / B 存在但不在版本控制内 / C 完好）| 正向（必须指得到）|
-| `scripts/check-line-endings.ts` | `pnpm exec tsx scripts/check-line-endings.ts` | ★ 工作树里**物理含 CRLF** 的 tracked 文件（★ **按字节扫**，★ **不用 `git diff` / `git status`** —— ★ 那两个在 `text=auto` 仓库里对行尾差异**不可靠**：diff 被归一化吞掉、status 只看 stat）| 正向（必须全是 LF）|
-| `scripts/check-backlog-ledger.ts` | `pnpm exec tsx scripts/check-backlog-ledger.ts` | ★ `docs/handover/T07-ordered-backlog.md` 里**待办条目 ↔ 实现存在性**的对账（★ ① 登记完整性：每条待办必须登记实现路径**或**显式声明「本条无实现路径」② 登记真实性：登记的路径**必须真实存在** ⇒ ⇒ **专治「只记得改代码、不记得改索引」那种单向漂移**）| 正向（登记必须指得到）|
+| `scripts/check-json-note-fidelity.ts` | `pnpm run check:json-note` | ★ 文档里的 `note` ↔ `bench/perf.ts` **真正落盘**的那串 **逐字节相等**（★ 判据 = 逐字节 · **不是**归一化）★ **2026-11-05 阶段 4 起【已接进 `verify` 链 · 第 17 段】** ⇒ ⇒ 它守的「改落盘 note 必须同批改逐字副本」这条纪律**不再纯靠人记**（★ 零本地 import ⇒ 完全独立 ⇒ ⇒ CI 安全）| 正向（必须逐字相同）|
+| `scripts/check-benchmark-numbers.ts` | `pnpm run check:benchmark-numbers` | ★ 同一批数在多个载体里**逐位相等** + ★ 出关条件**状态**两侧一致 + ★ 规范**措辞**在断言形态 ★ **2026-11-05 阶段 3 起【已接进 `verify` 链 · 第 12 段】**| 正向（必须说同一句话）|
+| `scripts/check-wording-drift.ts` | `pnpm run check:wording-drift` | ★ 旧措辞「只读…2 行」**不许以断言形态出现**（★ 全仓负向扫描）★ **2026-11-05 阶段 4 起【已接进 `verify` 链 · 第 18 段】** ⇒ ⇒ ★ **进链的理由已被实测推翻并订正**：★ 原判据「豁免数随文档增长 ⇒ 余量 2 不够」是**错的** ⇒ ⇒ ★ **豁免只在【引用旧措辞】时才产生** ⇒ ⇒ 实测「新增不含旧措辞的内容 ⇒ 豁免仍 6 处」⇒ ⇒ ⇒ ★ ⇒ **余量已提到 4（上限 8 → 10）**| 负向（禁止说错话）|
+| `scripts/check-mermaid-copies.ts` | `pnpm run check:mermaid-copies` | ★ 两份 mermaid 抽取副本 ↔ 权威版**逐字相等**（锚点定位）+ ★ **静态结构体检**（首行 / 末行 / 嵌套围栏 / `%%` 形态 ⇒ ★ 仓库**原本没有任何 mermaid 校验** ⇒ 它是唯一防线）★ **2026-11-05 阶段 3 起【已接进 `verify` 链 · 第 16 段】**| 正向（副本必须逐字一致）|
+| `scripts/check-credential-hygiene.ts` | `pnpm exec tsx scripts/check-credential-hygiene.ts` | ★ 文档/注释里引用的**机器凭据路径**是否真实存在 + 是否在版本控制内（★ 三档：A 悬空 / B 存在但不在版本控制内 / C 完好）★ **仍链外**：★ 误报面高（330 条凭据 / 4 条豁免规则 / 边界密）| 正向（必须指得到）|
+| `scripts/check-line-endings.ts` | `pnpm exec tsx scripts/check-line-endings.ts` | ★ 工作树里**物理含 CRLF** 的 tracked 文件（★ **按字节扫**，★ **不用 `git diff` / `git status`** —— ★ 那两个在 `text=auto` 仓库里对行尾差异**不可靠**：diff 被归一化吞掉、status 只看 stat）★ **仍链外**：★ **语义与 CI 相反**（它防 Windows 开发机 ⇒ CI 是 ubuntu ⇒ 恒绿 ⇒ 进链 = 零收益 + 一个恒绿段）| 正向（必须全是 LF）|
+| `scripts/check-backlog-ledger.ts` | `pnpm exec tsx scripts/check-backlog-ledger.ts` | ★ `docs/handover/T07-ordered-backlog.md` 里**待办条目 ↔ 实现存在性**的对账（★ ① 登记完整性：每条待办必须登记实现路径**或**显式声明「本条无实现路径」② 登记真实性：登记的路径**必须真实存在** ⇒ ⇒ **专治「只记得改代码、不记得改索引」那种单向漂移**）★ **仍链外**：★ 读 backlog ⇒ **台账改版就误报**| 正向（登记必须指得到）|
 
 ★ **依赖方向（★ 2026-11-05 实测订正 · 原表述说过头了）**：★ `check-benchmark-numbers.ts` **import** `check-wording-drift.ts` 的判定入口
 ⇒ ⇒ ⇒ **「判定只有一份」** ⇒ ⇒ ⇒ ★ **但这是【单向】依赖**（★ `check-wording-drift.ts` 与 `check-json-note-fidelity.ts` **零本地 import** ⇒ ⇒ **完全独立**）

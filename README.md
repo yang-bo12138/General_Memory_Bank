@@ -11,7 +11,7 @@
 
 ```bash
 pnpm install     # 装依赖
-pnpm run verify  # 门禁：类型检查 → 代码风格 → 单元测试 → 9 条契约脚本 → 3 条文档审计 → 2 条 T07 守卫（共 16 段）
+pnpm run verify  # 门禁：类型检查 → 代码风格 → 单元测试 → 9 条契约脚本 → 3 条文档审计 → 4 条链外转正守卫（共 18 段）
 pnpm build       # 构建产物（tsup：CJS + ESM + d.ts）
 ```
 
@@ -69,6 +69,6 @@ pnpm build       # 构建产物（tsup：CJS + ESM + d.ts）
 >
 > 门禁的形状由 `scripts/check-gate-entry.ts` **机器可检**：
 > `scripts.ci` 必须**恰好**是 `pnpm run verify` 的别名，
-> 且 `scripts.verify` 串起的 16 条子命令逐名齐全、每段都写成 `pnpm run <名>`。
+> 且 `scripts.verify` 串起的 18 条子命令逐名齐全、每段都写成 `pnpm run <名>`。
 >
 > CI 工作流在 `.github/workflows/ci.yml`，跑的是 `pnpm run verify`（**不是** `pnpm ci`）。
