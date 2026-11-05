@@ -99,6 +99,7 @@
   3. `docs/progress/vector-round-progress.md` 的 **A5** 行更新；
   4. `docs/design/DECISIONS.md` **只加一行指针**；
   5. **`pnpm run verify` 全绿**（含 `audit:two-layer` 零真缺、`audit:tier-qualifiers` 绿、`check:params` 绿 ⇒ **Params 仍 60 项**、`table-name-boundary` 绿 ⇒ **`src/store/**` 无 `vector_codes`**）。
+  6. ★ **出关条件③ 的状态登记（★ 只进本文件 · ★ **不进** ADR / README / DELIVERY）**：2026-11-05 实测 **1M 重编码冷档端到端 > 5 分钟** ⇒ ⇒ **出关条件③ = ❌ 红** ⇒ ⇒ ★ **为什么只登记在这里**：★ 「③ 红」是【**实测结果**】、不是【**决策理由**】⇒ ⇒ 决策记录（ADR / README / DELIVERY）里写它 = **把结论混进理由** ⇒ ⇒ ★ **秒数与档位的权威出处仍是 ⑦ `docs/design/perf-c2-admissible-two-stage.md` 的 R4 行**（★ 本文件**不复述秒数** ⇒ ⇒ 免得多一处载体、又得分心同步）⇒ ⇒ ★ **状态维度已有机器守卫** = `scripts/check-benchmark-numbers.ts`（★ 状态表 ⇄ 对应 R 行两侧状态一致 · ★ 8 侧）。
 
 ## 9. 依赖包
 
