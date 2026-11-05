@@ -55,7 +55,7 @@
 * **验收标准**：
   1. **写入扫描循环另装一个计数器实例**（**不移动** `rowCounter.uninstall()`）⇒ 写入循环 `store.write()` 内部的向量扫描**不被计量**（断言「写入循环内计数增量 = 0」）；
   2. **两个实例串行安装** ⇒ 第二个 `uninstall()` 不会把 `db.prepare` 还原成「第一个的包装」；
-  3. **断言 1b**：`bytesRead === codeRows × 768 + candidateRows × 3,072`（写路径，零容差）；
+  3. **断言 1b**：`bytesRead === codeRows × 768 + candidateRows × 3,072`（写路径，零容差）；⇒ ⇒ ★★ **⚠️【拿错字段型陷阱】这里的 `candidateRows` 是【legacy 计数器】口径**（写路径 == `memoryRowsRead`）⇒ ⇒ **它【不是】落盘的四个读数之一**（落盘的是 `memoryRowsRead` / `codeRowsRead` / `bytesRead` / `candidateUniverse`）⇒ ⇒ ⇒ ⚠️ **1M 档实测：落盘 `candidateUniverse.max` = 5,286，而 `memoryRowsRead.max` = 2** ⇒ ⇒ ⇒ **误拿 `candidateUniverse` 代入 ⇒ `5,286 × 768 + 5,286 × 3,072 = 20,298,240` ≠ 实测 `4,065,792` ⇒ ⇒ 【恒红】** ⇒ ⇒ ⇒ ★ **两个字段名字太像 ⇒ ⇒ 写这条断言时必须确认自己拿的是哪一个** ⇒ ⇒ ⇒ ★ 正确写法 = `5,286 × 768 + 2 × 3,072 = 4,065,792`（⇒ ⇒ 与 ① §11 留痕 B 的恒等式一致）⇒ ⇒ ⇒ ★ **写错不会「偏松」而是「恒红」** ⇒ ⇒ ⇒ 好在它**一上来就红**、不会静默放过；
   4. **断言 1c-bench**：`embeddingCalls ≥ embeddingExactRows`（`embeddingExactRows` = `scoreOf` **返回了行**的次数；软删行存在时**严格大于**）⇒ ⚠️ **不许用 `embeddingRowsRead` 当比较对象**（它是字节账分子、含 Q4/Q5 的 survivors 整行 ⇒ 写路径下必然大于 `embeddingCalls` ⇒ 用它比对**恒红** ⇒ 口径会写出一条在自己实现上就不成立的断言）；
   5. **`candidateUniverse` ≡ `scan.scanned`**（生产返回值对拍）⇒ 落盘值就是生产给的那个数；
   6. **`uninstall()` 逐位还原** `db.prepare`（既有纪律，回归）；
@@ -117,7 +117,7 @@
 | `bytesRead` | `writeSegments.vectorByteReads` / `vectorRouteByteReads` | `CountSummary` | **向量载荷字节**：Σ `code.byteLength` + Σ `embedding.byteLength`（**不含**正文 / 词串 / id / 标量 / SQLite 页开销）⇒ **真实搬运量的下界** |
 | `memoryRowsRead` | 同上 | `CountSummary` | **物化的 `memories` 行数**（窄读 + 向量）＝ ADR §8.5 的「原口径」 |
 | `codeRowsRead` | 同上 | `CountSummary` | **物化的 `vector_codes` 行数**（Q2 返回行数） |
-| `candidateUniverse` | 同上 | `CountSummary` | **命中桶内的候选总数**（＝ `scan.scanned` ＝ `PruneOutcome.candidates`） |
+| `candidateUniverse` | 同上 | `CountSummary` | **命中桶内的候选总数**；★ **但两条路径的【取法】不同**（★ **同一个名字、两种口径** ⇒ ⇒ **别默认它恒等于 `scan.scanned`**）：**写路径** = ＝ `scan.scanned` ＝ `PruneOutcome.candidates`；**读路径** = `COUNT(DISTINCT memory_id)`（**在计时窗口外**算；⚠️ `searchPruned()` **不返回** `scanned` ⇒ ⇒ **读路径的它 ≠ `scan.scanned`** ⇒ ⇒ 详见 ① §1.7）⇒ ⇒ ⚠️ **两者在真实数据上数值恒等**（唯一索引 ⇒ 一记忆只属一桶）⇒ ⇒ **但来源不同 ⇒ 禁止互比**（详见 ① §11 第 13 条） |
 | `embeddingRowsRead` | `….breakdown` | `CountSummary` | 其中**带 `embedding`** 的物化行数（字节账的分子） |
 | `embeddingExactRows` | `….breakdown` | `CountSummary` | ★ **`scoreOf` 返回了行的次数**（= `embeddingCalls` 减去「白调用」）⇒ **断言 1c-bench 的比较对象**（⚠️ **不是** `embeddingRowsRead`） |
 | `embeddingCalls` | `….breakdown` | `CountSummary` | bench 侧 `get()` **调用次数**（⇒ **剪枝率的分子**；定义上 == `prune` 的 `exactReads`，§1.7） |
@@ -166,7 +166,7 @@
 |---|---|---|
 | 字节恒等式 | `expect(bytesRead.max).toBe(codeBytes.max + embeddingBytes.max)`（**零容差**） | 把 `bytesRead` 换成「行数」 |
 | 健康库检查 | `expect(badCodeRows).toBe(0)`；`expect(codeBytes.max).toBe(codeRowsRead.max * 768)` | 把码字节写成 `× 784` |
-| **交叉校验 1b** | `expect(bytesRead.max).toBe(codeRows.max * 768 + candidateRows.max * 3072)`（**写路径**） | 分类漏了 Q4 / 漏了 `scoreOf` |
+| **交叉校验 1b** | `expect(bytesRead.max).toBe(codeRows.max * 768 + candidateRows.max * 3072)`（**写路径**）⇒ ⇒ ★★ **⚠️ `candidateRows` = 【legacy 计数器】口径**（写路径 == `memoryRowsRead`）⇒ ⇒ **不是**落盘的 `candidateUniverse` ⇒ ⇒ ⚠️ 1M 档落盘 `candidateUniverse.max` = **5,286** 而 `memoryRowsRead.max` = **2** ⇒ ⇒ ⇒ **误用 `candidateUniverse` ⇒ `5,286 × 768 + 5,286 × 3,072 = 20,298,240` ≠ `4,065,792` ⇒ ⇒ 【恒红】** | 分类漏了 Q4 / 漏了 `scoreOf`；★ **拿错字段**（`candidateRows` ↔ `candidateUniverse`）⇒ ⇒ 恒红 |
 | **等价性 1c** | `expect(out.exactReads).toBe(scoreOfCalls)`（**tests/unit/prune.test.ts**，直接调 `pruneTopK`） | prune.ts 改了 `exactReads` 的计数口径 |
 | **口径纪律 1c-bench** | `expect(embeddingCalls.max).toBeGreaterThanOrEqual(embeddingExactRows.max)`（⚠️ **不许用 `embeddingRowsRead`**：它是**字节账分子**、含 Q4/Q5 的 survivors 整行 ⇒ 写路径下必然大于 `embeddingCalls` ⇒ 用它比对**恒红**） | 把剪枝率分子换成「返回行数」⇒ **假绿** |
 | **两轮对齐 1d（写路径形态）** | `expect(samplesAligned).toBe(true)` | 两轮看到的不是同一批数据 |

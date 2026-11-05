@@ -37,6 +37,7 @@
     "check:mermaid-copies": "tsx scripts/check-mermaid-copies.ts",
     "check:json-note": "tsx scripts/check-json-note-fidelity.ts",
     "check:benchmark-numbers": "tsx scripts/check-benchmark-numbers.ts",
+    "check:wording-drift": "tsx scripts/check-wording-drift.ts",
     "check:gate-entry": "tsx scripts/check-gate-entry.ts",
     "audit:tier-qualifiers": "tsx scripts/audit-tier-qualifiers.ts",
     "audit:two-layer": "tsx scripts/audit-two-layer.ts",
