@@ -128,13 +128,13 @@ const reason = result.skipped;       // 'too_soon' | 'disabled' | null
 | 项 | 值 |
 |---|---|
 | **阶段** | **阶段 5 收官且已合入 `main`**（`9a3eec9` · PR #5）⇒ T01~T06 全部落地 |
-| **门禁** | `pnpm run verify` **EXIT=0** —— **14 段链**：typecheck → lint → test → 8 条契约脚本 → **3 条文档审计** |
+| **门禁** | `pnpm run verify` **EXIT=0** —— **16 段链**：typecheck → lint → test → 9 条契约脚本 → 3 条文档审计 → 2 条 T07 守卫（★ 2026-11-05 T07 阶段 3：14 → 16 段）|
 | **构建** | `pnpm run build` 通过（ESM / CJS / d.ts 三个产物） |
-| **测试** | **82 文件 / 1,738 断言**（本分支定稿实测；`main` 上仍是 67 / 1,194） |
-| **源码 `src/`** | **60 个 `.ts` / 21,472 行**（实测，不含测试） |
-| **测试 `tests/`** | **104 个 `.ts` / 44,946 行**（实测） |
-| **查看器与服务 `viewer/`＋`mcp/`** | **34 个文件 / 9,303 行**（实测；**不进发布产物**，`dist/` 仍只有 `index.*`） |
-| **门禁与审计脚本 `scripts/`** | **16 个**（8 条契约 + **3 条文档审计（已接门禁）** + 1 个负控台 + `check-gate-entry` + `capture-golden` + **`backup.ts`** + `verify_errata_writeback.py`） |
+| **测试** | **99 文件 / 1,984 断言**（★ 2026-11-05 实跑；★ 口径 = vitest 收集到的全部：★ `tests/` 94 + `src/` 3 + `mcp/` 2）—— ⚠️ **此前写的「82 文件 / 1,738 断言」是 2026-11-02 阶段 5 收官时的历史快照**（★ 保留在 `:11` / `:13` 作历史读数）|
+| **源码 `src/`** | **67 个 `.ts` / 24,463 行**（★ 2026-11-05 实测，不含测试）|
+| **测试 `tests/`** | **113 个 `.ts` / 51,407 行**（★ 2026-11-05 实测，含 94 个 `.test.ts`）|
+| **查看器与服务 `viewer/`＋`mcp/`** | **36 个文件 / 9,303 行**（★ 2026-11-05 实测；**不进发布产物**，`dist/` 仍只有 `index.*`）|
+| **门禁与审计脚本 `scripts/`** | **26 个**（★ 2026-11-05 实测 · 不含 `README.md` 与 `lib/`）＝ **9 条契约脚本 + 3 条文档审计（已接门禁）** + 1 个负控台 + `check-gate-entry` + **`check-backlog-ledger`** + **`check-json-note-fidelity` / `check-benchmark-numbers` / `check-wording-drift` / `check-mermaid-copies` / `check-credential-hygiene` / `check-line-endings`（链外守卫）** + `capture-golden` + **`backup.ts`** + `verify_errata_writeback.py` + `migrate.ts` + `backfill-codes.ts` + `bench-mutation.sh` + `restore-checklist.md`）⇒ ★ **另有 `scripts/lib/` 4 个共享模块** |
 | **阶段 3（神经元交互，6 任务）** | ✅ **T01~T06 全部已合并** |
 | **阶段 4（生命周期 / 重放 / 可观测，8 任务）** | ✅ **T01~T08 全部落地，且已合入 `main`** ⇒ 公开面 **22 个方法** |
 | **阶段 5（只读查看器 + 服务集成，6 任务）** | ✅ **T01~T06 全部落地** ⇒ 七面板可打开、面板 3 可跑召回、MCP 10 工具、公开面 **23 个方法** |
@@ -207,7 +207,7 @@ const reason = result.skipped;       // 'too_soon' | 'disabled' | null
 | 3 | **「跨档对照必须核对 `mode`」** | 让前提**从「我心里知道」变成机器可核对** |
 | 4 | **「毫秒占比两档不同」** | 行数（不变量）与毫秒（变量）**分层**，否则「逐位相同」会把两层糊在一起 |
 
-**三条机器保障**（★ **2026-11-02 起已接进 `pnpm run verify` 门禁链的 12~14 段** ⇒ 红了就阻断合并）：
+**三条机器保障**（★ **2026-11-02 起已接进 `pnpm run verify` 门禁链** ⇒ 红了就阻断合并；★ **2026-11-05 T07 阶段 3 后它们顺移成第 13~15 段**（★ 第 12 段是新增的 `check:benchmark-numbers`））:
 
 | 脚本 | 守什么 | 判别力证明 |
 |---|---|---|
@@ -253,7 +253,7 @@ const reason = result.skipped;       // 'too_soon' | 'disabled' | null
 2. **判读时看 max 那一档** —— 若生产库有软删行，**R6** 的实测会略低于 12,782 ⇒ **那不叫达标，叫「软删行不再计入读放大」**。
 3. **路径取舍** ⇒ (b) 为主 + 组合方案 (a)+(b)，**但「修缺陷②」是路径 (b) 的前置**。
 4. **「候选 ≤ 2000」** ⇒ 改写成「**估算量级、不是上限**」并与 H1 彻底分开 ⇒ ✅ **2026-11-03 已裁（`DECISIONS.md` 的 D10）**：H1/H2 的主语钉成**写入去重路径**，召回路径的同名量另立 **R6（观测值 · 本轮不设门槛）** ⇒ 正文见 `DESIGN-v2-errata.md` §11.8。
-5. **✅ 接门禁已闭环（2026-11-02）** ⇒ 三个审计脚本已进 `pnpm run verify`（第 12~14 段）：扩展名改回 `.ts`、`EXPECTED_GATE_COMMANDS` 11 → 14、删掉手写声明 `.d.mts`、补两个含反例的契约单测 ⇒ 详见 `docs/progress/stage3-progress.md` §十四。
+5. **✅ 接门禁已闭环（2026-11-02）** ⇒ 三个审计脚本已进 `pnpm run verify`（第 12~14 段）：扩展名改回 `.ts`、`EXPECTED_GATE_COMMANDS` 11 → 14、删掉手写声明 `.d.mts`、补两个含反例的契约单测 ⇒ 详见 `docs/progress/stage3-progress.md` §十四。⇒ ★ **⚠️ 2026-11-05 更新**：★ 门禁已 **14 → 16 段**（★ T07 阶段 3 · 新增 `check:benchmark-numbers` 与 `check:mermaid-copies`）⇒ ⇒ **这三个审计脚本顺移成第 13~15 段**（★ 原文的「第 12~14 段」是 **2026-11-02 当时的位置**，按历史记录保留不改）。
 
 ---
 

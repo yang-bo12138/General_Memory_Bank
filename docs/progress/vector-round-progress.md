@@ -1,7 +1,7 @@
 # 矢量路接线轮（P2-T09~T12）· 交付与遗留
 
 > 时点：2026-11-03（Asia/Shanghai）· 分支 `perf/ivf-single-pass` → PR **#6**
-> 门禁：`pnpm run verify` **EXIT=0**（14 段链）· **90 文件 / 1,838 条断言** · `pnpm run build` **EXIT=0**
+> 门禁：`pnpm run verify` **EXIT=0**（**16 段链** · ★ 2026-11-05 T07 阶段 3：14 → 16）· **99 文件 / 1,984 条断言**（★ 2026-11-05 实跑）· `pnpm run build` **EXIT=0**
 > 设计：`docs/design/p5-vector-path-design.md`（D1~D9 + §11 实现后读数）· 裁决索引：`DECISIONS.md` 的 **ADR-P5-VEC** · 勘误：`DESIGN-v2-errata.md` **§11**
 >
 > ⚠️ **本文件取代以下过期陈述**（那几处已同步改掉或加了指针）：
@@ -112,16 +112,16 @@
 
 | # | 问题 | 现状 |
 |---|---|---|
-| **E1** | **`D:\.pnpm-store` 有坏块**（`os error 1392`） | 只绕过了（`--store-dir "D:/WorkBuddyData/.pnpm-store-clean"`），**没修根因** ⇒ 建议 `chkdsk /f D:` |
+| **E1** | **`D:\.pnpm-store` 有坏块**（`os error 1392`） | ⚠️ ★ **2026-11-05 现状订正**：**已规避** —— ★ ① **pnpm store 已迁到 E 盘**（★ `pnpm store path` 实测 = `E:\.pnpm-store\v11`）⇒ ⇒ 依赖安装这条路**已彻底脱离 D 盘坏块**；★ ② **仓库本体也已迁到 E 盘**（★ `E:\WorkBuddyData\2026-11-02-08-56-53\gmb`）⇒ ⇒ **代码也不再在坏块风险区**；★ ③ **当时的绕过手段**（`--store-dir "D:/WorkBuddyData/.pnpm-store-clean"`）**已随迁移失效、当前不需要**（★ 那是历史事实，保留不改）。⚠️ ★ **但 `chkdsk /f D:` 仍是治本手段、且【根因未修】** —— ★ **D 盘的健康问题与本仓库已无关**，但盘本身仍建议由用户用管理员权限修复 |
 | **E2** | 装依赖「假失败」 | `pnpm install` 若**只**报 `ERR_PNPM_IGNORED_BUILDS`，pnpm 认定整次失败、**不写 `node_modules/.modules.yaml`** ⇒ 之后每个 `pnpm run` 都先自动重装。判据是 **`.modules.yaml` 存在**，不是「命令没报错」 |
-| **E3** | 跑脚本要加前缀 | `npm_config_verify_deps_before_run=false`（否则触发依赖预检 → 撞坏块） |
+| **E3** | 跑脚本要加前缀 | `npm_config_verify_deps_before_run=false`（否则触发依赖预检 → 撞坏块）—— ⚠️ ★ **2026-11-05 现状订正**：**store 已迁到 E 盘 ⇒ 这条前缀【不再是「避坏块」的必需项】** ⇒ ⇒ **但【未验证能否直接去掉】** ⇒ ⇒ ★ **保留这条（按现状照用最安全）**，并记下「它现在挡的是【依赖预检本身】、不是【坏块】」 |
 | **E4** | 工作区垃圾 | `pnpm-store-fresh/`（5,370 个文件，某工程师的临时 store，可删）；已合并的 `feat/p5-verify-integrity` 仍保留 |
 
 ## 五、复验入口
 
 ```bash
 cd gmb
-npm_config_verify_deps_before_run=false pnpm run verify   # 期望 EXIT=0 · 90 文件 / 1,832 断言 · 14 段链
+npm_config_verify_deps_before_run=false pnpm run verify   # 期望 EXIT=0 · 99 文件 / 1,984 断言 · 16 段链（★ 2026-11-05 实测）
 npm_config_verify_deps_before_run=false pnpm run build    # 期望 EXIT=0（dist 只有 index.*）
 ```
 
