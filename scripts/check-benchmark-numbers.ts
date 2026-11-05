@@ -60,10 +60,31 @@
  *   · 可复算恒等式：`bytesRead = 码行数 × 768 B + embedding 行数 × 3,072 B`
  *     （写路径 `5,286 × 768 + 2 × 3,072 = 4,065,792`；读路径 `9,079 × 768 + 85 × 3,072 = 7,233,792`）
  *
+ * ## ★★ 「档位串」是【硬规则】、不是【一份清单】（★ 主理人裁决 · 2026-11-05）
+ *
+ * ⚠️ ★ **为什么是规则而不是清单**：★ 「文档 + 代码两处维护」会漂
+ *   ⇒ ⇒（★ 本项目已栽过这个：ADR 漏网就是它）⇒ ⇒ ⇒ **规则不会漂**。
+ *
+ * > ★★★ **「凡落一个实测数 ⇒ ⇒ 必须带它的【档位串】⇒ ⇒ 而档位串必须含【全部已知的条件维度】」**
+ *
+ * ★ 四个**已知**的条件维度（★ 将来发现新的 ⇒ ⇒ **加进这一行** ⇒ ⇒ **不许另起一份清单**）：
+ * | 维度 | 取值 | 为什么必须带 |
+ * |---|---|---|
+ * | **口径** | 写路径 / bench / 生产召回 | 同一个数在不同口径下含义不同 |
+ * | **k** | 20（写路径·bench）/ 60（生产召回 × `VECTOR_OVERFETCH_FACTOR`） | 上界随 k 变 ⇒ ⇒ 论证随之变 |
+ * | **页缓存冷热** | 冷 765–870 s vs 热 247 s（差 3.1–3.5×） | 同一命令差 3 倍 ⇒ ⇒ 缺它 = 数不可复现 |
+ * | **并发** | 单人独占 vs 重叠跑 | 磁盘争用污染【时长】、不污染【写放大量】 |
+ *
+ * ⇒ ⇒ ★ **这是「凡落一个实测数必须带它的档位串」这条纪律的【机器侧表述】**
+ *   ⇒ ⇒ ⇒ ★ 即：本脚本比对的每一个数，**它的载体行都必须带着这些维度**
+ *   ⇒ ⇒ ⇒ ★ **缺哪一维 ⇒ ⇒ 机器/评审都能看出来**。
+ *
  * ## 用法
  *   tsx scripts/check-benchmark-numbers.ts               # 校验（默认）
- *   tsx scripts/check-benchmark-numbers.ts --self-test   # 自带正控 + 反向对照 + 4 条负控
+ *   tsx scripts/check-benchmark-numbers.ts --self-test   # 自带正控 + 反向对照 + 全部负控
  *   tsx scripts/check-benchmark-numbers.ts --root <目录> # 指定根目录（自测 / 排障用）
+ *   tsx scripts/check-benchmark-numbers.ts --max-wording-anchors N     # 放宽【措辞锚点】清单上限（★ 必须显式）
+ *   tsx scripts/check-benchmark-numbers.ts --max-outreach-statuses N   # 放宽【出关条件状态】清单上限（★ 必须显式）
  */
 
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -519,9 +540,15 @@ const WORDING_ANCHORS: readonly {
 type WordingAnchor = (typeof WORDING_ANCHORS)[number];
 
 /**
- * ★ 锚点条目总数上限（★ **放宽必须显式传参** `--max-anchors N` ⇒ ⇒ **不许悄悄改常量**）。
+/**
+ * ★ **两个清单、两个上限**（★ **放宽必须显式传参** ⇒ ⇒ **不许悄悄改常量**）。
+ *
+ * ⚠️ ★ **为什么拆成两个**（★ 主理人裁决 · 2026-11-05）：★ **两个清单的【合理规模】不同**
+ *   ⇒ ⇒（措辞锚点：当前 1 条 · 出关条件状态：当前 4 条）⇒ ⇒ ★ **一个共享上限要么太松、要么太紧**
+ *   ⇒ ⇒ ★ **太松** ⇒ ⇒ 清单被悄悄撑大没人管；★ **太紧** ⇒ ⇒ 加一条正常条目就得改常量。
  */
-const DEFAULT_MAX_ANCHORS = 8;
+const DEFAULT_MAX_WORDING_ANCHORS = 4;
+const DEFAULT_MAX_OUTREACH_STATUSES = 8;
 
 const CATEGORY_ANCHOR_WIDENED = '锚点清单被改宽';
 
@@ -1214,6 +1241,12 @@ type ListControl = {
   readonly name: string;
   /** 期望的失败类别（★ `''` ⇒ **不许**报这一类 ⇒ ⇒ 用来验「显式放宽上限」确实生效）。 */
   readonly expect: string;
+  /**
+   * ★ 期望消息里**必须**出现的片段（★ `''` ⇒ 不要求）。
+   * ★ **用途**：★ 两条负控可能报出**同一个类别**（★ 「锚点清单被改宽」）⇒ ⇒
+   *   只断言类别 ⇒ ⇒ 分不清是哪一把锁在响 ⇒ ⇒ ★ **加这一条 ⇒ ⇒ 断言到【哪一把锁】**。
+   */
+  readonly expectDetail: string;
   readonly run: (dir: string) => WordingReport;
 };
 
@@ -1221,10 +1254,12 @@ const LIST_CONTROLS: readonly ListControl[] = [
   {
     name: '负控 M · 清单被改窄（把措辞锚点少列一个载体 ⇒ ⇒ 期望形状的载体数对不上）',
     expect: CATEGORY_ANCHOR_WIDENED,
+    expectDetail: '期望牵住 4 个载体',
     run: (dir) =>
       checkWording(
         dir,
-        DEFAULT_MAX_ANCHORS,
+        DEFAULT_MAX_WORDING_ANCHORS,
+        DEFAULT_MAX_OUTREACH_STATUSES,
         WORDING_ANCHORS.map((anchor) => ({
           ...anchor,
           carriers: anchor.carriers.slice(0, anchor.carriers.length - 1),
@@ -1232,14 +1267,22 @@ const LIST_CONTROLS: readonly ListControl[] = [
       ),
   },
   {
-    name: '负控 N · 清单条目数超过上限（上限显式调到 1 ⇒ ⇒ 实际 5 条 ⇒ ⇒ 超了）',
+    name: '负控 N · 措辞锚点清单条目数超过上限（上限显式调到 0 ⇒ ⇒ 实际 1 条 ⇒ ⇒ 超了）',
     expect: CATEGORY_ANCHOR_WIDENED,
-    run: (dir) => checkWording(dir, 1),
+    expectDetail: '措辞锚点清单的条目数 1 超过上限 0',
+    run: (dir) => checkWording(dir, 0, DEFAULT_MAX_OUTREACH_STATUSES),
+  },
+  {
+    name: '负控 N3 · 出关条件状态清单条目数超过上限（上限显式调到 1 ⇒ ⇒ 实际 4 条 ⇒ ⇒ 超了）',
+    expect: CATEGORY_ANCHOR_WIDENED,
+    expectDetail: '出关条件状态清单的条目数 4 超过上限 1',
+    run: (dir) => checkWording(dir, DEFAULT_MAX_WORDING_ANCHORS, 1),
   },
   {
     name: '负控 N2 · 显式放宽上限（上限显式调到 5 ⇒ ⇒ 不再报「超过上限」）',
     expect: '',
-    run: (dir) => checkWording(dir, 5),
+    expectDetail: '',
+    run: (dir) => checkWording(dir, 5, DEFAULT_MAX_OUTREACH_STATUSES),
   },
 ];
 
@@ -1267,7 +1310,11 @@ function runSelfTest(): number {
     materialize(new Map());
     const positive = check(dir);
     const positiveStatus = checkStatus(dir);
-    const positiveWording = checkWording(dir, DEFAULT_MAX_ANCHORS);
+    const positiveWording = checkWording(
+      dir,
+      DEFAULT_MAX_WORDING_ANCHORS,
+      DEFAULT_MAX_OUTREACH_STATUSES,
+    );
     const positiveAll = [...positive.issues, ...positiveStatus.issues, ...positiveWording.issues];
     if (positiveAll.length === 0) {
       process.stdout.write(
@@ -1286,7 +1333,11 @@ function runSelfTest(): number {
     materialize(new Map([[reverseFile, `> （反向对照：这一行不属于任何载体）\n${reverseBase}`]]));
     const shifted = check(dir);
     const shiftedStatus = checkStatus(dir);
-    const shiftedWording = checkWording(dir, DEFAULT_MAX_ANCHORS);
+    const shiftedWording = checkWording(
+      dir,
+      DEFAULT_MAX_WORDING_ANCHORS,
+      DEFAULT_MAX_OUTREACH_STATUSES,
+    );
     const shiftedAll = [...shifted.issues, ...shiftedStatus.issues, ...shiftedWording.issues];
     if (shiftedAll.length === 0) {
       process.stdout.write('✅ 反向对照：在载体**之外**插一行 ⇒ 仍零错误（无假报警）\n');
@@ -1320,7 +1371,7 @@ function runSelfTest(): number {
         control.dimension === 'status'
           ? checkStatus(dir)
           : control.dimension === 'wording'
-            ? checkWording(dir, DEFAULT_MAX_ANCHORS)
+            ? checkWording(dir, DEFAULT_MAX_WORDING_ANCHORS, DEFAULT_MAX_OUTREACH_STATUSES)
             : check(dir);
 
       // ★★★★ **根因断言**：mutate 之后，判定必须【不再通过】
@@ -1374,6 +1425,15 @@ function runSelfTest(): number {
       }
       const hit = report.issues.find((issue) => issue.category === control.expect);
       if (hit !== undefined) {
+        // ★ 断言到【哪一把锁】⇒ ⇒ 只断言类别会分不清是「形状锁」还是「上限锁」在响
+        if (control.expectDetail !== '' && !hit.detail.includes(control.expectDetail)) {
+          failures += 1;
+          process.stdout.write(
+            `✗ ${control.name} ⇒ 报出了「${control.expect}」、但消息里没有「${control.expectDetail}」` +
+              `⇒ ⇒ **断言没锁到是哪一把锁**（实际消息：${hit.detail}）\n`,
+          );
+          continue;
+        }
         process.stdout.write(`✅ ${control.name} ⇒ 报出「${control.expect}」\n`);
       } else {
         failures += 1;
@@ -1435,13 +1495,27 @@ function runCli(argv: readonly string[]): number {
   const rootArg = rootIndex === -1 ? '' : (argv[rootIndex + 1] ?? '');
   const root = rootArg === '' ? REPO_ROOT : resolve(rootArg);
 
-  const maxIndex = argv.indexOf('--max-anchors');
-  const maxArg = maxIndex === -1 ? '' : (argv[maxIndex + 1] ?? '');
-  const maxAnchors = maxArg === '' ? DEFAULT_MAX_ANCHORS : Number(maxArg);
+  // ★ **两个上限、两个参数**（★ 放宽任一个都必须【显式】传参 ⇒ ⇒ 不许悄悄改常量）
+  const readLimit = (flag: string, fallback: number): number => {
+    const index = argv.indexOf(flag);
+    if (index === -1) {
+      return fallback;
+    }
+    const raw = argv[index + 1];
+    const parsed = Number(raw);
+    if (raw === undefined || !Number.isFinite(parsed) || parsed < 0) {
+      process.stderr.write(`✗ ${flag} 需要一个非负整数（收到「${String(raw)}」）\n`);
+      process.exitCode = 2;
+      return fallback;
+    }
+    return parsed;
+  };
+  const maxWordingAnchors = readLimit('--max-wording-anchors', DEFAULT_MAX_WORDING_ANCHORS);
+  const maxOutreachStatuses = readLimit('--max-outreach-statuses', DEFAULT_MAX_OUTREACH_STATUSES);
 
   const report = check(root);
   const statusReport = checkStatus(root);
-  const wordingReport = checkWording(root, maxAnchors);
+  const wordingReport = checkWording(root, maxWordingAnchors, maxOutreachStatuses);
 
   process.stdout.write('跨载体一致性校验（同一批实测数在各处不许各说各话）\n');
   process.stdout.write(`  根目录：${root}\n`);

@@ -8,8 +8,11 @@
  * |---|---|---|
  * | **断言形态** | 旧措辞**裸用**（不加引号）、当事实陈述 | ❌ **违规 ⇒ 判红** |
  * | **引述形态** | 旧措辞**落在引号里**（`「…」` / `『…』` / `“…”` / `` `…` ``） | ✅ 豁免（类 A） |
- * | **释义形态** | 所在行含特征短语「真实含义是」 | ✅ 豁免（类 B） |
+ * | **释义形态** | 旧措辞**邻近**特征短语「真实含义是」（★ 间隔 ≤ 40 字） | ✅ 豁免（类 B） |
  *
+ * ⚠️ ★★ **类 B 是【逐个命中】判的、不是【整行】判的**（★ 本轮收紧项 · ★ 阈值由主理人拍「≤ 40 字」）：
+ *   ⇒ ⇒ 同一行里若有一个**紧邻**释义标记的旧措辞、**又**有一个**远离**它的旧措辞
+ *   ⇒ ⇒ ⇒ ⇒ **前者豁免、后者判红** ⇒ ⇒ ⇒ ⇒ 断言形态的漏网被堵住。
  * ⚠️ ★ **匹配是【按段】做的、不是对整行做的**：先把行按引号切成段 ⇒ ⇒ 段内独立匹配
  *   ⇒ ⇒ **一段引号内的命中 = 引述**（豁免）· **引号外的命中 = 断言**（判红）
  *   ⇒ ⇒ ⇒ 为什么要分段：宽式正则若对整行跑 ⇒ ⇒ 会**横跨两处引述**
@@ -29,7 +32,7 @@
  * |---|---|---|---|
  * | **断言处** | 引号**外** | ❌ **违规**（判红） | `assertion`（★ 规范措辞必须出现在这里） |
  * | **引述形态** | 引号**内**（`「」` / `『』` / `“”` / `` ` ``） | ✅ 豁免（类 A） | `quoted`（豁免） |
- * | **释义形态** | 所在行含特征短语「真实含义是」 | ✅ 整行豁免（类 B） | `explanation`（豁免） |
+ * | **释义形态** | 该子串**邻近**特征短语「真实含义是」（★ 间隔 ≤ 40 字） | ✅ 豁免（类 B） | `explanation`（豁免） |
  *
  * ⚠️ ★ **两个入口答的是【不同的问题】，但共用【同一份切段实现】**（`splitSegments()`）：
  *   · `classifyLine` 答：「这一行里有没有**旧措辞**、它是否被豁免」；
@@ -71,9 +74,11 @@
  * ⇒ ⇒ 所以豁免**只认内容特征**，共两类：
  *   · **A ·「被引用的词」**：命中片段**落在引号内**（`「」` / `『』` / `“”` / `` ` ``）
  *     ⇒ ⇒ 它是被**引用**的一个词，不是被**断言**的一个事实；
- *   · **B ·「释义行」**：所在行含特征短语「真实含义是」
+ *   · **B ·「释义形态」**：命中片段**邻近**特征短语「真实含义是」（★ **间隔 ≤ 40 字**）
  *     ⇒ ⇒ 它在**解释**这个词。
  * ⇒ ⇒ ⚠️ **凡不满足这两类的命中 ⇒ ⇒ 一律判红**。
+ * ⇒ ⇒ ★ **两类都是【逐个命中】判的**（★ A 看命中自己在不在引号里 · B 看它离释义标记多近）
+ *   ⇒ ⇒ ⇒ ⇒ **没有「整行放行」这回事** ⇒ ⇒ ⇒ ⇒ 同一行里「一处合规、一处违规」能被分开。
  *
  * ⚠️ ★★ **为什么 A 类不能省**（实测出来的坑）：
  *   释义段实际是**两行** ⇒ ⇒ 而**只有第一行**含「真实含义是」
@@ -105,18 +110,17 @@
  *
  * ## 已知限制（说清楚，别假装没有）
  *
- * ⚠️ ★ **豁免判据是【行内】的**：同一行里若既有一个「被引用的词」、又有一个
- *   「当断言用的」旧措辞 ⇒ ⇒ 本脚本**看不出**这个区别 ⇒ ⇒ 它会整行放行。
- *   ⇒ ⇒ 缓解：豁免条目数**有上限** ⇒ ⇒ 一行放行多处 ⇒ ⇒ 很快会撞上限 ⇒ ⇒ 报出来。
- * ⚠️ ★★ **类 B（释义行）是【整行】豁免 ⇒ ⇒ 这是「存在性判」而非「集合判」**
- *   （★ 同一类问题在另一条脚本上被实际抓到过：★ 同一个编号在一行里出现两次、只改一处 ⇒ ⇒
- *   ⇒ ⇒ 判定仍然通过 ⇒ ⇒ 夹具无效 ⇒ ⇒ 必须改成「所有同类标记必须一致」）。
- *   ⇒ ⇒ **本脚本的具体盲区**：一行里**既有**「真实含义是」这个释义标记、**又**在某处
- *   ⇒ ⇒ **断言式**地用了旧措辞 ⇒ ⇒ **整行被豁免** ⇒ ⇒ 那处断言**看不见**。
- *   ⇒ ⇒ 缓解：① 豁免条目数有上限（撑大就会被报出来）· ② 类 A（引述形态）是**逐个命中**判的
- *   ⇒ ⇒ ⇒ **不受行级豁免影响** ⇒ ⇒ ⇒ 真正需要盯的只有「释义标记 + 同行断言」这一种组合。
- *   ⇒ ⇒ ⇒ 若要收紧（把类 B 改成「释义短语必须**邻近**该命中」），那是**改判据** ⇒ ⇒
- *   ⇒ ⇒ ⇒ **须主理人拍** ⇒ ⇒ ⇒ **本轮未改**（按现有规格实现 ⇒ ⇒ 只把盲区写清楚）。
+ * ✅ ★★ **类 B 已从「整行豁免」收紧成「逐个命中 + 行级上下文」**（★ 主理人拍板 · ★ 本轮已改）：
+ *   ⇒ ⇒ 判据 = **释义标记与该命中的间隔 ≤ 40 字**（★ 数的是字符数）⇒ ⇒ 超过 ⇒ ⇒ **该命中判红**。
+ *   ⇒ ⇒ ⇒ 旧盲区（「一行里有释义标记、别处又断言式地用旧措辞 ⇒ 整行被豁免」）**已堵住**。
+ *   ⇒ ⇒ ⇒ 且**由负控机械证明**（★ 同一行「近的一处豁免 + 远的一处判红」⇒ ⇒ 两次跑结论必须一致）。
+ * ⚠️ ★ **残余限制 ①：间隔阈值数的是【字符数】、不是【语义】**：
+ *   ⇒ ⇒ 一行里若有一段**恰好 ≤ 40 字**的无关文字把旧措辞与释义标记连起来 ⇒ ⇒ 那处仍会被豁免。
+ *   ⇒ ⇒ 缓解：豁免条目数**有上限** ⇒ ⇒ 靠量堆豁免很快会撞上限 ⇒ ⇒ 报出来。
+ * ⚠️ ★ **残余限制 ②：类 A（引述形态）仍是「该命中在引号内就豁免」**：
+ *   ⇒ ⇒ 一行里若既有一个「被引用的词」、又有一个「当断言用的」旧措辞 ⇒ ⇒
+ *   ⇒ ⇒ 那处断言**看得见**（★ A 是逐个命中判的、不牵连同行）⇒ ⇒ 但**引号内那处**永远豁免。
+ *   ⇒ ⇒ 缓解：同上（豁免条目数有上限）。
  *
  * ## 用法
  *
@@ -166,8 +170,20 @@ const SELF_REL = relative(REPO_ROOT, SELF_PATH).split(sep).join('/');
  */
 const FORBIDDEN_PATTERN = /只读[^，。；）]{0,12}2 行/gu;
 
-/** 释义特征短语（行内含它 ⇒ 这一行在**解释**这个词 ⇒ 豁免类 B）。 */
+/** 释义特征短语（★ 命中**邻近**它 ⇒ 它在**解释**这个词 ⇒ 豁免类 B）。 */
 const FEATURE_PHRASE = '真实含义是';
+
+/**
+ * ★ 类 B 的**邻近阈值**：释义特征短语与该命中之间的**间隔字符数**上限。
+ *
+ * ⚠️ ★ **为什么是「间隔」而不是「同一行」**（★ 本轮收紧的根因）：
+ *   「同一行含特征短语 ⇒ ⇒ 整行豁免」是**存在性判** ⇒ ⇒ 一行里只要有一处释义标记
+ *   ⇒ ⇒ ⇒ **别处的断言式旧措辞就跟着被放行** ⇒ ⇒ ⇒ 那处断言**看不见**。
+ *   ⇒ ⇒ 改成「**逐个命中** + **行级上下文**」⇒ ⇒ 释义标记必须**就在附近**才放行。
+ *
+ * ⚠️ ★ **阈值 40 字由主理人拍**（★ 本轮收紧项）⇒ ⇒ 判据写死在这里、只此一份。
+ */
+export const MAX_FEATURE_DISTANCE = 40;
 
 /** 引号对（命中片段落在引号内 ⇒ 它是被**引用**的词 ⇒ 豁免类 A）。 */
 const QUOTE_PAIRS: readonly (readonly [string, string])[] = [
@@ -227,7 +243,12 @@ const OLD_WORDING_TAIL = '了 2 行';
 /** 豁免类别（`undefined` ⇒ ⇒ 该命中是**违例**）。 */
 export type Allowance =
   | { readonly kind: 'quoted'; readonly quote: string }
-  | { readonly kind: 'feature-phrase'; readonly phrase: string };
+  | {
+      readonly kind: 'feature-phrase';
+      readonly phrase: string;
+      /** ★ 释义标记与该命中之间的**间隔字符数**（≤ `MAX_FEATURE_DISTANCE` 才豁免）。 */
+      readonly distance: number;
+    };
 
 /** 一处命中（违例或豁免）。 */
 export interface Occurrence {
@@ -317,6 +338,56 @@ function truncate(text: string): string {
 }
 
 /**
+ * 一个**文本跨度**（半开区间 `[start, end)`）。
+ */
+interface Span {
+  /** 起始偏移（含）。 */
+  readonly start: number;
+  /** 结束偏移（不含）。 */
+  readonly end: number;
+}
+
+/**
+ * 找出本行里所有**特征短语**的跨度。
+ *
+ * @param line 整行文本
+ * @param phrase 特征短语
+ * @returns 跨度列表（按出现顺序）
+ */
+function findPhraseSpans(line: string, phrase: string): Span[] {
+  const spans: Span[] = [];
+  let from = 0;
+  for (;;) {
+    const start = line.indexOf(phrase, from);
+    if (start === -1) {
+      break;
+    }
+    spans.push({ start, end: start + phrase.length });
+    from = start + phrase.length;
+  }
+  return spans;
+}
+
+/**
+ * 两个跨度之间的**间隔字符数**（★ 中间夹着的那些字）。
+ *
+ * ⚠️ ★ **重叠算 0**：两个跨度重叠 ⇒ ⇒ 中间隔了 0 个字 ⇒ ⇒ 视为「紧邻」。
+ *
+ * @param left 左边那个
+ * @param right 右边那个
+ * @returns 间隔字符数
+ */
+function gapBetween(left: Span, right: Span): number {
+  if (left.end <= right.start) {
+    return right.start - left.end;
+  }
+  if (right.end <= left.start) {
+    return left.start - right.end;
+  }
+  return 0;
+}
+
+/**
  * 一行被引号切出来的【段】。
  *
  * ⚠️ ★ **为什么要按段扫、而不是对整行扫**：
@@ -385,15 +456,31 @@ function splitSegments(line: string): Segment[] {
  */
 function scanLine(line: string, file: string, lineNo: number, inSelf: boolean): Occurrence[] {
   const segments = splitSegments(line);
+  const featureSpans = findPhraseSpans(line, FEATURE_PHRASE);
   const out: Occurrence[] = [];
   for (const segment of segments) {
     for (const match of segment.text.matchAll(FORBIDDEN_PATTERN)) {
       const snippet = match[0] ?? '';
+      const hitStart = segment.offset + match.index;
+      const hitSpan: Span = { start: hitStart, end: hitStart + snippet.length };
       let allowance: Allowance | undefined;
       if (segment.quoted) {
+        // ★ 类 A：该命中落在引号内 ⇒ ⇒ 它是被**引用**的词。
         allowance = { kind: 'quoted', quote: segment.quote };
-      } else if (line.includes(FEATURE_PHRASE)) {
-        allowance = { kind: 'feature-phrase', phrase: FEATURE_PHRASE };
+      } else {
+        // ★ 类 B：**逐个命中**判定 ⇒ ⇒ 释义标记必须【邻近】该命中（间隔 ≤ 阈值）。
+        //   ⚠️ ★ 不再是「整行含特征短语就整行豁免」⇒ ⇒ 同一行里「近的一处 + 远的一处」
+        //   ⇒ ⇒ ⇒ 必须给出**两个不同**的结论。
+        let best: number | undefined;
+        for (const span of featureSpans) {
+          const gap = gapBetween(hitSpan, span);
+          if (best === undefined || gap < best) {
+            best = gap;
+          }
+        }
+        if (best !== undefined && best <= MAX_FEATURE_DISTANCE) {
+          allowance = { kind: 'feature-phrase', phrase: FEATURE_PHRASE, distance: best };
+        }
       }
       out.push({ file, line: lineNo, snippet, context: truncate(line), allowance, inSelf });
     }
@@ -443,7 +530,7 @@ export type SnippetShape =
  *
  * ★ **判定顺序**（与 `classifyLine` 的豁免顺序一致）：
  *   ① 子串落在**引号内** ⇒ ⇒ `quoted`（引述形态 ⇒ 豁免）；
- *   ② 否则、**整行**含特征短语「真实含义是」⇒ ⇒ `explanation`（释义形态 ⇒ 整行豁免）；
+ *   ② 否则、特征短语「真实含义是」**邻近**该子串（★ 间隔 ≤ 40 字）⇒ ⇒ `explanation`（释义形态 ⇒ 豁免）；
  *   ③ 否则 ⇒ ⇒ `assertion`（断言处 ⇒ 规范措辞必须出现在这里）。
  *
  * ⚠️ ★ **同一行里子串出现多次时 ⇒ ⇒ 以【第一次出现】为准**（段序 = 行内先后）。
@@ -454,13 +541,26 @@ export type SnippetShape =
  */
 export function classifySnippet(line: string, snippet: string): SnippetShape | undefined {
   for (const segment of splitSegments(line)) {
-    if (!segment.text.includes(snippet)) {
+    const index = segment.text.indexOf(snippet);
+    if (index === -1) {
       continue;
     }
     if (segment.quoted) {
       return 'quoted';
     }
-    return line.includes(FEATURE_PHRASE) ? 'explanation' : 'assertion';
+    // ★ 与 `scanLine` 同构：释义形态要求特征短语**邻近**该子串（★ 判据只有一份）。
+    const hitSpan: Span = {
+      start: segment.offset + index,
+      end: segment.offset + index + snippet.length,
+    };
+    let best: number | undefined;
+    for (const span of findPhraseSpans(line, FEATURE_PHRASE)) {
+      const gap = gapBetween(hitSpan, span);
+      if (best === undefined || gap < best) {
+        best = gap;
+      }
+    }
+    return best !== undefined && best <= MAX_FEATURE_DISTANCE ? 'explanation' : 'assertion';
   }
   return undefined;
 }
@@ -547,7 +647,8 @@ function scanTree(root: string, maxAllowed: number): Report {
       category: '旧措辞被当作断言',
       detail:
         `${violation.file}:${violation.line} ⇒ 「${violation.snippet}」 ⇒ ` +
-        `该处把旧措辞当成【断言】在用（既不在引号里、所在行也不含释义特征短语「${FEATURE_PHRASE}」）` +
+        `该处把旧措辞当成【断言】在用（既不在引号里、离释义特征短语「${FEATURE_PHRASE}」` +
+        `也超过 ${MAX_FEATURE_DISTANCE} 字）` +
         '⇒ ⇒ 口径里一律写「至多 2 行」⇒ ⇒ 请改成「至多 2 行」（或把它写成**被引用的词**）',
     });
   }
@@ -583,7 +684,7 @@ function scanTree(root: string, maxAllowed: number): Report {
 function describeAllowance(allowance: Allowance): string {
   return allowance.kind === 'quoted'
     ? `被引用的词（引号 ${allowance.quote}）`
-    : `释义行（含特征短语「${allowance.phrase}」）`;
+    : `释义形态（特征短语「${allowance.phrase}」与该命中相距 ${allowance.distance} 字 ≤ ${MAX_FEATURE_DISTANCE}）`;
 }
 
 /**
@@ -605,7 +706,9 @@ function printReport(report: Report, root: string, maxAllowed: number): void {
   process.stdout.write(
     '    ① 「被引用的词」：命中片段落在引号内（`「」` / `『』` / `“”` / `` ` ``）\n',
   );
-  process.stdout.write(`    ② 「释义行」：所在行含特征短语「${FEATURE_PHRASE}」\n`);
+  process.stdout.write(
+    `    ② 「释义形态」：命中与释义特征短语「${FEATURE_PHRASE}」相距 ≤ ${MAX_FEATURE_DISTANCE} 字\n`,
+  );
   process.stdout.write(`  豁免条目上限：${maxAllowed}（★ 只统计本脚本自身之外的豁免）\n`);
 
   const listed = report.allowed.filter((item) => !item.inSelf);
@@ -640,6 +743,14 @@ function printReport(report: Report, root: string, maxAllowed: number): void {
 interface Control {
   readonly name: string;
   readonly expect: IssueCategory;
+  /**
+   * ★ 期望的**违例条数**（★ 不给 ⇒ 只要求「至少报出一条该类别的错」）。
+   *
+   * ★ **为什么需要它**：负控 D 的要点是「同一行里**近的一处豁免 + 远的一处判红**」
+   *   ⇒ ⇒ 判红**一条**就对了（两条 ⇒ 说明**近的那处也被判红了** ⇒ ⇒ 类 B 收得太紧）；
+   *   ⇒ ⇒ 零条 ⇒ 说明**远的那处也没抓住** ⇒ ⇒ 收紧根本没生效。
+   */
+  readonly expectViolationCount?: number;
   readonly mutate: (repo: string) => void;
 }
 
@@ -855,6 +966,72 @@ function runSelfTest(): number {
       }
     }
 
+    /* ── 反向对照 ④：旧措辞【紧邻】释义标记（标记在命中【之后】）⇒ ⇒ 必须**不**红 ── */
+    {
+      const work = join(tmpRoot, 'case-reverse-explain-after');
+      cpSync(pristine, work, { recursive: true });
+      const inserted = appendLine(
+        join(work, ADR_FILE),
+        `- ★ 反向对照 ④：实测精确分${OLD_WORDING_HEAD}${OLD_WORDING_TAIL}（这一行${FEATURE_PHRASE}「【至多】2 行」）⇒ ⇒ 紧邻释义标记（标记在后）⇒ ⇒ 必须**不**红。`,
+      );
+      if (!inserted) {
+        failures += 1;
+        process.stdout.write('✗ 反向对照 ④ ⇒ **夹具没生效**（没能插进副本）⇒ 夹具无效\n');
+      } else {
+        const report = scanTree(work, DEFAULT_MAX_ALLOWED);
+        const exempted = report.allowed.some(
+          (item) =>
+            item.file === ADR_FILE &&
+            item.snippet === `${OLD_WORDING_HEAD}${OLD_WORDING_TAIL}` &&
+            item.allowance?.kind === 'feature-phrase',
+        );
+        if (report.errors.length === 0 && exempted) {
+          process.stdout.write(
+            '✅ 反向对照 ④（紧邻释义标记 · 标记在后 ⇒ 必须不红）⇒ 零错误且该处**由类 B 豁免**\n',
+          );
+        } else {
+          failures += 1;
+          process.stdout.write(
+            `✗ 反向对照 ④（紧邻释义标记 · 标记在后 ⇒ 必须不红）⇒ 错误 ${report.errors.length} 处 / 类 B 豁免 ${exempted}` +
+              '⇒ ⇒ 类 B 收得太紧（把紧邻的释义也判红了）⇒ 必须修\n',
+          );
+        }
+      }
+    }
+
+    /* ── 反向对照 ⑤：旧措辞【紧邻】释义标记（标记在命中【之前】）⇒ ⇒ 必须**不**红 ── */
+    {
+      const work = join(tmpRoot, 'case-reverse-explain-before');
+      cpSync(pristine, work, { recursive: true });
+      const inserted = appendLine(
+        join(work, ADR_FILE),
+        `- ★ 反向对照 ⑤：这一行${FEATURE_PHRASE}「【至多】2 行」（实测精确分${OLD_WORDING_HEAD}${OLD_WORDING_TAIL}）⇒ ⇒ 紧邻释义标记（标记在前）⇒ ⇒ 必须**不**红。`,
+      );
+      if (!inserted) {
+        failures += 1;
+        process.stdout.write('✗ 反向对照 ⑤ ⇒ **夹具没生效**（没能插进副本）⇒ 夹具无效\n');
+      } else {
+        const report = scanTree(work, DEFAULT_MAX_ALLOWED);
+        const exempted = report.allowed.some(
+          (item) =>
+            item.file === ADR_FILE &&
+            item.snippet === `${OLD_WORDING_HEAD}${OLD_WORDING_TAIL}` &&
+            item.allowance?.kind === 'feature-phrase',
+        );
+        if (report.errors.length === 0 && exempted) {
+          process.stdout.write(
+            '✅ 反向对照 ⑤（紧邻释义标记 · 标记在前 ⇒ 必须不红）⇒ 零错误且该处**由类 B 豁免**\n',
+          );
+        } else {
+          failures += 1;
+          process.stdout.write(
+            `✗ 反向对照 ⑤（紧邻释义标记 · 标记在前 ⇒ 必须不红）⇒ 错误 ${report.errors.length} 处 / 类 B 豁免 ${exempted}` +
+              '⇒ ⇒ 类 B 收得太紧（把紧邻的释义也判红了）⇒ 必须修\n',
+          );
+        }
+      }
+    }
+
     /* ── 形态判定自测（★ 新导出 `classifySnippet` 的契约证明）── */
     {
       const wording = `${OLD_WORDING_HEAD}${OLD_WORDING_TAIL}`;
@@ -926,6 +1103,20 @@ function runSelfTest(): number {
           writeFileSync(path, `${lines.join('\n')}\n`, 'utf8');
         },
       },
+      {
+        name: '负控 D · 同行既有释义标记、又有【远离】的断言式旧措辞（★ 类 B 收紧的证明）',
+        expect: '旧措辞被当作断言',
+        // ★ 期望**恰好 1 条**违例：近的那处（紧邻释义标记）豁免 · 远的那处（隔了 60+ 字）判红。
+        expectViolationCount: 1,
+        mutate: (repo) => {
+          // ★ 填充物长度 = 阈值 + 20 ⇒ ⇒ 必然超出 `MAX_FEATURE_DISTANCE` ⇒ ⇒ 不靠手数。
+          const filler = '·'.repeat(MAX_FEATURE_DISTANCE + 20);
+          appendLine(
+            join(repo, ADR_FILE),
+            `- ⚠️ ★ 负控 D：实测精确分${OLD_WORDING_HEAD}${OLD_WORDING_TAIL}（这一行${FEATURE_PHRASE}「【至多】2 行」）⇒ ⇒ ${filler} ⇒ ⇒ 而后面这半句是【断言】旧说法：实测精确分${OLD_WORDING_HEAD}${OLD_WORDING_TAIL} ⇒ ⇒ 必须判红（近的那处豁免 · 远的那处判红）。`,
+          );
+        },
+      },
     ];
 
     for (const [index, control] of controls.entries()) {
@@ -948,16 +1139,34 @@ function runSelfTest(): number {
       }
 
       const hit = report.errors.find((issue) => issue.category === control.expect);
-      if (hit !== undefined) {
-        process.stdout.write(`✅ ${control.name} ⇒ 报出「${control.expect}」\n`);
-      } else {
+      if (hit === undefined) {
         failures += 1;
         process.stdout.write(
           `✗ ${control.name} ⇒ **没有**报出「${control.expect}」（实际报出：${report.errors
             .map((issue) => issue.category)
             .join('、')}）\n`,
         );
+        continue;
       }
+
+      if (control.expectViolationCount !== undefined) {
+        const actual = report.violations.length;
+        if (actual !== control.expectViolationCount) {
+          failures += 1;
+          process.stdout.write(
+            `✗ ${control.name} ⇒ 违例条数 = ${actual}（期望 ${control.expectViolationCount}）` +
+              '⇒ ⇒ 同一行里「近的一处」与「远的一处」的结论**没有分开**' +
+              '（★ 多 = 近的那处也被判红了 = 类 B 收得太紧 · 少 = 远的那处没抓住 = 收紧没生效）⇒ ⇒ 必须修\n',
+          );
+          continue;
+        }
+        process.stdout.write(
+          `✅ ${control.name} ⇒ 报出「${control.expect}」且违例条数 = ${actual}（★ 近的豁免 · 远的判红）\n`,
+        );
+        continue;
+      }
+
+      process.stdout.write(`✅ ${control.name} ⇒ 报出「${control.expect}」\n`);
     }
   } finally {
     rmSync(tmpRoot, { recursive: true, force: true });
@@ -1004,7 +1213,7 @@ function runCli(argv: readonly string[]): number {
     return 1;
   }
 
-  process.stdout.write('\n✓ 未发现旧措辞漂移（所有命中都是「被引用的词」或「释义行」）\n');
+  process.stdout.write('\n✓ 未发现旧措辞漂移（所有命中都是「被引用的词」或「释义形态」）\n');
   process.stdout.write('DRIFT: false\n');
   return 0;
 }
