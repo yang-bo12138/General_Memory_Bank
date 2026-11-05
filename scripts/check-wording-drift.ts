@@ -15,8 +15,26 @@
  *   ⇒ ⇒ ⇒ 为什么要分段：宽式正则若对整行跑 ⇒ ⇒ 会**横跨两处引述**
  *   ⇒ ⇒ （「」不在排除集里）⇒ ⇒ 两处**都合规的引述**会被并成一个「跨引号命中」⇒ ⇒ **假红**
  *   ⇒ ⇒ ⇒ **本轮真实踩过一次**（设计稿的「四处同批」登记行）⇒ ⇒ 才改成按段扫。
- * ⚠️ ★★ **本文件里写不出「违规示例」**：任何**连续**的旧措辞都会把守卫自己判红
+ * ⚠️ ★★ **本文件里写不出「违规示例」**：任何**连续的**旧措辞都会把守卫自己判红
  *   ⇒ ⇒ 所以示例只能用**形态描述**表达（就像上表）⇒ ⇒ ⇒ **这本身说明「守卫对自己」的约束是实的**。
+ *
+ * ## ★★ **对外契约（下游脚本【必须】用它）**
+ *
+ * ★ 本文件导出两个判定入口 ⇒ ⇒ **下游【必须】import 它们** ⇒ ⇒
+ *   **不许自己重写一遍「按引号切段 / 豁免规则」** ⇒ ⇒ 那会造成**两份判定** ⇒ ⇒
+ *   两份判定会漂 ⇒ ⇒ 而「判定只有一份」正是这条守卫链的立身之本。
+ * ★ **单向依赖**：本文件**导出** · 下游**import** ⇒ ⇒ **绝不能反向**（会成环）。
+ *
+ * | 形态 | 怎么认 | `classifyLine`（判**旧措辞**） | `classifySnippet`（判**任意子串**） |
+ * |---|---|---|---|
+ * | **断言处** | 引号**外** | ❌ **违规**（判红） | `assertion`（★ 规范措辞必须出现在这里） |
+ * | **引述形态** | 引号**内**（`「」` / `『』` / `“”` / `` ` ``） | ✅ 豁免（类 A） | `quoted`（豁免） |
+ * | **释义形态** | 所在行含特征短语「真实含义是」 | ✅ 整行豁免（类 B） | `explanation`（豁免） |
+ *
+ * ⚠️ ★ **两个入口答的是【不同的问题】，但共用【同一份切段实现】**（`splitSegments()`）：
+ *   · `classifyLine` 答：「这一行里有没有**旧措辞**、它是否被豁免」；
+ *   · `classifySnippet` 答：「这一行里、**这个子串**是不是以断言形态出现」（裁决③「措辞锚点维度」要的就是它）。
+ *   ⇒ ⇒ ⇒ **切段 = 底层能力（只有一份）· 旧措辞豁免 = 一层 · 规范措辞形态 = 一层** ⇒ ⇒ ⇒ 三层同源。
  *
  * ## 背景（为什么要有这条脚本）
  *
@@ -382,6 +400,48 @@ function scanLine(line: string, file: string, lineNo: number, inSelf: boolean): 
  */
 export function classifyLine(line: string, file: string, lineNo: number): Occurrence[] {
   return scanLine(line, file, lineNo, false);
+}
+
+/**
+ * 某个子串在一行里处于什么形态。
+ *
+ * ⚠️ ★ **与 `classifyLine` 共用同一份切段实现**（`splitSegments()`）⇒ ⇒
+ *   **切段只有一份** ⇒ ⇒ 「判定只有一份」在三层里都成立
+ *   （切段 = 底层能力 · 旧措辞豁免 = 一层 · 规范措辞形态 = 一层）。
+ */
+export type SnippetShape =
+  /** 断言处（引号外、且整行不是释义行）⇒ ★ 规范措辞必须出现在这里。 */
+  | 'assertion'
+  /** 引述形态（落在引号内）⇒ ★ 豁免。 */
+  | 'quoted'
+  /** 释义形态（所在行含特征短语「真实含义是」）⇒ ★ 豁免。 */
+  | 'explanation';
+
+/**
+ * 判定某个子串在一行里的形态。
+ *
+ * ★ **判定顺序**（与 `classifyLine` 的豁免顺序一致）：
+ *   ① 子串落在**引号内** ⇒ ⇒ `quoted`（引述形态 ⇒ 豁免）；
+ *   ② 否则、**整行**含特征短语「真实含义是」⇒ ⇒ `explanation`（释义形态 ⇒ 整行豁免）；
+ *   ③ 否则 ⇒ ⇒ `assertion`（断言处 ⇒ 规范措辞必须出现在这里）。
+ *
+ * ⚠️ ★ **同一行里子串出现多次时 ⇒ ⇒ 以【第一次出现】为准**（段序 = 行内先后）。
+ *
+ * @param line 整行文本
+ * @param snippet 要判定的子串（★ 必须**逐字**出现在 line 里）
+ * @returns 形态；★ `undefined` ⇒ 该子串不在这一行里
+ */
+export function classifySnippet(line: string, snippet: string): SnippetShape | undefined {
+  for (const segment of splitSegments(line)) {
+    if (!segment.text.includes(snippet)) {
+      continue;
+    }
+    if (segment.quoted) {
+      return 'quoted';
+    }
+    return line.includes(FEATURE_PHRASE) ? 'explanation' : 'assertion';
+  }
+  return undefined;
 }
 
 /**
@@ -771,6 +831,34 @@ function runSelfTest(): number {
               '⇒ ⇒ 宽式正则横跨了两处引述 ⇒ ⇒ **假红** ⇒ ⇒ 必须按段扫\n',
           );
         }
+      }
+    }
+
+    /* ── 形态判定自测（★ 新导出 `classifySnippet` 的契约证明）── */
+    {
+      const wording = `${OLD_WORDING_HEAD}${OLD_WORDING_TAIL}`;
+      const inside = classifySnippet(`旧措辞「${wording}」是旧说法。`, wording);
+      const outside = classifySnippet(`实测精确分${wording} ⇒ ⇒ 断言形态。`, wording);
+      const explained = classifySnippet(
+        `实测精确分${wording}（这一行的真实含义是「至多」）。`,
+        wording,
+      );
+      const absent = classifySnippet('这一行里没有那个说法。', wording);
+      if (
+        inside === 'quoted' &&
+        outside === 'assertion' &&
+        explained === 'explanation' &&
+        absent === undefined
+      ) {
+        process.stdout.write(
+          '✅ 形态判定：同一子串在引号内=quoted / 引号外=assertion / 释义行=explanation / 不在行内=undefined ✔\n',
+        );
+      } else {
+        failures += 1;
+        process.stdout.write(
+          `✗ 形态判定：inside=${String(inside)} outside=${String(outside)} ` +
+            `explained=${String(explained)} absent=${String(absent)} ⇒ ⇒ 形态判据失灵 ⇒ ⇒ 必须修\n`,
+        );
       }
     }
 
