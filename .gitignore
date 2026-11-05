@@ -36,3 +36,9 @@ vitest.config.ts.timestamp-*.mjs
 # tsx 在受限临时目录环境下的残留（路径解析退化为字面量 undefined）
 undefined/
 .tmp_arch/
+
+# D: 盘体检的【人读副本】（★ 本地便利件 · 不入库）
+#   ★ 为什么不入库：★ 正式凭据是 `docs/evidence/disk-health.json`（★ 含判据原始量 · ★ 可复算）
+#   ⇒ ⇒ 而这份 .txt 是控制台 transcript 的拷贝 ⇒ ⇒ ① 内容与 JSON 重复、② 结论可能过期
+#   （★ 例：`check:json-note` 那种「逐字副本」机制**不覆盖它** ⇒ ⇒ 过期了没人会发现）
+docs/evidence/disk-health.txt

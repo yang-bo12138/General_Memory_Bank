@@ -446,7 +446,7 @@ pnpm exec tsx bench/perf.ts --scale=1000000 --queries=1000 --writes=500 --cache-
 | **必须用 `=`，不能用空格** | `bench/lib/harness.ts:1327 parseArgs()` 逐字实现：`--db path` 会被解析成 `{db:'true', path:'true'}`（空格后面的词不以 `--` 开头 ⇒ 直接 `continue` 丢掉）⇒ **库路径变成字符串 `"true"`** | `bench/lib/harness.ts:1327-1344` |
 | **`--cache-state` 的合法值只有三档** | `cold` / `warm` / `unknown`；非法值**报错而不是钳制**（`parsePageCacheState`） | `bench/perf.ts:1261`、`pageCacheState.note` |
 | **`--reuse=true` 复用时若复用不了会报错** | 默认 `forceRebuild=false` ⇒ 不许悄悄删库重灌（3~5 小时的活） | `bench/perf.ts:1290-1295` |
-| **`--store-dir=E:\.pnpm-store` 不是 `perf.ts` 的参数** | 它是 **pnpm** 的参数，起因是 `D:\.pnpm-store` 有坏块（`os error 1392`），改用干净 store：`pnpm add -D --store-dir "D:/WorkBuddyData/.pnpm-store-clean"`。<br>⇒ 误传给 `perf.ts` **不会报错，会被静默忽略**（`parseArgs` 收下但没人读） | `docs/progress/vector-round-progress.md:112`、`docs/design/p5-t01-t05-design.md:151-159` |
+| **`--store-dir=E:\.pnpm-store` 不是 `perf.ts` 的参数** | 它是 **pnpm** 的参数，起因是 `D:\.pnpm-store` 有坏块（`os error 1392`），改用干净 store：`pnpm add -D --store-dir "D:/WorkBuddyData/.pnpm-store-clean"`。<br>⇒ 误传给 `perf.ts` **不会报错，会被静默忽略**（`parseArgs` 收下但没人读）<br>★ ⚠️ **2026-11-05 23:49 订正**：★ **「有坏块」这个归因【已被证伪】** —— ★ 全量诊断 ⇒ **`chkdsk D: /scan` = `0 KB in bad sectors` + `found no problems`** · SMART **未纠正读写错误 = 0** ⇒ ⇒ ★★ **D: 盘健康** ⇒ ⇒ ★ **真正成因至今未定位**（★ 不猜）⇒ ⇒ ★ **迁移决策依然正确** | `docs/progress/vector-round-progress.md:112`、`docs/design/p5-t01-t05-design.md:151-159` |
 | **规模守卫在最前面** | 规模不达标 ⇒ 非零退出码 ⇒ **绝不落盘**（不会产生一个「假的百万级 JSON」） | `bench/perf.ts:1266-1274` |
 
 ---

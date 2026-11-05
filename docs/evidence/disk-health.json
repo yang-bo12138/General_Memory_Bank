@@ -1,0 +1,158 @@
+{
+  "schemaVersion": 1,
+  "ranAt": "2026-11-05T23:49:15.1838715+08:00",
+  "admin": true,
+  "drive": "D:",
+  "machine": {
+    "platform": "Windows_NT",
+    "psVersion": "5.1.26100.9711"
+  },
+  "physicalDisks": [
+    {
+      "friendlyName": "ST1000DM010-2EP102",
+      "mediaType": "HDD",
+      "healthStatus": "Healthy",
+      "operationalStatus": "OK",
+      "sizeGB": 932
+    },
+    {
+      "friendlyName": "Colorful SL500 320GB",
+      "mediaType": "SSD",
+      "healthStatus": "Healthy",
+      "operationalStatus": "OK",
+      "sizeGB": 298
+    },
+    {
+      "friendlyName": "WD Blue SN570 1TB SSD",
+      "mediaType": "SSD",
+      "healthStatus": "Healthy",
+      "operationalStatus": "OK",
+      "sizeGB": 932
+    }
+  ],
+  "smart": {
+    "available": true,
+    "diskNumber": 1,
+    "friendlyName": "ST1000DM010-2EP102",
+    "counters": {
+      "ObjectId": "{1}\\\\BO\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_StorageReliabilityCounter.ObjectId=\"{22ec241a-af08-11f1-b069-806e6f6e6963}:RC:\\\\?\\scsi#disk\u0026ven_\u0026prod_st1000dm010-2ep1#5\u00261bc941f\u00260\u0026070000#{53f56307-b6bf-11d0-94f2-00a0c91efb8b}\"",
+      "UniqueId": "{22ec241a-af08-11f1-b069-806e6f6e6963}:RC:\\\\?\\scsi#disk\u0026ven_\u0026prod_st1000dm010-2ep1#5\u00261bc941f\u00260\u0026070000#{53f56307-b6bf-11d0-94f2-00a0c91efb8b}",
+      "DeviceId": "1",
+      "FlushLatencyMax": 843,
+      "LoadUnloadCycleCount": 2219,
+      "PowerOnHours": 9282,
+      "ReadErrorsCorrected": 0,
+      "ReadErrorsTotal": 0,
+      "ReadErrorsUncorrected": 0,
+      "ReadLatencyMax": 12219,
+      "StartStopCycleCount": 2206,
+      "Temperature": 32,
+      "TemperatureMax": 0,
+      "Wear": 0,
+      "WriteLatencyMax": 1648
+    }
+  },
+  "chkdsk": {
+    "ran": true,
+    "exitCode": 0,
+    "raw": "The type of the file system is NTFS.\r\nVolume label is ��е.\r\n\r\nStage 1: Examining basic file system structure ...\r\nProgress: 0 of 451328 done; Stage:  0%; Total:  2%; ETA:   0:21:43    \r\nProgress: 12335 of 451328 done; Stage:  2%; Total:  3%; ETA:   0:21:32 .  \r\nProgress: 21775 of 451328 done; Stage:  4%; Total:  3%; ETA:   0:21:23 .. \r\nProgress: 51457 of 451328 done; Stage: 11%; Total:  5%; ETA:   0:00:19 ...\r\nProgress: 82946 of 451328 done; Stage: 18%; Total:  8%; ETA:   0:00:19    \r\nProgress: 87649 of 451328 done; Stage: 19%; Total:  8%; ETA:   0:00:20 .  \r\nProgress: 89975 of 451328 done; Stage: 19%; Total:  8%; ETA:   0:00:27 .. \r\nProgress: 112352 of 451328 done; Stage: 24%; Total: 10%; ETA:   0:00:25 ...\r\nProgress: 199169 of 451328 done; Stage: 44%; Total: 17%; ETA:   0:00:17    \r\nProgress: 233217 of 451328 done; Stage: 51%; Total: 19%; ETA:   0:00:16 .  \r\nProgress: 243454 of 451328 done; Stage: 53%; Total: 20%; ETA:   0:00:17 .. \r\nProgress: 244596 of 451328 done; Stage: 54%; Total: 20%; ETA:   0:00:19 ...\r\nProgress: 245201 of 451328 done; Stage: 54%; Total: 20%; ETA:   0:00:20    \r\nProgress: 247671 of 451328 done; Stage: 54%; Total: 20%; ETA:   0:00:22 .  \r\nProgress: 260097 of 451328 done; Stage: 57%; Total: 21%; ETA:   0:00:23 .. \r\nProgress: 299173 of 451328 done; Stage: 66%; Total: 24%; ETA:   0:00:22 ...\r\nProgress: 337894 of 451328 done; Stage: 74%; Total: 27%; ETA:   0:00:20    \r\nProgress: 337913 of 451328 done; Stage: 74%; Total: 27%; ETA:   0:00:20 .  \r\nProgress: 337969 of 451328 done; Stage: 74%; Total: 27%; ETA:   0:00:20 .. \r\nProgress: 338076 of 451328 done; Stage: 74%; Total: 27%; ETA:   0:00:22 ...\r\nProgress: 338237 of 451328 done; Stage: 74%; Total: 28%; ETA:   0:00:24    \r\nProgress: 338425 of 451328 done; Stage: 74%; Total: 28%; ETA:   0:00:25 .  \r\nProgress: 338645 of 451328 done; Stage: 75%; Total: 28%; ETA:   0:00:25 .. \r\nProgress: 338880 of 451328 done; Stage: 75%; Total: 28%; ETA:   0:00:27 ...\r\nProgress: 339020 of 451328 done; Stage: 75%; Total: 28%; ETA:   0:00:27    \r\nProgress: 339193 of 451328 done; Stage: 75%; Total: 29%; ETA:   0:00:28 .  \r\nProgress: 339608 of 451328 done; Stage: 75%; Total: 29%; ETA:   0:00:29 .. \r\nProgress: 349983 of 451328 done; Stage: 77%; Total: 30%; ETA:   0:00:30 ...\r\nProgress: 351138 of 451328 done; Stage: 77%; Total: 30%; ETA:   0:00:30    \r\nProgress: 397313 of 451328 done; Stage: 88%; Total: 33%; ETA:   0:00:28 .  \r\nProgress: 431508 of 451328 done; Stage: 95%; Total: 36%; ETA:   0:00:27 .. \r\nProgress: 451328 of 451328 done; Stage: 100%; Total: 37%; ETA:   0:00:25 ...\r\n                                                                                       \r\n                                                                                       \r\n  451328 file records processed.                                                        \r\n\r\nFile verification completed.\r\n Phase duration (File record verification): 14.94 seconds.\r\nProgress: 1 of 14860 done; Stage:  0%; Total: 30%; ETA:   0:00:26    \r\nProgress: 14860 of 14860 done; Stage: 100%; Total: 25%; ETA:   0:00:44 .  \r\n                                                                                       \r\n                                                                                       \r\n  14860 large file records processed.                                   \r\n\r\n Phase duration (Orphan file record recovery): 5.23 milliseconds.\r\nProgress: 0 of 0 done; Stage: 99%; Total: 25%; ETA:   0:00:44 .. \r\n                                                                                       \r\n                                                                                       \r\n  0 bad file records processed.                                     \r\n\r\n Phase duration (Bad file record checking): 0.03 milliseconds.\r\n\r\nStage 2: Examining file name linkage ...\r\nProgress: 81921 of 564016 done; Stage: 14%; Total: 29%; ETA:   0:00:38 ...\r\nProgress: 280776 of 564016 done; Stage: 49%; Total: 39%; ETA:   0:00:25    \r\nProgress: 367278 of 564016 done; Stage: 65%; Total: 44%; ETA:   0:00:22 .  \r\nProgress: 10268 of 10268 done; Stage: 100%; Total: 48%; ETA:   0:00:19 .. \r\n                                                                                       \r\n                                                                                       \r\n  10268 reparse records processed.                                      \r\n\r\nProgress: 451376 of 564016 done; Stage: 80%; Total: 48%; ETA:   0:00:19 ...\r\nProgress: 451647 of 564016 done; Stage: 80%; Total: 48%; ETA:   0:00:19    \r\nProgress: 452245 of 564016 done; Stage: 80%; Total: 48%; ETA:   0:00:19 .  \r\nProgress: 452440 of 564016 done; Stage: 80%; Total: 48%; ETA:   0:00:19 .. \r\nProgress: 452591 of 564016 done; Stage: 80%; Total: 48%; ETA:   0:00:19 ...\r\nProgress: 452780 of 564016 done; Stage: 80%; Total: 49%; ETA:   0:00:20    \r\nProgress: 454323 of 564016 done; Stage: 80%; Total: 49%; ETA:   0:00:20 .  \r\nProgress: 454781 of 564016 done; Stage: 80%; Total: 49%; ETA:   0:00:20 .. \r\nProgress: 455119 of 564016 done; Stage: 80%; Total: 49%; ETA:   0:00:20 ...\r\nProgress: 455518 of 564016 done; Stage: 80%; Total: 49%; ETA:   0:00:22    \r\nProgress: 455793 of 564016 done; Stage: 80%; Total: 49%; ETA:   0:00:22 .  \r\nProgress: 456235 of 564016 done; Stage: 80%; Total: 49%; ETA:   0:00:22 .. \r\nProgress: 456765 of 564016 done; Stage: 80%; Total: 49%; ETA:   0:00:22 ...\r\nProgress: 457461 of 564016 done; Stage: 81%; Total: 49%; ETA:   0:00:24    \r\nProgress: 457948 of 564016 done; Stage: 81%; Total: 49%; ETA:   0:00:24 .  \r\nProgress: 458426 of 564016 done; Stage: 81%; Total: 50%; ETA:   0:00:24 .. \r\nProgress: 459224 of 564016 done; Stage: 81%; Total: 50%; ETA:   0:00:24 ...\r\nProgress: 460128 of 564016 done; Stage: 81%; Total: 50%; ETA:   0:00:25    \r\nProgress: 461173 of 564016 done; Stage: 81%; Total: 50%; ETA:   0:00:25 .  \r\nProgress: 462125 of 564016 done; Stage: 81%; Total: 50%; ETA:   0:00:25 .. \r\nProgress: 464226 of 564016 done; Stage: 82%; Total: 51%; ETA:   0:00:25 ...\r\nProgress: 464441 of 564016 done; Stage: 82%; Total: 51%; ETA:   0:00:25    \r\nProgress: 466494 of 564016 done; Stage: 82%; Total: 51%; ETA:   0:00:25 .  \r\nProgress: 466639 of 564016 done; Stage: 82%; Total: 51%; ETA:   0:00:27 .. \r\nProgress: 466676 of 564016 done; Stage: 82%; Total: 51%; ETA:   0:00:27 ...\r\nProgress: 466717 of 564016 done; Stage: 82%; Total: 51%; ETA:   0:00:27    \r\nProgress: 466777 of 564016 done; Stage: 82%; Total: 51%; ETA:   0:00:27 .  \r\nProgress: 466866 of 564016 done; Stage: 82%; Total: 51%; ETA:   0:00:28 .. \r\nProgress: 466909 of 564016 done; Stage: 82%; Total: 51%; ETA:   0:00:28 ...\r\nProgress: 466960 of 564016 done; Stage: 82%; Total: 51%; ETA:   0:00:28    \r\nProgress: 467017 of 564016 done; Stage: 82%; Total: 51%; ETA:   0:00:28 .  \r\nProgress: 467082 of 564016 done; Stage: 82%; Total: 52%; ETA:   0:00:29 .. \r\nProgress: 467260 of 564016 done; Stage: 82%; Total: 52%; ETA:   0:00:30 ...\r\nProgress: 467534 of 564016 done; Stage: 82%; Total: 52%; ETA:   0:00:30    \r\nProgress: 467844 of 564016 done; Stage: 82%; Total: 52%; ETA:   0:00:30 .  \r\nProgress: 468740 of 564016 done; Stage: 83%; Total: 52%; ETA:   0:00:30 .. \r\nProgress: 469929 of 564016 done; Stage: 83%; Total: 53%; ETA:   0:00:30 ...\r\nProgress: 470246 of 564016 done; Stage: 83%; Total: 53%; ETA:   0:00:30    \r\nProgress: 470641 of 564016 done; Stage: 83%; Total: 53%; ETA:   0:00:30 .  \r\nProgress: 471230 of 564016 done; Stage: 83%; Total: 54%; ETA:   0:00:30 .. \r\nProgress: 471547 of 564016 done; Stage: 83%; Total: 54%; ETA:   0:00:30 ...\r\nProgress: 471899 of 564016 done; Stage: 83%; Total: 54%; ETA:   0:00:32    \r\nProgress: 472336 of 564016 done; Stage: 83%; Total: 54%; ETA:   0:00:32 .  \r\nProgress: 473086 of 564016 done; Stage: 83%; Total: 54%; ETA:   0:00:32 .. \r\nProgress: 473396 of 564016 done; Stage: 83%; Total: 54%; ETA:   0:00:32 ...\r\nProgress: 473963 of 564016 done; Stage: 84%; Total: 54%; ETA:   0:00:33    \r\nProgress: 474129 of 564016 done; Stage: 84%; Total: 54%; ETA:   0:00:33 .  \r\nProgress: 474379 of 564016 done; Stage: 84%; Total: 54%; ETA:   0:00:33 .. \r\nProgress: 474749 of 564016 done; Stage: 84%; Total: 54%; ETA:   0:00:33 ...\r\nProgress: 475505 of 564016 done; Stage: 84%; Total: 54%; ETA:   0:00:33    \r\nProgress: 476291 of 564016 done; Stage: 84%; Total: 54%; ETA:   0:00:35 .  \r\nProgress: 478879 of 564016 done; Stage: 84%; Total: 55%; ETA:   0:00:35 .. \r\nProgress: 479458 of 564016 done; Stage: 85%; Total: 55%; ETA:   0:00:35 ...\r\nProgress: 480255 of 564016 done; Stage: 85%; Total: 55%; ETA:   0:00:35    \r\nProgress: 480973 of 564016 done; Stage: 85%; Total: 56%; ETA:   0:00:35 .  \r\nProgress: 482099 of 564016 done; Stage: 85%; Total: 56%; ETA:   0:00:35 .. \r\nProgress: 483051 of 564016 done; Stage: 85%; Total: 56%; ETA:   0:00:35 ...\r\nProgress: 484285 of 564016 done; Stage: 85%; Total: 56%; ETA:   0:00:35    \r\nProgress: 487485 of 564016 done; Stage: 86%; Total: 57%; ETA:   0:00:35 .  \r\nProgress: 488846 of 564016 done; Stage: 86%; Total: 57%; ETA:   0:00:35 .. \r\nProgress: 490284 of 564016 done; Stage: 86%; Total: 57%; ETA:   0:00:35 ...\r\nProgress: 492522 of 564016 done; Stage: 87%; Total: 57%; ETA:   0:00:35    \r\nProgress: 493229 of 564016 done; Stage: 87%; Total: 57%; ETA:   0:00:35 .  \r\nProgress: 493525 of 564016 done; Stage: 87%; Total: 57%; ETA:   0:00:35 .. \r\nProgress: 494055 of 564016 done; Stage: 87%; Total: 57%; ETA:   0:00:36 ...\r\nProgress: 494498 of 564016 done; Stage: 87%; Total: 57%; ETA:   0:00:36    \r\nProgress: 495287 of 564016 done; Stage: 87%; Total: 57%; ETA:   0:00:36 .  \r\nProgress: 496181 of 564016 done; Stage: 87%; Total: 57%; ETA:   0:00:36 .. \r\nProgress: 497274 of 564016 done; Stage: 88%; Total: 57%; ETA:   0:00:36 ...\r\nProgress: 498094 of 564016 done; Stage: 88%; Total: 57%; ETA:   0:00:36    \r\nProgress: 499048 of 564016 done; Stage: 88%; Total: 57%; ETA:   0:00:36 .  \r\nProgress: 500024 of 564016 done; Stage: 88%; Total: 58%; ETA:   0:00:36 .. \r\nProgress: 500927 of 564016 done; Stage: 88%; Total: 58%; ETA:   0:00:38 ...\r\nProgress: 501497 of 564016 done; Stage: 88%; Total: 58%; ETA:   0:00:38    \r\nProgress: 502474 of 564016 done; Stage: 89%; Total: 58%; ETA:   0:00:38 .  \r\nProgress: 503526 of 564016 done; Stage: 89%; Total: 58%; ETA:   0:00:38 .. \r\nProgress: 504974 of 564016 done; Stage: 89%; Total: 58%; ETA:   0:00:38 ...\r\nProgress: 505682 of 564016 done; Stage: 89%; Total: 58%; ETA:   0:00:40    \r\nProgress: 506363 of 564016 done; Stage: 89%; Total: 58%; ETA:   0:00:40 .  \r\nProgress: 506462 of 564016 done; Stage: 89%; Total: 58%; ETA:   0:00:40 .. \r\nProgress: 506535 of 564016 done; Stage: 89%; Total: 58%; ETA:   0:00:40 ...\r\nProgress: 506897 of 564016 done; Stage: 89%; Total: 58%; ETA:   0:00:40    \r\nProgress: 507241 of 564016 done; Stage: 89%; Total: 58%; ETA:   0:00:40 .  \r\nProgress: 507657 of 564016 done; Stage: 90%; Total: 58%; ETA:   0:00:40 .. \r\nProgress: 564016 of 564016 done; Stage: 100%; Total: 58%; ETA:   0:00:40 ...\r\n                                                                                       \r\n                                                                                       \r\n  564016 index entries processed.                                                       \r\n\r\nIndex verification completed.\r\n Phase duration (Index verification): 43.68 seconds.\r\nProgress: 0 of 0 done; Stage: 99%; Total: 58%; ETA:   0:00:40    \r\n                                                                                       \r\n                                                                                       \r\n  0 unindexed files scanned.                                        \r\n\r\n Phase duration (Orphan reconnection): 266.77 milliseconds.\r\nProgress: 0 of 0 done; Stage: 99%; Total: 58%; ETA:   0:00:40 .  \r\n                                                                                       \r\n                                                                                       \r\n  0 unindexed files recovered to lost and found.                    \r\n\r\n Phase duration (Orphan recovery to lost and found): 0.77 milliseconds.\r\nProgress: 10268 of 10268 done; Stage: 100%; Total: 58%; ETA:   0:00:40 .. \r\n                                                                                       \r\n                                                                                       \r\n  10268 reparse records processed.                                      \r\n\r\n Phase duration (Reparse point and Object ID verification): 18.05 milliseconds.\r\n\r\nStage 3: Examining security descriptors ...\r\nSecurity descriptor verification completed.\r\n Phase duration (Security descriptor verification): 17.15 milliseconds.\r\nProgress: 6 of 6 done; Stage: 100%; Total: 70%; ETA:   0:00:39 ...\r\n                                                                                       \r\n                                                                                       \r\n  56345 data files processed.                                           \r\n\r\n Phase duration (Data attribute verification): 0.04 milliseconds.\r\nCHKDSK is verifying Usn Journal...\r\nProgress: 0 of 4577 done; Stage:  0%; Total: 72%; ETA:   0:00:38    \r\nProgress: 4577 of 4577 done; Stage: 100%; Total: 74%; ETA:   0:00:22 .  \r\n                                                                                       \r\n                                                                                       \r\n  37495632 USN bytes processed.                                                           \r\n\r\nUsn Journal verification completed.\r\n Phase duration (USN journal verification): 278.25 milliseconds.\r\n\r\nWindows has scanned the file system and found no problems.\r\nNo further action is required.\r\n\r\n 976760831 KB total disk space.\r\n 194525280 KB in 214257 files.\r\n     79328 KB in 56346 indexes.\r\n         0 KB in bad sectors.\r\n    588355 KB in use by the system.\r\n     65536 KB occupied by the log file.\r\n 781567868 KB available on disk.\r\n\r\n      4096 bytes in each allocation unit.\r\n 244190207 total allocation units on disk.\r\n 195391967 allocation units available on disk.\r\nTotal duration: 59.21 seconds (59219 ms).\r\n"
+  },
+  "volumes": [
+    {
+      "driveLetter": "C:",
+      "usedGB": 280,
+      "freeGB": 18,
+      "diskNumber": 0
+    },
+    {
+      "driveLetter": "D:",
+      "usedGB": 146.9,
+      "freeGB": 784.6,
+      "diskNumber": 1
+    },
+    {
+      "driveLetter": "E:",
+      "usedGB": 277.2,
+      "freeGB": 654.3,
+      "diskNumber": 2
+    }
+  ],
+  "topDirectories": [
+    {
+      "name": "WeGame",
+      "gb": 54.14
+    },
+    {
+      "name": "Git",
+      "gb": 27.22
+    },
+    {
+      "name": "qq-bridge",
+      "gb": 21.81
+    },
+    {
+      "name": "$RECYCLE.BIN",
+      "gb": 16.98
+    },
+    {
+      "name": "WorkBuddy",
+      "gb": 10.09
+    },
+    {
+      "name": "WPS",
+      "gb": 6.74
+    },
+    {
+      "name": "QQLiveData",
+      "gb": 4.31
+    },
+    {
+      "name": "QQ",
+      "gb": 2.52
+    },
+    {
+      "name": "EDIFIER_TempoHub",
+      "gb": 1.1
+    },
+    {
+      "name": "DeepSeek",
+      "gb": 1.02
+    }
+  ],
+  "recycleBinBytes": 18232350097,
+  "verdict": {
+    "action": "★ 盘健康 —— 不用做 chkdsk /f、也不用换盘",
+    "severity": "ok",
+    "reasons": [
+      "chkdsk /scan：**0 KB in bad sectors**（★ 零坏簇）＋ found no problems ⇒ ★ 文件系统层健康",
+      "SMART：**未纠正读错误 = 0** ⇒ ★ 读路径没有坏块迹象；★ **未纠正写错误 = null（★ Windows 对该盘【未提供】写侧计数 ⇒ ⇒ 【不是】0、只是【没测到】）**",
+      "⇒ ⇒ ★ **写侧虽未测到，但坏簇是【读写通吃】的物理层概念 ⇒ ⇒ chkdsk 的「零坏簇」已覆盖写路径** ⇒ ⇒ ★ **⇒ 结论不变**",
+      "⇒ ⇒ ★ **结论：当初那次的文件损坏【不能归因于物理坏块】** ⇒ ⇒ 「chkdsk /f D:」这条待办【可以撤销】"
+    ],
+    "evidence": {
+      "chkdskBadSectorsKB": 0,
+      "chkdskNoProblems": true,
+      "smartPending": null,
+      "smartReadErrorsUncorrected": 0,
+      "smartReadErrorsUncorrectedPresent": true,
+      "smartWriteErrorsUncorrected": null,
+      "smartWriteErrorsUncorrectedPresent": false
+    },
+    "note": "★ 本脚本【只读】、不执行 /f、不删任何东西 ⇒ ★ /f 与换盘都要你本人决定"
+  },
+  "verdictEvidence": {
+    "chkdskBadSectorsKB": 0,
+    "chkdskNoProblems": true,
+    "smartPending": null,
+    "smartReadErrorsUncorrected": 0,
+    "smartReadErrorsUncorrectedPresent": true,
+    "smartWriteErrorsUncorrected": null,
+    "smartWriteErrorsUncorrectedPresent": false
+  },
+  "recomputedAt": "2026-11-06T07:54:14.6493874+08:00",
+  "smartRaw": {
+    "available": false,
+    "matchesTargetDisk": false,
+    "reason": "★ 旧版脚本取的是「WMI 第一个实例」⇒ ★ 可能不是目标盘 ⇒ ★ 已作废 ⇒ ★ 请以管理员重跑一次诊断"
+  }
+}

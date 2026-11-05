@@ -168,6 +168,13 @@ MCP（独立进程，**与查看器无关**，走**写**句柄）：
 >   **历史叙事不改**）⇒ ⇒ ★ **要照抄的是【上面那两条现状】，不是下面三条**；
 > · ★ **坏块的根因仍未修**（★ `D:\.pnpm-store` 的 `os error 1392`）⇒ ⇒ **`chkdsk /f D:` 需要管理员**
 >   ⇒ ⇒ **治本要用户做**（★ 见 `docs/progress/vector-round-progress.md` 的 E1 行）。
+> · ★★ **2026-11-05 23:49 订正本条（★ 「坏块」这个归因【已被证伪】、该待办【已撤销】）**：★ 全量诊断
+>   ⇒ ⇒ **`chkdsk D: /scan`（管理员 · exit 0 · 59.21 s）= `0 KB in bad sectors` ＋ `found no problems`**
+>   ⇒ ⇒ ★ **SMART（目标盘 ST1000DM010）：`ReadErrorsTotal = 0` · `ReadErrorsUncorrected = 0`**（★ 读侧【实测到】）
+>   ⇒ ⇒ ★★ **写侧 = `WriteErrorsUncorrected = null`（★ Windows 对该盘【未提供】写侧计数 ⇒ ⇒ 【不是】0、只是【没测到】）**
+>   ⇒ ⇒ ★★ **D: 盘健康**（★ 依据：chkdsk 的**零坏簇** ⇒ ★ 坏簇是【读写通吃】的物理层概念 ⇒ ⇒ **写路径已被覆盖**）
+>   ⇒ ⇒ ★ ⇒ **不需要 `chkdsk /f`、不需要换盘** ⇒ ⇒ ★ ⇒ **「当初那次 `os error 1392`」【不能归因于物理坏块】**
+>   ⇒ ⇒ ★ ⇒ **真正成因至今未定位**（★ 不猜）⇒ ⇒ ★ **凭据 = `docs/evidence/disk-health.json`**。
 
 ```bash
 cd /d/WorkBuddyData/2026-11-02-08-56-53/gmb

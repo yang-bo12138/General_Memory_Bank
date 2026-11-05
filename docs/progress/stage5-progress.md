@@ -372,6 +372,7 @@ H1（12,782 行 = 门槛 6.39 倍，**沿用阶段 3 读数、本轮未复测**�
 |---|---|---|
 | `node_modules` 被清空 **3 次** | ① 用 `rm -rf` 删 worktree 里的 junction ⇒ **顺着链接删了主仓**；②③ `pnpm install` **只**报 `ERR_PNPM_IGNORED_BUILDS` 时 pnpm 认定整次失败、**不写 `node_modules/.modules.yaml`** ⇒ 之后每个 `pnpm run` 都先自动重装，与并行 gate 互删 `.bin` | 加 `--config.strict-dep-builds=false` 重装；**判据是 `.modules.yaml` 存在**（不是「命令没报错」）。⚠️ **不要** `pnpm approve-builds`（会下载约 100MB Chromium） |
 | `D:\.pnpm-store` 文件损坏（`os error 1392`） | 文件系统层面，早于本轮所有工程师 | 换干净 store 重装（`--store-dir`）；**未修根因** ⇒ 建议对 D 盘跑一次 `chkdsk /f` |
+| ↳ **2026-11-05 23:49 订正**：★ **「文件系统层面」这个归因【已被证伪】** —— ★ 全量诊断 ⇒ **`chkdsk D: /scan` = `0 KB in bad sectors` + `found no problems`** · SMART **未纠正读写错误 = 0** ⇒ ⇒ ★★ **D: 盘健康 ⇒ ⇒ 「`chkdsk /f`」这条建议【撤销】**（★ 无坏可修 ⇒ ★ 而 `/f` 要独占卷 + D: 上有 46 个第三方目录 ⇒ ★ 不做比做更安全）⇒ ⇒ ★ **真正成因至今未定位**（★ 不猜）· ★ 凭据 `docs/evidence/disk-health.json` | ★ 原文保留（★ 历史记录） | ★ **迁移决策依然正确**（store 迁 E 盘）· ★ **「坏块」这个说法【只在这行是历史记录】、别再当现状** |
 | `npx biome` 报 46 条假错 | npm 上有个**同名无关包** `biome@0.3.3` | 只用 `pnpm run lint` 或 `./node_modules/.bin/biome` |
 | `pnpm run <script>` 触发依赖预检 | 见上第 2 条 | 跑脚本前缀 `npm_config_verify_deps_before_run=false` |
 | **CI 一直红在「安装依赖」第 5 步**（`ERR_PNPM_IGNORED_BUILDS`），本地却全绿 | pnpm 12 在「有包带构建脚本、却没被 `allowBuilds` 放行」时让**整次安装失败**；electron 被刻意排除在 `allowBuilds` 外 ⇒ 必失败。而本地一直用 `--config.strict-dep-builds=false` 绕过 | 把意图写进仓库配置：`pnpm-workspace.yaml` 的 **`strictDepBuilds: false`**（`264ff3e`）。⚠️ 这**不是**关掉安全策略：`allowBuilds` 仍是白名单；该开关只决定「跳过要不要报错」 |

@@ -2,6 +2,11 @@
 
 > **决策（用户 2026-11-05 10:07 拍板）**：**T07 收口后执行 A 方案** —— 把整个仓库从 D 盘移到 E 盘。
 > **触发原因**：`D:\.pnpm-store` 有坏块（`os error 1392`，登记在 `docs/progress/vector-round-progress.md:115`）⇒ ⇒ **根因未修**（那行原文：「只绕过了…**没修根因** ⇒ 建议 `chkdsk /f D:`」）⇒ ⇒ **代码本体仍在 D 盘坏块风险区**。
+> ⚠️ ★★ **2026-11-05 23:49 订正（★ 原文保留 —— 它是「迁移当时为什么发生」的历史事实）**：★ 全量诊断
+> ⇒ ⇒ **`chkdsk D: /scan` = `0 KB in bad sectors` + `found no problems`** · SMART **未纠正读写错误 = 0**
+> ⇒ ⇒ ★★ **D: 盘【健康】⇒ ⇒ 「坏块」这个归因【被证伪】⇒ ⇒ 「代码本体在坏块风险区」这个说法【不成立】**
+> ⇒ ⇒ ★ ⇒ **迁移本身依然是对的**（★ store 迁 E 盘仍是正确决策）⇒ ⇒ ★ **「`chkdsk /f D:`」待办【已撤销】**
+> ⇒ ⇒ ★ **真正成因至今未定位**（★ 不猜）⇒ ⇒ ★ 凭据 `docs/evidence/disk-health.json`。
 
 ---
 
@@ -138,7 +143,7 @@ rm -rf D:/.../pnpm-store-fresh                     # 157 MB（★ 遗留 store�
 | # | 动作 | 为什么我做不了 |
 |---|---|---|
 | 1 | ★ **在 WorkBuddy 里用 `E:\WorkBuddyData\2026-11-02-08-56-53` 重开工作区**（新会话） | 工作区路径是**会话启动时注入**的 ⇒ ⇒ 搬移后当前会话的 cwd 失效 ⇒ ⇒ 必须在 IDE 里重选 |
-| 2 | ★ **（可选）D 盘坏块根因修复**：`chkdsk /f D:` | 需要**管理员**（★ 本会话已核实 `IsAdmin = False`）⇒ ⇒ 治本要用户做 |
+| 2 | ~~★ **（可选）D 盘坏块根因修复**：`chkdsk /f D:`~~ | ★★ **2026-11-05 23:49 已诊断完毕 ⇒ 【撤销】** —— ★ `chkdsk D: /scan` = **`0 KB in bad sectors` + `found no problems`** · SMART **未纠正读写错误 = 0** ⇒ ⇒ ★★ **D: 盘健康 ⇒ 无坏可修** ⇒ ⇒ ★ 而 `/f` 要**独占卷** + ★ D: 上有 **46 个顶层目录的第三方数据** ⇒ ⇒ ★ **不做比做更安全** ⇒ ⇒ ★ **真正成因（当初那次 `os error 1392`）至今未定位**（★ 不猜）⇒ ★ 凭据 `docs/evidence/disk-health.json` |
 
 ⇒ ⇒ ★ **注意第 1 条**：**搬移后请在新会话里说「继续 T07」** ⇒ ⇒ 交接信息全在 `T07-ordered-backlog.md` 与 `handover/bench/`，⇒ ⇒ **不会丢上下文**。
 
@@ -150,7 +155,7 @@ rm -rf D:/.../pnpm-store-fresh                     # 157 MB（★ 遗留 store�
 |---|---|---|---|
 | 1 | `docs/decisions/adr-perf-recall-vs-h1.md:446` | ★ **已写的是 `--store-dir=E:\.pnpm-store`** | ✅ **不用动**（现状正确） |
 | 2 | `docs/design/p5-t01-t05-design.md:159/172/177` | 装 electron 时的临时绕过 `--store-dir "D:/WorkBuddyData/.pnpm-store-clean"` | ★ **保留历史价值**，但★ **补一句现状**（store 已迁到 `E:\.pnpm-store`）⇒ ⇒ 免得下一个人照着它跑 |
-| 3 | `docs/progress/vector-round-progress.md:115` | 「`D:\.pnpm-store` 有坏块（`os error 1392`）⇒ 只绕过了、**没修根因** ⇒ 建议 `chkdsk /f D:`」 | ★ **更新为「已规避（store 迁至 E 盘）+ 仓库也已迁至 E 盘」** ⇒ ⇒ ★ **但 `chkdsk` 根因未修的事实要保留**（★ 那是 D 盘的健康问题，不是本仓库的问题） |
+| 3 | `docs/progress/vector-round-progress.md:115` | 「`D:\.pnpm-store` 有坏块（`os error 1392`）⇒ 只绕过了、**没修根因** ⇒ 建议 `chkdsk /f D:`」 | ★ **更新为「已规避（store 迁至 E 盘）+ 仓库也已迁至 E 盘」** ⇒ ⇒ ★ ~~**但 `chkdsk` 根因未修的事实要保留**（★ 那是 D 盘的健康问题，不是本仓库的问题）~~ ⇒ ⇒ ★★ **2026-11-05 23:49 订正：那件事【根本不是坏块】** —— ★ 实测 D: **零坏簇 + SMART 未纠正错误 = 0** ⇒ ⇒ **D: 盘健康 ⇒ `chkdsk /f D:` 待办【撤销】** ⇒ ⇒ ★ 真正成因至今未定位（★ 不猜） |
 
 ---
 

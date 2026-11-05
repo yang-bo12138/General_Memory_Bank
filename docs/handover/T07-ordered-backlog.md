@@ -239,6 +239,7 @@ CREATE UNIQUE INDEX idx_vcm_memory_unique ON vector_cell_members(memory_id);
 ⇒ ★ **完整方案见 `T07-migration-plan.md`**（含逐步命令、验收判据、回滚、风险登记）。
 
 **为什么**：`D:\.pnpm-store` 有坏块（`os error 1392`）⇒ ⇒ **根因未修**（`docs/progress/vector-round-progress.md:115` 原文：「只绕过了…**没修根因** ⇒ 建议 `chkdsk /f D:`」）⇒ ⇒ **代码本体仍在 D 盘坏块风险区**。
+★ ⚠️ ★★ **2026-11-05 23:49 订正（★ 原文保留 —— 历史事实）**：★ 全量诊断 ⇒ ⇒ **`chkdsk D: /scan` = `0 KB in bad sectors` + `found no problems`** · SMART **未纠正读写错误 = 0** ⇒ ⇒ ★★ **D: 盘【健康】⇒ ⇒ 「坏块」这个归因【被证伪】⇒ ⇒ 「代码本体在坏块风险区」不成立** ⇒ ⇒ ★ **迁移决策依然正确** · ★ **「`chkdsk /f D:`」待办【已撤销】** · ★ 真正成因至今未定位（★ 不猜）· ★ 凭据 `docs/evidence/disk-health.json`。
 
 **侦察结论（三条关键）**：
 1. ★ **代码零路径依赖 ⇒ 搬移不需要改任何代码**（配置全相对 · `.git/config` 无 `worktree` · 全仓盘符引用仅 2 处、且都在注释里）。
