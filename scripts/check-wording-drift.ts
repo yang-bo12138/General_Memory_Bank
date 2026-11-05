@@ -278,21 +278,11 @@ const HEADROOM = 2;
  * ★ **只统计本脚本自身之外的豁免**；超过 ⇒ ⇒ 报「豁免条目过多」。
  *
  * ⚠️ ★★ **这个上限【只用于扫真实仓库】**（★ `runCli` 那条路径）
- *   ⇒ ⇒ **自测夹具副本不用它**（★ 见 `NO_CAP` 与 `Control.maxAllowed` 的注释）
+ *   ⇒ ⇒ **自测夹具副本不用它**（★ 见 `Control.useProductionCap` 与 `fixtureCap()` 的注释）
  *   ⇒ ⇒ ⇒ **两套语义必须分开**（★ 否则夹具【必然多出的那几处豁免】会被误判成「白名单被撑大」
  *   ⇒ ⇒ ⇒ ⇒ 而那会让每个「必须不红」的反向对照都凭空多出 1 个错 ⇒ ⇒ ⇒ 夹具自己就失效了）。
  */
 const MAX_ALLOWED = BASE_ALLOWED + HEADROOM;
-
-/**
- * ★ 「无上限」哨兵（★ = `Number.POSITIVE_INFINITY`）。
- *
- * ★ **用在哪**：★ **自测夹具副本**（★ 理由见 `Control.maxAllowed` 的注释）。
- * ★ **为什么夹具不用生产上限**：★ 夹具副本 = 仓库副本 + 夹具自己引入的那几处豁免
- *   ⇒ ⇒ 它的豁免数**必然**比生产基线多 ⇒ ⇒ 若拿生产上限扫它 ⇒ ⇒ 那些**夹具自己的**豁免
- *   ⇒ ⇒ ⇒ 就会被误判成「白名单被撑大」⇒ ⇒ ⇒ **夹具自己的断言就被污染了**。
- */
-const NO_CAP = Number.POSITIVE_INFINITY;
 
 /** 上下文截断长度（报告里贴整行 ⇒ ⇒ 但别刷屏）。 */
 const CONTEXT_LIMIT = 120;
@@ -684,7 +674,7 @@ function collectFiles(root: string): string[] {
  * 扫一棵树。
  *
  * @param root 扫描根（绝对路径）
- * @param maxAllowed 豁免条目数上限（**只统计本脚本自身之外**的豁免）· ★ `NO_CAP` = 不设上限（★ 夹具副本用）
+ * @param maxAllowed 豁免条目数上限（**只统计本脚本自身之外**的豁免）· ★ **生产语义** = `MAX_ALLOWED`
  * @returns 报告
  */
 function scanTree(root: string, maxAllowed: number): Report {
@@ -849,17 +839,6 @@ interface Control {
    */
   readonly expectViolationCount?: number;
   /**
-   * ★ 本夹具**自己引入**的豁免处数（★ 用于给夹具副本算上限 ⇒ ⇒ 夹具不被生产上限误伤）。
-   *
-   * ★ **为什么要有它**：★ 夹具副本 = 仓库副本 + 夹具自己加的那几行
-   *   ⇒ ⇒ 它的豁免数**必然**比仓库基线多 ⇒ ⇒ 若拿生产上限（`MAX_ALLOWED`）扫它
-   *   ⇒ ⇒ ⇒ 夹具自己的豁免就会被误判成「白名单被撑大」⇒ ⇒ ⇒ **每个「必须不红」的反向对照
-   *   ⇒ ⇒ ⇒ 都会凭空多出 1 个错** ⇒ ⇒ ⇒ **夹具自己就失效了**。
-   *
-   * ★ **它怎么算出来**：★ 由 `mutate()` 用**与扫描同一套判定**（`countExemptionsIn()`）数
-   *   ⇒ ⇒ **不是手数、也不是清单** ⇒ ⇒ 判据与实现不会漂。
-   */
-  readonly ownExemptions?: number;
   /**
    * ★ 这个夹具**是否用生产上限**扫（★ 默认否）。
    *
@@ -873,7 +852,7 @@ interface Control {
    * @param repo 副本根
    * @returns 自带豁免处数（★ 用 `countExemptionsIn()` 数 ⇒ ⇒ 不手数）
    */
-  readonly mutate: (repo: string) => void;
+  readonly mutate: (repo: string) => number;
 }
 
 /** 释义段所在文件（相对仓库根）。 */
@@ -1306,11 +1285,18 @@ function runSelfTest(): number {
     for (const [index, control] of controls.entries()) {
       const work = join(tmpRoot, `case-control-${index}`);
       cpSync(pristine, work, { recursive: true });
-      control.mutate(work);
+      // ★ 夹具自己引入的豁免数（★ 由 mutate() 用**同一套判定**数出来 ⇒ ⇒ 不是手数）。
+      const own = control.mutate(work);
 
-      // ★ 负控框架：★ 只有「豁免条目过多」那条负控用【生产上限】⇒ ⇒ 它靠被顶破来验那条判据
-      //   ⇒ ⇒ ★ 其余负控用【无上限】⇒ ⇒ 专注验【判定行为】⇒ ⇒ 不被白名单闸门波及。
-      const report = scanTree(work, control.useProductionCap ? MAX_ALLOWED : NO_CAP);
+      /* ★★ **两套语义在这里分流**（★ 本轮的核心修复）：
+       *   · 默认（**夹具语义**）⇒ 上限 = **基线 + 该夹具自带的那几处**
+       *     ⇒ ⇒ ⇒ 夹具自己的豁免**不会**被误判成「白名单被撑大」
+       *     ⇒ ⇒ ⇒ 「必须不红」的反向对照**不再凭空多出 1 个错**。
+       *   · 只有「豁免条目过多」那条负控用**生产语义**（★ `MAX_ALLOWED`）
+       *     ⇒ ⇒ ⇒ 它验的正是「生产上限会被顶破」⇒ ⇒ ⇒ 才是真的在验那条判据。
+       */
+      const cap = control.useProductionCap === true ? MAX_ALLOWED : fixtureCap(own);
+      const report = scanTree(work, cap);
 
       /* ★★★★ **根因断言**：判据不是「内容变了」⇒ ⇒ **太弱**
        *   （夹具没进判定路径 ⇒ 判定仍零错误 ⇒ ⇒ 这条负控自己就是恒绿的）
