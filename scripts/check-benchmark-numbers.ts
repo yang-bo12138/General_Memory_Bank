@@ -373,6 +373,8 @@ const CATEGORY_RENDER = '写法不一致（值同、写法不同）';
 const CATEGORY_MISSING = '规范写法缺失';
 const CATEGORY_STATUS_MISSING = '状态字面缺失';
 const CATEGORY_STATUS_CONFLICT = '状态语义冲突（两侧状态 emoji 不同）';
+const CATEGORY_STATUS_REF = '状态表与 R 行的引用断裂';
+const CATEGORY_STATUS_LINK = 'R 行与状态表的条件编号对不上';
 
 /**
  * ★ 出关条件的**状态**（★ 状态 = 那一格的状态 emoji；★ 备注（「以替代口径达成」「已测 · 红」）**不是**状态）。
@@ -397,6 +399,10 @@ type StatusSpec = {
   readonly gateCarrier: string;
   /** ★ **两侧必须一致的状态 emoji**（★ 规范值）。 */
   readonly state: (typeof STATUS_EMOJI)[number];
+  /** ★ 状态表「依据」列里必须出现的 R 行引用（★ 写死 ⇒ ⇒ 把「状态表 ↔ R 行」这条引用链钉住）。 */
+  readonly tableRef: string;
+  /** ★ 对应 R 行里必须出现的条件编号引用（★ 写死 ⇒ ⇒ R 行里的【所有】同类标记都必须等于它）。 */
+  readonly rConditionRef: string;
 };
 
 /**
@@ -412,6 +418,8 @@ const STATUS_SPECS: readonly StatusSpec[] = [
     tableCarrier: 'status-table-1',
     gateCarrier: 'gate-r2',
     state: '✅',
+    tableRef: 'R2 行',
+    rConditionRef: '出关条件①',
   },
   {
     id: 'gate-2',
@@ -419,6 +427,8 @@ const STATUS_SPECS: readonly StatusSpec[] = [
     tableCarrier: 'status-table-2',
     gateCarrier: 'gate-r3',
     state: '⏳',
+    tableRef: 'R3 行',
+    rConditionRef: '出关条件②',
   },
   {
     id: 'gate-3',
@@ -426,6 +436,8 @@ const STATUS_SPECS: readonly StatusSpec[] = [
     tableCarrier: 'status-table-3',
     gateCarrier: 'gate-r4',
     state: '❌',
+    tableRef: 'R4 行',
+    rConditionRef: '出关条件③',
   },
   {
     id: 'gate-4',
@@ -433,6 +445,8 @@ const STATUS_SPECS: readonly StatusSpec[] = [
     tableCarrier: 'status-table-4',
     gateCarrier: 'gate-r7',
     state: '✅',
+    tableRef: 'R7 行',
+    rConditionRef: '出关条件④',
   },
 ];
 
@@ -498,6 +512,9 @@ const WORDING_ANCHORS: readonly {
     ],
   },
 ];
+
+/** 措辞锚点（★ 供负控覆盖清单用 ⇒ 类型单独抽出来）。 */
+type WordingAnchor = (typeof WORDING_ANCHORS)[number];
 
 /**
  * ★ 锚点条目总数上限（★ **放宽必须显式传参** `--max-anchors N` ⇒ ⇒ **不许悄悄改常量**）。
@@ -719,7 +736,44 @@ function checkStatus(root: string): StatusReport {
     lines.set(carrier.id, hits);
   }
 
-  // ── ② 逐条件比对两侧的状态 emoji ──
+  // ── ② ★ 引用链检查（★ 状态表「依据」列 → R 行 · ★ 那一行的 R 行必须存在）──
+  for (const spec of STATUS_SPECS) {
+    const tableHit = lines.get(spec.tableCarrier)?.[0];
+    if (tableHit === undefined) {
+      continue; // 载体定位失败已经报过
+    }
+    if (!tableHit.text.includes(spec.tableRef)) {
+      issues.push({
+        category: CATEGORY_STATUS_REF,
+        detail:
+          `${spec.tableCarrier}（${CARRIER_BY_ID.get(spec.tableCarrier)?.file ?? '?'}:${tableHit.lineNo}）` +
+          `· 条件「${spec.label}」⇒ 「依据」列里没有引用「${spec.tableRef}」` +
+          '⇒ ⇒ 状态表与 R 行的引用链断了',
+      });
+    }
+  }
+
+  // ── ③ ★ 条件编号一致性（★ R 行里的【所有】「出关条件N」标记都必须指向同一个编号）──
+  //   ★ 「有没有那个标记」不够 —— ★ 「有两个不同的标记」才是不一致 ⇒ ⇒ 全部必须相等。
+  for (const spec of STATUS_SPECS) {
+    const gateHit = lines.get(spec.gateCarrier)?.[0];
+    if (gateHit === undefined) {
+      continue;
+    }
+    const refs = [...gateHit.text.matchAll(/出关条件[①②③④]/gu)].map((match) => match[0]);
+    const wrong = [...new Set(refs)].filter((ref) => ref !== spec.rConditionRef);
+    if (wrong.length > 0) {
+      issues.push({
+        category: CATEGORY_STATUS_LINK,
+        detail:
+          `${spec.gateCarrier}（${CARRIER_BY_ID.get(spec.gateCarrier)?.file ?? '?'}:${gateHit.lineNo}）` +
+          `· 条件「${spec.label}」⇒ 该行里的条件编号标记有 ${wrong.join('、')}` +
+          `，而状态表那一格是「${spec.rConditionRef}」⇒ ⇒ 编号对不上`,
+      });
+    }
+  }
+
+  // ── ④ 逐条件比对两侧的状态 emoji ──
   let comparisons = 0;
   for (const spec of STATUS_SPECS) {
     const tableHit = lines.get(spec.tableCarrier)?.[0];
@@ -792,7 +846,11 @@ type WordingReport = {
  * ★ **判据**：★ 每个载体的那一行 ⇒ ⇒ **必须逐字含规范措辞** ⇒ ⇒ ★ **而且它必须处于【断言形态】**
  * ⇒ ⇒ ★ **引述形态 / 释义形态 ⇒ ⇒ 豁免**（★ 那是「在引用这个说法」、不是「在断言这个说法」）。
  */
-function checkWording(root: string, maxAnchors: number): WordingReport {
+function checkWording(
+  root: string,
+  maxAnchors: number,
+  anchors: readonly WordingAnchor[] = WORDING_ANCHORS,
+): WordingReport {
   const issues: Issue[] = [];
   const cells: WordingCell[] = [];
 
@@ -825,7 +883,7 @@ function checkWording(root: string, maxAnchors: number): WordingReport {
 
   // ── ② 逐锚点逐载体比对措辞 ──
   let comparisons = 0;
-  for (const anchor of WORDING_ANCHORS) {
+  for (const anchor of anchors) {
     for (const target of anchor.carriers) {
       const hits = lines.get(target.carrier);
       if (hits === undefined) {
@@ -919,10 +977,7 @@ function checkWording(root: string, maxAnchors: number): WordingReport {
 
   // ── ③ ★ 清单形状的两道锁（★ 与状态维度共用同一份期望形状）──
   const expectedIds = EXPECTED_ANCHOR_SHAPE.map((entry) => entry.id);
-  const actualIds = [
-    ...WORDING_ANCHORS.map((anchor) => anchor.id),
-    ...STATUS_SPECS.map((spec) => spec.id),
-  ];
+  const actualIds = [...anchors.map((anchor) => anchor.id), ...STATUS_SPECS.map((spec) => spec.id)];
   const missing = expectedIds.filter((id) => !actualIds.includes(id));
   const extra = actualIds.filter((id) => !expectedIds.includes(id));
   if (missing.length > 0 || extra.length > 0) {
@@ -933,6 +988,37 @@ function checkWording(root: string, maxAnchors: number): WordingReport {
         `实际：${actualIds.join('、')}；★ 缺：${missing.join('、') || '无'}；` +
         `★ 多：${extra.join('、') || '无'}）⇒ ⇒ **清单被改宽 / 改窄**`,
     });
+  }
+  // ★★★ ★★★ **逐条比【载体数】**（★★ 这一段此前**从未存在** ⇒ ⇒ `EXPECTED_ANCHOR_SHAPE`
+  //   里的 `carrierCount` 字段是**死的** ⇒ ⇒ 「清单少列了一个载体」【没人管】⇒ ⇒ 锁一形同虚设）。
+  //   ⚠️ ★ 上面的注释写着「守卫怎么知道『少列了一个载体』？⇒ ⇒ 判据必须有一个【独立于清单】的期望值」
+  //   ⇒ ⇒ **那正是本段要做的事** ⇒ ⇒ 注释承诺的行为必须真的发生（★ 否则 = 「说过头」）。
+  const actualCarrierCount = (id: string): number | undefined => {
+    const anchor = anchors.find((candidate) => candidate.id === id);
+    if (anchor !== undefined) {
+      return anchor.carriers.length;
+    }
+    const spec = STATUS_SPECS.find((candidate) => candidate.id === id);
+    if (spec !== undefined) {
+      // ★ 状态规格牵住【两侧】＝ 状态表那一格 + 对应 R 行那一格
+      return 2;
+    }
+    return undefined;
+  };
+  for (const expected of EXPECTED_ANCHOR_SHAPE) {
+    const actual = actualCarrierCount(expected.id);
+    if (actual === undefined) {
+      continue;
+    }
+    if (actual !== expected.carrierCount) {
+      issues.push({
+        category: CATEGORY_ANCHOR_WIDENED,
+        detail:
+          `锚点「${expected.id}」⇒ ★ 期望牵住 ${expected.carrierCount} 个载体、` +
+          `实际 ${actual} 个 ⇒ ⇒ **清单被改窄 / 改宽**` +
+          '⇒ ⇒ 改清单必须同批改期望（★ 期望形状在【分处两地】的硬编码里）',
+      });
+    }
   }
   if (actualIds.length > maxAnchors) {
     issues.push({
@@ -1031,6 +1117,71 @@ const NEGATIVE_CONTROLS: readonly Mutation[] = [
     from: '2026-11-05 实测精确分【至多】2 行',
     to: '「2026-11-05 实测精确分【至多】2 行」',
   },
+  {
+    name: '负控 J · 把状态表④的「依据」列引用改掉（★ 引用链断裂）',
+    expect: CATEGORY_STATUS_REF,
+    dimension: 'status',
+    file: 'docs/design/perf-c2-admissible-two-stage.md',
+    from: '| ✅ **以替代口径达成** | R7 行 ·',
+    to: '| ✅ **以替代口径达成** | R9 行 ·',
+  },
+  {
+    name: '负控 K · 把 R7 行里的条件编号改成另一个（★ 编号对不上）',
+    expect: CATEGORY_STATUS_LINK,
+    dimension: 'status',
+    file: 'docs/design/perf-c2-admissible-two-stage.md',
+    from: '出关条件④：报告 `bytesRead` 与 `survivors` 的 p50/**p99/max**',
+    to: '出关条件①：报告 `bytesRead` 与 `survivors` 的 p50/**p99/max**',
+  },
+  {
+    name: '负控 L · 把状态表①的 R 行引用删掉（★ 引用链断裂）',
+    expect: CATEGORY_STATUS_REF,
+    dimension: 'status',
+    file: 'docs/design/perf-c2-admissible-two-stage.md',
+    from: '| ✅ **达成** | R2 行 ·',
+    to: '| ✅ **达成** | ·',
+  },
+];
+
+/**
+ * ★ **清单级负控**（★ 改的是【清单】、不是文件 ⇒ ⇒ 需要另一套机制）。
+ *
+ * ⚠️ ★ **为什么必须有它们**：★★ **两把锁（期望形状 / 上限）此前【一条负控都没有】**
+ *   ⇒ ⇒ 也就是说「锁有没有牙」**从来没被验过** ⇒ ⇒ ★ **实测：锁一的 `carrierCount` 字段是死的**
+ *   ⇒ ⇒ 清单少列一个载体 ⇒ ⇒ 守卫**不红** ⇒ ⇒ ⇒ **这正是「守卫的守卫没有守卫」**
+ *   ⇒ ⇒ ⇒ ★ 所以这两条负控是**给锁装上牙齿**，不是给守卫再加一层装饰。
+ */
+type ListControl = {
+  readonly name: string;
+  /** 期望的失败类别（★ `''` ⇒ **不许**报这一类 ⇒ ⇒ 用来验「显式放宽上限」确实生效）。 */
+  readonly expect: string;
+  readonly run: (dir: string) => WordingReport;
+};
+
+const LIST_CONTROLS: readonly ListControl[] = [
+  {
+    name: '负控 M · 清单被改窄（把措辞锚点少列一个载体 ⇒ ⇒ 期望形状的载体数对不上）',
+    expect: CATEGORY_ANCHOR_WIDENED,
+    run: (dir) =>
+      checkWording(
+        dir,
+        DEFAULT_MAX_ANCHORS,
+        WORDING_ANCHORS.map((anchor) => ({
+          ...anchor,
+          carriers: anchor.carriers.slice(0, anchor.carriers.length - 1),
+        })),
+      ),
+  },
+  {
+    name: '负控 N · 清单条目数超过上限（上限显式调到 1 ⇒ ⇒ 实际 5 条 ⇒ ⇒ 超了）',
+    expect: CATEGORY_ANCHOR_WIDENED,
+    run: (dir) => checkWording(dir, 1),
+  },
+  {
+    name: '负控 N2 · 显式放宽上限（上限显式调到 5 ⇒ ⇒ 不再报「超过上限」）',
+    expect: '',
+    run: (dir) => checkWording(dir, 5),
+  },
 ];
 
 function runSelfTest(): number {
@@ -1125,6 +1276,43 @@ function runSelfTest(): number {
         continue;
       }
 
+      const hit = report.issues.find((issue) => issue.category === control.expect);
+      if (hit !== undefined) {
+        process.stdout.write(`✅ ${control.name} ⇒ 报出「${control.expect}」\n`);
+      } else {
+        failures += 1;
+        process.stdout.write(
+          `✗ ${control.name} ⇒ **没有**报出「${control.expect}」（实际报出：` +
+            `${report.issues.map((issue) => issue.category).join('、') || '（无）'}）\n`,
+        );
+      }
+    }
+
+    // ── ★ 清单级负控：改的是【清单】、不是文件（★ 给两把锁装上牙齿）──
+    for (const control of LIST_CONTROLS) {
+      const report = control.run(dir);
+      if (control.expect === '') {
+        // ★ 期望「不报这一类」⇒ ⇒ 用来验「显式放宽上限确实生效」
+        const fired = report.issues.filter((issue) => issue.category === CATEGORY_ANCHOR_WIDENED);
+        if (fired.length === 0) {
+          process.stdout.write(`✅ ${control.name} ⇒ **没有**报「${CATEGORY_ANCHOR_WIDENED}」\n`);
+        } else {
+          failures += 1;
+          process.stdout.write(
+            `✗ ${control.name} ⇒ 竟然报出了「${CATEGORY_ANCHOR_WIDENED}」⇒ ⇒ 显式放宽上限没生效\n`,
+          );
+        }
+        continue;
+      }
+      // ★ **根因断言**：mutate 之后，判定必须【不再通过】⇒ ⇒ 否则这条负控自己就是恒绿的
+      if (report.issues.length === 0) {
+        failures += 1;
+        process.stdout.write(
+          `✗ ${control.name} ⇒ **判定仍然通过（零错误）** ⇒ ⇒ 这条负控自己就是恒绿的 ⇒ ` +
+            '⇒ **夹具没进判定路径**（★ 已由这条根因断言当场抓住）\n',
+        );
+        continue;
+      }
       const hit = report.issues.find((issue) => issue.category === control.expect);
       if (hit !== undefined) {
         process.stdout.write(`✅ ${control.name} ⇒ 报出「${control.expect}」\n`);
