@@ -46,6 +46,26 @@
 > ⚠️ GitHub Actions 的工作流在 `.github/workflows/ci.yml`：
 > 它跑的是 **`pnpm run verify`**（**不是** `pnpm ci`）。
 
+## ⚠️ 链外守卫（★ **不在 `verify` 链里** · 2026-11-05 起 · T07）
+
+> ★ 这三个**不在**上面的 `verify` 链里（★ 链外入口）⇒ ⇒ ⇒ **跑 `pnpm run verify` 【不会】跑它们**
+> ⇒ ⇒ ⇒ ⇒ **凡结论依赖它们的 ⇒ ⇒ 必须手动跑**（★ 或把「跑过它」的留痕写进结论里）。
+
+| 脚本 | 链外入口 | 守什么 | 方向 |
+|---|---|---|---|
+| `scripts/check-json-note-fidelity.ts` | `pnpm run check:json-note` | ★ 文档里的 `note` ↔ `bench/perf.ts` **真正落盘**的那串 **逐字节相等**（★ 判据 = 逐字节 · **不是**归一化）| 正向（必须逐字相同）|
+| `scripts/check-benchmark-numbers.ts` | `pnpm run check:benchmark-numbers` | ★ 同一批数在多个载体里**逐位相等** + ★ 出关条件**状态**两侧一致 + ★ 规范**措辞**在断言形态 | 正向（必须说同一句话）|
+| `scripts/check-wording-drift.ts` | `pnpm run check:wording-drift` | ★ 旧措辞「只读…2 行」**不许以断言形态出现**（★ 全仓负向扫描）| 负向（禁止说错话）|
+
+★ **它们互为依赖**：★ `check-benchmark-numbers.ts` **import** `check-wording-drift.ts` 的判定入口
+⇒ ⇒ ⇒ **「判定只有一份」** ⇒ ⇒ ⇒ **改任一个都可能波及另外两个** ⇒ ⇒ ⇒
+⇒ ⇒ ★ **改这三个文件前先互发预告**（★ 见下面检查单第 ④ 条）。
+
+★ 每个都自带 `--self-test`（★ 正控 + 反向对照 + 负控 + 根因断言）⇒ ⇒ ⇒
+⇒ ⇒ ★ **断言项数看 `--self-test` 的实跑输出**（★ **数字是会过期的快照** ⇒ ⇒ 别把条数写进会漂的散文里）。
+
+---
+
 ## 文档审计（**2026-11-02 起 = 门禁的第 12~14 段**）
 
 > ★ **这三条已经不是「可复跑但不算数」的旁路脚本了**：它们在 `pnpm run verify` 的链上，
@@ -250,6 +270,21 @@ pnpm exec tsx bench/regression/weights.ts --capture  # 重新采集 golden
 ⚠️ **若发现某条 stash 的内容已被某个 commit 完全覆盖**（`git diff stash@{0} HEAD -- <file>` 为空），
 它已**冗余**，且留着**有害**（将来有人 `git stash pop` 会把一份已提交的改动贴回去 ⇒ 制造冲突）⇒ **可以 drop**；
 但 drop 前**必须**确认它里面**没有别人的未落地内容**。
+
+### ④ 改【三个共享守卫】之前 —— 先互发预告（★ 路径 + 预计时长）
+
+★ `scripts/check-benchmark-numbers.ts` · `scripts/check-wording-drift.ts` · `scripts/check-json-note-fidelity.ts`
+⇒ ⇒ ⇒ 三个**互为依赖** ⇒ ⇒ ⇒ 改任一个都可能**波及另外两个**。
+
+⇒ ⇒ **动手前先给对方（ teammate / 主理人）发一条**：「我要动 `<路径>` · 预计 `<时长>` · 改的是 `<哪一段>`」。
+
+⇒ ⇒ ⇒ ★ **这条不是为了礼节**（★ 本轮真出过两次）：
+　① 两个人同时改 `check-wording-drift.ts` ⇒ ⇒ ⇒ **一个人的在途改动被另一个人的 `git add -A` 一起卷走**
+　　⇒ ⇒ ⇒ ⇒ 提交信息里的**数字当场对不上**（★ 实测：写「11 项」而实际是 13 项）；
+　② 撞名覆盖：★ 按规格表新建文件时**没先核目标原文在不在** ⇒ ⇒ ⇒ **覆盖掉了一份已验收的文件**。
+
+⇒ ⇒ ⇒ ★ 碰巧撞上了 ⇒ ⇒ **先核对方的目标文件原文在不在**（★ 防 ②）⇒ ⇒
+⇒ ⇒ ⇒ **也不要 `git add -A`**（★ 防 ① ⇒ ⇒ ⇒ 参见上面第 ① 条：只 `git add` 自己的那几个路径）。
 
 ### 附：门禁偶发「红」时的判定
 
