@@ -56,8 +56,12 @@ import { fileURLToPath } from 'node:url';
  *     `check:wording-drift`（★ 豁免上限 8 = 基线 6 + 余量 2 ⇒ **再正常演化 2 处就误报**
  *       ⇒ 进链 = 给 CI 埋雷 ⇒ ⇒ **等余量 ≥6 再进**）·
  *     `check:json-note`（★ 判据是逐字节相等 ⇒ 误报 = 真的没同批改 ⇒ ★ **本轮暂不进**
- *       ⇒ 理由：它与 `check:benchmark-numbers` 有**单向依赖**（后者 import 前者的判定入口
- *       ⇒ ⇒ **同时进链会让「改一个波及两个」的风险面变大** ⇒ ⇒ 建议下一轮单独裁决）·
+ *       ⇒ ★ **⚠️ 2026-11-05 订正本条的理由**：★ 原写「它与 `check:benchmark-numbers` 有单向依赖」
+ *       ⇒ ⇒ ★ **那是错的** ⇒ ⇒ **实测的依赖图是**：`benchmark-numbers` → `wording-drift`（单向）
+ *       ⇒ ⇒ ★ **而 `check:json-note` 零本地 import ⇒ 【完全独立】** ⇒ ⇒ **「同时进链会扩大波及面」
+ *       这条理由【不成立】** ⇒ ⇒ ⇒ ★ **它暂不进的真实理由 = 【本轮只授权进 2 条】**（★ 用户口径）
+ *       ⇒ ⇒ ⇒ ★ **⇒ 它是【最该进链】的那条**（★ 它守的正是「改落盘 note 必须同批改逐字副本」
+ *       ⇒ ⇒ **这条纪律目前【纯靠人记】** ⇒ ⇒ ★ 下一轮建议进链 ⇒ ⇒ **详见 `scripts/README.md` 的登记**）·
  *     `check:credential-hygiene`（★ 误报面高：330 条凭据 / 4 条豁免规则 / 边界密）·
  *     `check:line-endings`（★ **语义与 CI 相反**：它防 Windows 开发机 ⇒ CI 是 ubuntu ⇒ 恒绿
  *       ⇒ 进链 = 零收益 + 一个恒绿段）·

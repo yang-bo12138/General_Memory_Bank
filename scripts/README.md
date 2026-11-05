@@ -279,7 +279,11 @@ pnpm exec tsx bench/regression/weights.ts --capture  # 重新采集 golden
 ### ④ 改【三个共享守卫】之前 —— 先互发预告（★ 路径 + 预计时长）
 
 ★ `scripts/check-benchmark-numbers.ts` · `scripts/check-wording-drift.ts` · `scripts/check-json-note-fidelity.ts`
-⇒ ⇒ ⇒ 三个**互为依赖** ⇒ ⇒ ⇒ 改任一个都可能**波及另外两个**。
+⇒ ⇒ ⇒ ⚠️ ★ **2026-11-05 订正：这三个【不是「互为依赖」】** ⇒ ⇒ ⇒ **实测的依赖图**：
+★ `check-benchmark-numbers.ts` **import** `check-wording-drift.ts` 的判定入口（★ **单向**）
+⇒ ⇒ ⇒ ★ 而 **`check-json-note-fidelity.ts` 零本地 import ⇒ 【完全独立】**
+⇒ ⇒ ⇒ ★ **⇒ 真实的波及面是：「改 `wording-drift` 会波及 `benchmark-numbers`；★ 改 `json-note` 不波及任何守卫」**
+⇒ ⇒ ⇒ ★ **⇒ 本条的纪律仍成立（★ 三个都是共享资产 ⇒ 都值得先打招呼）**，★ **但「改任一个都波及另外两个」是说过头了** ⇒ ⇒ ★ **⇒ 别因为「怕波及」而不敢单独改 `json-note`**。
 
 ⇒ ⇒ **动手前先给对方（ teammate / 主理人）发一条**：「我要动 `<路径>` · 预计 `<时长>` · 改的是 `<哪一段>`」。
 
