@@ -240,8 +240,59 @@ const SCANNED_EXTENSIONS: ReadonlySet<string> = new Set([
 /** 单文件大小上限（超过 ⇒ 跳过 ⇒ ⇒ 免得把生成物扫进来）。 */
 const MAX_FILE_BYTES = 5 * 1024 * 1024;
 
-/** 豁免条目数上限（**只统计本文件之外**的豁免；超过 ⇒ 报「豁免条目过多」）。 */
-const DEFAULT_MAX_ALLOWED = 6;
+/**
+ * ★ 豁免**基线**（★ 生产语义）：★ 本仓库「本脚本自身之外」的合法引述豁免数。
+ *
+ * ★ **基线是多少**：★ **6**（★ 实测于 2026-11-05 · E 盘 HEAD）——★ 分布：
+ *   · `docs/design/perf-c2-t06-byte-metering.md` × 3
+ *   · `docs/handover/T06-delivery-overview.md` × 1
+ *   · `docs/handover/T07-ordered-backlog.md` × 1
+ *   · `scripts/README.md` × 1
+ * ★ **为什么是这个数**：★ 它是**当前仓库里真实存在的、全部合法的引述**的条数
+ *   ⇒ ⇒ 而这 6 处**每一处都是「被引用的词」（落在引号里）** ⇒ ⇒ 都是**真豁免**、不是后门。
+ * ★ **怎么复算（★ 基线必须【可复算】、否则它就只是「拍死的数」）**：
+ *   ⇒ ⇒ `pnpm run check:wording-drift` ⇒ ⇒ 输出里「豁免（仓库内 · 实际放行 N 处 …）」的 **N**
+ *   ⇒ ⇒ 就是当前基线（★ 报告**同时打印基线 / 余量 / 上限** ⇒ ⇒ 基线过期时一眼看得见）。
+ * ★ **为什么要显式写死、而不是「跟着扫描结果浮动」**：
+ *   ⇒ ⇒ 若上限**跟着当前值浮动** ⇒ ⇒ 上限恒等于当前值 ⇒ ⇒ **判据永远不触发**
+ *   ⇒ ⇒ ⇒ 「白名单不许被撑大」这条纪律就成了空话 ⇒ ⇒ ⇒ **阈值要能被质疑和核对**
+ *   ⇒ ⇒ ⇒ （★ 与 architect「阈值必须带依据区间」同款纪律）。
+ */
+const BASE_ALLOWED = 6;
+
+/**
+ * ★ 豁免**余量**（★ 基线之上允许的【自然增长】空间）。
+ *
+ * ★ **余量是多少**：★ **2**。
+ * ★ **为什么要留余量**：★ 豁免数会随「新增文档 / 新增交接资产入库」**自然增长**
+ *   ⇒ ⇒ 若余量为 0 ⇒ ⇒ **每入库一份新资产就把生产守卫顶红** ⇒ ⇒ ⇒ 那会逼人去「调大上限」
+ *   ⇒ ⇒ ⇒ 而「调大上限」正是这条判据要防的后门 ⇒ ⇒ ⇒ **余量是给正常增长留的空间，不是给后门留的**。
+ * ★ **为什么是 2、不是更多**：★ 余量越大 ⇒ ⇒ 「被撑大」这条判据越晚触发 ⇒ ⇒ 后门开得越久
+ *   ⇒ ⇒ ⇒ 2 足以覆盖「一次入库多带几处引述」的常见情形，又不至于让判据形同虚设。
+ */
+const HEADROOM = 2;
+
+/**
+ * ★ 豁免条目数上限（★ **生产语义**）：★ = **基线 + 余量**。
+ *
+ * ★ **只统计本脚本自身之外的豁免**；超过 ⇒ ⇒ 报「豁免条目过多」。
+ *
+ * ⚠️ ★★ **这个上限【只用于扫真实仓库】**（★ `runCli` 那条路径）
+ *   ⇒ ⇒ **自测夹具副本不用它**（★ 见 `NO_CAP` 与 `Control.maxAllowed` 的注释）
+ *   ⇒ ⇒ ⇒ **两套语义必须分开**（★ 否则夹具【必然多出的那几处豁免】会被误判成「白名单被撑大」
+ *   ⇒ ⇒ ⇒ ⇒ 而那会让每个「必须不红」的反向对照都凭空多出 1 个错 ⇒ ⇒ ⇒ 夹具自己就失效了）。
+ */
+const MAX_ALLOWED = BASE_ALLOWED + HEADROOM;
+
+/**
+ * ★ 「无上限」哨兵（★ = `Number.POSITIVE_INFINITY`）。
+ *
+ * ★ **用在哪**：★ **自测夹具副本**（★ 理由见 `Control.maxAllowed` 的注释）。
+ * ★ **为什么夹具不用生产上限**：★ 夹具副本 = 仓库副本 + 夹具自己引入的那几处豁免
+ *   ⇒ ⇒ 它的豁免数**必然**比生产基线多 ⇒ ⇒ 若拿生产上限扫它 ⇒ ⇒ 那些**夹具自己的**豁免
+ *   ⇒ ⇒ ⇒ 就会被误判成「白名单被撑大」⇒ ⇒ ⇒ **夹具自己的断言就被污染了**。
+ */
+const NO_CAP = Number.POSITIVE_INFINITY;
 
 /** 上下文截断长度（报告里贴整行 ⇒ ⇒ 但别刷屏）。 */
 const CONTEXT_LIMIT = 120;
@@ -633,7 +684,7 @@ function collectFiles(root: string): string[] {
  * 扫一棵树。
  *
  * @param root 扫描根（绝对路径）
- * @param maxAllowed 豁免条目数上限（**只统计本脚本自身之外**的豁免）
+ * @param maxAllowed 豁免条目数上限（**只统计本脚本自身之外**的豁免）· ★ `NO_CAP` = 不设上限（★ 夹具副本用）
  * @returns 报告
  */
 function scanTree(root: string, maxAllowed: number): Report {
@@ -677,7 +728,8 @@ function scanTree(root: string, maxAllowed: number): Report {
       detail:
         `豁免 ${allowedCounted} 处 > 上限 ${maxAllowed}（★ 只统计本脚本自身之外的豁免）⇒ ⇒ ` +
         '白名单被撑大 ⇒ ⇒ 「引用式豁免」开始被当后门用 ⇒ ⇒ ' +
-        '请改判据，或显式调高 --max-allowed（并说明理由）',
+        `请改判据，或显式调高基线（★ 当前基线 ${BASE_ALLOWED} + 余量 ${HEADROOM} = ${MAX_ALLOWED}）` +
+        '（并说明理由）',
     });
   }
 
@@ -692,6 +744,30 @@ function scanTree(root: string, maxAllowed: number): Report {
 }
 
 /* ── 报告 ── */
+
+/**
+ * 数一段文本里有几处**豁免**（★ 用与扫描**完全相同**的判定 ⇒ ⇒ 数字必然一致 ⇒ ⇒ 不用手数）。
+ *
+ * ★ **为什么需要它**：★ 自测夹具要算「夹具自己引入了几处豁免」
+ *   ⇒ ⇒ 才能把夹具副本的上限设成「基线 + 夹具自带的那几处」⇒ ⇒ ⇒ 而这个数
+ *   ⇒ ⇒ ⇒ **必须由同一套判定算出来**（★ 手数 ⇒ ⇒ 判据会与实现漂移 ⇒ ⇒ 那就是清单）。
+ *
+ * @param text 文本（可以是多行）
+ * @param file 用于报告的文件名（★ 合成值）
+ * @returns 豁免处数
+ */
+function countExemptionsIn(text: string, file: string): number {
+  let count = 0;
+  const lines = text.split(/\r?\n/u);
+  for (const [index, line] of lines.entries()) {
+    for (const item of scanLine(line, file, index + 1, false)) {
+      if (item.allowance !== undefined) {
+        count += 1;
+      }
+    }
+  }
+  return count;
+}
 
 /**
  * 把豁免理由翻成人话（报告里贴出来 ⇒ ⇒ 一眼可见「放行了什么」）。
@@ -727,7 +803,10 @@ function printReport(report: Report, root: string, maxAllowed: number): void {
   process.stdout.write(
     `    ② 「释义形态」：命中与释义特征短语「${FEATURE_PHRASE}」相距 ≤ ${MAX_FEATURE_DISTANCE} 字\n`,
   );
-  process.stdout.write(`  豁免条目上限：${maxAllowed}（★ 只统计本脚本自身之外的豁免）\n`);
+  process.stdout.write(
+    `  豁免条目上限：${maxAllowed}（★ 只统计本脚本自身之外的豁免` +
+      `· ★ 生产语义 = 基线 ${BASE_ALLOWED} + 余量 ${HEADROOM} = ${MAX_ALLOWED}）\n`,
+  );
 
   const listed = report.allowed.filter((item) => !item.inSelf);
   const selfListed = report.allowed.filter((item) => item.inSelf);
@@ -769,6 +848,31 @@ interface Control {
    *   ⇒ ⇒ 零条 ⇒ 说明**远的那处也没抓住** ⇒ ⇒ 收紧根本没生效。
    */
   readonly expectViolationCount?: number;
+  /**
+   * ★ 本夹具**自己引入**的豁免处数（★ 用于给夹具副本算上限 ⇒ ⇒ 夹具不被生产上限误伤）。
+   *
+   * ★ **为什么要有它**：★ 夹具副本 = 仓库副本 + 夹具自己加的那几行
+   *   ⇒ ⇒ 它的豁免数**必然**比仓库基线多 ⇒ ⇒ 若拿生产上限（`MAX_ALLOWED`）扫它
+   *   ⇒ ⇒ ⇒ 夹具自己的豁免就会被误判成「白名单被撑大」⇒ ⇒ ⇒ **每个「必须不红」的反向对照
+   *   ⇒ ⇒ ⇒ 都会凭空多出 1 个错** ⇒ ⇒ ⇒ **夹具自己就失效了**。
+   *
+   * ★ **它怎么算出来**：★ 由 `mutate()` 用**与扫描同一套判定**（`countExemptionsIn()`）数
+   *   ⇒ ⇒ **不是手数、也不是清单** ⇒ ⇒ 判据与实现不会漂。
+   */
+  readonly ownExemptions?: number;
+  /**
+   * ★ 这个夹具**是否用生产上限**扫（★ 默认否）。
+   *
+   * ★ **只有「豁免条目过多」这条负控用生产上限**（★ 它验的就是「生产上限会被顶破」这件事
+   *   ⇒ ⇒ 必须用**生产**上限、且必须能顶破它 ⇒ ⇒ 才是真的在验那条判据）。
+   */
+  readonly useProductionCap?: boolean;
+  /**
+   * ★ 把副本改坏（★ **并返回这条夹具自己引入的豁免处数**）。
+   *
+   * @param repo 副本根
+   * @returns 自带豁免处数（★ 用 `countExemptionsIn()` 数 ⇒ ⇒ 不手数）
+   */
   readonly mutate: (repo: string) => void;
 }
 
@@ -865,7 +969,26 @@ function runSelfTest(): number {
     cpSync(REPO_ROOT, pristine, { recursive: true, filter: shouldCopy });
 
     /* ── 正控：当前状态 ⇒ 零错误，且豁免机制**确实被用到**（不是空转）── */
-    const positive = scanTree(pristine, DEFAULT_MAX_ALLOWED);
+    const positive = scanTree(pristine, MAX_ALLOWED);
+    /**
+     * ★ **仓库当前的豁免基线**（★ 实测值 ⇒ ⇒ 现场量出来 ⇒ ⇒ 仓库长了几处都跟着动）。
+     *
+     * ★ **为什么夹具用它、而不是生产上限**：★ 夹具副本 = 仓库副本 + 夹具自己加的那几行
+     *   ⇒ ⇒ 它的豁免数**必然**比基线多 ⇒ ⇒ 若拿生产上限（`MAX_ALLOWED`）扫它
+     *   ⇒ ⇒ ⇒ 夹具自己的豁免就会被误判成「白名单被撑大」⇒ ⇒ ⇒ **夹具自己就失效了**。
+     */
+    const liveBaseline = positive.allowedCounted;
+    /**
+     * ★ 算一个夹具副本该用的上限：**基线 + 该夹具自带的那几处**。
+     *
+     * ★ **为什么这样算**：★ 夹具只该被「**它自己引入的那几处豁免**」顶到临界
+     *   ⇒ ⇒ 上限 = 基线 + 它自带的数量 ⇒ ⇒ ⇒ 无论仓库现在有几处豁免
+     *   ⇒ ⇒ ⇒ **夹具的结论都不受仓库现状影响**（★ 这才是「两套语义」的真意）。
+     *
+     * @param own 该夹具自己引入的豁免处数
+     * @returns 该夹具副本的豁免上限
+     */
+    const fixtureCap = (own: number): number => liveBaseline + own;
     if (positive.errors.length === 0) {
       process.stdout.write('✅ 正控：当前状态零错误\n');
     } else {
@@ -901,15 +1024,14 @@ function runSelfTest(): number {
     {
       const work = join(tmpRoot, 'case-reverse-assert');
       cpSync(pristine, work, { recursive: true });
-      const inserted = appendLine(
-        join(work, ADR_FILE),
-        `- ⚠️ ★ 反向对照：实测精确分${OLD_WORDING_HEAD}${OLD_WORDING_TAIL} ⇒ ⇒ 这是【断言】形态 ⇒ ⇒ 必须判红。`,
-      );
+      const fixtureText = `- ⚠️ ★ 反向对照：实测精确分${OLD_WORDING_HEAD}${OLD_WORDING_TAIL} ⇒ ⇒ 这是【断言】形态 ⇒ ⇒ 必须判红。`;
+      const inserted = appendLine(join(work, ADR_FILE), fixtureText);
       if (!inserted) {
         failures += 1;
         process.stdout.write('✗ 反向对照 ① ⇒ **夹具没生效**（没能插进副本）⇒ 夹具无效\n');
       } else {
-        const report = scanTree(work, DEFAULT_MAX_ALLOWED);
+        // ★ 夹具上限 = 基线 + 它自带的豁免数（★ 用同一套判定数出来 ⇒ ⇒ 不是手写的清单）。
+        const report = scanTree(work, fixtureCap(countExemptionsIn(fixtureText, ADR_FILE)));
         const hit = report.errors.find((issue) => issue.category === '旧措辞被当作断言');
         if (report.errors.length > 0 && hit !== undefined) {
           process.stdout.write(
@@ -938,7 +1060,8 @@ function runSelfTest(): number {
         failures += 1;
         process.stdout.write('✗ 反向对照 ② ⇒ **夹具没生效**（没能插进副本）⇒ 夹具无效\n');
       } else {
-        const report = scanTree(work, DEFAULT_MAX_ALLOWED);
+        // ★ 夹具上限 = 基线 + 它自带的豁免数（★ 这条夹具带 1 处引述豁免 ⇒ ⇒ 上限 = 基线 + 1）。
+        const report = scanTree(work, fixtureCap(1));
         const stillAllowed = report.allowed.some(
           (item) =>
             item.file === EXPLANATION_FILE &&
@@ -963,15 +1086,14 @@ function runSelfTest(): number {
     {
       const work = join(tmpRoot, 'case-two-quotes');
       cpSync(pristine, work, { recursive: true });
-      const inserted = appendLine(
-        join(work, ADR_FILE),
-        `- ★ 反向对照 ③：「${OLD_WORDING_HEAD}${OLD_WORDING_TAIL}」与「${OLD_WORDING_HEAD}${OLD_WORDING_TAIL}」两处引述 ⇒ ⇒ 必须**不**红（★ 宽式正则不许横跨两处引述）。`,
-      );
+      const fixtureText = `- ★ 反向对照 ③：「${OLD_WORDING_HEAD}${OLD_WORDING_TAIL}」与「${OLD_WORDING_HEAD}${OLD_WORDING_TAIL}」两处引述 ⇒ ⇒ 必须**不**红（★ 宽式正则不许横跨两处引述）。`;
+      const inserted = appendLine(join(work, ADR_FILE), fixtureText);
       if (!inserted) {
         failures += 1;
         process.stdout.write('✗ 反向对照 ③ ⇒ **夹具没生效**（没能插进副本）⇒ 夹具无效\n');
       } else {
-        const report = scanTree(work, DEFAULT_MAX_ALLOWED);
+        // ★ 夹具上限 = 基线 + 它自带的豁免数（★ 这条夹具带 2 处引述豁免 ⇒ ⇒ 上限 = 基线 + 2）。
+        const report = scanTree(work, fixtureCap(countExemptionsIn(fixtureText, ADR_FILE)));
         if (report.errors.length === 0) {
           process.stdout.write('✅ 反向对照 ③（同一行两处引述 ⇒ 必须不红）⇒ 零错误\n');
         } else {
@@ -988,15 +1110,14 @@ function runSelfTest(): number {
     {
       const work = join(tmpRoot, 'case-reverse-explain-after');
       cpSync(pristine, work, { recursive: true });
-      const inserted = appendLine(
-        join(work, ADR_FILE),
-        `- ★ 反向对照 ④：实测精确分${OLD_WORDING_HEAD}${OLD_WORDING_TAIL}（这一行${FEATURE_PHRASE}「【至多】2 行」）⇒ ⇒ 紧邻释义标记（标记在后）⇒ ⇒ 必须**不**红。`,
-      );
+      const fixtureText = `- ★ 反向对照 ④：实测精确分${OLD_WORDING_HEAD}${OLD_WORDING_TAIL}（这一行${FEATURE_PHRASE}「【至多】2 行」）⇒ ⇒ 紧邻释义标记（标记在后）⇒ ⇒ 必须**不**红。`;
+      const inserted = appendLine(join(work, ADR_FILE), fixtureText);
       if (!inserted) {
         failures += 1;
         process.stdout.write('✗ 反向对照 ④ ⇒ **夹具没生效**（没能插进副本）⇒ 夹具无效\n');
       } else {
-        const report = scanTree(work, DEFAULT_MAX_ALLOWED);
+        // ★ 夹具上限 = 基线 + 它自带的豁免数（★ 这条夹具带 1 处类 B 豁免 ⇒ ⇒ 上限 = 基线 + 1）。
+        const report = scanTree(work, fixtureCap(countExemptionsIn(fixtureText, ADR_FILE)));
         const exempted = report.allowed.some(
           (item) =>
             item.file === ADR_FILE &&
@@ -1021,15 +1142,14 @@ function runSelfTest(): number {
     {
       const work = join(tmpRoot, 'case-reverse-explain-before');
       cpSync(pristine, work, { recursive: true });
-      const inserted = appendLine(
-        join(work, ADR_FILE),
-        `- ★ 反向对照 ⑤：这一行${FEATURE_PHRASE}「【至多】2 行」（实测精确分${OLD_WORDING_HEAD}${OLD_WORDING_TAIL}）⇒ ⇒ 紧邻释义标记（标记在前）⇒ ⇒ 必须**不**红。`,
-      );
+      const fixtureText = `- ★ 反向对照 ⑤：这一行${FEATURE_PHRASE}「【至多】2 行」（实测精确分${OLD_WORDING_HEAD}${OLD_WORDING_TAIL}）⇒ ⇒ 紧邻释义标记（标记在前）⇒ ⇒ 必须**不**红。`;
+      const inserted = appendLine(join(work, ADR_FILE), fixtureText);
       if (!inserted) {
         failures += 1;
         process.stdout.write('✗ 反向对照 ⑤ ⇒ **夹具没生效**（没能插进副本）⇒ 夹具无效\n');
       } else {
-        const report = scanTree(work, DEFAULT_MAX_ALLOWED);
+        // ★ 夹具上限 = 基线 + 它自带的豁免数（★ 这条夹具带 1 处类 B 豁免 ⇒ ⇒ 上限 = 基线 + 1）。
+        const report = scanTree(work, fixtureCap(countExemptionsIn(fixtureText, ADR_FILE)));
         const exempted = report.allowed.some(
           (item) =>
             item.file === ADR_FILE &&
@@ -1062,12 +1182,14 @@ function runSelfTest(): number {
         return `- ★ 校准夹具（间隔 ${gap} 字）：${hit}${filler}${FEATURE_PHRASE}「【至多】2 行」`;
       };
       const path = join(work, ADR_FILE);
+      const fixtureText = `${buildLine(40)}\n${buildLine(41)}`;
       const inserted = appendLine(path, buildLine(40)) && appendLine(path, buildLine(41));
       if (!inserted) {
         failures += 1;
         process.stdout.write('✗ 类 B 阈值校准 ⇒ **夹具没生效**（没能插进副本）⇒ 夹具无效\n');
       } else {
-        const report = scanTree(work, DEFAULT_MAX_ALLOWED);
+        // ★ 夹具上限 = 基线 + 它自带的豁免数（★ 两条里 40 字那条豁免、41 字那条判红 ⇒ ⇒ 自带 1 处豁免）。
+        const report = scanTree(work, fixtureCap(countExemptionsIn(fixtureText, ADR_FILE)));
         const violated = report.violations.find(
           (item) => item.snippet === `${OLD_WORDING_HEAD}${OLD_WORDING_TAIL}`,
         );
@@ -1123,10 +1245,10 @@ function runSelfTest(): number {
         name: '负控 A · 变体措辞（「只**读到** 2 行」）',
         expect: '旧措辞被当作断言',
         mutate: (repo) => {
-          appendLine(
-            join(repo, ADR_FILE),
-            `- ⚠️ ★ 负控：实测精确分${OLD_WORDING_HEAD}到${OLD_WORDING_TAIL} ⇒ ⇒ 变体也必须判红。`,
-          );
+          const fixtureText = `- ⚠️ ★ 负控：实测精确分${OLD_WORDING_HEAD}到${OLD_WORDING_TAIL} ⇒ ⇒ 变体也必须判红。`;
+          appendLine(join(repo, ADR_FILE), fixtureText);
+          // ★ 这条夹具是【断言】形态 ⇒ ⇒ 自带豁免 = 0。
+          return countExemptionsIn(fixtureText, ADR_FILE);
         },
       },
       {
@@ -1134,30 +1256,35 @@ function runSelfTest(): number {
         expect: '旧措辞被当作断言',
         mutate: (repo) => {
           const path = join(repo, EXPLANATION_FILE);
-          replaceInFile(
-            path,
-            `「${OLD_WORDING_HEAD}${OLD_WORDING_TAIL}」${FEATURE_PHRASE}`,
-            `实测精确分${OLD_WORDING_HEAD}${OLD_WORDING_TAIL}`,
-          );
-          replaceInFile(
-            path,
-            `「${OLD_WORDING_HEAD}${OLD_WORDING_TAIL}」是**单样本**的说法`,
-            `${OLD_WORDING_HEAD}${OLD_WORDING_TAIL}是**单样本**的说法`,
+          const originalA = `「${OLD_WORDING_HEAD}${OLD_WORDING_TAIL}」${FEATURE_PHRASE}`;
+          const originalB = `「${OLD_WORDING_HEAD}${OLD_WORDING_TAIL}」是**单样本**的说法`;
+          const replacedA = `实测精确分${OLD_WORDING_HEAD}${OLD_WORDING_TAIL}`;
+          const replacedB = `${OLD_WORDING_HEAD}${OLD_WORDING_TAIL}是**单样本**的说法`;
+          replaceInFile(path, originalA, replacedA);
+          replaceInFile(path, originalB, replacedB);
+          // ★ 这条夹具把两处**豁免**改成**违例** ⇒ ⇒ 豁免数不增反减 ⇒ ⇒ 自带 = 0。
+          return (
+            countExemptionsIn(replacedA, EXPLANATION_FILE) +
+            countExemptionsIn(replacedB, EXPLANATION_FILE)
           );
         },
       },
       {
         name: '负控 C · 豁免条目过多（★ 白名单不许被撑大）',
         expect: '豁免条目过多',
+        // ★ **这条负控用【生产上限】**（★ 它验的正是「生产上限会被顶破」⇒ ⇒ 必须用生产上限）。
+        useProductionCap: true,
         mutate: (repo) => {
           const path = join(repo, 'docs/design/wording-drift-fixture.md');
           const lines: string[] = [];
-          for (let index = 0; index < 6; index += 1) {
+          for (let index = 0; index < HEADROOM + 4; index += 1) {
             lines.push(
               `> ★ 夹具 ${index}：「${OLD_WORDING_HEAD}${OLD_WORDING_TAIL}」${FEATURE_PHRASE}「【至多】2 行」。`,
             );
           }
-          writeFileSync(path, `${lines.join('\n')}\n`, 'utf8');
+          const fixtureText = `${lines.join('\n')}\n`;
+          writeFileSync(path, fixtureText, 'utf8');
+          return countExemptionsIn(fixtureText, 'docs/design/wording-drift-fixture.md');
         },
       },
       {
@@ -1168,10 +1295,10 @@ function runSelfTest(): number {
         mutate: (repo) => {
           // ★ 填充物长度 = 阈值 + 20 ⇒ ⇒ 必然超出 `MAX_FEATURE_DISTANCE` ⇒ ⇒ 不靠手数。
           const filler = '·'.repeat(MAX_FEATURE_DISTANCE + 20);
-          appendLine(
-            join(repo, ADR_FILE),
-            `- ⚠️ ★ 负控 D：实测精确分${OLD_WORDING_HEAD}${OLD_WORDING_TAIL}（这一行${FEATURE_PHRASE}「【至多】2 行」）⇒ ⇒ ${filler} ⇒ ⇒ 而后面这半句是【断言】旧说法：实测精确分${OLD_WORDING_HEAD}${OLD_WORDING_TAIL} ⇒ ⇒ 必须判红（近的那处豁免 · 远的那处判红）。`,
-          );
+          const fixtureText = `- ⚠️ ★ 负控 D：实测精确分${OLD_WORDING_HEAD}${OLD_WORDING_TAIL}（这一行${FEATURE_PHRASE}「【至多】2 行」）⇒ ⇒ ${filler} ⇒ ⇒ 而后面这半句是【断言】旧说法：实测精确分${OLD_WORDING_HEAD}${OLD_WORDING_TAIL} ⇒ ⇒ 必须判红（近的那处豁免 · 远的那处判红）。`;
+          appendLine(join(repo, ADR_FILE), fixtureText);
+          // ★ 这条夹具自带 1 处豁免（近的那处 · 类 B）· 远的那处是违例（不计豁免）。
+          return countExemptionsIn(fixtureText, ADR_FILE);
         },
       },
     ];
@@ -1181,7 +1308,9 @@ function runSelfTest(): number {
       cpSync(pristine, work, { recursive: true });
       control.mutate(work);
 
-      const report = scanTree(work, DEFAULT_MAX_ALLOWED);
+      // ★ 负控框架：★ 只有「豁免条目过多」那条负控用【生产上限】⇒ ⇒ 它靠被顶破来验那条判据
+      //   ⇒ ⇒ ★ 其余负控用【无上限】⇒ ⇒ 专注验【判定行为】⇒ ⇒ 不被白名单闸门波及。
+      const report = scanTree(work, control.useProductionCap ? MAX_ALLOWED : NO_CAP);
 
       /* ★★★★ **根因断言**：判据不是「内容变了」⇒ ⇒ **太弱**
        *   （夹具没进判定路径 ⇒ 判定仍零错误 ⇒ ⇒ 这条负控自己就是恒绿的）
@@ -1256,7 +1385,8 @@ function runCli(argv: readonly string[]): number {
   const maxIndex = argv.indexOf('--max-allowed');
   const maxAllowedRaw = maxIndex === -1 ? '' : (argv[maxIndex + 1] ?? '');
   const maxAllowed = Number.parseInt(maxAllowedRaw, 10);
-  const max = Number.isFinite(maxAllowed) && maxAllowed >= 0 ? maxAllowed : DEFAULT_MAX_ALLOWED;
+  // ★ **生产语义**：上限 = 基线 + 余量（★ 显式传 `--max-allowed` 可临时覆盖 ⇒ ⇒ 但那是「有意留的摩擦」）。
+  const max = Number.isFinite(maxAllowed) && maxAllowed >= 0 ? maxAllowed : MAX_ALLOWED;
 
   const report = scanTree(root, max);
   printReport(report, root, max);
