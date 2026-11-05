@@ -48,7 +48,7 @@
 
 ## ⚠️ 链外守卫（★ **不在 `verify` 链里** · 2026-11-05 起 · T07）
 
-> ★ 这三个**不在**上面的 `verify` 链里（★ 链外入口）⇒ ⇒ ⇒ **跑 `pnpm run verify` 【不会】跑它们**
+> ★ 这些**不在**上面的 `verify` 链里（★ 链外入口）⇒ ⇒ ⇒ **跑 `pnpm run verify` 【不会】跑它们**
 > ⇒ ⇒ ⇒ ⇒ **凡结论依赖它们的 ⇒ ⇒ 必须手动跑**（★ 或把「跑过它」的留痕写进结论里）。
 
 | 脚本 | 链外入口 | 守什么 | 方向 |
@@ -56,10 +56,12 @@
 | `scripts/check-json-note-fidelity.ts` | `pnpm run check:json-note` | ★ 文档里的 `note` ↔ `bench/perf.ts` **真正落盘**的那串 **逐字节相等**（★ 判据 = 逐字节 · **不是**归一化）| 正向（必须逐字相同）|
 | `scripts/check-benchmark-numbers.ts` | `pnpm run check:benchmark-numbers` | ★ 同一批数在多个载体里**逐位相等** + ★ 出关条件**状态**两侧一致 + ★ 规范**措辞**在断言形态 | 正向（必须说同一句话）|
 | `scripts/check-wording-drift.ts` | `pnpm run check:wording-drift` | ★ 旧措辞「只读…2 行」**不许以断言形态出现**（★ 全仓负向扫描）| 负向（禁止说错话）|
+| `scripts/check-credential-hygiene.ts` | `pnpm exec tsx scripts/check-credential-hygiene.ts` | ★ 文档/注释里引用的**机器凭据路径**是否真实存在 + 是否在版本控制内（★ 三档：A 悬空 / B 存在但不在版本控制内 / C 完好）| 正向（必须指得到）|
+| `scripts/check-line-endings.ts` | `pnpm exec tsx scripts/check-line-endings.ts` | ★ 工作树里**物理含 CRLF** 的 tracked 文件（★ **按字节扫**，★ **不用 `git diff` / `git status`** —— ★ 那两个在 `text=auto` 仓库里对行尾差异**不可靠**：diff 被归一化吞掉、status 只看 stat）| 正向（必须全是 LF）|
 
-★ **它们互为依赖**：★ `check-benchmark-numbers.ts` **import** `check-wording-drift.ts` 的判定入口
+★ **前三个互为依赖**：★ `check-benchmark-numbers.ts` **import** `check-wording-drift.ts` 的判定入口
 ⇒ ⇒ ⇒ **「判定只有一份」** ⇒ ⇒ ⇒ **改任一个都可能波及另外两个** ⇒ ⇒ ⇒
-⇒ ⇒ ★ **改这三个文件前先互发预告**（★ 见下面检查单第 ④ 条）。
+⇒ ⇒ ★ **改这三个文件前先互发预告**（★ 见下面检查单第 ④ 条）⇒ ⇒ ⇒ ★ **后面两个是独立脚本**（★ 不 import 上面任何一个 ⇒ ⇒ **改它们不会波及对方**）。
 
 ★ 每个都自带 `--self-test`（★ 正控 + 反向对照 + 负控 + 根因断言）⇒ ⇒ ⇒
 ⇒ ⇒ ★ **断言项数看 `--self-test` 的实跑输出**（★ **数字是会过期的快照** ⇒ ⇒ 别把条数写进会漂的散文里）。
