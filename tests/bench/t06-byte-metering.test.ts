@@ -55,6 +55,7 @@ import {
   profileCodeWidths,
   readSamplesAlignedOf,
 } from '../../bench/perf.js';
+import { blankComments } from '../../scripts/lib/code-span.js';
 import { DEFAULT_PARAMS } from '../../src/core/params.js';
 import { MemoryStore } from '../../src/store/MemoryStore.js';
 import {
@@ -64,6 +65,7 @@ import {
 import { blobToVector, loadCentroidModel } from '../../src/vector/centroids.js';
 import { normalizeNumbers } from '../../src/vector/dot.js';
 import { codeWidthByteLengths } from '../../src/vector/quantize.js';
+import { readCode } from '../helpers/sourceScan.js';
 
 /** 冒烟用的语料规模（**故意很小** ⇒ 门禁秒级完成）。 */
 const SMOKE_SIZE = 1500;
@@ -1587,6 +1589,55 @@ describe('T06 · E：口径断言与落盘结构', () => {
       expect(note).toContain('`survivorsCount` = 本路径剪枝后的 survivors 条数');
     }
     db.db.close();
+  });
+
+  /**
+   * ★★★ **QA 补强 · bench 侧不许自己写码长表**（★ C36：「同一件事不得有两套实现」）。
+   *
+   * ★ **为什么这条必须有断言**：设计稿 §6 T09 的「实现要点 ①」明写
+   *   「★ 集合的**唯一出处** = `src/vector/quantize.ts` 的 `codeWidthByteLengths(dim)`
+   *   ⇒ ★ **bench 侧不许另写一份长度表**（★ 那会造出两处口径 ⇒ 未来漂移）」
+   *   ⇒ ⇒ 但**没有任何断言守它** ⇒ ⇒ 有人在 bench 里写一句 `const LENGTHS = [768, 384, 96]`
+   *   ⇒ ⇒ 生产侧改了档位、bench 侧没改 ⇒ ⇒ **int4 / 二值的库又被误判成坏码行**（★ 假红）⇒ ⇒ **无人发现**。
+   *
+   * ⚠️ **判据必须排除注释行**（★ 同 A7 的纪律）：bench 的注释里**大量**出现 768 / 384 / 96
+   *   （★ 那是在解释码宽）⇒ ⇒ 裸 grep 一定命中 ⇒ ⇒ 必须涂白注释后再判。
+   */
+  it('★ QA 补强 · bench 侧不许硬编码码长（★ 集合的唯一出处 = `codeWidthByteLengths()`）', () => {
+    /**
+     * ★ **判据（纯函数 · 可喂数据）**：在**已涂白注释**的源码里找「硬编码的码长字面量」。
+     *
+     * ⚠️ **为什么只认这三个数**：★ 768 = `EMBED_DIM`（int8 档）· 384 = int4 档 · 96 = 二值档
+     *   ⇒ ⇒ 任何一处硬编码 ⇒ 都是「第二份码长表」⇒ ⇒ 与生产侧口径漂移。
+     *
+     * @param code 已涂白注释的源码
+     * @returns 命中的「行号 + 字面量」
+     */
+    function findHardcodedCodeLengths(code: string): Array<{ line: number; literal: string }> {
+      const hits: Array<{ line: number; literal: string }> = [];
+      code.split(/\r?\n/).forEach((line, index) => {
+        for (const match of line.matchAll(/\b(768|384|96)\b/g)) {
+          hits.push({ line: index + 1, literal: match[1] ?? '' });
+        }
+      });
+      return hits;
+    }
+
+    // ★ 三个 bench 侧文件（★ 「坏码行」判据与码宽标签的所在地）
+    for (const file of ['bench/lib/harness.ts', 'bench/lib/byteSources.ts', 'bench/perf.ts']) {
+      expect({ file, hits: findHardcodedCodeLengths(readCode(file)) }).toEqual({
+        file,
+        hits: [],
+      });
+    }
+
+    // ⚠️ **负控**：同一套判据喂「自写了一张表」的源码 ⇒ **必须报出来**（★ 证明它不是恒绿守卫）
+    const evil = 'const CODE_LENGTHS = [768, 384, 96];';
+    expect(findHardcodedCodeLengths(evil).length).toBe(3);
+    // ⚠️ **负控 2**：注释里写了这些数 ⇒ **不报**（★ 证明判据真的排除了注释行）
+    expect(
+      findHardcodedCodeLengths(blankComments('// int8 = 768 B · int4 = 384 B · 二值 = 96 B')),
+    ).toEqual([]);
   });
 
   it('★ T09 · `profileCodeWidths()`：从库里读出码宽（★ 零配置）· 混档时主导档仍报且 `mixed = true`', () => {

@@ -1511,4 +1511,59 @@ describe('T08 · 读路径接线（A4 · A5）', () => {
 
     fixture.db.close();
   });
+
+  /**
+   * ★★★ **QA 补强 · 「零拷贝视图必须带 `byteOffset`」的机器背书**
+   * （★ **本轮 QA 实测发现的假绿盲区**：★ 去掉 `byteOffset` ⇒ **全量 2003 个用例照样全绿**）。
+   *
+   * ★★ **为什么这条重要**：
+   *   `readCodes()` 返回的 `code` 必须是**源 BLOB 的视图**（不是拷贝）
+   *   ⇒ ⇒ `new Uint8Array(row.code.buffer, row.code.byteOffset, row.code.byteLength)`
+   *   ⇒ ⇒ **三个参数缺一不可**（★ `Buffer` 的 `byteOffset` **不保证为 0**）。
+   *
+   * ⚠️ ★ **为什么既有测试抓不住**：★ 既有夹具的 BLOB 全部来自 better-sqlite3
+   *   ⇒ ⇒ 实测它的 `byteOffset` **恒为 0**（★ QA 已用 `.tmp/bench/*.db` 逐库核过）
+   *   ⇒ ⇒ **丢掉 `byteOffset` 结果一模一样** ⇒ ⇒ 既有 2003 个用例**全绿**（★ 实测过）。
+   *   ⇒ ⇒ ⇒ 本条**故意造一个 `byteOffset ≠ 0` 的 BLOB** ⇒ ⇒ 丢掉偏移就必须变红。
+   *
+   * ⚠️ ★ **注意**（★ **设计稿与现实的一处出入 · QA 只报告、不擅自改设计**）：
+   *   设计稿 §6 T08 的「实现要点 ①」说「不许写 `new Uint8Array(row.code)`（★ 那会按「元素值」转换
+   *   ⇒ 静默算错）」⇒ ★ **对 `Buffer` 源而言这句不准确**：`new Uint8Array(buffer)` 是**按元素值拷贝**
+   *   ⇒ ⇒ 字节值**相同**（★ 不算错）⇒ ⇒ 真实后果是「**零拷贝退化成逐行拷贝**」（★ 热读路径上的性能回归）
+   *   ⇒ ⇒ 而**真正会「静默算错」**的是 `prune.ts` 的 `signedViewOf()` 丢掉 `byteOffset`
+   *   （★ 那才是**重解释** ⇒ 读到另一段字节 ⇒ 上界算错 ⇒ 静默漏检）
+   *   ⇒ ⇒ ⇒ 本条断言守的是「**必须零拷贝**」（★ 契约层面），
+   *   ⇒ ⇒ ⇒ 而 `tests/unit/prune.test.ts` 里那条守的是「**重解释不许错位**」（★ 值层面）。
+   */
+  it('★ QA 补强 · `readCodes()` 的 `code` 必须是源 BLOB 的**零拷贝视图**（★ 带 `byteOffset`）', () => {
+    // ── 夹具：一块**大缓冲**里切出一段 BLOB ⇒ ★ 它的 `byteOffset ≠ 0` ──
+    const backing = Buffer.alloc(EMBED_DIM + 16);
+    const blob = backing.subarray(16, 16 + EMBED_DIM);
+    // ⚠️ **负控**：夹具真的带非零偏移（★ 否则下面两条是恒绿）
+    expect(blob.byteOffset).toBe(16);
+    expect(blob.byteLength).toBe(EMBED_DIM);
+
+    // ★ 一个**只认这一行**的假库（★ `readCodes()` 只用到 `prepare().all()`）
+    const fakeDb = {
+      prepare: () => ({
+        all: () => [{ id: 'm-1', code: blob, scale: 1, eps: 0 }],
+      }),
+    } as unknown as Database.Database;
+
+    const pool = readCodes(fakeDb, ['f-1']);
+    const row = pool.get('m-1');
+    expect(row).toBeDefined();
+    // ★ 码宽自识别：768 B ⇒ int8（★ 这一条说明「行确实进了码池」）
+    expect(row?.codeWidth).toBe('int8');
+
+    // ── ★★★ 核心：**零拷贝视图**的三条契约 ──
+    // ① 底层 ArrayBuffer 必须是**同一个对象**（⇒ 真的零拷贝，不是拷贝）
+    expect(row?.code.buffer).toBe(backing.buffer);
+    // ② 偏移必须**原样带过来**（★ 丢了 ⇒ 从第 0 段读起 ⇒ 错位）
+    expect(row?.code.byteOffset).toBe(blob.byteOffset);
+    // ③ 长度必须原样
+    expect(row?.code.byteLength).toBe(blob.byteLength);
+    // ④ 字节内容逐位相同（★ 视图与源必须是同一批字节）
+    expect([...(row?.code ?? new Uint8Array())]).toEqual([...blob]);
+  });
 });

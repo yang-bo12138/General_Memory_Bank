@@ -16,6 +16,7 @@
 
 import { describe, expect, it, vi } from 'vitest';
 
+import { blankComments } from '../../scripts/lib/code-span.js';
 import { compareHits } from '../../src/vector/flat.js';
 import {
   type CodedEntry,
@@ -25,6 +26,7 @@ import {
   pruneTopK,
 } from '../../src/vector/prune.js';
 import { approxDot, approxDotWithWidth, unpackCode } from '../../src/vector/quantize.js';
+import { readCode, readRaw } from '../helpers/sourceScan.js';
 
 /**
  * ★★★ **把 `quantize.ts` 的两个点积函数换成「间谍」**（T08 · A2 的机械背书）。
@@ -758,5 +760,153 @@ describe('★ A2 · int8 走 `approxDot` 原路（★ 生产 int8 路径永不�
 
     expect(approxDotWithWidth).toHaveBeenCalledTimes(1);
     expect(approxDot).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * ★★★ **QA 补强 · A7：`src/vector/prune.ts` 仍是纯函数库**
+ * （规格 `docs/design/perf-c2-codewidth-int4-wiring.md` §6 的 A7 · ★ **T08 交付时本条没有任何自动化断言**）。
+ *
+ * ★ **为什么这条必须有断言（★ 本轮 QA 实测发现的盲区）**：
+ *   A7 的判据是「`grep -n "better-sqlite3\|SELECT\|INSERT\|UPDATE\|DELETE" src/vector/prune.ts` ⇒ 零命中」
+ *   ⇒ ⇒ **它是一个"人去跑一次 grep"的纪律，不是机器守卫**
+ *   ⇒ ⇒ 任何一次「顺手在 `prune.ts` 里 import 一下 db / 写一句 SQL」都**不会被任何测试发现**
+ *   ⇒ ⇒ 后果：`scanned` / `bytesRead` 的口径被撕成两处（§5.1 的纪律 ④）⇒ T06 的账没法归因。
+ *
+ * ⚠️ ★★ **判据必须排除注释行**（★ 这是本条最容易做错的地方）：
+ *   `prune.ts` 的**文件头注释里本来就写着** `better-sqlite3` / `UPDATE ...` / `DELETE` / `INSERT`
+ *   （★ 那正是「为什么不许用」的纪律说明本身）⇒ ⇒ **裸 grep 一定命中**
+ *   ⇒ ⇒ ⇒ 所以本条用 `readCode()`（★ `tests/helpers/sourceScan.ts` ⇒ **涂白注释**、保留字符串）
+ *   ⇒ ⇒ ⇒ 判据 = 「**真实代码**里不许出现这些词」。
+ *
+ * ⚠️ ★ **判据是纯函数**（★ 可喂数据）⇒ ⇒ ⇒ 负控才能证明它**不是恒绿守卫**。
+ */
+describe('★ A7 · `prune.ts` 仍是纯函数库（★ 真实代码里零命中 better-sqlite3 / SQL）', () => {
+  /**
+   * ★ **判据（纯函数 · 可喂数据）**：在一段**已涂白注释**的源码里找「越界」的词。
+   *
+   * ⚠️ **为什么关键词集合正好是设计稿 A7 那一行**：
+   *   `better-sqlite3`（能读库）· `SELECT` / `INSERT` / `UPDATE` / `DELETE`（能写 SQL）
+   *   ⇒ ⇒ **不多不少** ⇒ 判据不会因为「多查一个词」而误报，也不会因为「少查一个词」而漏。
+   *
+   * @param code 已涂白注释的源码
+   * @returns 命中的「行号 + 词」（空数组 = 干净）
+   */
+  function findForbiddenTokens(code: string): Array<{ line: number; token: string }> {
+    const pattern = /better-sqlite3|\bSELECT\b|\bINSERT\b|\bUPDATE\b|\bDELETE\b/g;
+    const hits: Array<{ line: number; token: string }> = [];
+    code.split(/\r?\n/).forEach((line, index) => {
+      for (const match of line.matchAll(pattern)) {
+        hits.push({ line: index + 1, token: match[0] });
+      }
+    });
+    return hits;
+  }
+
+  it('★ 真实仓库：`src/vector/prune.ts` 的**真实代码**里零命中（★ 注释已被涂白，不算）', () => {
+    // ⚠️ ★ **负控（分母不许为 0）**：文件必须真的读得到、且**确实含注释**
+    //   ⇒ ⇒ 否则「扫描 0 行 ⇒ 零命中」会是一条**恒绿**的空气断言。
+    const raw = readRaw('src/vector/prune.ts');
+    expect(raw.length).toBeGreaterThan(0);
+    // ★ 注释里**确实**有 `better-sqlite3`（★ 纪律说明本身）⇒ ⇒ 「涂白」这一步真的在干活。
+    expect(raw).toContain('better-sqlite3');
+
+    const hits = findForbiddenTokens(readCode('src/vector/prune.ts'));
+    expect(hits).toEqual([]);
+  });
+
+  it('★ 负控：同一套判据喂「真的写了 SQL」的源码 ⇒ **必须报出来**（★ 证明它不是恒绿守卫）', () => {
+    const evil = [
+      "import Database from 'better-sqlite3';",
+      "const stmt = db.prepare('SELECT id FROM vector_codes');",
+      "db.prepare('DELETE FROM vector_codes').run();",
+    ].join('\n');
+    const hits = findForbiddenTokens(evil);
+    expect(hits.length).toBeGreaterThanOrEqual(3);
+    expect(hits.map((hit) => hit.token)).toContain('better-sqlite3');
+    expect(hits.map((hit) => hit.token)).toContain('SELECT');
+    expect(hits.map((hit) => hit.token)).toContain('DELETE');
+  });
+
+  it('★ 负控：注释里写了这些词 ⇒ **不报**（★ 证明判据真的排除了注释行）', () => {
+    // ⚠️ **这条是「涂白」这一步的机器背书**：不涂白的话 ⇒ 下面这行就会命中
+    //   ⇒ ⇒ 「零命中」就永远达不到 ⇒ ⇒ 守卫要么恒红、要么被人加豁免 ⇒ ⇒ 失去牙齿。
+    const onlyComment = [
+      '// 不 import better-sqlite3、不写 SELECT / INSERT / UPDATE / DELETE',
+      'export const x = 1;',
+    ].join('\n');
+    expect(findForbiddenTokens(blankComments(onlyComment))).toEqual([]);
+  });
+});
+
+/**
+ * ★★★ **QA 补强 · 「零拷贝视图必须带 `byteOffset`」的机器背书**
+ * （★ **本轮 QA 实测发现的假绿盲区**：★ 去掉 `byteOffset` ⇒ **全量 2003 个用例照样全绿**）。
+ *
+ * ★★ **为什么这条极其重要**：
+ *   `src/vector/prune.ts` 的 `signedViewOf()` 把打包字节**重解释**成 `Int8Array`
+ *   ⇒ ⇒ `new Int8Array(code.buffer, code.byteOffset, code.byteLength)`（★ 三个参数缺一不可）
+ *   ⇒ ⇒ **偏移错了** ⇒ 读的是**底层 ArrayBuffer 的第 0 段** ⇒ ★ **不是同一批字节**
+ *   ⇒ ⇒ 上界算错 ⇒ ⇒ **漏检**（本档唯一不可接受的失效形状）。
+ *
+ * ⚠️ ★★ **两种偏移错法的失效形状不同（★ 本条断言把两种都堵住 · ★ QA 实测过）**：
+ *   | 变异 | 后果 | 本条的判据 |
+ *   |---|---|---|
+ *   | `new Int8Array(code.buffer)`（★ 偏移整个丢掉） | 长度变成**整个底层缓冲** ⇒ `approxDot` 的「码与查询等长」守卫 ⇒ **响亮失败**（`MemoryError`） | ★ 变红（抛错） |
+ *   | `new Int8Array(code.buffer, 0, code.byteLength)`（★ 偏移写成 0） | 长度**对**、字节**错** ⇒ ⇒ **静默**按另一段字节算上界 ⇒ ⇒ **静默漏检** | ★ 变红（`exactReads` 2 ≠ 1） |
+ *   ⇒ ⇒ ★ **只有第二行才是真正危险的形状** ⇒ ⇒ 本条必须能**按值**判红（★ 不许只判「有没有抛错」）。
+ *
+ * ⚠️ **为什么既有测试抓不住**：★ 既有夹具全部用 `Uint8Array.from([...])` 造码
+ *   ⇒ ⇒ 它们的 `byteOffset` **恒为 0** ⇒ ⇒ **丢掉 `byteOffset` 结果一模一样** ⇒ ⇒ 恒绿。
+ *   ⇒ ⇒ ⇒ 本条**故意造一个 `byteOffset ≠ 0` 的视图** ⇒ ⇒ 偏移错了就必然被抓住。
+ */
+describe('★ QA 补强 · 码视图的 `byteOffset` 不可丢（★ 丢了 ⇒ 上界按错的字节算 ⇒ 漏检）', () => {
+  it('★ `code` 带非零 `byteOffset` 时，上界必须按**视图自己的字节**算（★ 偏移错了 ⇒ 读错字节）', () => {
+    // ── 夹具：一块大缓冲 + 两个**截然不同**的区域 ──
+    //   正确区域（偏移 8..11）= [1, 0, 0, 0]  ⇒ 上界 = 1.0
+    //   错误区域（偏移 0..3）  = [50, 0, 0, 0] ⇒ 上界 = 50.0（★ 偏移写成 0 就会读到它）
+    const backing = new Uint8Array(16);
+    backing.set([1, 0, 0, 0], 8);
+    backing.set([50, 0, 0, 0], 0);
+    const view = new Uint8Array(backing.buffer, 8, 4);
+    // ⚠️ **负控**：夹具真的带非零偏移（★ 否则下面两条是恒绿）
+    expect(view.byteOffset).toBe(8);
+    expect([...view]).toEqual([1, 0, 0, 0]);
+
+    const entries: PruneEntry[] = [
+      { kind: 'coded', id: 'offset-view', code: view, codeWidth: 'int8', scale: 1, eps: 0 },
+      {
+        kind: 'coded',
+        id: 'plain',
+        code: Uint8Array.from([1, 0, 0, 0]),
+        codeWidth: 'int8',
+        scale: 5,
+        eps: 0,
+      },
+    ];
+    // ⚠️ **上界的对照值**（手算，不复用被测代码）：
+    //   `offset-view` 的上界 = query[0] × code[0] × scale = 1 × 1 × 1 = **1**
+    //   `plain`       的上界 = 1 × 1 × 5 = **5**
+    // ★ 门槛取 **3**：★ 1 < 3 ⇒ `offset-view` 被剪掉；★ 5 ≥ 3 ⇒ `plain` 留下
+    //   ⇒ ⇒ 丢掉 `byteOffset` ⇒ `offset-view` 的上界变成 50 ⇒ ≥ 3 ⇒ **它会被留下** ⇒ 本条变红。
+    const out = pruneTopK(entries, {
+      query,
+      k: 2,
+      threshold: 3,
+      scoreOf: (id) => (id === 'plain' ? 0.5 : 0.1),
+    });
+
+    expect(out.exactReads).toBe(1);
+    expect(out.survivors.map((hit) => hit.id)).toEqual(['plain']);
+
+    // ⚠️ **负控**：门槛放宽到 0.5 ⇒ 两条都该留下（★ 证明上一条不是因为「这条根本进不来」）
+    const loose = pruneTopK(entries, {
+      query,
+      k: 2,
+      threshold: 0.5,
+      scoreOf: (id) => (id === 'plain' ? 0.5 : 0.1),
+    });
+    expect(loose.exactReads).toBe(2);
+    expect(loose.survivors.map((hit) => hit.id).sort()).toEqual(['offset-view', 'plain']);
   });
 });
