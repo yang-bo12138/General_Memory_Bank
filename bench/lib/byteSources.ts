@@ -316,12 +316,24 @@ export function parseSelectList(sql: string): SelectItem[] {
  * ⚠️ **非向量字节列走 UTF-8 实测**（`Buffer.byteLength(v, 'utf8')`）
  *   ⇒ **不用「声明长度」**（口径 §1.3 末条：id 格式一改声明长度就错）。
  *
+ * ★★ **「坏码行」的判据是【集合】、不是【单一长度】**（T09 · B1）：
+ *   码宽是**数据属性**（由这一行的 blob 长度决定）⇒ 三档码宽的长度都合法
+ *   （768 维 ⇒ int8 = 768 B · int4 = 384 B · 二值 = 96 B）
+ *   ⇒ ⇒ **用单一期望长度会把 int4 / 二值的码行全判成「坏码行」**
+ *   ⇒ ⇒ **白读**（字节已搬、却被 `readCodes()` fail-open 丢弃）⇒ ⇒ **前提违例 ⇒ 假红**。
+ *   ⇒ ⇒ **集合的唯一出处 = `src/vector/quantize.ts` 的 `codeWidthByteLengths(dim)`**
+ *   （★ 与生产侧 `detectCodeWidth()` **同一份口径** ⇒ ⇒ 不会出现两处漂移）。
+ *
  * @param row 物化出来的一行
  * @param shape 该行所属的形状
- * @param expectedCodeBytes 期望的码长（768 = 768 个 int8）
+ * @param expectedCodeBytes 期望的码长**集合**（★ 该维度下任一已知码宽的长度）
  * @returns 这一行的字节模型
  */
-export function bytesOfRow(row: unknown, shape: ShapeEntry, expectedCodeBytes: number): RowBytes {
+export function bytesOfRow(
+  row: unknown,
+  shape: ShapeEntry,
+  expectedCodeBytes: readonly number[],
+): RowBytes {
   const record = (row ?? {}) as Record<string, unknown>;
   let payloadBytes = 0;
   let contentBytes = 0;
@@ -338,9 +350,11 @@ export function bytesOfRow(row: unknown, shape: ShapeEntry, expectedCodeBytes: n
     }
     if (column === 'code') {
       const length = blobByteLength(value);
-      if (value !== null && value !== undefined && length !== expectedCodeBytes) {
+      if (value !== null && value !== undefined && !expectedCodeBytes.includes(length)) {
         // ⚠️ **坏码行 = 白读**（进了结果集 ⇒ 字节已搬 ⇒ 但 `readCodes()` fail-open 丢弃它）
         //   ⇒ ⇒ 计数并报「前提违例」（口径 §2 断言 1a / §6 修正 7）。
+        // ⚠️ ★ **判据 = 「长度不属于该维度下任何已知码宽」**（★ 与生产侧 `detectCodeWidth()` 同一口径）
+        //   ⇒ ⇒ **int4 / 二值的码行不算坏码行**（★ 否则白读计数会巨大 ⇒ 假红）。
         badCode = true;
       }
       payloadBytes += length;

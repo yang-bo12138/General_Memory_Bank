@@ -39,6 +39,7 @@ import { openDatabase } from '../../src/db/connection.js';
 import { ensureSchema } from '../../src/db/migrate.js';
 import { runWriteTransaction } from '../../src/store/transaction.js';
 import { vectorToBlob } from '../../src/vector/centroids.js';
+import { codeWidthByteLengths } from '../../src/vector/quantize.js';
 import { rebuildBuckets } from '../../src/vector/rebuild.js';
 import {
   type ByteSourceKind,
@@ -930,7 +931,13 @@ export interface ByteReadSnapshot {
   readonly contentBytes: number;
   /** ★ **向量载荷字节**（`codeBytes + embeddingBytes`，**零容差恒等式**）。 */
   readonly bytesRead: number;
-  /** ★ **坏码行数**（码长 ≠ 768 ⇒ 读了、搬了字节、却被 fail-open 丢弃 ⇒ **白读**）。 */
+  /**
+   * ★ **坏码行数**（码长**不属于该维度下任何已知码宽** ⇒ 读了、搬了字节、
+   * 却被 fail-open 丢弃 ⇒ **白读**）。
+   *
+   * ⚠️ ★ **判据是【集合】**（T09 · B1）：int8 = 768 B · int4 = 384 B · 二值 = 96 B
+   *   ⇒ ⇒ **三档都合法** ⇒ ⇒ 只有「不属于任何一档」的才算坏码行。
+   */
   readonly badCodeRows: number;
 }
 
@@ -965,13 +972,19 @@ export interface RowReadCounterOptions {
    */
   readonly forceDisabled?: boolean;
   /**
-   * ★ **期望的码长（字节）** —— 用来检出**坏码行**（码长 ≠ 768 ⇒ 读了、搬了字节、
-   * 却被 `readCodes()` fail-open 丢弃 ⇒ **白读** ⇒ 断言 1a 的前提违例）。
+   * ★ **期望的码长**（★ **集合**：该维度下**任一已知码宽**的长度）
+   *   —— 用来检出**坏码行**（码长不属于任何已知码宽 ⇒ 读了、搬了字节、
+   *   却被 `readCodes()` fail-open 丢弃 ⇒ **白读** ⇒ 断言 1a 的前提违例）。
    *
-   * ⚠️ **缺省 = `DEFAULT_PARAMS.EMBED_DIM`**（768 个 int8 = 768 字节）
-   *   ⇒ ⇒ **不许写死另一个数**（维度是参数 ⇒ 码长跟着参数走）。
+   * ⚠️ ★ **为什么是【集合】而不是「单一长度」**（T09 · B1）：
+   *   码宽是**数据属性**（由这一行的 blob 长度决定）⇒ int4 = 384 B · 二值 = 96 B
+   *   ⇒ ⇒ **用单一长度会把 int4 / 二值的码行全判成「坏码行」** ⇒ ⇒ **假红**。
+   *
+   * ⚠️ **缺省 = 该维度下所有已知码宽的长度**（★ 来自 `src/vector/quantize.ts` 的
+   *   `codeWidthByteLengths(dim)` ⇒ ★ **与生产侧 `detectCodeWidth()` 同一份口径**
+   *   ⇒ ⇒ **bench 侧不许另写一份长度表**（★ 那会造出两处口径 ⇒ 未来漂移））。
    */
-  readonly expectedCodeBytes?: number;
+  readonly expectedCodeBytes?: readonly number[];
 }
 
 /**
@@ -1024,8 +1037,11 @@ export function installRowReadCounter(
   // ⚠️ **「装了但不计数」**（**仅测试用的注入点**）⇒ 实测值恒为 0
   //   ⇒ ⇒ 用来验证「计数器失效 ⇒ 兜底把 `mode` 标成 `derived`」这条纪律。
   const forceDisabled = options.forceDisabled === true;
-  // ⚠️ ★ **期望的码长**（768 个 int8 = 768 字节）⇒ 用来检出**坏码行**（白读）。
-  const expectedCodeBytes = options.expectedCodeBytes ?? DEFAULT_PARAMS.EMBED_DIM;
+  // ⚠️ ★ **期望的码长（★ 集合：该维度下任一已知码宽的长度）** ⇒ 用来检出**坏码行**（白读）。
+  //   ★ 集合的**唯一出处** = `src/vector/quantize.ts` 的 `codeWidthByteLengths(dim)`
+  //   ⇒ ⇒ **与生产侧 `detectCodeWidth()` 同一份口径**（★ bench 侧不许另写一份长度表）。
+  const expectedCodeBytes =
+    options.expectedCodeBytes ?? codeWidthByteLengths(DEFAULT_PARAMS.EMBED_DIM);
 
   const handle = db as unknown as { prepare: (source: string) => unknown };
   // ⚠️ **存「原函数对象」而不是它的 bind 产物** ⇒ `uninstall()` 能**逐位**还原

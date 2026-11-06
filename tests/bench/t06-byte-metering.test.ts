@@ -52,6 +52,7 @@ import {
   THRESHOLDS,
   type WritePathReadSample,
   measurePerf,
+  profileCodeWidths,
   readSamplesAlignedOf,
 } from '../../bench/perf.js';
 import { DEFAULT_PARAMS } from '../../src/core/params.js';
@@ -62,6 +63,7 @@ import {
 } from '../../src/store/dedupCandidates.js';
 import { blobToVector, loadCentroidModel } from '../../src/vector/centroids.js';
 import { normalizeNumbers } from '../../src/vector/dot.js';
+import { codeWidthByteLengths } from '../../src/vector/quantize.js';
 
 /** 冒烟用的语料规模（**故意很小** ⇒ 门禁秒级完成）。 */
 const SMOKE_SIZE = 1500;
@@ -902,7 +904,7 @@ describe('T06 · D：字节模型单测（`bytesOfRow()`）', () => {
       scale: 0.5,
       eps: 1e-9,
     };
-    const bytes = bytesOfRow(row, shape, 768);
+    const bytes = bytesOfRow(row, shape, [768]);
     // ⚠️ ★ **核心**：载荷 = **只有码**（标量不进 `bytesRead` ⇒ 口径 §1.3 裁决 A）。
     expect(bytes.payloadBytes).toBe(768);
     expect(bytes.contentBytes).toBe(0);
@@ -910,14 +912,66 @@ describe('T06 · D：字节模型单测（`bytesOfRow()`）', () => {
     expect(bytes.badCode).toBe(false);
   });
 
-  it('★ **坏码行**（码长 ≠ 768）⇒ `badCode = true`（= 白读 ⇒ 断言 1a 的前提违例）', () => {
+  it('★ **坏码行**（码长不属于任何已知码宽）⇒ `badCode = true`（= 白读 ⇒ 断言 1a 的前提违例）', () => {
     const shape = shapeOf('Q2');
-    const bytes = bytesOfRow({ memory_id: 'm-1', code: Buffer.alloc(100, 1) }, shape, 768);
+    const bytes = bytesOfRow({ memory_id: 'm-1', code: Buffer.alloc(100, 1) }, shape, [768]);
     // ⚠️ ★ **字节照样计入**（它**已经被读了、被搬了**）⇒ 但**同时**标记为坏码。
     expect(bytes.payloadBytes).toBe(100);
     expect(bytes.badCode).toBe(true);
     // ⚠️ **健康库的对照**：768 B 的码 ⇒ 不是坏码。
-    expect(bytesOfRow({ code: Buffer.alloc(768) }, shape, 768).badCode).toBe(false);
+    expect(bytesOfRow({ code: Buffer.alloc(768) }, shape, [768]).badCode).toBe(false);
+  });
+
+  it('★ T09 · 「坏码行」的判据是【集合】：int4 的 384 B **不是**坏码行（★ 单一长度会把 int4 全判成坏码行）', () => {
+    // ⚠️ ★★★ **这条是 T09 的牙**（★ 判据若退回「单一期望长度」⇒ ⇒ int4 库的**每一行**都成坏码行
+    //   ⇒ ⇒ 落盘 `badCodeRows` 巨大 ⇒ ⇒ `checkPerf` 判红 ⇒ ⇒ **假红**）。
+    // ★ 集合的**唯一出处** = `src/vector/quantize.ts`（★ 与生产侧同一份口径 ⇒ 不许另写一份）。
+    const lengths = codeWidthByteLengths(DEFAULT_PARAMS.EMBED_DIM);
+    expect(lengths).toEqual([768, 384, 96]);
+    const shape = shapeOf('Q2');
+    // ① 三档码长**都不算**坏码行
+    for (const length of lengths) {
+      expect(bytesOfRow({ code: Buffer.alloc(length) }, shape, lengths).badCode).toBe(false);
+    }
+    // ② 不属于任何一档的 ⇒ 坏码行
+    expect(bytesOfRow({ code: Buffer.alloc(100) }, shape, lengths).badCode).toBe(true);
+  });
+
+  it('★★ T09 · 【端到端】harness 的**缺省期望码长**必须是集合：int4 的 384 B 码行 ⇒ `badCodeRows === 0`', () => {
+    // ⚠️ ★★★ **这条补的是上一条的盲区**（★ 主理人复核时做变异测试发现的）：
+    //   上一条**直接调 `bytesOfRow` 并把 `lengths` 传进去** ⇒ ⇒ **绕过了 harness 的缺省值那一行**
+    //   ⇒ ⇒ ★★ 于是「把 harness 的缺省值退回单一长度 768」这个变异**抓不住任何断言**（假绿）
+    //   ⇒ ⇒ ★★ 本条走**真实链路**：`installRowReadCounter(db)`（★ 不传 `expectedCodeBytes`
+    //   ⇒ 用它的缺省）⇒ ★ 读一条 384 B 的码行 ⇒ ★ 看 `badCodeRows` 是不是 0。
+    //   ⇒ ⇒ ★★ 变异「缺省值退回 [768]」⇒ ⇒ 本条**必须变红**。
+    const { db } = buildSmokeBench(newWorkDir());
+    const counter = installRowReadCounter(db.db);
+    // ⚠️ ★ **借一条库里已有的码行**（★ `fine_id` 有外键约束 ⇒ 不能凭空造）
+    //   ⇒ ★ 把它**改写成 int4 档（384 B）** ⇒ ★ 这样「一行、且长度是 384」⇒ 观察它算不算坏码行。
+    const victim = db.db.prepare('SELECT fine_id, memory_id FROM vector_codes LIMIT 1').get() as
+      | { fine_id: string; memory_id: string }
+      | undefined;
+    expect(victim).toBeDefined();
+    db.db
+      .prepare('UPDATE vector_codes SET code = ? WHERE fine_id = ? AND memory_id = ?')
+      .run(Buffer.alloc(384, 7), victim?.fine_id, victim?.memory_id);
+    counter.start();
+    // ★ 走一条认领 `vector_codes` 的真实查询（★ 形状 Q2）。
+    db.db.prepare('SELECT memory_id, code, scale, eps FROM vector_codes').all();
+    counter.stop();
+    const after = counter.snapshot();
+    // ★★★ **核心断言**：384 B 不是坏码行 ⇒ 缺省期望码长是**集合**（★ 若退回单一 768 ⇒ 这里会是 1）。
+    expect(after.badCodeRows).toBe(0);
+    // ★ 载荷字节确实被采到了（★ 证明「不是没读到、所以没报错」的假绿）。
+    expect(after.bySource.code?.bytes ?? 0).toBeGreaterThanOrEqual(384);
+    // ★ 且码行确实被物化出了行（★ 证明上面那个字节数不是空壳）。
+    expect(after.bySource.code?.rows ?? 0).toBeGreaterThan(0);
+    // ★ ★ 而且**码行读数 > 0 且坏码行数 = 0** ⇒ ⇒ 那条 384 B 的行被读到了、且**没被当成坏码行**
+    //   ⇒ ⇒ ★ 若缺省退回单一 768 ⇒ badCodeRows 会是 1 ⇒ ★ 本条变红（★ 这就是这条断言的牙）。
+    expect(after.codeRowsRead).toBeGreaterThan(0);
+    expect(after.badCodeRows).toBe(0);
+    counter.uninstall();
+    db.db.close();
   });
 
   it('★ 向量行：`embedding` 的 `.byteLength` 进载荷；**正文走 UTF-8 实测**且**不进** `bytesRead`', () => {
@@ -933,7 +987,7 @@ describe('T06 · D：字节模型单测（`bytesOfRow()`）', () => {
       difficulty: 0.5,
       embedding,
     };
-    const bytes = bytesOfRow(row, shape, 768);
+    const bytes = bytesOfRow(row, shape, [768]);
     // ⚠️ ★ **载荷 = 只有向量**（3,072 B）。
     expect(bytes.payloadBytes).toBe(3072);
     expect(bytes.hasEmbedding).toBe(true);
@@ -947,7 +1001,7 @@ describe('T06 · D：字节模型单测（`bytesOfRow()`）', () => {
 
   it('★ 窄读行（Q3）：**0 载荷字节**（没有 `embedding` ⇒ 不进 `bytesRead`）', () => {
     const shape = shapeOf('Q3');
-    const bytes = bytesOfRow({ id: 'm-1', last_access: 1, pin_factor: 0.5 }, shape, 768);
+    const bytes = bytesOfRow({ id: 'm-1', last_access: 1, pin_factor: 0.5 }, shape, [768]);
     expect(bytes.payloadBytes).toBe(0);
     expect(bytes.contentBytes).toBe(0);
     expect(bytes.hasEmbedding).toBe(false);
@@ -955,7 +1009,7 @@ describe('T06 · D：字节模型单测（`bytesOfRow()`）', () => {
 
   it('★ 成员行（Q1）：**0 载荷字节**（成员 id 不是向量载荷）', () => {
     const shape = shapeOf('Q1');
-    const bytes = bytesOfRow({ fine_id: 'f-1', memory_id: 'm-1' }, shape, 768);
+    const bytes = bytesOfRow({ fine_id: 'f-1', memory_id: 'm-1' }, shape, [768]);
     expect(bytes.payloadBytes).toBe(0);
     expect(bytes.contentBytes).toBe(0);
   });
@@ -978,14 +1032,14 @@ describe('T06 · D：字节模型单测（`bytesOfRow()`）', () => {
         embedding: Buffer.alloc(3072, 1),
       },
       shape,
-      768,
+      [768],
     );
     expect(bytes.payloadBytes).toBe(3072);
   });
 
   it('★ `embedding` 为 `null` ⇒ **不**计入载荷、**不**算 `hasEmbedding`（⇒ 白读不算）', () => {
     const shape = shapeOf('scoreOf');
-    const bytes = bytesOfRow({ embedding: null }, shape, 768);
+    const bytes = bytesOfRow({ embedding: null }, shape, [768]);
     expect(bytes.payloadBytes).toBe(0);
     expect(bytes.hasEmbedding).toBe(false);
   });
@@ -1456,6 +1510,59 @@ describe('T06 · E：口径断言与落盘结构', () => {
     expect(result.writeSegments.vectorCandidateRows).toBeDefined();
     expect(result.writeSegments.vectorCandidateScan).toBeDefined();
     expect(result.writeSegments.writeTotal).toBeDefined();
+    // ⚠️ ★★★ **码宽标签必须落盘**（T09 · B3 · ★ F23 的纪律）：
+    //   ★ `expect.arrayContaining` **不是精确匹配** ⇒ ⇒ 新字段「悄悄消失」也不会被发现
+    //   ⇒ ⇒ **必须主动把它写进这条断言**（★ 否则「加字段」这一步本身就是没有牙的）。
+    //   ★ 这个夹具走生产写路径 ⇒ 码宽 = `int8` ⇒ 且**不是混档**。
+    expect(result.codeWidth).toBe('int8');
+    expect(result.codeWidthMixed).toBe(false);
+    db.db.close();
+  });
+
+  it('★ T09 · `profileCodeWidths()`：从库里读出码宽（★ 零配置）· 混档时主导档仍报且 `mixed = true`', () => {
+    const { db } = buildSmokeBench(newWorkDir());
+    // ① 刚建好的库 = 生产写路径的档 = int8（★ 全是 768 B）
+    const pure = profileCodeWidths(db.db);
+    expect(pure.dominant).toBe('int8');
+    expect(pure.widths).toEqual(['int8']);
+    expect(pure.mixed).toBe(false);
+    expect(pure.unknownLengthRows).toBe(0);
+    expect(pure.rowsByWidth.int8).toBeGreaterThan(0);
+
+    // ② 把 10 行码改成 **int4 的长度（384 B）** ⇒ ⇒ 变成**混档**库
+    //   ⇒ ⇒ **主导档仍要报**（B4）⇒ ⇒ 且 `mixed = true`（★ 混档库不被藏起来）。
+    db.db
+      .prepare(
+        'UPDATE vector_codes SET code = ? ' +
+          'WHERE memory_id IN (SELECT memory_id FROM vector_codes LIMIT 10)',
+      )
+      .run(Buffer.alloc(384));
+    const mixed = profileCodeWidths(db.db);
+    expect(mixed.mixed).toBe(true);
+    expect(mixed.widths).toEqual(['int8', 'int4']); // ★ 按 `CODE_WIDTHS` 的顺序
+    expect(mixed.dominant).toBe('int8'); // ★ 行数多的那一档
+    expect(mixed.rowsByWidth.int4).toBe(10);
+
+    // ③ 再塞一行「不属于任何一档」的长度（100 B）⇒ ⇒ 那是**真·坏码行**（不是某一档）
+    db.db
+      .prepare(
+        'UPDATE vector_codes SET code = ? ' +
+          'WHERE memory_id IN (SELECT memory_id FROM vector_codes LIMIT 1 OFFSET 20)',
+      )
+      .run(Buffer.alloc(100));
+    const withBad = profileCodeWidths(db.db);
+    expect(withBad.unknownLengthRows).toBe(1);
+    // ⚠️ ★ **真·坏码行不是「某一档」** ⇒ ⇒ `widths` 里**不许**出现它
+    expect(withBad.widths).toEqual(['int8', 'int4']);
+
+    // ④ ★ **库里一条码都没有 ⇒ `null`**（★ 如实写 `null` ⇒ **不许**退化成 `'int8'`）
+    //   ⇒ ⇒ 「没有码」与「int8 的码」是**两件事** ⇒ ⇒ 混起来就是撒谎。
+    db.db.prepare('DELETE FROM vector_codes').run();
+    const empty = profileCodeWidths(db.db);
+    expect(empty.dominant).toBeNull();
+    expect(empty.widths).toEqual([]);
+    expect(empty.mixed).toBe(false);
+    expect(empty.unknownLengthRows).toBe(0);
     db.db.close();
   });
 

@@ -134,6 +134,12 @@ import { loadCentroidModel } from '../src/vector/centroids.js';
 import { normalizeNumbers } from '../src/vector/dot.js';
 import { IvfVectorBackend } from '../src/vector/ivf.js';
 import {
+  CODE_WIDTHS,
+  type CodeWidth,
+  codeWidthByteLengths,
+  detectCodeWidth,
+} from '../src/vector/quantize.js';
+import {
   type BenchQuery,
   type CorpusOptions,
   DEFAULT_CORPUS_OPTIONS,
@@ -377,7 +383,7 @@ export interface VectorByteSample {
    *   ⇒ ⇒ **理由栏不许把它写成当前事实**。
    */
   readonly bucketMemberRowsDerived: number | null;
-  /** 码长 ≠ 768 的行数（**健康库恒 0** ⇒ 非 0 ⇒ 前提违例 ⇒ 判红）。 */
+  /** 码长**不属于该维度下任何已知码宽**的行数（**健康库恒 0** ⇒ 非 0 ⇒ 前提违例 ⇒ 判红）。 */
   readonly badCodeRows: number;
   /** **命中零来源**（未登记形状）的行数（**必须 0**）。 */
   readonly unclassifiedRows: number;
@@ -599,6 +605,23 @@ export interface RecallVectorPathSummary {
 export interface PerfResult {
   /** 语料规模（**实测**）。 */
   readonly corpusSize: number;
+  /**
+   * ★ **这一轮测的是哪一档码宽**（★ **从库里读出来的** ⇒ 零配置 ⇒ **不许由参数传入**）。
+   *
+   * ⚠️ ★ **为什么必须落盘**（T09 · B3）：四列表的每一行都要**自证是哪一档**
+   *   ⇒ ⇒ 没有这个标签 ⇒ 读的人无法判断「这一行的字节数是按哪档码宽算的」。
+   *
+   * ⚠️ **库里一条码都没有 ⇒ `null`**（★ 如实写 `null`，**不许**退化成 `'int8'`）
+   *   ⇒ ⇒ 「没有码」与「int8 的码」是**两件事** ⇒ ⇒ 混起来就是撒谎。
+   */
+  readonly codeWidth: CodeWidth | null;
+  /**
+   * ★ **混档**（★ 库里出现 ≥ 2 个已知码宽）。
+   *
+   * ⚠️ ★ **混档时 `codeWidth` 仍报主导档**（B4）⇒ ⇒ 「混档」是**另一个字段**
+   *   ⇒ ⇒ 混档库**不被藏起来**，同时主导档仍然可读。
+   */
+  readonly codeWidthMixed: boolean;
   /** recall 的样本数（**报告必须写明**）。 */
   readonly recallSamples: number;
   /**
@@ -992,6 +1015,13 @@ export function measurePerf(
   writeCount: number,
   measurementOptions: PerfMeasurementOptions = {},
 ): PerfResult {
+  // ⚠️ ★★★ **码宽探测（★ 在【计时窗口之外】· B5）**：
+  //   ★ 放在**最开头**（预热之前、任何计时窗口之前）⇒ ⇒ **探测 SQL 不进任何计时窗口**
+  //   ⇒ ⇒ **不影响毫秒读数**（与 `countDistinctMembers()` 同一纪律：口径 §1.7）。
+  //   ⚠️ ★ **它测的是「这个库本来的样子」**：★ bench 的**写入路径自己会写 int8 码**
+  //   （生产写路径 `writeCodeRow()` ⇒ `encodeVector()`）⇒ ⇒ 跑完之后库里会**多出** int8 的码行
+  //   ⇒ ⇒ 所以**必须在跑之前探测**（★ 否则「主导档」会被 bench 自己的写入污染掉几个百分点）。
+  const codeWidthProfile = profileCodeWidths(db);
   const queries = generateQueries(options, queryCount);
   const model = loadCentroidModel(db);
   const backend = new IvfVectorBackend({
@@ -1593,6 +1623,10 @@ export function measurePerf(
 
   return {
     corpusSize: options.size,
+    // ⚠️ ★★ **码宽标签**（T09 · B2/B3/B4）：★ **从库里读出来的**（★ 零配置）
+    //   ⇒ ⇒ 混档时仍报主导档 · 混档事实由 `codeWidthMixed` 单独承载。
+    codeWidth: codeWidthProfile.dominant,
+    codeWidthMixed: codeWidthProfile.mixed,
     recallSamples: recallSamples.length,
     recallVectorPath,
     vectorScanNote: VECTOR_SCAN_NOTE,
@@ -1902,6 +1936,78 @@ function buildVectorByteReads(
 }
 
 /**
+ * ★★★ **码宽画像**（T09 · B2/B3/B4）—— 「这一轮测的是哪一档码宽」。
+ *
+ * ★ **码宽是【数据属性】，不是【调用方的选择】** ⇒ ⇒ **零配置**：
+ *   bench **不许**有 `--code-width` 参数（★ 加了就等于让调用方替库做决定 ⇒ 会与库里的实际码宽脱节）
+ *   ⇒ ⇒ 换档的操作是「**离线重编码那个库**」（`pnpm codes:backfill --code-width=int4`）。
+ */
+export interface CodeWidthProfile {
+  /**
+   * ★ **主导码宽**（行数最多的那一档）；**库里一条码都没有 ⇒ `null`**。
+   *
+   * ⚠️ ★ **混档时仍要报主导档**（B4）⇒ ⇒ 「混档」是**另一个字段**（`mixed`），不是把主导档藏起来。
+   */
+  readonly dominant: CodeWidth | null;
+  /** ★ 库里出现的**全部**已知码宽（★ 按 `CODE_WIDTHS` 的顺序：int8 → int4 → binary）。 */
+  readonly widths: readonly CodeWidth[];
+  /** ★ **混档**（★ 出现 ≥ 2 个已知码宽）⇒ ⇒ 「混档库不被藏起来」（B4）。 */
+  readonly mixed: boolean;
+  /** ★ 每一档的**行数**（★ 键 = 码宽）。 */
+  readonly rowsByWidth: Readonly<Record<string, number>>;
+  /**
+   * ★ **长度不属于任何已知码宽的行数**（★ = 真·坏码行 ⇒ 读了、搬了字节、却被 fail-open 丢弃）。
+   *
+   * ⚠️ 它**不是** `badCodeRows`（★ 那个是**计时窗口内**的观测值；这个是**全库**的静态画像）。
+   */
+  readonly unknownLengthRows: number;
+}
+
+/**
+ * 探测**这个库里**的码宽画像（★ 一次聚合查询 ⇒ O(1) 次扫描）。
+ *
+ * ★★ **判据与生产侧完全同源**（★ 硬要求）：
+ *   用 `src/vector/quantize.ts` 的 `detectCodeWidth()`（★ 它内部就是
+ *   `codeWidthByteLengths(dim)`）⇒ ⇒ **bench 侧不许另写一份长度表**
+ *   ⇒ ⇒ 「bench 判坏码行」与「生产判坏码行」是**同一份口径** ⇒ ⇒ 不会出现两处漂移。
+ *
+ * ⚠️ ★ **探测在计时窗口之外**（B5）：
+ *   本函数**只被 `measurePerf()` 在最开头调用一次**（预热之前、任何计时窗口之前）
+ *   ⇒ ⇒ **探测 SQL 不进任何计时窗口** ⇒ ⇒ **不影响毫秒读数**。
+ *   ⚠️ 与既有的 `countDistinctMembers()` 同一纪律（口径 §1.7：「聚合查询在计时窗口之外执行」）。
+ *
+ * @param db 库句柄
+ * @returns 码宽画像
+ */
+export function profileCodeWidths(db: Database.Database): CodeWidthProfile {
+  const rows = db
+    .prepare('SELECT length(code) AS len, count(*) AS n FROM vector_codes GROUP BY len')
+    .all() as Array<{ len: number; n: number }>;
+  const rowsByWidth: Record<string, number> = {};
+  let unknownLengthRows = 0;
+  for (const row of rows) {
+    // ⚠️ ★ **生产侧同一个函数**（★ `detectCodeWidth` 对「不属于任何一档」的长度返回 `null` ⇒ 不抛错）
+    const width = detectCodeWidth(row.len, DEFAULT_PARAMS.EMBED_DIM);
+    if (width === null) {
+      unknownLengthRows += row.n;
+      continue;
+    }
+    rowsByWidth[width] = (rowsByWidth[width] ?? 0) + row.n;
+  }
+  const widths = CODE_WIDTHS.filter((width) => rowsByWidth[width] !== undefined);
+  let dominant: CodeWidth | null = null;
+  let dominantRows = -1;
+  for (const width of widths) {
+    const count = rowsByWidth[width] ?? 0;
+    if (count > dominantRows) {
+      dominant = width;
+      dominantRows = count;
+    }
+  }
+  return { dominant, widths, mixed: widths.length > 1, rowsByWidth, unknownLengthRows };
+}
+
+/**
  * 性能门槛的**断言**（**逐条写死** ⇒ 可被变异打红）。
  *
  * ⚠️ **这些是「软阈值」**（§7.1 把它们列在**软阈值**栏）⇒
@@ -2034,8 +2140,14 @@ export function checkPerf(result: PerfResult): string[] {
       );
     }
     if (reads.breakdown.badCodeRows > 0) {
+      // ⚠️ ★ **文案必须用【集合口径】**（T09 · B1 ⇒ 「注释/文案不许说谎」）：
+      //   旧文案写「码长 ≠ 768」⇒ ★ **那是 int8 独占时代的说法** ⇒ 现在 int4 = 384 B、
+      //   二值 = 96 B **都是合法码长** ⇒ ⇒ 照旧文案写会让人以为「int4 的码行是坏码行」。
+      //   ⇒ ⇒ 现在的口径 = 「码长**不属于该维度下任何已知码宽**」（★ 与生产侧同一份口径）。
       failures.push(
-        `${label}有 ${reads.breakdown.badCodeRows} 行**坏码行**（码长 ≠ 768）` +
+        `${label}有 ${reads.breakdown.badCodeRows} 行**坏码行**` +
+          '（码长不属于该维度下任何已知码宽：' +
+          `${codeWidthByteLengths(DEFAULT_PARAMS.EMBED_DIM).join(' / ')}）` +
           '⇒ 读了、搬了字节，却被 fail-open 丢弃 ⇒ **白读** ⇒ 前提违例 ⇒ 不可判定',
       );
     }
@@ -2153,6 +2265,14 @@ function main(): void {
 
   writeJsonFile(outPath, {
     corpusSize: result.corpusSize,
+    // ⚠️ ★★★ **码宽标签**（T09 · B2/B3/B4）—— ★ **从库里读出来的**（★ 不由参数传入 ⇒ 零配置）：
+    //   · `codeWidth` = **主导档**（★ 混档时仍报主导档 ⇒ 不藏）；
+    //   · `codeWidthMixed` = **混档事实**（★ 混档库不被藏起来）。
+    //   ⚠️ **为什么放在顶层**（而不是 `note` 里）：★ `note` 是**整段超长字符串**
+    //   ⇒ ⇒ 它必须保持「若干单引号字面量的 `+` 拼接」（★ `check:json-note` 靠源码结构抽取）
+    //   ⇒ ⇒ **插不进运行期才知道的值** ⇒ ⇒ 码宽标签只能是**独立字段**（★ 零配置照样成立）。
+    codeWidth: result.codeWidth,
+    codeWidthMixed: result.codeWidthMixed,
     trainedCells: prepared.fineCells,
     trainedMembers: prepared.members,
     thresholds: THRESHOLDS,
@@ -2206,6 +2326,9 @@ function main(): void {
 
   process.stdout.write(
     `  recall P99（old-path · 不传向量）= ${result.recallP99Ms.toFixed(3)}ms（★ 参考线 ${THRESHOLDS.recallP99Ms}ms · 不判红绿，样本 ${result.recallSamples}）\n` +
+      `  ★ 码宽档 = **${result.codeWidth ?? '（库里没有码行）'}**` +
+      `${result.codeWidthMixed ? '（★ **混档**：这个库里有 ≥ 2 档码宽 ⇒ 报的是主导档）' : ''}` +
+      '（★ 从库里读出来的 ⇒ 零配置 ⇒ 不由参数传入）\n' +
       `  recall P99（new-path · 传向量）= ${result.recallVectorPath.p99Ms.toFixed(3)}ms（**只观测、不判门槛**，样本 ${result.recallVectorPath.samples}）\n` +
       `    ★ 两档均值差 = ${result.recallVectorPath.meanDeltaMs.toFixed(3)}ms` +
       `（new ${result.recallVectorPath.meanMs.toFixed(3)}ms − old ${result.recallVectorPath.oldPathMeanMs.toFixed(3)}ms；正数 = 接线后更慢）\n` +
