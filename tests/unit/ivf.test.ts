@@ -1537,11 +1537,24 @@ describe('T08 · 读路径接线（A4 · A5）', () => {
    */
   it('★ QA 补强 · `readCodes()` 的 `code` 必须是源 BLOB 的**零拷贝视图**（★ 带 `byteOffset`）', () => {
     // ── 夹具：一块**大缓冲**里切出一段 BLOB ⇒ ★ 它的 `byteOffset ≠ 0` ──
+    //
+    // ★★ **第 2 轮加强（★ QA 自己发现的夹具弱点）**：★ 原夹具用 `Buffer.alloc` ⇒ **全是 0**
+    //   ⇒ ⇒ 「读到错误的区段」与「读到正确的区段」**字节完全一样** ⇒ ⇒ 断言④（字节内容）
+    //   **抓不住「丢偏移」**（只能靠断言②「偏移原样」抓 ⇒ 属于**结构层面**的抓）
+    //   ⇒ ⇒ 现在把**两段填成截然不同的图案** ⇒ ⇒ 断言④就能**按值**抓「读错区段」。
     const backing = Buffer.alloc(EMBED_DIM + 16);
+    // ⚠️ **错误区段**（偏移 0..15）= 0xAA ⇒ 「丢偏移」时会读到它
+    backing.fill(0xaa, 0, 16);
+    // ★ **正确区段**（偏移 16..）= 0x55 ⇒ 正确的视图必须全是它
+    backing.fill(0x55, 16, 16 + EMBED_DIM);
     const blob = backing.subarray(16, 16 + EMBED_DIM);
     // ⚠️ **负控**：夹具真的带非零偏移（★ 否则下面两条是恒绿）
     expect(blob.byteOffset).toBe(16);
     expect(blob.byteLength).toBe(EMBED_DIM);
+    // ⚠️ **负控**：两段图案真的不同（★ 否则「按值抓错区段」不成立）
+    expect(blob[0]).toBe(0x55);
+    expect(backing[0]).toBe(0xaa);
+    expect(blob[0]).not.toBe(backing[0]);
 
     // ★ 一个**只认这一行**的假库（★ `readCodes()` 只用到 `prepare().all()`）
     const fakeDb = {
@@ -1556,14 +1569,33 @@ describe('T08 · 读路径接线（A4 · A5）', () => {
     // ★ 码宽自识别：768 B ⇒ int8（★ 这一条说明「行确实进了码池」）
     expect(row?.codeWidth).toBe('int8');
 
-    // ── ★★★ 核心：**零拷贝视图**的三条契约 ──
+    // ── ★★★ 核心：**零拷贝视图**的四条契约 ──
     // ① 底层 ArrayBuffer 必须是**同一个对象**（⇒ 真的零拷贝，不是拷贝）
+    //    ★★ **抓「丢视图」（`new Uint8Array(row.code)`）**：丢了视图 ⇒ 底层缓冲**换了一个**
+    //      ⇒ ⇒ 这条红。★ 注意：**字节值仍然是对的**（拷贝 ⇒ 值同）⇒ ⇒ 字节层面抓不到它
+    //      ⇒ ⇒ 「丢视图」的真正代价是「**零拷贝退化成逐行拷贝**」（热读路径性能回归）
     expect(row?.code.buffer).toBe(backing.buffer);
     // ② 偏移必须**原样带过来**（★ 丢了 ⇒ 从第 0 段读起 ⇒ 错位）
+    //    ★★ **抓「丢偏移」（`new Uint8Array(row.code.buffer, 0, len)`）**：偏移变成 0 ⇒ 这条红
     expect(row?.code.byteOffset).toBe(blob.byteOffset);
     // ③ 长度必须原样
     expect(row?.code.byteLength).toBe(blob.byteLength);
     // ④ 字节内容逐位相同（★ 视图与源必须是同一批字节）
+    //    ★★ **按值**抓「读错区段」：丢偏移 ⇒ 读到 0xAA 那段 ⇒ 这条红（★ 而不只靠 ②）
     expect([...(row?.code ?? new Uint8Array())]).toEqual([...blob]);
+    expect(row?.code[0]).toBe(0x55);
+    // ⑤ ★ **不得含「错误区段」的字节**（★ 与 ②【互不依赖】⇒ 断言②先红时，⑤仍独立守「值」）
+    //    ⇒ 这一条把「读错区段」这个形状**按值**钉死（★ 0xAA 只存在于错误区段）
+    expect(row?.code.includes(0xaa)).toBe(false);
+
+    // ⚠️ ★★ **负控（自包含 · 不依赖任何变异）**：★ 把「读错区段」的那份字节**当场造出来**
+    //   ⇒ ⇒ 内容判据必须判它**不合格** ⇒ ⇒ 否则「断言④/⑤其实抓不住错区段」就没人知道
+    //   ⇒ ⇒ ★ 这一条保证 ④⑤ **不是恒绿断言**（★ 判据有鉴别力 ⇒ 变异一改就红）。
+    const wrongSection = new Uint8Array(backing.buffer, 0, EMBED_DIM);
+    expect(wrongSection.byteOffset).toBe(0);
+    expect(wrongSection.byteLength).toBe(EMBED_DIM); // ★ 长度**恰好相同** ⇒ 「长度对不对」骗得过
+    expect([...wrongSection]).not.toEqual([...blob]);
+    expect(wrongSection.includes(0xaa)).toBe(true);
+    expect(wrongSection.every((byte) => byte === 0x55)).toBe(false);
   });
 });
