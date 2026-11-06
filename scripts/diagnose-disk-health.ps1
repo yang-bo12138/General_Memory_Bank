@@ -419,6 +419,76 @@ function ConvertTo-RepoJson {
 }
 
 # ─────────────────────────────────────────────────────────────
+# ★★ 格式判据（★ 抽出来 ⇒ 落盘与自检【共用同一份判据】⇒ ⇒ 两条路径不可能给出不同结论）
+#   ★ 四条判据（★ 与 `biome.json` 的 `indentWidth: 2` / `lineEnding: lf` 对齐）：
+#     ① 无 CRLF（★ 全文件只有 LF）
+#     ② **首个缩进行的缩进 = 2 空格**（★ ★ 这条专抓 PS 的 4 空格制 ⇒ ★ 因为 JSON 的顶层是「{」，
+#        第一层键的缩进在 2 空格制下必然是 2、在 4 空格制下必然是 4 ⇒ ★ 一看便知）
+#        ⇒ ⚠️ **不能用「有没有 4 空格缩进的行」当判据**（★ 4 空格在 2 空格制里是【合法的第三层】）
+#     ③ 文件以 LF 结尾
+#     ④ **结构性冒号后恰好 1 个空格**（★ ★ 专抓 PS 5.1 的「冒号后 2 空格」⇒ ★ 那是 PS 7 才改掉的）
+#        ⇒ ⚠️ 判据必须落在【行首的「引号键 + 冒号」】上（★ 那是结构性冒号）
+#          ⇒ ⇒ 而【字符串值内部】的「:  」不匹配（★ 它不在行首引号键的位置上）
+# ─────────────────────────────────────────────────────────────
+function Test-RepoJsonFormat {
+    param([Parameter(Mandatory = $true)] [string] $Text)
+    $hasCrLf = $Text.Contains("`r")
+    $firstIndent = -1
+    foreach ($line in ($Text -split "`n")) {
+        if ($line -match '^([ ]+)\S') { $firstIndent = $Matches[1].Length; break }
+    }
+    $endsWithLf = $Text.EndsWith("`n")
+    $doubleSpaceColon = [regex]::IsMatch($Text, '(?m)^\s*"[^"]*":  ')
+    return [ordered]@{
+        ok = ((-not $hasCrLf) -and ($firstIndent -eq 2) -and $endsWithLf -and (-not $doubleSpaceColon))
+        hasCrLf = $hasCrLf
+        firstIndent = $firstIndent
+        endsWithLf = $endsWithLf
+        doubleSpaceColon = $doubleSpaceColon
+    }
+}
+
+# ─────────────────────────────────────────────────────────────
+# ★★ 落盘 + 自检（★ 抽出来 ⇒ ① 主流程与 ② `-RecomputeFrom`【走同一份判据】）
+#   ★ ⚠️ **2026-11-06 补上的缺口**：★ 此前自检代码只写在主流程里 ⇒ ⇒ **重算模式写盘没有任何自检**
+#     ⇒ ⇒ ★ 而重算模式【同样会写仓库里的凭据文件】⇒ ⇒ ⇒ 缺口已堵
+#   ★ 返回值：0 = 全部自检通过；2 = 自检失败（★ 调用方须据此非零退出）
+# ─────────────────────────────────────────────────────────────
+function Write-JsonEvidence {
+    param(
+        [Parameter(Mandatory = $true)] [string] $Path,
+        [Parameter(Mandatory = $true)] $InputObject,
+        [int] $Depth = 10
+    )
+    # ★★ **必须用「无 BOM 的 UTF-8」**（★ ★ 2026-11-05 实测踩到的坑）：
+    #   PS 5.1 的 `Set-Content -Encoding utf8` **会写 BOM** ⇒ ⇒ **Node 的 `JSON.parse` 直接报错**
+    #   （★ `SyntaxError: Unexpected token '﻿'`）⇒ ⇒ ★ 而 PowerShell 自己的 `ConvertFrom-Json`
+    #   能读 ⇒ ⇒ **⇒ 骗得过自己、骗不过仓库的 TS 工具链** ⇒ ⇒ ★ 必须显式用无 BOM 编码器。
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, (ConvertTo-RepoJson -InputObject $InputObject -Depth $Depth), $utf8NoBom)
+
+    # ── 自检 ①：无 BOM 的 UTF-8 + 可被严格解析（★ 证明「机器可读」而不是「我认为它可读」）──
+    $raw = [System.IO.File]::ReadAllBytes($Path)
+    $hasBom = ($raw.Length -ge 3 -and $raw[0] -eq 0xEF -and $raw[1] -eq 0xBB -and $raw[2] -eq 0xBF)
+    $parsed = $null
+    try { $parsed = [System.Text.Encoding]::UTF8.GetString($raw) | ConvertFrom-Json } catch { }
+    if ($hasBom -or $null -eq $parsed) {
+        Write-Host '✗ 自检失败：落盘 JSON 不是「无 BOM 的 UTF-8」或不可解析 ⇒ ★ 请把这条报给主理人' -ForegroundColor Red
+        return 2
+    }
+    Write-Host '✓ 落盘自检通过：无 BOM 的 UTF-8 · 可被严格解析（★ Node 的 JSON.parse 也能读）' -ForegroundColor Green
+
+    # ── 自检 ②：格式四条判据（★ ⇒ 产物一出生就合规 ⇒ 不会在「入库那一刻」把 lint 弄红）──
+    $fmt = Test-RepoJsonFormat -Text ([System.Text.Encoding]::UTF8.GetString($raw))
+    if (-not $fmt.ok) {
+        Write-Host ('✗ 格式自检失败：CRLF={0} · 首个缩进={1}（期望 2）· 末尾换行={2}（期望 True）· 冒号后双空格={3}（期望 False）⇒ ★ 产物不符合仓库规范 ⇒ ★ 请把这条报给主理人' -f $fmt.hasCrLf, $fmt.firstIndent, $fmt.endsWithLf, $fmt.doubleSpaceColon) -ForegroundColor Red
+        return 2
+    }
+    Write-Host '✓ 格式自检通过：LF 行尾 · 2 空格缩进 · 冒号后 1 空格 · 末尾有换行（★ 与 biome.json 对齐 ⇒ ★ 入库不会红 lint）' -ForegroundColor Green
+    return 0
+}
+
+# ─────────────────────────────────────────────────────────────
 # ★★ 判读函数（★ 抽出来 ⇒ ① 主流程与 ② `-RecomputeFrom` 复用【同一份判据】
 #   ⇒ ⇒ 两条路径【不可能给出不同结论】⇒ ⇒ ★ 这就是「判据只有一份」的纪律）
 # ─────────────────────────────────────────────────────────────
@@ -577,8 +647,9 @@ if ($RecomputeFrom -ne '') {
         }
         $src.smart.counters = $slim
     }
-    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($OutFile, (ConvertTo-RepoJson -InputObject $src -Depth 10), $utf8NoBom)
+    # ★ ★ 落盘 + 自检（★ 与主流程【共用同一份判据】⇒ ⇒ 两条路径产物必然同格式）
+    $rc = Write-JsonEvidence -Path $OutFile -InputObject $src -Depth 10
+    if ($rc -ne 0) { exit $rc }
     Write-Host ("   ⇒ 结论：{0}" -f $v.action) -ForegroundColor $(if ($v.severity -eq 'ok') { 'Green' } elseif ($v.severity -eq 'unknown') { 'Yellow' } else { 'Red' })
     foreach ($r in $v.reasons) { Write-Host "     · $r" }
     Write-Host ("★ 已写回：{0}" -f $OutFile) -ForegroundColor Green
@@ -606,48 +677,10 @@ Write-Host '★ 本脚本【只读】：没执行 /f、没删任何东西 ⇒ /f
 # ─────────────────────────────────────────────────────────────
 # 落盘（★ 唯一写入 ⇒ 诊断结果成为可复核的凭据）
 # ─────────────────────────────────────────────────────────────
-# ★★ **必须用「无 BOM 的 UTF-8」**（★ ★ 2026-11-05 实测踩到的坑）：
-#   PS 5.1 的 `Set-Content -Encoding utf8` **会写 BOM** ⇒ ⇒ **Node 的 `JSON.parse` 直接报错**
-#   （★ `SyntaxError: Unexpected token '﻿'`）⇒ ⇒ ★ 而 PowerShell 自己的 `ConvertFrom-Json`
-#   能读 ⇒ ⇒ **⇒ 骗得过自己、骗不过仓库的 TS 工具链** ⇒ ⇒ ★ 必须显式用无 BOM 编码器。
-$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-$json = ConvertTo-RepoJson -InputObject $report -Depth 8
-[System.IO.File]::WriteAllText($OutFile, $json, $utf8NoBom)
-
-# ★★ 落盘自检（★ 证明「机器可读」而不是「我认为它可读」）
-$raw = [System.IO.File]::ReadAllBytes($OutFile)
-$hasBom = ($raw.Length -ge 3 -and $raw[0] -eq 0xEF -and $raw[1] -eq 0xBB -and $raw[2] -eq 0xBF)
-$parsed = $null
-try { $parsed = [System.Text.Encoding]::UTF8.GetString($raw) | ConvertFrom-Json } catch { }
-if ($hasBom -or $null -eq $parsed) {
-    Write-Host '✗ 自检失败：落盘 JSON 不是「无 BOM 的 UTF-8」或不可解析 ⇒ ★ 请把这条报给主理人' -ForegroundColor Red
-    exit 2
-}
-Write-Host '✓ 落盘自检通过：无 BOM 的 UTF-8 · 可被严格解析（★ Node 的 JSON.parse 也能读）' -ForegroundColor Green
-
-# ★★ **格式自检**（★ 2026-11-06 新增 ⇒ ★ 证明产物【一出生就合规】⇒ ⇒ 不会在「入库那一刻」把 lint 弄红）
-#   ★ 判据（四条，★ 与 `biome.json` 的 `indentWidth: 2` / `lineEnding: lf` 对齐）：
-#     ① 无 CRLF（★ 全文件只有 LF）
-#     ② **首个缩进行的缩进 = 2 空格**（★ ★ 这条专抓 PS 的 4 空格制 ⇒ ★ 因为 JSON 的顶层是「{」，
-#        第一层键的缩进在 2 空格制下必然是 2、在 4 空格制下必然是 4 ⇒ ★ 一看便知）
-#        ⇒ ⚠️ **不能用「有没有 4 空格缩进的行」当判据**（★ 4 空格在 2 空格制里是【合法的第三层】）
-#     ③ 文件以 LF 结尾
-#     ④ **结构性冒号后恰好 1 个空格**（★ ★ 专抓 PS 5.1 的「冒号后 2 空格」⇒ ★ 那是 PS 7 才改掉的）
-#        ⇒ ⚠️ 判据必须落在【行首的「引号键 + 冒号」】上（★ 那是结构性冒号）
-#          ⇒ ⇒ 而【字符串值内部】的「:  」不匹配（★ 它不在行首引号键的位置上）
-$text = [System.Text.Encoding]::UTF8.GetString($raw)
-$hasCrLf = $text.Contains("`r")
-$firstIndent = -1
-foreach ($line in ($text -split "`n")) {
-    if ($line -match '^([ ]+)\S') { $firstIndent = $Matches[1].Length; break }
-}
-$endsWithLf = $text.EndsWith("`n")
-$doubleSpaceColon = [regex]::IsMatch($text, '(?m)^\s*"[^"]*":  ')
-if ($hasCrLf -or $firstIndent -ne 2 -or -not $endsWithLf -or $doubleSpaceColon) {
-    Write-Host ('✗ 格式自检失败：CRLF={0} · 首个缩进={1}（期望 2）· 末尾换行={2}（期望 True）· 冒号后双空格={3}（期望 False）⇒ ★ 产物不符合仓库规范 ⇒ ★ 请把这条报给主理人' -f $hasCrLf, $firstIndent, $endsWithLf, $doubleSpaceColon) -ForegroundColor Red
-    exit 2
-}
-Write-Host '✓ 格式自检通过：LF 行尾 · 2 空格缩进 · 冒号后 1 空格 · 末尾有换行（★ 与 biome.json 对齐 ⇒ ★ 入库不会红 lint）' -ForegroundColor Green
+# ★ ★ 落盘 + 自检（★ 与 `-RecomputeFrom`【共用同一份判据】⇒ ⇒ 两条路径产物必然同格式）
+#   ★ 无 BOM 的 UTF-8 · 可被严格解析 · 格式四条判据（★ 详见 `Write-JsonEvidence`）
+$rc = Write-JsonEvidence -Path $OutFile -InputObject $report -Depth 8
+if ($rc -ne 0) { exit $rc }
 
 Write-Host ("★ 诊断结果已落盘：{0}" -f $OutFile) -ForegroundColor Green
 Write-Host ("★ 人读副本（transcript）：{0}" -f $textOut) -ForegroundColor Green
@@ -655,6 +688,7 @@ Write-Host '  ⇒ 把它交给主理人 ⇒ ★ 可作为仓库凭据提交（�
 try { Stop-Transcript | Out-Null } catch { }
 # ★ transcript 转成「无 BOM 的 UTF-8」（★ PS 的 transcript 是 UTF-16LE ⇒ ⇒ 转了才能进 git 当文本看）
 try {
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     $transcriptText = [System.IO.File]::ReadAllText($textOut, [System.Text.Encoding]::Unicode)
     [System.IO.File]::WriteAllText($textOut, $transcriptText, $utf8NoBom)
 } catch { }
