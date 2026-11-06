@@ -18,10 +18,14 @@ import {
   EPS_SAFETY_MARGIN,
   MAX_CODE_VALUE,
   approxDot,
+  approxDotWithWidth,
   blobToCode,
   codeToBlob,
+  codeWidthFromBlobLength,
   decodeVector,
+  decodeVectorWithWidth,
   encodeVector,
+  encodeVectorWithWidth,
   upperBound,
 } from '../../src/vector/quantize.js';
 
@@ -209,5 +213,120 @@ describe('int8 量化的可证上界（C′ 档 · A3 / A4）', () => {
     const query = unitVector(mulberry32(17));
     expect(() => upperBound(query, code.code, code.scale, -1e-9)).toThrow(/eps/);
     expect(() => upperBound(query, code.code, code.scale, Number.NaN)).toThrow(/eps/);
+  });
+});
+
+/**
+ * ★★ 候选码宽（★ 出关条件②「四列表」的前置 · ★ 2026-11-06）。
+ *
+ * ★ **这一组断言的三个职责**：
+ *   ① **机械证明「int8 逐位不变」** ⇒ ⇒ ★ 这是「`quantize.ts` 只增不改」这句承诺的背书
+ *      ⇒ ⇒ 没有它，任何人加码宽都可能悄悄改坏生产路径；
+ *   ② **证明「新码宽下可证上界仍然成立」** ⇒ ⇒ ★ 上界只要求「`x̂` 是真实还原 + `eps` ≥ 真实误差」
+ *      ⇒ ⇒ ★ **与码宽无关** ⇒ ⇒ ⇒ 换码宽**不会引入漏检**，只会让 `eps` 变大 ⇒ 剪枝变少；
+ *   ③ **把「更窄的码 ⇒ eps 更大」这个预期写成断言** ⇒ ⇒ ★ 免得下一手把它当成 bug 去「修」。
+ */
+describe('候选码宽（int4 / 二值）', () => {
+  const random = mulberry32(20261106);
+  const bases = Array.from({ length: 200 }, () => unitVector(random));
+  const queries = Array.from({ length: 20 }, () => unitVector(random));
+
+  it('★ 字节数与 R3 行「表二」逐位一致：int4 = 384 B · 二值 = 96 B', () => {
+    const base = bases[0] as Float32Array;
+    expect(encodeVectorWithWidth(base, 'int4').code.length).toBe(384);
+    expect(encodeVectorWithWidth(base, 'binary').code.length).toBe(96);
+    expect(encodeVectorWithWidth(base, 'int8').code.length).toBe(768);
+  });
+
+  it('★ int8 路径**逐位不变**：新函数与既有 `encodeVector` 落库的**字节**完全相同', () => {
+    // ★ 这一条是「`quantize.ts` 只增不改」这句承诺的**机器背书**：
+    //   ⇒ 若有人日后让新函数走新算法 ⇒ ⇒ 本断言立刻红 ⇒ ⇒ 生产路径不会悄悄变。
+    // ⚠️ **比的是【字节】而不是【元素值】**（★ 新函数统一用 `Uint8Array` 装 ⇒ `-117` 存成 `139`
+    //   ⇒ 两者**字节完全相同**、只是「有符号 vs 无符号」的表示不同 ⇒ ⇒ 比元素值会假红）
+    for (const base of bases) {
+      const legacy = encodeVector(base);
+      const fresh = encodeVectorWithWidth(base, 'int8');
+      const legacyBytes = [
+        ...new Uint8Array(legacy.code.buffer, legacy.code.byteOffset, legacy.code.byteLength),
+      ];
+      const freshBytes = [
+        ...new Uint8Array(fresh.code.buffer, fresh.code.byteOffset, fresh.code.byteLength),
+      ];
+      expect(freshBytes).toEqual(legacyBytes);
+      expect(fresh.scale).toBe(legacy.scale);
+      expect(fresh.eps).toBe(legacy.eps);
+      expect(fresh.width).toBe('int8');
+    }
+  });
+
+  it('★ round-trip：解包还原后的真实误差**恰好**等于 `eps` 减去安全余量', () => {
+    // ★ 这条同时钉住【打包/解包正确】与【eps 逐行实算】⇒ ⇒ 算错一位就会红
+    for (const width of ['int4', 'binary'] as const) {
+      for (const base of bases.slice(0, 20)) {
+        const encoded = encodeVectorWithWidth(base, width);
+        const restored = decodeVectorWithWidth(encoded.code, encoded.scale, width, DIM);
+        let squaredError = 0;
+        for (let dim = 0; dim < DIM; dim += 1) {
+          const difference = (base[dim] as number) - (restored[dim] as number);
+          squaredError += difference * difference;
+        }
+        const actualError = Math.sqrt(squaredError);
+        expect(encoded.eps).toBeGreaterThanOrEqual(actualError);
+        expect(encoded.eps - actualError).toBeLessThan(1e-5);
+        expect(encoded.eps - actualError).toBeGreaterThanOrEqual(EPS_SAFETY_MARGIN * 0.5);
+      }
+    }
+  });
+
+  it('★ 可证上界在 int4 下仍然**无一例外**（10 万对 · 无容差）', () => {
+    const encoded = bases.map((base) => encodeVectorWithWidth(base, 'int4'));
+    for (let index = 0; index < 100_000; index += 1) {
+      const query = queries[index % queries.length] as Float32Array;
+      const rowIndex = (index * 37) % bases.length;
+      const base = bases[rowIndex] as Float32Array;
+      const code = encoded[rowIndex] as ReturnType<typeof encodeVectorWithWidth>;
+      const upper = approxDotWithWidth(query, code.code, code.scale, 'int4', DIM) + code.eps;
+      expect(upper).toBeGreaterThanOrEqual(cosOf(query, base));
+    }
+  });
+
+  it('★ 可证上界在二值下仍然**无一例外**（★ 但 eps 大到让剪枝几乎失效）', () => {
+    const encoded = bases.map((base) => encodeVectorWithWidth(base, 'binary'));
+    for (let index = 0; index < 100_000; index += 1) {
+      const query = queries[index % queries.length] as Float32Array;
+      const rowIndex = (index * 37) % bases.length;
+      const base = bases[rowIndex] as Float32Array;
+      const code = encoded[rowIndex] as ReturnType<typeof encodeVectorWithWidth>;
+      const upper = approxDotWithWidth(query, code.code, code.scale, 'binary', DIM) + code.eps;
+      expect(upper).toBeGreaterThanOrEqual(cosOf(query, base));
+    }
+    // ★ 二值的还原值是 ±maxAbs ⇒ ⇒ eps ≈ ‖x − x̂‖₂ ≈ 1（★ 归一化向量的量级）
+    //   ⇒ ⇒ **剪枝几乎必然失效**（任何 cos ≤ 1 ≤ upper）⇒ ⇒ 这是**预期结果、不是 bug**
+    //   ⇒ ⇒ 记在这里 ⇒ 免得下一手把它当成「算错了」去「修」。
+    const sample = encoded[0] as ReturnType<typeof encodeVectorWithWidth>;
+    expect(sample.eps).toBeGreaterThan(0.5);
+  });
+
+  it('★ 更窄的码 ⇒ eps 更大（★ 预期，不是 bug）', () => {
+    const base = bases[0] as Float32Array;
+    const int8 = encodeVectorWithWidth(base, 'int8');
+    const int4 = encodeVectorWithWidth(base, 'int4');
+    const binary = encodeVectorWithWidth(base, 'binary');
+    expect(int4.eps).toBeGreaterThan(int8.eps);
+    expect(binary.eps).toBeGreaterThan(int4.eps);
+  });
+
+  it('★ 码宽可从 BLOB 长度自识别（★ 零配置、零 schema 改动）', () => {
+    expect(codeWidthFromBlobLength(768, DIM)).toBe('int8');
+    expect(codeWidthFromBlobLength(384, DIM)).toBe('int4');
+    expect(codeWidthFromBlobLength(96, DIM)).toBe('binary');
+    // ★ 坏码行必须**响亮失败**（★ 与 `ivf.ts` 的 fail-open 是两层：这里判不出 ⇒ 上层跳过）
+    expect(() => codeWidthFromBlobLength(123, DIM)).toThrow(/不属于任何已知码宽/);
+  });
+
+  it('★ 打包字节数不足 ⇒ 响亮失败（int4 要偶数维 · 二值要 8 的倍数）', () => {
+    const odd = new Float32Array(767);
+    expect(() => encodeVectorWithWidth(odd, 'int4')).toThrow(/偶数/);
+    expect(() => encodeVectorWithWidth(odd, 'binary')).toThrow(/8 的倍数/);
   });
 });

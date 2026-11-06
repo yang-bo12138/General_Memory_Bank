@@ -63,11 +63,17 @@ import { DEFAULT_PARAMS } from '../src/core/params.js';
 import { openDatabase } from '../src/db/connection.js';
 import { ensureSchema } from '../src/db/migrate.js';
 import { blobToVector } from '../src/vector/centroids.js';
-import { codeToBlob, encodeVector } from '../src/vector/quantize.js';
+import {
+  CODE_WIDTHS,
+  type CodeWidth,
+  type EncodedVectorWidth,
+  codeToBlobWithWidth,
+  encodeVectorWithWidth,
+} from '../src/vector/quantize.js';
 
 /** 一次回填的用法说明（错误信息里回显，避免「报错了但不知道怎么用」）。 */
 export const USAGE =
-  '用法：tsx scripts/backfill-codes.ts --db=<库文件> [--batch-size=500] [--dry-run] [--limit=N] [--force]';
+  '用法：tsx scripts/backfill-codes.ts --db=<库文件> [--batch-size=500] [--dry-run] [--limit=N] [--force] [--code-width=int8|int4|binary]';
 
 /** 每多少批打一行进度（**不逐行刷屏**：100 万行逐行打 = 100 万行日志）。 */
 export const PROGRESS_EVERY_BATCHES = 10;
@@ -84,7 +90,23 @@ export interface BackfillArgs {
   limit?: number;
   /** 忽略「已编码」跳过逻辑，把已存在的码行**重算覆盖**（`INSERT OR REPLACE`）。 */
   force: boolean;
+  /**
+   * ★ 码宽（★ 2026-11-06 · 出关条件② 的前置 · ★ **缺省 `int8` = 生产现状**）。
+   *
+   * ⚠️ ★★ **非 `int8` 的档只能用于「统计 ε」**（★ 原因见 `CODE_WIDTH_USAGE_NOTE`）：
+   *   ⇒ ⇒ ★ `src/vector/ivf.ts:580` 现在只认「1 字节/维」⇒ ⇒ **非 int8 的码行会被跳过**
+   *   ⇒ ⇒ ★ **该库跑召回/剪枝测试只会得到假数据** ⇒ ⇒ ★ **不许拿它跑 bench**
+   */
+  codeWidth?: CodeWidth;
 }
+
+/**
+ * ★ 非 `int8` 档的**使用边界**（★ 每次跑都原样打出来 ⇒ ★ 免得有人拿它跑 bench 得出假数）。
+ */
+export const CODE_WIDTH_USAGE_NOTE =
+  '★ 本档码宽【不是 int8】⇒ ⇒ 该库的码行**读路径当前会跳过**（★ src/vector/ivf.ts 只认「1 字节/维」）' +
+  ' ⇒ ⇒ ★★ **该库只能用于统计 `vector_codes.eps` 的分布**（★ 出关条件② 四列表的 ε 列）' +
+  ' ⇒ ⇒ ★★ **不许用它跑召回 / 剪枝 / 延迟测试**（★ 会得到「候选宇宙为空」的假数据）';
 
 /** 坏 `embedding` 的细分原因（诊断用：只说「跳过 12 行」等于没说）。 */
 export interface BadEmbeddingBreakdown {
@@ -242,6 +264,13 @@ export interface BackfillRunOptions {
   now?: () => number;
   /** 进度出口（缺省写 stderr）。 */
   onProgress?: ProgressSink;
+  /**
+   * ★ 告警出口（★ 2026-11-06 新增 · ★ 缺省写 stderr；测试可注入空实现 ⇒ 不污染测试输出）。
+   *
+   * ⚠️ **为什么不走 `onProgress`**：★ `onProgress` 收的是**结构化进度**（`BackfillProgress`）
+   *   ⇒ ⇒ ★ 而告警是**一句话** ⇒ ⇒ ★ 塞进去会把结构弄脏 ⇒ ⇒ ★ 单开一个出口。
+   */
+  warn?: (message: string) => void;
 }
 
 /** 默认进度出口：**stderr**（stdout 留给最终报告，别让进度把报告冲散）。 */
@@ -320,13 +349,43 @@ export function parseArgs(argv: readonly string[]): BackfillArgs {
   const batchSize = readPositiveInt(argv, '--batch-size');
   const limit = readPositiveInt(argv, '--limit');
 
+  // ★ 码宽（★ 缺省 int8 = 生产现状 ⇒ ⇒ 不传就是零行为变更）
+  const rawCodeWidth = readOption(argv, '--code-width');
+  let codeWidth: CodeWidth = 'int8';
+  if (rawCodeWidth !== undefined) {
+    if (!CODE_WIDTHS.includes(rawCodeWidth as CodeWidth)) {
+      throw MemoryError.invalidInput(`--code-width 只接受 ${CODE_WIDTHS.join(' / ')}。${USAGE}`, {
+        reason: 'code-width',
+        expected: CODE_WIDTHS.join(' / '),
+        actual: rawCodeWidth,
+      });
+    }
+    codeWidth = rawCodeWidth as CodeWidth;
+  }
+
+  // ★★ **安全闸**：换码宽**必须**带 `--force`
+  //   ⇒ ⇒ 理由：没有 `--force` 时脚本会**跳过已编码的行** ⇒ ⇒ 产出的是「一部分 int8 + 一部分 int4」
+  //     的**混合库** ⇒ ⇒ 而那是最难认出来的中间态 ⇒ ⇒ **宁可报错也不让它发生**
+  const force = argv.includes('--force');
+  if (codeWidth !== 'int8' && !force) {
+    throw MemoryError.invalidInput(
+      `换码宽（${codeWidth}）必须带 --force：★ 否则脚本会跳过已编码的行 ⇒ ⇒ 产出「混合码宽」的库。${USAGE}`,
+      {
+        reason: 'force',
+        expected: '--force',
+        actual: '未传',
+      },
+    );
+  }
+
   return {
     dbPath: resolve(rawDb),
     // ⚠️ 条件展开（`exactOptionalPropertyTypes`）：显式 `batchSize: undefined` 与「不传」是两件事。
     ...(batchSize === undefined ? {} : { batchSize }),
     ...(limit === undefined ? {} : { limit }),
     dryRun: argv.includes('--dry-run'),
-    force: argv.includes('--force'),
+    force,
+    codeWidth,
   };
 }
 
@@ -637,9 +696,21 @@ function runDryRun(
 export function runBackfill(args: BackfillArgs, options: BackfillRunOptions = {}): BackfillResult {
   const now = options.now ?? ((): number => Date.now());
   const onProgress = options.onProgress ?? writeProgressToStderr;
+  const warn =
+    options.warn ??
+    ((message: string): void => {
+      process.stderr.write(`${message}\n`);
+    });
 
   const batchSize = args.batchSize ?? DEFAULT_PARAMS.SWEEP_BATCH_SIZE;
   const expectedBytes = DEFAULT_PARAMS.EMBED_DIM * 4;
+  const codeWidth = args.codeWidth ?? 'int8';
+
+  // ★★ **码宽告警（★ 非 int8 时每次都打）**：★ 这一行的存在理由 =
+  //   「免得有人拿一个 int4/二值的库去跑 bench ⇒ ⇒ 读到「候选宇宙为空」的假数据却以为码坏了」
+  if (codeWidth !== 'int8') {
+    warn(`⚠ ${CODE_WIDTH_USAGE_NOTE}`);
+  }
 
   if (!existsSync(args.dbPath)) {
     throw MemoryError.notFound(`库文件不存在：${args.dbPath}`, { path: args.dbPath });
@@ -716,9 +787,11 @@ export function runBackfill(args: BackfillArgs, options: BackfillRunOptions = {}
           continue;
         }
 
-        let encoded: { code: Int8Array; scale: number; eps: number };
+        let encoded: EncodedVectorWidth;
         try {
-          encoded = encodeVector(blobToVector(embedding));
+          // ★ 统一走 `encodeVectorWithWidth`（★ int8 档的落库**字节与既有 `encodeVector` 逐位相同**
+          //   ⇒ ⇒ 由 `tests/unit/quantize.test.ts` 的「int8 路径逐位不变」那条断言背书）
+          encoded = encodeVectorWithWidth(blobToVector(embedding), codeWidth);
         } catch (error) {
           // ⚠️ **只吞 `INVALID_INPUT`**（含 NaN / Inf）：那是「这一行坏了」，不是「回填坏了」
           if (error instanceof MemoryError && error.code === MemoryError.INVALID_INPUT) {
@@ -732,7 +805,7 @@ export function runBackfill(args: BackfillArgs, options: BackfillRunOptions = {}
         pending.push({
           fineId: row.fine_id,
           memoryId: row.memory_id,
-          blob: codeToBlob(encoded.code),
+          blob: codeToBlobWithWidth(encoded.code),
           scale: encoded.scale,
           eps: encoded.eps,
         });
