@@ -1,0 +1,130 @@
+{
+  "rows": [
+    {
+      "label": "int8",
+      "bytesPerRow": 768,
+      "implemented": true,
+      "eps": {
+        "count": 1000220,
+        "min": 0.004485561972375988,
+        "mean": 0.005491353805663937,
+        "p50": 0.005476812467087325,
+        "p90": 0.005837952953195035,
+        "p99": 0.006154907630835476,
+        "p999": 0.006374722829471134,
+        "max": 0.006792749345700722
+      },
+      "pruneRate": {
+        "count": 200,
+        "min": 0,
+        "mean": 0.000864739692021521,
+        "p50": 0.0002738975623116954,
+        "p99": 0.0125,
+        "max": 0.037037037037037035
+      },
+      "writeP99Ms": 1800.4539,
+      "vectorRouteP99Ms": 4540.6426,
+      "storageMediaClass": "HDD",
+      "pageCacheState": "warm",
+      "maxExactRowsAllowed": null,
+      "maxPruneRateAllowed": null,
+      "note": "★ 生产现状（`src/vector/quantize.ts`）⇒ ε = 编码时实算的 ‖x−x̂‖₂"
+    },
+    {
+      "label": "int4",
+      "bytesPerRow": 384,
+      "implemented": true,
+      "eps": {
+        "count": 1000220,
+        "min": 0.08073619070352686,
+        "mean": 0.09962095303407989,
+        "p50": 0.09935282981653354,
+        "p90": 0.10590010678445451,
+        "p99": 0.11163529015106488,
+        "p999": 0.11555413464834936,
+        "max": 0.12687057783704675
+      },
+      "pruneRate": null,
+      "writeP99Ms": null,
+      "vectorRouteP99Ms": null,
+      "storageMediaClass": null,
+      "pageCacheState": null,
+      "maxExactRowsAllowed": 662,
+      "maxPruneRateAllowed": 0.1252364737041241,
+      "note": "★ 2026-11-06 已实现（对称量化 · 值域 [-7,7] · 两维 1 字节）⇒ ★ **ε 已实测**（★ 见 R3 行表一）⇒ ★ 剪枝率与延迟两列**仍缺**（★ 待读路径接线 + 重新采集）"
+    },
+    {
+      "label": "二值（1 bit/维）",
+      "bytesPerRow": 96,
+      "implemented": true,
+      "eps": {
+        "count": 1000220,
+        "min": 1.2777946685720802,
+        "mean": 1.6649672270776106,
+        "p50": 1.6587235175925208,
+        "p90": 1.8047024274343733,
+        "p99": 1.9329359463125755,
+        "p999": 2.018734235546297,
+        "max": 2.2639709982582183
+      },
+      "pruneRate": null,
+      "writeP99Ms": null,
+      "vectorRouteP99Ms": null,
+      "storageMediaClass": null,
+      "pageCacheState": null,
+      "maxExactRowsAllowed": 1158,
+      "maxPruneRateAllowed": 0.21906923950056753,
+      "note": "★ 2026-11-06 已实现 ⇒ ★ **ε 已实测且【可证剪枝恒失效】**（★ ε 的 min > 1 ⇒ ⇒ `upper = q·x̂ + ε > 1 ≥ cos_true` ⇒ ⇒ **永远进不了剪枝** ⇒ ⇒ **剪枝率恒 100%** ⇒ ⇒ ★ **本档不需要读路径接线、也不需要重新采集**）"
+    },
+    {
+      "label": "PQ（子空间×码本）",
+      "bytesPerRow": 0,
+      "implemented": false,
+      "eps": null,
+      "pruneRate": null,
+      "writeP99Ms": null,
+      "vectorRouteP99Ms": null,
+      "storageMediaClass": null,
+      "pageCacheState": null,
+      "maxExactRowsAllowed": null,
+      "maxPruneRateAllowed": null,
+      "note": "★ 未实现 ⇒ ★ 且**每行字节数取决于还没定的配置**（子空间数 × 码本大小）⇒ ⇒ 连字节侧都算不出"
+    }
+  ],
+  "missing": [
+    {
+      "label": "int4",
+      "missing": ["剪枝率", "延迟"],
+      "reason": "★ ε 已实测 ⇒ ★ 但【剪枝率与延迟】要**读路径接线 + 重新采集**才有（★ 凭据 `t07-warm.json` 是 int8 档的）"
+    },
+    {
+      "label": "二值（1 bit/维）",
+      "missing": ["剪枝率", "延迟"],
+      "reason": "★ ε 已实测 ⇒ ★ 但【剪枝率与延迟】要**读路径接线 + 重新采集**才有（★ 凭据 `t07-warm.json` 是 int8 档的）"
+    },
+    {
+      "label": "PQ（子空间×码本）",
+      "missing": ["ε", "剪枝率", "延迟"],
+      "reason": "★ 连每行字节数都取决于还没定的配置 ⇒ ⇒ 连「字节侧临界值」都算不出"
+    }
+  ],
+  "evidence": {
+    "storageMediaClass": "HDD",
+    "pageCacheState": "warm",
+    "corpusSize": 1000000,
+    "bytesReadMax": 4065792,
+    "bytesReadBudget": 6144000,
+    "candidateUniverseMax": 5286,
+    "memoryRowsReadMax": 2,
+    "pruneRate": {
+      "count": 200,
+      "min": 0,
+      "mean": 0.000864739692021521,
+      "p50": 0.0002738975623116954,
+      "p99": 0.0125,
+      "max": 0.037037037037037035
+    },
+    "writeP99Ms": 1800.4539,
+    "vectorRouteP99Ms": 4540.6426
+  }
+}

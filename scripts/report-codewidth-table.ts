@@ -52,6 +52,8 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 
+import type { CodeWidth } from '../src/vector/quantize.js';
+
 const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 const DEFAULT_DB = join(REPO_ROOT, '.tmp/bench/perf-1000000.db');
 const DEFAULT_EVIDENCE = join(REPO_ROOT, 'docs/evidence/t07-warm.json');
@@ -71,6 +73,8 @@ const CURRENT_CODE_WIDTH_BYTES = 768;
  */
 interface CandidateWidth {
   readonly label: string;
+  /** ★ 对应的码宽枚举值（★ `null` = 还没有对应的码宽（如 PQ ⇒ 它的实现形态都还没定））。 */
+  readonly width: CodeWidth | null;
   /** ★ 每行码字节数（★ `null` = 取决于还没定的配置 ⇒ 连字节侧都算不出）。 */
   readonly bytesPerRow: number | null;
   /** ★ 是否已有实现（★ ⇒ 才有「实测三列」）。 */
@@ -82,24 +86,28 @@ interface CandidateWidth {
 const CANDIDATE_WIDTHS: readonly CandidateWidth[] = [
   {
     label: 'int8',
+    width: 'int8',
     bytesPerRow: 768,
     implemented: true,
-    note: '★ 当前唯一实现（`src/vector/quantize.ts`）⇒ ε = 编码时实算的 ‖x−x̂‖₂',
+    note: '★ 生产现状（`src/vector/quantize.ts`）⇒ ε = 编码时实算的 ‖x−x̂‖₂',
   },
   {
     label: 'int4',
+    width: 'int4',
     bytesPerRow: 384,
-    implemented: false,
-    note: '★ 未实现 ⇒ ε / 剪枝率 / 延迟 三列都缺 ⇒ ★ 需先实现 + 重新编码 + 重新采集',
+    implemented: true,
+    note: '★ 2026-11-06 已实现（对称量化 · 值域 [-7,7] · 两维 1 字节）⇒ ★ **ε 已实测**（★ 见 R3 行表一）⇒ ★ 剪枝率与延迟两列**仍缺**（★ 待读路径接线 + 重新采集）',
   },
   {
     label: '二值（1 bit/维）',
+    width: 'binary',
     bytesPerRow: 96,
-    implemented: false,
-    note: '★ 未实现 ⇒ ★ 且 ε 的增长幅度**不可线性外推** ⇒ ⇒ 必须实测',
+    implemented: true,
+    note: '★ 2026-11-06 已实现 ⇒ ★ **ε 已实测且【可证剪枝恒失效】**（★ ε 的 min > 1 ⇒ ⇒ `upper = q·x̂ + ε > 1 ≥ cos_true` ⇒ ⇒ **永远进不了剪枝** ⇒ ⇒ **剪枝率恒 100%** ⇒ ⇒ ★ **本档不需要读路径接线、也不需要重新采集**）',
   },
   {
     label: 'PQ（子空间×码本）',
+    width: null,
     bytesPerRow: null,
     implemented: false,
     note: '★ 未实现 ⇒ ★ 且**每行字节数取决于还没定的配置**（子空间数 × 码本大小）⇒ ⇒ 连字节侧都算不出',
@@ -288,7 +296,7 @@ export function computeByteSideLimit(
  * ★ **把 ε 分布 + 凭据切片拼成四列表**（★ 纯函数 ⇒ 自测可喂合成数据）。
  */
 export function buildCodeWidthTable(
-  eps: EpsDistribution | null,
+  epsByWidth: ReadonlyMap<CodeWidth, EpsDistribution | null>,
   evidence: EvidenceSlice,
 ): CodeWidthTable {
   const rows: CodeWidthRow[] = [];
@@ -296,7 +304,12 @@ export function buildCodeWidthTable(
 
   for (const candidate of CANDIDATE_WIDTHS) {
     const bytesPerRow = candidate.bytesPerRow;
+    const eps = candidate.width === null ? null : (epsByWidth.get(candidate.width) ?? null);
     const hasMeasured = candidate.implemented && bytesPerRow !== null && eps !== null;
+    // ★ **剪枝率与延迟只属于 int8 档**（★ 凭据 `docs/evidence/t07-warm.json` 是 **int8 档**的
+    //   ⇒ ⇒ 别的档没有自己的凭据 ⇒ ⇒ ★ 绝不能把 int8 的三列挂到 int4 行上 ⇒ ⇒ 那是假数据）
+    const isEvidenceWidth = candidate.width === 'int8';
+    const hasEvidence = hasMeasured && isEvidenceWidth;
     const limit =
       bytesPerRow === null
         ? null
@@ -310,29 +323,34 @@ export function buildCodeWidthTable(
       bytesPerRow: bytesPerRow ?? 0,
       implemented: candidate.implemented,
       eps: hasMeasured ? eps : null,
-      pruneRate: hasMeasured ? evidence.pruneRate : null,
-      writeP99Ms: hasMeasured ? evidence.writeP99Ms : null,
-      vectorRouteP99Ms: hasMeasured ? evidence.vectorRouteP99Ms : null,
-      storageMediaClass: hasMeasured ? evidence.storageMediaClass : null,
-      pageCacheState: hasMeasured ? evidence.pageCacheState : null,
+      pruneRate: hasEvidence ? evidence.pruneRate : null,
+      writeP99Ms: hasEvidence ? evidence.writeP99Ms : null,
+      vectorRouteP99Ms: hasEvidence ? evidence.vectorRouteP99Ms : null,
+      storageMediaClass: hasEvidence ? evidence.storageMediaClass : null,
+      pageCacheState: hasEvidence ? evidence.pageCacheState : null,
       maxExactRowsAllowed: limit?.maxExactRowsAllowed ?? null,
       maxPruneRateAllowed: limit?.maxPruneRateAllowed ?? null,
       note: candidate.note,
     });
 
+    // ★ 「还缺哪几列」**按行逐列算**（★ 不是「整行有或没有」）⇒ ⇒ 一档只有 ε 时也要如实记缺两列
+    const gaps: string[] = [];
     if (!hasMeasured) {
-      const gaps: string[] = [];
-      if (candidate.implemented === false) {
-        gaps.push('ε');
-      }
+      gaps.push('ε');
+    }
+    if (!hasEvidence) {
       gaps.push('剪枝率', '延迟');
+    }
+    if (gaps.length > 0) {
       missing.push({
         label: candidate.label,
         missing: gaps,
         reason:
           bytesPerRow === null
             ? '★ 连每行字节数都取决于还没定的配置 ⇒ ⇒ 连「字节侧临界值」都算不出'
-            : '★ 未实现 ⇒ ⇒ ε / 剪枝率 / 延迟 三列必须【实现 + 重新编码 + 重新采集】才有',
+            : hasMeasured
+              ? '★ ε 已实测 ⇒ ★ 但【剪枝率与延迟】要**读路径接线 + 重新采集**才有（★ 凭据 `t07-warm.json` 是 int8 档的）'
+              : '★ 未实现 ⇒ ⇒ ε / 剪枝率 / 延迟 三列必须【实现 + 重新编码 + 重新采集】才有',
       });
     }
   }
@@ -374,7 +392,7 @@ export function renderTable(table: CodeWidthTable): string {
       continue;
     }
     lines.push(
-      `| **${row.label}** | ${row.bytesPerRow} B | ${renderDistribution(row.eps)} | ${renderDistribution(row.pruneRate)} | ${(row.writeP99Ms ?? 0).toFixed(2)} ms / ${(row.vectorRouteP99Ms ?? 0).toFixed(2)} ms（${row.storageMediaClass} · ${row.pageCacheState}）|`,
+      `| **${row.label}** | ${row.bytesPerRow} B | ${renderDistribution(row.eps)} | ${renderDistribution(row.pruneRate)} | ${row.writeP99Ms === null ? '—' : `${row.writeP99Ms.toFixed(2)} ms`} / ${row.vectorRouteP99Ms === null ? '—' : `${row.vectorRouteP99Ms.toFixed(2)} ms`}（${row.storageMediaClass ?? '—'} · ${row.pageCacheState ?? '—'}）|`,
     );
   }
   lines.push('');
@@ -472,7 +490,7 @@ export function runSelfTest(): readonly string[] {
   );
 
   // ── 正控：四列表的「缺列登记」必须与「是否已实现」一致 ──
-  const table = buildCodeWidthTable(summary, evidence);
+  const table = buildCodeWidthTable(new Map([['int8' as CodeWidth, summary]]), evidence);
   const missingLabels = table.missing.map((m) => m.label).join(',');
   const measuredRows = table.rows.filter((r) => r.eps !== null).length;
   results.push(
@@ -513,8 +531,48 @@ function main(): void {
     evidenceIndex >= 0 ? (process.argv[evidenceIndex + 1] ?? DEFAULT_EVIDENCE) : DEFAULT_EVIDENCE;
 
   const evidence = sliceEvidence(JSON.parse(readFileSync(evidencePath, 'utf8')));
-  const eps = readEpsDistribution(dbPath);
-  const table = buildCodeWidthTable(eps, evidence);
+  // ★ ★ **每档的 ε 各自从自己的库读**（★ 2026-11-06）：★ `--db` 可重复、写法 `<档宽>=<路径>`
+  //   （★ 不带 `<档宽>=` 的那个按「当前档」处理 ⇒ ⇒ 兼容旧的单库用法）
+  //   ★ 而 **int8 档的 ε 永远从默认库读** ⇒ ⇒ ★ 于是「跑 int4 档」也能同时给出 int8 那行 ⇒ ⇒ ★ 三行表可一次产全
+  const widthIndex = process.argv.indexOf('--code-width');
+  const rawWidth = widthIndex >= 0 ? (process.argv[widthIndex + 1] ?? 'int8') : 'int8';
+  if (rawWidth !== 'int8' && rawWidth !== 'int4' && rawWidth !== 'binary') {
+    throw new Error(`--code-width 只接受 int8 / int4 / binary（收到「${rawWidth}」）`);
+  }
+  const currentWidth = rawWidth as CodeWidth;
+  const epsByWidth = new Map<CodeWidth, EpsDistribution | null>();
+  const argv = process.argv.slice(1);
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index] as string;
+    let value: string | undefined;
+    if (token.startsWith('--db=')) {
+      value = token.slice('--db='.length);
+    } else if (token === '--db') {
+      value = argv[index + 1];
+      index += 1;
+    } else {
+      continue;
+    }
+    if (value === undefined) {
+      continue;
+    }
+    const separator = value.indexOf('=');
+    if (separator < 0) {
+      continue;
+    }
+    const width = value.slice(0, separator);
+    if (width !== 'int8' && width !== 'int4' && width !== 'binary') {
+      throw new Error(`--db 的档宽前缀只接受 int8 / int4 / binary（收到「${width}」）`);
+    }
+    epsByWidth.set(width as CodeWidth, readEpsDistribution(value.slice(separator + 1)));
+  }
+  if (!epsByWidth.has(currentWidth)) {
+    epsByWidth.set(currentWidth, readEpsDistribution(dbPath));
+  }
+  if (currentWidth !== 'int8' && !epsByWidth.has('int8')) {
+    epsByWidth.set('int8', readEpsDistribution(DEFAULT_DB));
+  }
+  const table = buildCodeWidthTable(epsByWidth, evidence);
 
   if (process.argv.includes('--json')) {
     process.stdout.write(`${JSON.stringify(table, null, 2)}\n`);
