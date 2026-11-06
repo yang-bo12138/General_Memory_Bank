@@ -585,7 +585,10 @@ const expectedCodeBytes = options.expectedCodeBytes ?? codeWidthByteLengths(DEFA
 | A11 | ★ **int4 的上界仍是可证上界**（零漏检） | ★ `tests/unit/quantize.test.ts` 已有 int4 的 10 万对零破界用例（★ `:277`）⇒ ★ **保持绿** ⇒ ★ **★ 这是「int4 不漏检」的机器背书**（★ 不许因为接线而放宽） |
 
 ★ **⚠️ 实现要点（写给工程师）**：
-1. ★ **`readCodes()` 的零拷贝视图**：`new Uint8Array(row.code.buffer, row.code.byteOffset, row.code.byteLength)` ⇒ ★ **必须带 `byteOffset`**（★ `Buffer` 的 `byteOffset` 不保证为 0）⇒ ★ **不许写 `new Uint8Array(row.code)`**。
+1. ★ **`readCodes()` 的零拷贝视图**：`new Uint8Array(row.code.buffer, row.code.byteOffset, row.code.byteLength)` ⇒ ★ **必须带 `row.code.byteOffset`**（★ `Buffer` 的 `byteOffset` 不保证为 0）⇒ ★ **两个错法都要点名**：
+   · ★ **`new Uint8Array(row.code)`** ⇒ **按「元素值」转换**（★ 不是字节视图）⇒ ⇒ **静默算错**；
+   · ★ **`new Uint8Array(row.code.buffer, 0, row.code.byteLength)`** ⇒ **丢掉偏移** ⇒ ⇒ 读到**错误的区段**；
+   ⇒ ⇒ ★ **「丢偏移」比「丢视图」更危险**：★ 两者都**不报错、只静默算错**，但 ★ 丢偏移连「长度对不对」这道自查都骗得过（★ 长度恰好相同 ⇒ 字节却是别人的）⇒ ⇒ ★ 这也是 T08 交付时「丢掉 `byteOffset`」这个变异**没有任何断言抓得住**的原因（★ 已由 QA 补的断言堵住）。
 2. ★ **`prune.ts` 的分派写法**：★ **`entry.codeWidth === 'int8' ? approxDot(...) : approxDotWithWidth(...)`** ⇒ ★ **int8 分支里 `approxDot` 的实参逐字不变** ⇒ ★ **不要「统一改成 `approxDotWithWidth`」**（★ 那是 4.63× 的 CPU 回归，§1.3）。
 3. ★ **`approxDotWithWidth` 需要 `dim` 参数** ⇒ ★ 传 `query.length`（★ 与 `assertCodedEntry` 的 `queryLength` 同一个来源 ⇒ ★ 免得两处不一致）。
 
