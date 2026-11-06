@@ -382,7 +382,12 @@ pool.set(row.id, {
 ```
 
 ★ **零拷贝视图的做法**：`row.code` 是 better-sqlite3 给的 `Buffer` ⇒ `new Uint8Array(row.code.buffer, row.code.byteOffset, row.code.byteLength)` ⇒ ★ **不复制**（★ 与既有 `blobToCode()` 同样的手法，F16）⇒ ⇒ **零额外内存**。
-★ ★ **⚠️ 但注意**：`Buffer` 的 `byteOffset` **不一定为 0** ⇒ ★ **必须用 `byteOffset + byteLength` 三元组** ⇒ ⇒ **不许写 `new Uint8Array(row.code)`**（那会按「元素值」转换 ⇒ ★ 是 `codeToBlob` 注释里警告过的那个坑）。
+★ ★ **⚠️ 但注意**：`Buffer` 的 `byteOffset` **不一定为 0** ⇒ ★ **必须用 `byteOffset + byteLength` 三元组** ⇒ ⇒ **不许写 `new Uint8Array(row.code)`**（★ 代价 = **零拷贝退化成逐行拷贝** ⇒ 热读路径性能回归）。
+★ ★★ **2026-11-06 QA 实测订正（★ 本句原先的说法是错的）**：★ 原写「那会按「元素值」转换 ⇒ 是 `codeToBlob` 注释里警告过的那个坑」⇒ ⇒ ★★ **实测不成立**：
+★ `Buffer.from(int8Array)` 与 `Buffer.from(int8Array.buffer, byteOffset, byteLength)` ⇒ ★ **字节完全相同**（★ 实测 `ff 01` == `ff 01`）⇒ ⇒ ★ **int8 的 -1 的补码就是 0xFF ⇒ 「按元素值转换」不会改错字节** ⇒ ⇒ ★ **两个错法的真实代价不同**：
+  · ★ **`new Uint8Array(row.code)`** ⇒ **按「元素值」拷贝**（★ 字节值与源相同 ⇒ **不算错**）⇒ ⇒ 代价 = **零拷贝退化成逐行拷贝**（★ **只是变慢**）；
+  · ★ **`new Uint8Array(row.code.buffer, 0, row.code.byteLength)`** ⇒ **丢掉偏移** ⇒ ⇒ 读到**错误的区段**（★ 长度恰好相同 ⇒ **静默算错**）⇒ ⇒ ★ ★ **「丢偏移」才是不报错的那个 ⇒ 才是真正危险的那个**。
+★ ⇒ ⇒ ★ **两个错法都要点名**（★ 与 §6 T08 实现要点 ① 保持一致）。
 
 ### 3.4 `src/vector/ivf.ts` · 两处 `CodedEntry` 构造
 
@@ -586,9 +591,9 @@ const expectedCodeBytes = options.expectedCodeBytes ?? codeWidthByteLengths(DEFA
 
 ★ **⚠️ 实现要点（写给工程师）**：
 1. ★ **`readCodes()` 的零拷贝视图**：`new Uint8Array(row.code.buffer, row.code.byteOffset, row.code.byteLength)` ⇒ ★ **必须带 `row.code.byteOffset`**（★ `Buffer` 的 `byteOffset` 不保证为 0）⇒ ★ **两个错法都要点名**：
-   · ★ **`new Uint8Array(row.code)`** ⇒ **按「元素值」转换**（★ 不是字节视图）⇒ ⇒ **静默算错**；
-   · ★ **`new Uint8Array(row.code.buffer, 0, row.code.byteLength)`** ⇒ **丢掉偏移** ⇒ ⇒ 读到**错误的区段**；
-   ⇒ ⇒ ★ **「丢偏移」比「丢视图」更危险**：★ 两者都**不报错、只静默算错**，但 ★ 丢偏移连「长度对不对」这道自查都骗得过（★ 长度恰好相同 ⇒ 字节却是别人的）⇒ ⇒ ★ 这也是 T08 交付时「丢掉 `byteOffset`」这个变异**没有任何断言抓得住**的原因（★ 已由 QA 补的断言堵住）。
+   · ★ **`new Uint8Array(row.code)`** ⇒ **按「元素值」拷贝**（★ 拷的是这个 view **自己覆盖的那 N 个字节** ⇒ ⇒ **字节值与源相同** ⇒ ⇒ **不算错**）⇒ ⇒ 代价 = **零拷贝退化成逐行拷贝**（热读路径性能回归）；
+   · ★ **`new Uint8Array(row.code.buffer, 0, row.code.byteLength)`** ⇒ **丢掉偏移** ⇒ ⇒ 读到**错误的区段**（★ 长度恰好相同 ⇒ **静默**）；
+   ⇒ ⇒ ★ **「丢偏移」比「丢视图」更危险**：★ 一个**静默算错**、一个**只是变慢**；★ 而丢偏移连「长度对不对」这道自查都骗得过（★ 长度恰好相同 ⇒ 字节却是别人的）⇒ ⇒ ★ 这也是 T08 交付时「丢掉 `byteOffset`」这个变异**没有任何断言抓得住**的原因（★ 已由 QA 补的断言堵住）。
 2. ★ **`prune.ts` 的分派写法**：★ **`entry.codeWidth === 'int8' ? approxDot(...) : approxDotWithWidth(...)`** ⇒ ★ **int8 分支里 `approxDot` 的实参逐字不变** ⇒ ★ **不要「统一改成 `approxDotWithWidth`」**（★ 那是 4.63× 的 CPU 回归，§1.3）。
 3. ★ **`approxDotWithWidth` 需要 `dim` 参数** ⇒ ★ 传 `query.length`（★ 与 `assertCodedEntry` 的 `queryLength` 同一个来源 ⇒ ★ 免得两处不一致）。
 

@@ -186,8 +186,12 @@ export function decodeVector(code: Int8Array, scale: number): Float32Array {
  * 把 `Int8Array` 转成**可落库的 BLOB**（`Buffer` 视图，**不复制**）。
  *
  * ⚠️ 用 `Buffer.from(code.buffer, byteOffset, length)` 而不是 `Buffer.from(code)`：
- * 后者会把 `-1` 当成「元素值」去转换（得到 `[-1]` 的**十进制字符串**语义上的错），
- * 前者是**原始字节视图**。这也是「int8 落库」最容易写错的一步。
+ * ★ **两者的【字节内容】完全相同**（★ 实测 `ff 01` == `ff 01`）⇒ ★ int8 的 -1 的补码就是 0xFF
+ *   ⇒ ⇒ **`Buffer.from(code)` 不会把字节改错**；★ 真正的差别只有两条：
+ *   · ★ 它**拷贝**（⇒ 每行一次分配 + 一次拷贝）⇒ **热读路径的性能回归**；
+ *   · ★ 它**从元素 0 开始**（⇒ 不带 `byteOffset`）⇒ ⇒ ★ **若这个 view 的 `byteOffset ≠ 0`，
+ *     它拷的仍是 view 自己的那几个元素** ⇒ ⇒ ★ **字节依然对**（★ 别把它想成「读错区段」）。
+ * ⇒ ⇒ ★ 结论：**这一处的真坑是「拷贝」（性能），不是「字节错」（正确性）**。
  *
  * @param code 码
  * @returns BLOB 视图
