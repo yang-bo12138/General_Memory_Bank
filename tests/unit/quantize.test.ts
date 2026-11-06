@@ -21,9 +21,11 @@ import {
   approxDotWithWidth,
   blobToCode,
   codeToBlob,
+  codeWidthByteLengths,
   codeWidthFromBlobLength,
   decodeVector,
   decodeVectorWithWidth,
+  detectCodeWidth,
   encodeVector,
   encodeVectorWithWidth,
   upperBound,
@@ -328,5 +330,83 @@ describe('候选码宽（int4 / 二值）', () => {
     const odd = new Float32Array(767);
     expect(() => encodeVectorWithWidth(odd, 'int4')).toThrow(/偶数/);
     expect(() => encodeVectorWithWidth(odd, 'binary')).toThrow(/8 的倍数/);
+  });
+});
+
+/**
+ * ★★★ **T08 · A1 / A6：读路径接线的两条机械背书**
+ * （规格 `docs/design/perf-c2-codewidth-int4-wiring.md` §2.2 的「第 2 道」· §6 的 A1 / A6）。
+ *
+ * ★ **A1 守的是「int8 逐位不变」**：★ 「生产 int8 路径走原路」这条承诺的**代数前提**
+ *   是「`approxDotWithWidth` 的 int8 分支与 `approxDot` 逐位相同」
+ *   ⇒ ⇒ **这条断言就是那个前提本身的机器背书** ⇒ ⇒ 有人改坏任何一个符号，它立刻红。
+ * ★ **A6 守的是「码宽自识别无歧义」**：★ 「长度 ⇒ 码宽」的映射必须**一一对应**
+ *   ⇒ ⇒ 否则某个 blob 长度会被**二义**解释 ⇒ ⇒ **静默漏检**（本档唯一不可接受的失效形状）。
+ */
+describe('T08 · 读路径接线：int8 逐位不变 + 码宽自识别', () => {
+  it('★ A1 · int8 的上界逐位不变（★ 2000 组随机向量 + 穷举 256 个字节值 · `Object.is`）', () => {
+    // ⚠️ **判据是 `toBe`（= `Object.is`）而不是 `toBeCloseTo`**：
+    //   `toBeCloseTo` 会放过 1 ulp 的漂移 ⇒ ⇒ **那正是「静默漏检」的入口**。
+    const random = mulberry32(20261108);
+
+    // ── ① 2000 组随机向量：同一批字节 ⇒ 两种算法 ⇒ 逐位相等 ──
+    let checked = 0;
+    for (let index = 0; index < 2_000; index += 1) {
+      const base = unitVector(random);
+      const query = unitVector(random);
+      const legacy = encodeVector(base);
+      const fresh = encodeVectorWithWidth(base, 'int8');
+      // ★ 字节必须逐位相同（否则比的就不是「同一批字节」了 ⇒ 断言失去意义）
+      const legacyBytes = new Uint8Array(
+        legacy.code.buffer,
+        legacy.code.byteOffset,
+        legacy.code.byteLength,
+      );
+      const freshBytes = new Uint8Array(
+        fresh.code.buffer,
+        fresh.code.byteOffset,
+        fresh.code.byteLength,
+      );
+      expect([...freshBytes]).toEqual([...legacyBytes]);
+      expect(approxDotWithWidth(query, freshBytes, fresh.scale, 'int8', DIM)).toBe(
+        approxDot(query, legacy.code, legacy.scale),
+      );
+      checked += 1;
+    }
+    expect(checked).toBe(2_000);
+
+    // ── ② ★ **穷举 256 个字节值**（★ 覆盖「有符号转换」的每一个分支）──
+    //   ⚠️ 只跑随机向量时，三元与位运算两种实现都能过 ⇒ **穷举才能抓住「某一类字节值上错位」**。
+    const probe = unitVector(mulberry32(99));
+    for (let byte = 0; byte < 256; byte += 1) {
+      const bytes = new Uint8Array(DIM).fill(byte);
+      const signed = new Int8Array(DIM).fill(byte);
+      expect(approxDotWithWidth(probe, bytes, 0.5, 'int8', DIM)).toBe(
+        approxDot(probe, signed, 0.5),
+      );
+    }
+  });
+
+  it('★ A6 · 三档长度必须两两不等；某维度下二义 ⇒ 响亮失败（★ 不许静默二义）', () => {
+    const lengths = codeWidthByteLengths(DIM);
+    // ★ 与 R3 行「表二」逐位一致：int8 = 768 B · int4 = 384 B · 二值 = 96 B
+    expect(lengths).toEqual([768, 384, 96]);
+    expect(new Set(lengths).size).toBe(3);
+    // ⚠️ ★ **生产维度恒为 768**（`EMBED_DIM` 是只读参数）⇒ ⇒ 该性质在运行期恒成立。
+    // ★ 而**维度 2** ⇒ int4 与二值的码长都是 1 字节 ⇒ **二义**
+    //   ⇒ ⇒ 「静默二义」= 静默漏检 ⇒ ⇒ 必须**响亮失败**，不许静默。
+    expect(() => detectCodeWidth(1, 2)).toThrow(/二义/);
+    expect(() => detectCodeWidth(2, 2)).toThrow(/二义/);
+  });
+
+  it('★ `detectCodeWidth` 是「不抛版」：未知长度 ⇒ `null`（★ 读路径靠它 fail-open）', () => {
+    expect(detectCodeWidth(768, DIM)).toBe('int8');
+    expect(detectCodeWidth(384, DIM)).toBe('int4');
+    expect(detectCodeWidth(96, DIM)).toBe('binary');
+    // ★ **不属于任何已知码宽 ⇒ `null`（不抛错）** ⇒ ⇒ 读路径「跳过这一行」⇒ ⇒ 精确兜底
+    expect(detectCodeWidth(100, DIM)).toBeNull();
+    // ⚠️ 与「抛错版」的差别（★ **两层语义，不许混**）：
+    //   抛错版给「诊断 / 脚本」用；不抛版给「读路径」用（★ 一条坏码行不能让整条召回不可用）。
+    expect(() => codeWidthFromBlobLength(100, DIM)).toThrow(/不属于任何已知码宽/);
   });
 });

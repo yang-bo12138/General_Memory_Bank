@@ -14,7 +14,7 @@
  *   把 `encodeVector()` 拉进来只会让「哪一位不同」变成灾难（A3/A4 另有专门用例）。
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { compareHits } from '../../src/vector/flat.js';
 import {
@@ -24,6 +24,27 @@ import {
   WRITE_EXACT_RESCORE_BUDGET,
   pruneTopK,
 } from '../../src/vector/prune.js';
+import { approxDot, approxDotWithWidth, unpackCode } from '../../src/vector/quantize.js';
+
+/**
+ * ★★★ **把 `quantize.ts` 的两个点积函数换成「间谍」**（T08 · A2 的机械背书）。
+ *
+ * ★ **为什么必须这样**（这是 A2 存在的**全部理由**）：
+ *   `approxDotWithWidth` 的 int8 分支与 `approxDot` **逐位相同**（A1 已证）
+ *   ⇒ ⇒ **任何「比值」的断言都抓不住「有人把 int8 切到新分支」**
+ *   ⇒ ⇒ ⇒ 唯一的办法是**观测「生产路径到底调了谁」** ⇒ ⇒ 间谍。
+ *
+ * ⚠️ **间谍是「调包不改行为」**：`vi.fn(actual.approxDot)` 仍然调用**真函数**
+ *   ⇒ ⇒ 本文件其余用例的行为**一字不变** ⇒ ⇒ 既有用例继续背书。
+ */
+vi.mock('../../src/vector/quantize.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/vector/quantize.js')>();
+  return {
+    ...actual,
+    approxDot: vi.fn(actual.approxDot),
+    approxDotWithWidth: vi.fn(actual.approxDotWithWidth),
+  };
+});
 
 /**
  * 造一条「码 + 精确向量」的夹具：`code = [1, 0, 0, 0]`、`scale = score`
@@ -31,21 +52,40 @@ import {
  *
  * ⚠️ **`eps = 0` 是刻意的**：它让「上界 == 精确分」，于是早停的边界条件
  *   （`upper < 第 k 名` vs `≤`）**恰好落在等号上** ⇒ 「严格小于」这条纪律才有牙。
- * ⚠️ **值走 `scale`、不走 `code`**：`Int8Array` 只能装整数（`Int8Array.from([0.5])` 会静默变成 0）
+ * ⚠️ **值走 `scale`、不走 `code`**：`Uint8Array` 只能装整数（`Uint8Array.from([0.5])` 会静默变成 0）
  *   —— 这条坑在本文件的第一版里真的踩到了（两条用例因此假通过）。
+ * ⚠️ **`codeWidth: 'int8'` 是必填的**（T08）：码宽是**数据属性**，不许有「缺省 = int8」，
+ *   ⇒ 忘了传就会静默按 int8 口径算上界 ⇒ ⇒ 静默漏检。
  */
 function exactEntry(id: string, score: number): CodedEntry {
-  return { kind: 'coded', id, code: Int8Array.from([1, 0, 0, 0]), scale: score, eps: 0 };
+  return {
+    kind: 'coded',
+    id,
+    code: Uint8Array.from([1, 0, 0, 0]),
+    codeWidth: 'int8',
+    scale: score,
+    eps: 0,
+  };
 }
 
 /** 精确分 = 点积（`‖q‖ = ‖x‖` 的夹具里它就是余弦；本文件不关心归一化）。 */
 const query = Float32Array.from([1, 0, 0, 0]);
 
-/** 精确分：`q·x`（其中 `x = scale × code`）。 */
+/**
+ * 精确分：`q·x`（其中 `x = scale × code`）。
+ *
+ * ⚠️ ★ **必须按码宽解包**（T08 · 规格 `docs/design/perf-c2-codewidth-int4-wiring.md` §5 的 M3）：
+ *   `code` 现在是 `Uint8Array`（★ 打包字节）⇒ ⇒ **直接读元素拿到的是 0..255**
+ *   ⇒ ⇒ int8 的负值会变成大正数 ⇒ ⇒ **参照值算错** ⇒ ⇒ 用例**假绿**。
+ * ⇒ ⇒ 这里用 `unpackCode()`（★ 它按码宽解包；int8 分支正好返回 `Int8Array`）。
+ * ⇒ ⇒ `dim` 取 `query.length`（★ `pruneTopK()` 已按码宽校验过「码长 == 该维度的期望码长」
+ *   ⇒ ⇒ **查询向量长度就是维度**）。
+ */
 function exactOf(entry: CodedEntry): number {
+  const unpacked = unpackCode(entry.code, entry.codeWidth, query.length);
   let sum = 0;
-  for (let index = 0; index < entry.code.length; index += 1) {
-    sum += (query[index] as number) * (entry.code[index] as number) * entry.scale;
+  for (let index = 0; index < query.length; index += 1) {
+    sum += (query[index] as number) * (unpacked[index] as number) * entry.scale;
   }
   return sum;
 }
@@ -90,7 +130,7 @@ describe('T04 · 剪枝原语（pruneTopK）', () => {
       expect(() => pruneTopK(good, { query, k: -1, scoreOf })).toThrowError(/k/);
       expect(() => pruneTopK(good, { query, k: 1.5, scoreOf })).toThrowError(/k/);
       expect(() =>
-        pruneTopK([{ ...exactEntry('a', 1), code: Int8Array.from([1, 0]) }], {
+        pruneTopK([{ ...exactEntry('a', 1), code: Uint8Array.from([1, 0]) }], {
           query,
           k: 1,
           scoreOf,
@@ -102,7 +142,8 @@ describe('T04 · 剪枝原语（pruneTopK）', () => {
             {
               kind: 'coded',
               id: 'a',
-              code: Int8Array.from([1, 0, 0, 0]),
+              code: Uint8Array.from([1, 0, 0, 0]),
+              codeWidth: 'int8',
               scale: Number.NaN,
               eps: 0,
             },
@@ -116,7 +157,16 @@ describe('T04 · 剪枝原语（pruneTopK）', () => {
       ).toThrowError(/标量/);
       expect(() =>
         pruneTopK(
-          [{ kind: 'coded', id: 'a', code: Int8Array.from([1, 0, 0, 0]), scale: 1, eps: -1e-9 }],
+          [
+            {
+              kind: 'coded',
+              id: 'a',
+              code: Uint8Array.from([1, 0, 0, 0]),
+              codeWidth: 'int8',
+              scale: 1,
+              eps: -1e-9,
+            },
+          ],
           { query, k: 1, scoreOf },
         ),
       ).toThrowError(/误差项/);
@@ -184,7 +234,8 @@ describe('T04 · 剪枝原语（pruneTopK）', () => {
         entries.push({
           kind: 'coded',
           id: `w-${String(index).padStart(3, '0')}`,
-          code: Int8Array.from([1, 0, 0, 0]),
+          code: Uint8Array.from([1, 0, 0, 0]),
+          codeWidth: 'int8',
           scale: 0.5,
           eps: 0.4,
         });
@@ -193,7 +244,8 @@ describe('T04 · 剪枝原语（pruneTopK）', () => {
         entries.push({
           kind: 'coded',
           id: `n-${String(index).padStart(3, '0')}`,
-          code: Int8Array.from([1, 0, 0, 0]),
+          code: Uint8Array.from([1, 0, 0, 0]),
+          codeWidth: 'int8',
           scale: 0.1,
           eps: 0,
         });
@@ -251,7 +303,8 @@ describe('T04 · 剪枝原语（pruneTopK）', () => {
         entries.push({
           kind: 'coded',
           id: `h-${String(index).padStart(3, '0')}`,
-          code: Int8Array.from([1, 0, 0, 0]),
+          code: Uint8Array.from([1, 0, 0, 0]),
+          codeWidth: 'int8',
           scale: 0.5,
           eps: 0.4,
         });
@@ -260,7 +313,8 @@ describe('T04 · 剪枝原语（pruneTopK）', () => {
         entries.push({
           kind: 'coded',
           id: `l-${String(index).padStart(3, '0')}`,
-          code: Int8Array.from([1, 0, 0, 0]),
+          code: Uint8Array.from([1, 0, 0, 0]),
+          codeWidth: 'int8',
           scale: 0.1,
           eps: 0,
         });
@@ -337,7 +391,8 @@ describe('T04 · 剪枝原语（pruneTopK）', () => {
       const loose: CodedEntry = {
         kind: 'coded',
         id: 'm-08',
-        code: Int8Array.from([1, 0, 0, 0]),
+        code: Uint8Array.from([1, 0, 0, 0]),
+        codeWidth: 'int8',
         scale: 0.5,
         eps: 0.1, // ⇒ upper = 0.6，精确分仍是 0.5
       };
@@ -413,14 +468,16 @@ describe('T04 · 剪枝原语（pruneTopK）', () => {
       const weak: CodedEntry = {
         kind: 'coded',
         id: 'a',
-        code: Int8Array.from([1, 0, 0, 0]),
+        code: Uint8Array.from([1, 0, 0, 0]),
+        codeWidth: 'int8',
         scale: 1,
         eps: 0,
       };
       const below: CodedEntry = {
         kind: 'coded',
         id: 'b',
-        code: Int8Array.from([0.5, 0, 0, 0]),
+        code: Uint8Array.from([0.5, 0, 0, 0]),
+        codeWidth: 'int8',
         scale: 1,
         eps: 0,
       };
@@ -445,7 +502,8 @@ describe('T04 · 剪枝原语（pruneTopK）', () => {
         entries.push({
           kind: 'coded',
           id: `m-${String(total - index).padStart(4, '0')}`,
-          code: Int8Array.from([Math.round(value * 127), 0, 0, 0]),
+          code: Uint8Array.from([Math.round(value * 127), 0, 0, 0]),
+          codeWidth: 'int8',
           scale: 1 / 127,
           eps: 1e-9,
         });
@@ -489,7 +547,8 @@ describe('T04 · 剪枝原语（pruneTopK）', () => {
         entries.push({
           kind: 'coded',
           id: `h-${String(index).padStart(3, '0')}`,
-          code: Int8Array.from([1, 0, 0, 0]),
+          code: Uint8Array.from([1, 0, 0, 0]),
+          codeWidth: 'int8',
           scale: 0.5,
           eps: 0.4,
         });
@@ -498,7 +557,8 @@ describe('T04 · 剪枝原语（pruneTopK）', () => {
         entries.push({
           kind: 'coded',
           id: `l-${String(index).padStart(3, '0')}`,
-          code: Int8Array.from([1, 0, 0, 0]),
+          code: Uint8Array.from([1, 0, 0, 0]),
+          codeWidth: 'int8',
           scale: 0.1,
           eps: 0,
         });
@@ -557,5 +617,146 @@ describe('T04 · 剪枝原语（pruneTopK）', () => {
       const expected = [...out.survivors].sort(compareHits).map((hit) => hit.id);
       expect(out.survivors.map((hit) => hit.id)).toEqual(expected);
     });
+  });
+});
+
+/**
+ * ★★★ **T08 · A2：int8 的 `CodedEntry` 走的是 `approxDot` 原路**
+ * （规格 `docs/design/perf-c2-codewidth-int4-wiring.md` §2.2 的「第 3 道」· §6 的 A2）。
+ *
+ * ★★ **这一组断言的判据有两层，缺一不可**：
+ *
+ * | 层 | 断言 | 抓什么 |
+ * |---|---|---|
+ * | ① | ★ **间谍观测**：int8 的 entry **只调 `approxDot`**、**一次都不调 `approxDotWithWidth`** | ★ **「有人把 int8 切到新分支」**（★ 唯一能抓它的一层） |
+ * | ② | ★ **早停决策逐位相同**（`exactReads` + `survivors` 的 id 序） | ★ **上界的值变了哪怕 1 ulp** |
+ *
+ * ⚠️ ★ **为什么 ① 不可省**：`approxDotWithWidth` 的 int8 分支与 `approxDot` **逐位相同**（A1 已证）
+ *   ⇒ ⇒ **只靠 ② 的话，有人把 int8 切到新分支，这一层照样绿**
+ *   ⇒ ⇒ ⇒ 必须有 ①（**观测「生产路径到底调了谁」**）。
+ * ⚠️ ★ **为什么 ② 不可省**：① 只证明「调了谁」，不证明「算对了」⇒ ⇒ 两者互补。
+ */
+describe('★ A2 · int8 走 `approxDot` 原路（★ 生产 int8 路径永不经过那个慢分支）', () => {
+  /** 把打包字节零拷贝地看成 int8（★ 与 `prune.ts` 的 `signedViewOf()` 同一手法）。 */
+  function int8ViewOf(code: Uint8Array): Int8Array {
+    return new Int8Array(code.buffer, code.byteOffset, code.byteLength);
+  }
+
+  /**
+   * 用 `approxDot`（★ 原函数）手算一遍「上界 + 早停」的决策 —— 作为参照物。
+   *
+   * ⚠️ **刻意不复用 `pruneTopK`**（★ 那就是「生产代码 == 生产代码」⇒ 测不出东西）。
+   * ⚠️ **判据是「早停决策」**：`exactReads`（读了几条）+ `survivors` 的 id 序
+   *   ⇒ ★ **最灵的判据**：★ 只要上界的值变了哪怕 1 ulp，早停的「剩余上界 < 第 K 名」
+   *   比较就可能翻转 ⇒ ⇒ `exactReads` 或 survivors 顺序变 ⇒ 红。
+   *
+   * @param entries 有码条目
+   * @param k 取前 k 条
+   * @returns 参照的早停决策
+   */
+  function referenceEarlyStop(
+    entries: readonly (PruneEntry & { kind: 'coded' })[],
+    k: number,
+  ): { exactReads: number; survivors: string[] } {
+    // ① 上界（★ 用 `approxDot` 原函数 —— 这就是「改前」的那条路）
+    const queued = entries.map((entry) => ({
+      id: entry.id,
+      upper: approxDot(query, int8ViewOf(entry.code), entry.scale) + entry.eps,
+    }));
+    // ② 排序：上界降序、同上界 id 升序
+    queued.sort((left, right) => {
+      if (left.upper !== right.upper) {
+        return right.upper - left.upper;
+      }
+      return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+    });
+    // ③ 精确重排 + 严格小于早停（★ `scoreFloor` 缺省 = 无下界 ⇒ 判据就是裸 `upper`）
+    const scores = new Map(entries.map((entry) => [entry.id, exactOf(entry)]));
+    const best: PruneHit[] = [];
+    let exactReads = 0;
+    for (const item of queued) {
+      if (best.length >= k) {
+        // 第 k 名 = 堆里最差的那一个
+        const worst = best.reduce((left, right) => (compareHits(left, right) > 0 ? left : right));
+        if (item.upper < worst.score) {
+          break;
+        }
+      }
+      exactReads += 1;
+      const score = scores.get(item.id);
+      if (score === undefined) {
+        continue;
+      }
+      best.push({ id: item.id, score });
+      best.sort(compareHits);
+      if (best.length > k) {
+        best.pop();
+      }
+    }
+    return { exactReads, survivors: best.map((hit) => hit.id) };
+  }
+
+  it('★ ① int8 只调 `approxDot`（★ 一次都不碰 `approxDotWithWidth`）② 早停决策逐位相同', () => {
+    vi.mocked(approxDot).mockClear();
+    vi.mocked(approxDotWithWidth).mockClear();
+
+    // 夹具（★ 与「断言 1c」同形）：40 条「上界宽、精确分低」+ 5 条「上界窄」
+    //   ⇒ `k = 3` ⇒ 堆会满 ⇒ **早停真的发生**（否则下面那条逐位比较会变成恒绿）。
+    const entries: PruneEntry[] = [];
+    for (let index = 0; index < 40; index += 1) {
+      entries.push({
+        kind: 'coded',
+        id: `w-${String(index).padStart(3, '0')}`,
+        code: Uint8Array.from([1, 0, 0, 0]),
+        codeWidth: 'int8',
+        scale: 0.5,
+        eps: 0.4,
+      });
+    }
+    for (let index = 0; index < 5; index += 1) {
+      entries.push({
+        kind: 'coded',
+        id: `n-${String(index).padStart(3, '0')}`,
+        code: Uint8Array.from([1, 0, 0, 0]),
+        codeWidth: 'int8',
+        scale: 0.1,
+        eps: 0,
+      });
+    }
+    const coded = entries as (PruneEntry & { kind: 'coded' })[];
+    const out = pruneTopK(entries, { query, k: 3, scoreOf: scoreTableOf(entries) });
+
+    // ── ① 间谍观测（★ 必须在参照物之前断言：参照物自己也会调 `approxDot`）──
+    expect(approxDotWithWidth).not.toHaveBeenCalled();
+    expect(approxDot).toHaveBeenCalledTimes(coded.length);
+
+    // ── ② 早停决策与「手算参照」逐位相同 ──
+    const reference = referenceEarlyStop(coded, 3);
+    expect(out.exactReads).toBe(reference.exactReads);
+    expect(out.survivors.map((hit) => hit.id)).toEqual(reference.survivors);
+    // ⚠️ 负控：早停真的发生了（`exactReads` 明显小于候选总数）⇒ 否则上面两条是恒绿
+    expect(out.exactReads).toBeLessThan(entries.length);
+    expect(out.exactReads).toBeGreaterThan(0);
+  });
+
+  it('★ 负控：int4 的 entry **确实**走 `approxDotWithWidth`（★ 证明间谍接上了线）', () => {
+    // ⚠️ **没有这一条，上面那条 `not.toHaveBeenCalled()` 就是恒绿**（间谍没接上也绿）
+    //   ⇒ ⇒ 必须证明「分派真的按码宽走」⇒ ⇒ int4 必须落到新分支。
+    vi.mocked(approxDot).mockClear();
+    vi.mocked(approxDotWithWidth).mockClear();
+
+    // ★ int4：两维一字节 ⇒ 4 维的 int4 码是 **2 字节**（★ `query` 是 4 维）
+    const int4Entry: CodedEntry = {
+      kind: 'coded',
+      id: 'x-000',
+      code: Uint8Array.from([0x01, 0x00]),
+      codeWidth: 'int4',
+      scale: 1,
+      eps: 0,
+    };
+    pruneTopK([int4Entry], { query, k: 1, scoreOf: () => 0 });
+
+    expect(approxDotWithWidth).toHaveBeenCalledTimes(1);
+    expect(approxDot).not.toHaveBeenCalled();
   });
 });

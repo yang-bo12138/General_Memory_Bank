@@ -30,11 +30,18 @@ import {
   assignFineBucket,
   buildCentroidModel,
   countUncodedCandidates,
+  readCodes,
   scanBucketCandidates,
   trainCentroids,
 } from '../../src/vector/ivf.js';
 import { sphericalKmeans } from '../../src/vector/kmeans.js';
-import { codeToBlob, encodeVector } from '../../src/vector/quantize.js';
+import {
+  type CodeWidth,
+  codeToBlob,
+  codeToBlobWithWidth,
+  encodeVector,
+  encodeVectorWithWidth,
+} from '../../src/vector/quantize.js';
 import {
   EMBED_DIM,
   createTestDb,
@@ -720,10 +727,10 @@ interface T04Fixture {
  *   是否逐位相同」⇒ 与规模无关；用大库只会让「哪一位不同」变成灾难（§5.1.8 的结论）。
  * ⚠️ 但**必须多于 `VECTOR_TOPK`（20）**，否则「剪枝」与「全量」天然相等 ⇒ A1 会变成真空断言。
  *
- * @param options 软删行数
+ * @param options 软删行数 + 码宽（★ 码宽缺省 `int8` = 生产写路径的档 ⇒ 既有夹具的字节**一字不变**）
  * @returns 夹具
  */
-function t04Fixture(options: { softDeleted?: number } = {}): T04Fixture {
+function t04Fixture(options: { softDeleted?: number; codeWidth?: CodeWidth } = {}): T04Fixture {
   const db = createTestDb();
   const base = pseudoUnitVector(1);
 
@@ -816,6 +823,9 @@ function t04Fixture(options: { softDeleted?: number } = {}): T04Fixture {
   );
   const fineIdOf = db.prepare('SELECT fine_id FROM vector_cell_members WHERE memory_id = ?');
   const uncodedIds: string[] = [];
+  // ★ **码宽**（T08）：缺省 `int8` ⇒ **走生产写路径的编码器** ⇒ 既有夹具的字节**一字不变**；
+  //   传 `int4` / `binary` ⇒ 走 `encodeVectorWithWidth()` ⇒ ⇒ 离线重编码出来的那种库。
+  const codeWidth = options.codeWidth ?? 'int8';
   for (const row of rows) {
     if (row.coded === false) {
       uncodedIds.push(row.id);
@@ -825,8 +835,13 @@ function t04Fixture(options: { softDeleted?: number } = {}): T04Fixture {
     if (fineId === undefined) {
       continue;
     }
-    const encoded = encodeVector(row.vector);
-    insertCode.run(fineId, row.id, codeToBlob(encoded.code), encoded.scale, encoded.eps);
+    if (codeWidth === 'int8') {
+      const encoded = encodeVector(row.vector);
+      insertCode.run(fineId, row.id, codeToBlob(encoded.code), encoded.scale, encoded.eps);
+    } else {
+      const encoded = encodeVectorWithWidth(row.vector, codeWidth);
+      insertCode.run(fineId, row.id, codeToBlobWithWidth(encoded.code), encoded.scale, encoded.eps);
+    }
   }
 
   return { db, model: trained.model, liveIds, uncodedIds, softDeletedIds, vectors };
@@ -1387,6 +1402,112 @@ describe('T04 · 两段式可证剪枝（A1 / A1′ / A2 / A7 / A8）', () => {
     }
     // ② 具体形状（负控：确认 top-3 里**真的**有无码行 —— 否则①可能是「两边都把它们丢了」）
     expect(pruned.search(query, 3).map((hit) => hit.id)).toEqual(['m-00', 'm-03', 'm-06']);
+
+    fixture.db.close();
+  });
+});
+
+/**
+ * ★★★ **T08 · A4 / A5：读路径接线的两条验收**
+ * （规格 `docs/design/perf-c2-codewidth-int4-wiring.md` §6 的 A4 / A5）。
+ *
+ * ★ **A4 守的是「int4 库能跑读路径」**：★ 接线前 `readCodes()` 只认「1 字节/维」
+ *   ⇒ ⇒ int4 的 384 B 码行**全被当成坏维度跳过** ⇒ ⇒ 候选宇宙里一条码都没有
+ *   ⇒ ⇒ **新码宽的库根本跑不了召回**。
+ * ★ **A5 守的是「坏码行 fail-open 不破」**：★ 接线前后的判据从「码长 ≠ 维度」改成
+ *   「码长不属于任何已知码宽」⇒ ⇒ **坏码行仍然只是被跳过**（不抛错）⇒ ⇒ 精确兜底。
+ */
+describe('T08 · 读路径接线（A4 · A5）', () => {
+  it('★ A4 · int4 码行能跑读路径：码池认得出 int4 · 结果与「精确路径」逐位相同', () => {
+    const fixture = t04Fixture({ codeWidth: 'int4' });
+    const pruning = makeT04Backend(fixture, { prune: true });
+    const exact = makeT04Backend(fixture, { prune: false });
+    const query = pseudoUnitVector(1);
+
+    // ── ① 码池真的认出了 int4（★ 不是「全被当成坏码行跳过了」）──
+    const fineIds = pruning.route(query, 2, fixture.model.fine.length);
+    const pool = readCodes(fixture.db, fineIds);
+    expect(pool.size).toBeGreaterThan(0);
+    for (const row of pool.values()) {
+      expect(row.codeWidth).toBe('int4');
+      expect(row.code.length).toBe(384); // ★ int4 = 384 B（768 维）
+    }
+
+    // ── ② 结果与「精确路径」逐位相同 ──
+    //   ⚠️ **`scanned`（候选宇宙）与 `exactReads`（进精排行数）会变**（★ 那是**正常的**：
+    //   int4 的 ε 约为 int8 的 18 倍 ⇒ 上界更松 ⇒ 剪得更少）⇒ ⇒ 只比**结果集**。
+    //   ⇒ ⇒ 而「结果集相同」正是「上界是**可证**上界」的机器背书（★ 剪枝不改变结果集）。
+    const pruned = pruning.search(query, 30);
+    const head = exact.search(query, 30);
+    expect(pruned.length).toBeGreaterThan(0); // 负控：不是「两边都空」
+    expect(pruned.length).toBe(head.length);
+    for (let index = 0; index < head.length; index += 1) {
+      expect(pruned[index]?.id).toBe(head[index]?.id);
+      expect(Object.is(pruned[index]?.score, head[index]?.score)).toBe(true);
+    }
+
+    fixture.db.close();
+  });
+
+  it('★ A5 · 坏码行 fail-open：长度不属于任何档 ⇒ 不抛错 · 该行按「无码」处理（精确兜底）', () => {
+    const fixture = t04Fixture();
+    const query = pseudoUnitVector(1);
+
+    // ── ① 改坏之前的结果（作为参照）──
+    const before = makeT04Backend(fixture, { prune: true }).search(query, 30);
+    expect(before.length).toBeGreaterThan(0);
+    // ⚠️ 负控：被改坏的那条**本来就会入选**（★ 否则「结果不变」可能是真空通过）
+    expect(before.some((hit) => hit.id === 'm-01')).toBe(true);
+
+    // ── ② 把一行码改成「长度不属于任何已知码宽」（★ 100 B：768 / 384 / 96 都不是它）──
+    const badId = 'm-01';
+    fixture.db
+      .prepare('UPDATE vector_codes SET code = ? WHERE memory_id = ?')
+      .run(Buffer.alloc(100, 7), badId);
+
+    // ── ③ ★ `readCodes()` **不抛错**，且那一行**不进码池** ──
+    const fineIds = makeT04Backend(fixture, { prune: false }).route(
+      query,
+      2,
+      fixture.model.fine.length,
+    );
+    let pool: Map<string, { codeWidth: CodeWidth }> = new Map();
+    expect(() => {
+      pool = readCodes(fixture.db, fineIds);
+    }).not.toThrow();
+    expect(pool.has(badId)).toBe(false);
+    // ⚠️ **其余行不受影响**（★ 坏的是**一行**，不是**一列**）
+    expect(pool.size).toBeGreaterThan(0);
+
+    // ── ④ ★ 该行按「无码」处理 ⇒ 结果与「把这条码行删掉」**逐位相同** ──
+    //   （★ 这就是「fail-open ⇒ 精确兜底」的机器背书：**不抛错、不错召回**）
+    const afterBad = makeT04Backend(fixture, { prune: true }).search(query, 30);
+    fixture.db.prepare('DELETE FROM vector_codes WHERE memory_id = ?').run(badId);
+    const afterDeleted = makeT04Backend(fixture, { prune: true }).search(query, 30);
+    expect(afterBad.length).toBe(afterDeleted.length);
+    for (let index = 0; index < afterDeleted.length; index += 1) {
+      expect(afterBad[index]?.id).toBe(afterDeleted[index]?.id);
+      expect(Object.is(afterBad[index]?.score, afterDeleted[index]?.score)).toBe(true);
+    }
+    // ★ 而且与「改坏之前」也**逐位相同**（★ 坏码行退化成精确兜底 ⇒ 结果不受影响）
+    expect(afterBad.length).toBe(before.length);
+    for (let index = 0; index < before.length; index += 1) {
+      expect(afterBad[index]?.id).toBe(before[index]?.id);
+      expect(Object.is(afterBad[index]?.score, before[index]?.score)).toBe(true);
+    }
+
+    // ── ⑤ 写路径的 `uncoded` 伴生读数：如实 +1（★ 用**全部细桶** ⇒ 不依赖探针）──
+    const writeScan = scanBucketCandidates(
+      fixture.db,
+      fixture.model,
+      query,
+      2,
+      fixture.model.fine.length,
+      {
+        ...writeScanOptions(fixture.db, query),
+      },
+    );
+    expect(writeScan.uncoded).toBe(fixture.uncodedIds.length + 1);
 
     fixture.db.close();
   });

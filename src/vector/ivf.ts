@@ -30,7 +30,7 @@ import { assertValidEmbedding, dot } from './dot.js';
 import { type VectorCandidateRow, compareHits, passesTimeWindow } from './flat.js';
 import { DEFAULT_MAX_ITERATIONS, sphericalKmeans } from './kmeans.js';
 import { type PruneEntry, WRITE_EXACT_RESCORE_BUDGET, pruneTopK } from './prune.js';
-import { blobToCode } from './quantize.js';
+import { type CodeWidth, detectCodeWidth } from './quantize.js';
 
 /** IVF 后端在 `stats().backend` 里的名字。 */
 export const IVF_BACKEND_NAME = 'ivf';
@@ -527,8 +527,20 @@ function readMemberIds(db: Database.Database, fineIds: readonly string[]): Set<s
 
 /** 一条**可用**的码行（`readCodes()` 的产物）。 */
 export interface CodedVectorRow {
-  /** 维度个 int8（`x̂ = scale × code`）。 */
-  readonly code: Int8Array;
+  /**
+   * ★ **打包后的码字节**（★ **零拷贝视图** · 长度由 `codeWidth` 决定：768 / 384 / 96 B）。
+   *
+   * ⚠️ 之所以是 `Uint8Array`（而不是 `Int8Array`）：三档码宽的**存储形状**不同
+   *   ⇒ ⇒ 统一用「打包字节」表示 ⇒ ⇒ **int4 的内存占用真的只有一半**。
+   */
+  readonly code: Uint8Array;
+  /**
+   * ★ 这一行的**码宽**（★ 由 BLOB 长度自识别 ⇒ **混档库天然可分辨**）。
+   *
+   * ⚠️ **必填**：码宽是**数据属性**（由这一行的 blob 长度决定），不是调用方的选择
+   *   ⇒ ⇒ 忘了传 ⇒ 上界会按错误的码宽算 ⇒ ⇒ **静默漏检**。
+   */
+  readonly codeWidth: CodeWidth;
   /** 还原标量（`x̂ = scale × code`）。 */
   readonly scale: number;
   /** 编码期实算的 `‖x − x̂‖₂`（已含安全余量）。 */
@@ -545,12 +557,19 @@ export interface CodedVectorRow {
  *
  * ★ **「无码」的五种形状在这里一次判完**（§5.1.5 的表）：
  *   · 码行不存在（池里没这个 id）；
- *   · `code` 长度 ≠ `EMBED_DIM`；
+ *   · `code` 的长度**不属于该维度下任何已知码宽**（768 / 384 / 96 B）；
  *   · `scale` 非有限；
  *   · `eps` 非有限或为负；
  *   · 码行的 `fine_id` 漂移 / 成为孤儿码（`WHERE vc.fine_id IN (...)` 天然把它排除）。
  *   ⇒ 前四种在下面**直接不放进池**；第五种由 SQL 的 `fine_id` 条件排除
  *   ⇒ 五种都落进调用方的 `uncoded` ⇒ `upper = +∞` ⇒ 精确兜底 ⇒ **迟一步、但不错**。
+ *
+ * ★★ **码宽按 BLOB 长度自识别**（T08 · 规格 `docs/design/perf-c2-codewidth-int4-wiring.md` §3.3）：
+ *   · **零配置、零 schema 改动**（★ 码宽是**数据属性**：由这一行的 blob 长度决定）；
+ *   · **混档库天然可分辨**（★ 每行只看**自己那一行**的长度 ⇒ 同一张表里可以混着三档）；
+ *   · ⚠️ **坏码行仍然 fail-open**（★ 不抛错）：长度不属于任何已知码宽 ⇒ `continue`
+ *     ⇒ ⇒ **一条坏码行不能让整条召回不可用**（响亮失败会让整条召回挂掉）
+ *     ⇒ ⇒ 该行按「无码」处理 ⇒ 进 survivors（精确兜底）。
  *
  * @param db 库句柄
  * @param fineIds 命中的细桶 id
@@ -574,10 +593,12 @@ export function readCodes(
       )
       .all(...chunk) as Array<{ id: string; code: Buffer; scale: number; eps: number }>;
     for (const row of rows) {
-      // ⚠️ **码长对不上 ⇒ 当无码**（不抛错、不补零）：回填按 `length(embedding) = @bytes`
-      //   分类，所以「坏维度 + 有码」只可能来自手工改库 ⇒ 这里 fail-open 比响亮失败更安全
-      //   （响亮失败会让整条召回不可用；fail-open 只是多读 3KB）。
-      if (row.code.byteLength !== dimensions) {
+      // ★ **码宽自识别**（★ 判据从「码长 ≠ 维度」改成「码长不属于任何已知码宽」）：
+      //   回填按 `length(embedding) = @bytes` 分类，所以「坏维度 + 有码」只可能来自手工改库
+      //   ⇒ ⇒ fail-open 比响亮失败更安全（响亮失败会让整条召回不可用；fail-open 只是多读 3KB）。
+      const codeWidth = detectCodeWidth(row.code.byteLength, dimensions);
+      if (codeWidth === null) {
+        // ★ **坏码行 ⇒ 跳过（不抛错）** ⇒ ⇒ 该行按「无码」处理 ⇒ 精确兜底 ⇒ **不漏召回**。
         continue;
       }
       if (!Number.isFinite(row.scale)) {
@@ -586,7 +607,14 @@ export function readCodes(
       if (!Number.isFinite(row.eps) || row.eps < 0) {
         continue;
       }
-      pool.set(row.id, { code: blobToCode(row.code), scale: row.scale, eps: row.eps });
+      pool.set(row.id, {
+        // ⚠️ ★★ **零拷贝视图必须带 `byteOffset`**：★ `Buffer` 的 `byteOffset` **不保证为 0**
+        //   ⇒ ⇒ **不许写 `new Uint8Array(row.code)`**（那会按「元素值」转换 ⇒ 静默算错）。
+        code: new Uint8Array(row.code.buffer, row.code.byteOffset, row.code.byteLength),
+        codeWidth,
+        scale: row.scale,
+        eps: row.eps,
+      });
     }
   }
   return pool;
@@ -802,7 +830,15 @@ export function scanBucketCandidates(
       entries.push({ kind: 'uncoded', id });
       continue;
     }
-    entries.push({ kind: 'coded', id, code: coded.code, scale: coded.scale, eps: coded.eps });
+    entries.push({
+      kind: 'coded',
+      id,
+      code: coded.code,
+      // ★ 码宽**必须带过来**（★ 它决定剪枝时怎么解包 ⇒ 漏了就会按 int8 口径算上界 ⇒ 静默漏检）
+      codeWidth: coded.codeWidth,
+      scale: coded.scale,
+      eps: coded.eps,
+    });
   }
 
   // ⑤ 剪枝（阈值 + top-K；两条路只差这里传的 threshold / k）
@@ -1009,7 +1045,8 @@ export class IvfVectorBackend implements VectorBackend {
   /**
    * 检索近邻（§4.15.3：「桶内是全量精确点积，不是近似召回」）—— 两条路，**结果逐位相同**。
    *
-   * ★ **两段式（C′ 档 T04）**：先读 768B 的 int8 码算**可证上界**，只对「可能入选」的行
+   * ★ **两段式（C′ 档 T04）**：先读**打包的码**算**可证上界**（★ 码宽由 BLOB 长度自识别：
+   *   int8 = 768 B · int4 = 384 B · 二值 = 96 B），只对「可能入选」的行
    *   读 3KB 原向量精确重排（`prune = true`，缺省）。`prune = false` ⇒ **HEAD 的原路**
    *   （全量精确点积），仅用于对照（A7）。
    *
@@ -1202,7 +1239,15 @@ export class IvfVectorBackend implements VectorBackend {
         entries.push({ kind: 'uncoded', id });
         continue;
       }
-      entries.push({ kind: 'coded', id, code: coded.code, scale: coded.scale, eps: coded.eps });
+      entries.push({
+        kind: 'coded',
+        id,
+        code: coded.code,
+        // ★ 码宽**必须带过来**（★ 它决定剪枝时怎么解包 ⇒ 漏了就会按 int8 口径算上界 ⇒ 静默漏检）
+        codeWidth: coded.codeWidth,
+        scale: coded.scale,
+        eps: coded.eps,
+      });
     }
 
     // ── ④ 精确重排 + 早停（读路径**不传** `threshold`：没有上界门槛）──

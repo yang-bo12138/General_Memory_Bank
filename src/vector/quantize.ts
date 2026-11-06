@@ -3,7 +3,7 @@
  *
  * ## 这个模块存在的唯一理由
  *
- * 「两段式」（先读 768B 的码、只对可能入选的行读 3KB 的原向量）**只有在「跳过的行可以被证明不会入选」时才不丢召回**。
+ * 「两段式」（先读打包的码、只对可能入选的行读 3KB 的原向量）**只有在「跳过的行可以被证明不会入选」时才不丢召回**。
  * 本模块提供那个证明所需的两个量：
  *
  * ```
@@ -219,10 +219,11 @@ export function blobToCode(blob: Uint8Array): Int8Array {
 //   ★ ★ **安全前提（本段存在的全部理由）**：**ε 仍是逐行实算的 `‖x − x̂‖₂`**
 //     ⇒ ⇒ ★ **可证上界不依赖码宽**（★ §8.3 的证明只要求 `x̂` 是真实还原、`eps` ≥ 真实误差）
 //     ⇒ ⇒ ★ **换码宽只会让 `eps` 变大 ⇒ 剪枝更少 ⇒ 【不漏检、只是更慢】** ⇒ ⇒ ★ 安全
-//   ⚠️ **本段【不接线读路径】**（★ 阶段 1 的边界）：★ `src/vector/ivf.ts:580` 现在写的是
-//     `row.code.byteLength !== dimensions ⇒ continue`（★ fail-open）⇒ ⇒ **非 1 字节/维的码行
-//     会被当成「坏维度」跳过** ⇒ ⇒ ★ **所以新码宽的库【当前不能跑召回/剪枝测试】**
-//     ⇒ ⇒ ★ **阶段 1 的产物只用于测 ε**（★ 阶段 2 才把读路径接上）
+//   ★ ★ **读路径已在 T08 接上**（★ 规格 `docs/design/perf-c2-codewidth-int4-wiring.md` §6 的 T08）：
+//     `src/vector/ivf.ts` 的 `readCodes()` 现在**按 BLOB 长度自识别码宽**
+//     （★ `detectCodeWidth()` —— **不抛错**的变体）⇒ ⇒ **int4 / 二值的库能跑召回与剪枝**
+//     ⇒ ⇒ ★ **零配置、零 schema 改动**（★ 码宽是**数据属性**，不是调用方的选择）
+//     ⇒ ⇒ ★ **混档库天然可分辨**（★ 每行只看**自己那一行**的 blob 长度）
 // ═══════════════════════════════════════════════════════════════════════════
 
 /** 候选码宽。★ `int8` 是生产现状；`int4` / `binary` 是出关条件② 的候选档。 */
@@ -508,6 +509,51 @@ export function codeToBlobWithWidth(code: Uint8Array): Buffer {
 }
 
 /**
+ * 某一维度下、某一码宽的**码长**（字节）。
+ *
+ * ★ 这是「码长 ↔ 码宽」映射的**唯一出处**（C36：同一件事不得有两套实现）⇒
+ *   `codeWidthFromBlobLength`（抛错版）· `detectCodeWidth`（不抛版）·
+ *   `codeWidthByteLengths`（长度表）三者的码长口径**完全一致**。
+ *
+ * ⚠️ 用 `Math.ceil`（而不是整除）⇒ 维度不是 8 的倍数时也不截断。
+ *
+ * @param dim 维度
+ * @param width 码宽
+ * @returns 码长（字节）
+ */
+function byteLengthOf(dim: number, width: CodeWidth): number {
+  return Math.ceil((dim * CODE_BITS_PER_DIM[width]) / 8);
+}
+
+/**
+ * 该维度下**所有**已知码宽的码长（★ 内部实现 · ★ 按 `CODE_WIDTHS` 的顺序：int8 → int4 → binary）。
+ *
+ * @param dim 维度
+ * @returns 码长数组（顺序 == `CODE_WIDTHS`）
+ */
+function byteLengthsOf(dim: number): number[] {
+  return CODE_WIDTHS.map((width) => byteLengthOf(dim, width));
+}
+
+/**
+ * 码宽自识别的**内部实现**（★ 不抛错 · ★ 不做二义自检）。
+ *
+ * ⚠️ **为什么它是内部函数**：`codeWidthFromBlobLength`（抛错版）与 `detectCodeWidth`（不抛版）
+ *   **共用这一份判定**（C36）⇒ ⇒ 「抛不抛错」是**出口的差别**，不是**判定的差别**。
+ *
+ * @param blobLength BLOB 字节数
+ * @param lengths 该维度下各码宽的码长（顺序 == `CODE_WIDTHS`）
+ * @returns 码宽；**不属于任何已知码宽 ⇒ `null`**
+ */
+function detectCodeWidthUnsafe(blobLength: number, lengths: readonly number[]): CodeWidth | null {
+  const index = lengths.indexOf(blobLength);
+  if (index === -1) {
+    return null;
+  }
+  return CODE_WIDTHS[index] ?? null;
+}
+
+/**
  * 从 BLOB 长度**反推**码宽（★ 「长度自识别」⇒ ⇒ **零配置、零 schema 改动**）。
  *
  * ⚠️ **为什么可以靠长度**：★ 768 维 ⇒ int8 = **768 B** · int4 = **384 B** · 二值 = **96 B**
@@ -520,16 +566,68 @@ export function codeToBlobWithWidth(code: Uint8Array): Buffer {
  * @throws {MemoryError} `INVALID_INPUT`（长度不属于任何合法档）
  */
 export function codeWidthFromBlobLength(blobLength: number, dim: number): CodeWidth {
-  for (const width of CODE_WIDTHS) {
-    if (blobLength === Math.ceil((dim * CODE_BITS_PER_DIM[width]) / 8)) {
-      return width;
-    }
+  const width = detectCodeWidthUnsafe(blobLength, byteLengthsOf(dim));
+  if (width !== null) {
+    return width;
   }
   throw MemoryError.invalidInput('码 BLOB 长度不属于任何已知码宽（★ 坏码行）', {
     reason: 'blobLength',
-    expected: CODE_WIDTHS.map(
-      (width) => `${width}=${String(Math.ceil((dim * CODE_BITS_PER_DIM[width]) / 8))}`,
-    ).join(' / '),
+    expected: CODE_WIDTHS.map((width) => `${width}=${String(byteLengthOf(dim, width))}`).join(
+      ' / ',
+    ),
     actual: String(blobLength),
   });
+}
+
+/**
+ * 码宽自识别（★ **不抛错**的变体 · ★ **读路径专用**）。
+ *
+ * ★ **为什么必须有这个「不抛版」**：`codeWidthFromBlobLength`（抛错版）对未知长度抛
+ *   `MemoryError` ⇒ ⇒ **读路径不能直接用它** —— 读路径要的是 **fail-open**
+ *   （★ 一条坏码行 ⇒ 跳过 ⇒ 该行按「无码」处理 ⇒ 精确兜底）
+ *   ⇒ ⇒ **一条坏码行不能让整条召回不可用**（响亮失败会让整条召回挂掉）。
+ *
+ * ★ **零漏检的底线自检（A6）**：**该维度下两档码宽的码长必须两两不等**
+ *   —— 否则某个 blob 长度会被**二义**解释（⇒ 静默按错误的码宽解包 ⇒ **静默漏检**）
+ *   ⇒ ⇒ **响亮失败**，不许静默二义。
+ *   ⚠️ 生产维度恒为 `EMBED_DIM = 768`（只读参数）⇒ 该自检恒成立（768 / 384 / 96 互不相同）。
+ *
+ * @param blobLength BLOB 字节数
+ * @param dim 维度
+ * @returns 该 blob 长度对应的码宽；**不属于任何已知码宽 ⇒ `null`**（★ 调用方 fail-open 跳过）
+ * @throws {MemoryError} `INVALID_INPUT`（★ 该维度下两档码宽的码长相同 ⇒ 自识别二义）
+ */
+export function detectCodeWidth(blobLength: number, dim: number): CodeWidth | null {
+  const lengths = byteLengthsOf(dim);
+  if (new Set(lengths).size !== lengths.length) {
+    // ⚠️ **响亮失败，不许静默二义**：「静默二义」= 按错误的码宽解包 = **静默漏检**
+    //   ⇒ ⇒ 这是本档唯一不可接受的失效形状（与「上界被低估」同款）。
+    throw MemoryError.invalidInput('该维度下有两档码宽的码长相同 ⇒ 码宽自识别二义（★ 静默漏检）', {
+      reason: 'dim',
+      expected: '各码宽的码长两两不等',
+      actual: CODE_WIDTHS.map((width) => `${width}=${String(byteLengthOf(dim, width))}`).join(
+        ' / ',
+      ),
+    });
+  }
+  return detectCodeWidthUnsafe(blobLength, lengths);
+}
+
+/**
+ * 该维度下**所有**已知码宽的码长（★ 长度表 · ★ 顺序 == `CODE_WIDTHS`：int8 → int4 → binary）。
+ *
+ * ★ **为什么要这张表**：三档的码长是维度的**固定比例**（8 / 4 / 1 bit 每维）
+ *   ⇒ ⇒ 「该码宽下的期望长度」就是一张三项的表
+ *   ⇒ ⇒ **int8 那一项恒等于 `dim`** ⇒ ⇒ **int8 的长度校验与改前逐字相同**（不需要任何特判 ⇒ 不会漂）。
+ *
+ * ★ **共用同一张表的两处**（C36：同一件事不得有两套实现）：
+ *   · `src/vector/prune.ts` 的 `assertCodedEntry()`（★ 剪枝侧校验码长）
+ *   · bench 侧判「坏码行」（★ 库侧口径）
+ *   ⇒ ⇒ 「库侧判坏码行」与「剪枝侧判坏码行」是**同一份口径**。
+ *
+ * @param dim 维度
+ * @returns 各码宽的码长（字节）
+ */
+export function codeWidthByteLengths(dim: number): readonly number[] {
+  return byteLengthsOf(dim);
 }

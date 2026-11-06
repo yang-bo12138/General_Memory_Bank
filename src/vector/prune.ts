@@ -4,10 +4,15 @@
  *
  * ## 这个模块存在的唯一理由
  *
- * 「两段式」（先读 768B 的 int8 码算**可证上界**，只对**可能入选**的行读 3KB 的原向量精确重排）
+ * 「两段式」（先读**打包的码**算**可证上界**，只对**可能入选**的行读 3KB 的原向量精确重排）
  * 在**读路径**（top-K 语义）与**写路径**（阈值 + top-K 语义）上是**同一件事**：
  * 「按上界降序精确重排，剩余上界的最大值已经不可能进前 K 时停止」。
  * ⇒ 把它写成一份实现 ⇒ 两条路不可能各写一份、也不可能各自漂移。
+ *
+ * ★ **码宽是「数据属性」，不是本模块的选择**（T08 · 规格
+ *   `docs/design/perf-c2-codewidth-int4-wiring.md` §2.1 / §3.1）：
+ *   每条 `CodedEntry` 自带 `codeWidth`（★ 由 BLOB 长度自识别 ⇒ 调用方不许编）
+ *   ⇒ ⇒ **int8 走既有 `approxDot`（逐位不变）** · **int4 / 二值走 `approxDotWithWidth`**。
  *
  * ## 它与调用方的边界（四条纪律，每条都对应一个具体后果）
  *
@@ -63,7 +68,13 @@
 import { MemoryError } from '../core/errors.js';
 import type { VectorHit } from './backend.js';
 import { compareHits } from './flat.js';
-import { approxDot } from './quantize.js';
+import {
+  CODE_WIDTHS,
+  type CodeWidth,
+  approxDot,
+  approxDotWithWidth,
+  codeWidthByteLengths,
+} from './quantize.js';
 
 /**
  * **写路径**的精确重排预算（`scanBucketCandidates()` 显式传这个值，§5.1.4）。
@@ -95,8 +106,26 @@ export interface CodedEntry {
   readonly kind: 'coded';
   /** 记忆 id。 */
   readonly id: string;
-  /** 维度个 int8。**长度校验在调用方**（`ivf.ts` 的 `readCodes()` 已判），这里只做形状断言。 */
-  readonly code: Int8Array;
+  /**
+   * ★ **打包后的码字节**（int8 = 768 B · int4 = 384 B · 二值 = 96 B）· ★ **零拷贝视图**。
+   *
+   * ⚠️ **为什么是 `Uint8Array` 而不是 `Int8Array`**：三档码宽的**存储形状不同**
+   *   （int4 是两维一字节、二值是八维一字节）⇒ ⇒ 统一用「打包字节」表示
+   *   ⇒ ⇒ **int4 的内存占用真的只有一半**（384 B vs 768 B）⇒ ⇒ 且**不需要任何中间数组**
+   *   （★ 融合解包：`approxDotWithWidth` 读字节、就地解包、就地累加）。
+   * ⚠️ **int8 分支不读它**（★ 读的是 `Int8Array` 视图 —— 见 `signedViewOf()`）：
+   *   `Int8Array` 直读是 V8 的最快路径；`Uint8Array` + 三元符号转换实测慢 **4.63×**。
+   */
+  readonly code: Uint8Array;
+  /**
+   * ★ 这一行的**码宽**（★ 决定怎么解包 · ★ 由 BLOB 长度自识别）。
+   *
+   * ⚠️ **必填，不是可选**：★ 「缺省 = int8」是**错的缺省** ——
+   *   库里的码宽是**数据属性**（由 BLOB 长度决定），不是**调用方选择**
+   *   ⇒ ⇒ 忘了传 ⇒ 会静默按 int8 口径算上界 ⇒ ⇒ **上界被低估 ⇒ 静默漏检**
+   *   ⇒ ⇒ **零漏检是本档的硬要求** ⇒ ⇒ 必须显式。
+   */
+  readonly codeWidth: CodeWidth;
   /** `x̂ = scale × code`；必须有限。 */
   readonly scale: number;
   /** 编码期实算的 `‖x − x̂‖₂`（已含 `EPS_SAFETY_MARGIN`）；必须非负有限。 */
@@ -121,7 +150,10 @@ export interface PruneHit {
 
 /** `pruneTopK()` 的入参。 */
 export interface PruneOptions {
-  /** 查询向量（**已 L2 归一化**；长度必须 == 每个 `code.length`）。 */
+  /**
+   * 查询向量（**已 L2 归一化**；长度必须 == 维度 ⇒ **每条 `code` 的长度按它的 `codeWidth` 校验**
+   * ⇒ int8 = `query.length` 字节 · int4 = 一半 · 二值 = 八分之一）。
+   */
   readonly query: Float32Array;
   /** 取前 `k` 条（非负整数；`0` ⇒ 返回空 survivors，但 `candidates` 仍如实计数）。 */
   readonly k: number;
@@ -208,7 +240,8 @@ interface Queued {
  * @param options 查询向量 / k / 门槛 / 精确分口径
  * @returns 入选行 + 三个计数
  * @throws {MemoryError} `INVALID_INPUT`：`k` 非非负整数 / `query` 为空 /
- *         `query.length` 与某条 `code.length` 不等 / `scale`·`eps` 非有限 / `eps < 0` /
+ *         某条 `code.length` 与「该码宽在 `query.length` 维下的期望码长」不等 /
+ *         `scale`·`eps` 非有限 / `eps < 0` /
  *         `threshold` 为 NaN / `exactRescoreBudget` 不是「有限非负整数」（含 `Infinity`）
  */
 export function pruneTopK(entries: readonly PruneEntry[], options: PruneOptions): PruneOutcome {
@@ -243,14 +276,32 @@ export function pruneTopK(entries: readonly PruneEntry[], options: PruneOptions)
   // ── ① 逐条算上界（无码 ⇒ +∞；threshold 只剪上界）──
   let uncoded = 0;
   const queued: Queued[] = [];
+  // ★ **码长表只算一次**（★ 逐条查表 ⇒ 每条一次数组分配 ⇒ 热循环里不能这么干）
+  //   ⇒ 它同时是 `assertCodedEntry()` 的期望长度来源（★ 与库侧判坏码行同一份口径）。
+  const codeLengths = codeWidthByteLengths(query.length);
   for (const entry of entries) {
     if (entry.kind === 'uncoded') {
       uncoded += 1;
       queued.push({ id: entry.id, upper: Number.POSITIVE_INFINITY });
       continue;
     }
-    assertCodedEntry(entry, query.length);
-    const upper = approxDot(query, entry.code, entry.scale) + entry.eps;
+    assertCodedEntry(entry, query.length, codeLengths);
+    // ★★★ **按码宽分派**（★ 这是本档最重要的一行）★★★
+    //
+    // · **int8 ⇒ 走既有 `approxDot`（★ 一字未改）** ⇒ ⇒ 「int8 的上界逐位不变」不是一句承诺，
+    //   而是「**同一个函数 + 同一批字节 + 同一个 scale + 同一个求和顺序**」的恒等式
+    //   ⇒ ⇒ 零漏检的代数前提在 int8 上**结构性地**成立。
+    // · **int4 / 二值 ⇒ 走 `approxDotWithWidth`**（★ 融合解包 ⇒ 无中间数组 ⇒ 不抵消省 IO 的收益）。
+    //
+    // ⚠️ ⚠️ **不许「统一改成 `approxDotWithWidth`」**：它的 int8 分支读的是 `Uint8Array`
+    //   ⇒ 必须过「转有符号」这一步 ⇒ ★ 实测比 `approxDot` 慢 **4.63×**
+    //   （5000 行 × 768 维 · 中位数 4.10 ms vs 18.99 ms；根因是三元符号位分支不可预测）
+    //   ⇒ ⇒ 那是**生产路径的 CPU 回归** ⇒ ⇒ 剪枝内循环会变慢 ⇒ ⇒ 延迟这一列整个失真。
+    const upper =
+      entry.codeWidth === 'int8'
+        ? approxDot(query, signedViewOf(entry.code), entry.scale) + entry.eps
+        : approxDotWithWidth(query, entry.code, entry.scale, entry.codeWidth, query.length) +
+          entry.eps;
     if (threshold !== undefined && upper < threshold) {
       continue;
     }
@@ -457,22 +508,55 @@ class WorstHeap {
 }
 
 /**
+ * 把打包字节**零拷贝**地重解释成 int8（★ 只在 int8 分支用）。
+ *
+ * ⚠️ **为什么需要它**：`CodedEntry.code` 是 `Uint8Array`（★ 打包字节的统一表示）
+ *   ⇒ 而 `approxDot` 读的是 `Int8Array`（★ V8 的最快路径：直读有符号值）
+ *   ⇒ ⇒ 必须**重解释**同一段字节（★ 不是转换、不是复制）。
+ *
+ * ★ **零拷贝 ⇒ 逐位等价于改前那个 `Int8Array`**（同一段内存、同一批字节、同一求和顺序）
+ *   ⇒ ⇒ **int8 的上界逐位不变**（★ 这是「int8 走原路」的实现层保证）。
+ * ⚠️ **必须带 `byteOffset` + `byteLength`**（★ `Buffer` 的 `byteOffset` 不保证为 0）。
+ *
+ * @param code 打包字节
+ * @returns int8 视图（零拷贝）
+ */
+function signedViewOf(code: Uint8Array): Int8Array {
+  return new Int8Array(code.buffer, code.byteOffset, code.byteLength);
+}
+
+/**
  * 校验「有码」条目（形状 / 有限性）。
  *
+ * ⚠️ **码长的期望值按码宽查表**（★ 不是「一律等于维度」）：
+ *   三档的码长是维度的固定比例（8 / 4 / 1 bit 每维）⇒ ⇒ 「该码宽下的期望长度」是一张三项的表
+ *   ⇒ ⇒ **int8 那一项恒等于 `dim`** ⇒ ⇒ **int8 的校验与改前逐字相同**（不需要特判 ⇒ 不会漂）。
+ *
  * @param entry 有码条目
- * @param queryLength 查询向量长度（码必须等长）
+ * @param queryLength 查询向量长度（= 维度）
+ * @param codeLengths 该维度下各码宽的码长（顺序 == `CODE_WIDTHS`）
  * @throws {MemoryError} `INVALID_INPUT`
  */
-function assertCodedEntry(entry: CodedEntry, queryLength: number): void {
-  if (entry.code.length !== queryLength) {
+function assertCodedEntry(
+  entry: CodedEntry,
+  queryLength: number,
+  codeLengths: readonly number[],
+): void {
+  const expectedLength = expectedCodeLength(entry.codeWidth, codeLengths);
+  if (entry.code.length !== expectedLength) {
     // ⚠️ **响亮失败，不钳制、不补零**：维度对不上算出来的「上界」不是上界
     //   ⇒ 继续跑就是**静默漏检**（本档唯一不可接受的失效形状）。
     //   ⚠️ 生产路径上这种行**进不到这里**：`readCodes()` 已把它们归入「无码」⇒ 精确兜底。
-    throw MemoryError.invalidInput('码的长度必须与查询向量一致', {
-      reason: 'dim',
-      expected: String(queryLength),
-      actual: `${String(entry.code.length)}（id = ${entry.id}）`,
-    });
+    //   ⚠️ **错误信息必须带码宽**：同一个 `code.length` 在不同码宽下含义不同
+    //   ⇒ ⇒ 不带码宽的话排障时会看到「长度 384 ≠ 768」这种看不懂的报错。
+    throw MemoryError.invalidInput(
+      `码的长度必须与查询向量一致（★ 码宽 ${entry.codeWidth} · ${String(expectedLength)} 字节）`,
+      {
+        reason: 'dim',
+        expected: `${String(expectedLength)}（${entry.codeWidth} × ${String(queryLength)} 维）`,
+        actual: `${String(entry.code.length)}（id = ${entry.id}）`,
+      },
+    );
   }
   if (!Number.isFinite(entry.scale)) {
     throw MemoryError.invalidInput('码的还原标量必须有限', {
@@ -490,6 +574,27 @@ function assertCodedEntry(entry: CodedEntry, queryLength: number): void {
       actual: `${String(entry.eps)}（id = ${entry.id}）`,
     });
   }
+}
+
+/**
+ * 某一码宽在该维度下的**期望码长**（★ 走 `quantize.ts` 的唯一长度表）。
+ *
+ * @param width 码宽
+ * @param codeLengths 该维度下各码宽的码长（顺序 == `CODE_WIDTHS`）
+ * @returns 期望码长（字节）
+ * @throws {MemoryError} `INVALID_INPUT`（码宽不在表内 —— 类型上不可能，兜底而已）
+ */
+function expectedCodeLength(width: CodeWidth, codeLengths: readonly number[]): number {
+  const index = CODE_WIDTHS.indexOf(width);
+  const length = index === -1 ? undefined : codeLengths[index];
+  if (length === undefined) {
+    throw MemoryError.invalidInput('未知的码宽', {
+      reason: 'codeWidth',
+      expected: CODE_WIDTHS.join(' / '),
+      actual: width,
+    });
+  }
+  return length;
 }
 
 /**
