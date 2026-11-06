@@ -393,6 +393,21 @@ export interface VectorByteSample {
   readonly legacyCandidateRows: number;
   /** legacy 计数器的码行数（**交叉校验 1b** 用）。 */
   readonly legacyCodeRows: number;
+  /**
+   * ★ **本样本的 survivors 条数**（★ T10：出关条件④ 的口径缺口）。
+   *
+   * ⚠️ ★ **它不是「候选宇宙」**（`candidateUniverse`）也不是「进精排行数」（`embeddingExactRows`）
+   *   ⇒ ⇒ **三个数是三件事** ⇒ ⇒ 混起来就是「剪枝率」这个出关条件消失。
+   *
+   * ★ **两路的取数来源不同，但落进同一个字段**：
+   *   · **写路径** = Q4「整行读 survivors」的**行数**（`bySource.survivorRow.rows` 的**差值**）
+   *     ⇒ ⇒ 与 `prune` 的 `out.survivors.length` **同源**（Q4 读的就是那些 survivors）；
+   *   · **读路径** = `backend.search()` 的**返回长度**
+   *     ⇒ ⇒ `search()` 返回 `hits.slice(0, k)`，而 `prune` 的 `WorstHeap` **容量 = k**
+   *       ⇒ ⇒ `survivors.length ≤ k` ⇒ ⇒ **`slice(0, k)` 永不截断**
+   *       ⇒ ⇒ **返回长度 ≡ survivors 条数**（★ 这条推理是「读路径口径」的**唯一依据**）。
+   */
+  readonly survivorsCount: number;
 }
 
 /**
@@ -464,6 +479,18 @@ export interface VectorByteReads {
   readonly bytesRead: CountSummary;
   /** 命中桶内的候选总数。 */
   readonly candidateUniverse: CountSummary;
+  /**
+   * ★ **survivors 条数的分布**（★ T10：出关条件④ 的口径缺口 · ★ **顶层读数**、不是 breakdown 的一项）。
+   *
+   * ⚠️ ★ **为什么在顶层、不在 `breakdown`**：`breakdown` 的 13 项是「**字节来源分解**」
+   *   ⇒ ⇒ 而 `survivorsCount` 是「**条数**」⇒ ⇒ 语义上与 `candidateUniverse` 同级
+   *   ⇒ ⇒ **且 `breakdown` 的 13 项清单不用动**（★ 改动面最小）。
+   *
+   * ⚠️ ★ **k 口径必须一起读**（★ 写在 `note` 里）：★ **bench 侧两条路的 k = `VECTOR_TOPK` = 20**
+   *   · ★ **生产召回的 k = `VECTOR_TOPK × VECTOR_OVERFETCH_FACTOR` = 60**
+   *   ⇒ ⇒ ★ **两口径的条数不可比**（★ 拿 bench 的 20 去比生产的 60 就是错读）。
+   */
+  readonly survivorsCount: CountSummary;
   /** 来源分解（**13 项**）。 */
   readonly breakdown: VectorByteReadsBreakdown;
   /** 口径说明（**必须落盘** ⇒ 读的人不会把它误读成「一次真实写入的总字节」）。 */
@@ -1224,7 +1251,12 @@ export function measurePerf(
     // ⚠️ **计数窗口只包住 `search()`**（`route()` 不读行 ⇒ 读的是中心向量，在内存里）。
     const before = rowCounter.snapshot();
     rowCounter.start();
-    backend.search(query.embedding, DEFAULT_PARAMS.VECTOR_TOPK);
+    // ★★ **接住 `search()` 的返回值**（★ T10）：★ 返回长度 ≡ survivors 条数
+    //   ⇒ ★ **依据**：`search()` 返回 `hits.slice(0, k)`（`src/vector/ivf.ts`），
+    //   而 `prune` 的 `WorstHeap` **容量 = k**（`src/vector/prune.ts`）
+    //   ⇒ ⇒ `survivors.length ≤ k` ⇒ ⇒ **`slice(0, k)` 永不截断**
+    //   ⇒ ⇒ **返回长度 ≡ survivors 条数**（★ 这条推理是「读路径口径」的**唯一依据**）。
+    const hits = backend.search(query.embedding, DEFAULT_PARAMS.VECTOR_TOPK);
     // ⚠️ **计时在 `search()` 之后立刻取**（⇒ 与历史基线的取时位置**逐字同形**）。
     const end = process.hrtime.bigint();
     rowCounter.stop();
@@ -1247,7 +1279,9 @@ export function measurePerf(
     // ⚠️ ★★ **第四个参数 = 「由 `route()` 命中桶推算的成员行数之和」**
     //   ⇒ ⇒ 它与样本里的 `bucketMemberRows`（**计数器实测**）**逐样本配对**
     //   ⇒ ⇒ 读路径的对账量（口径裁决落地 #1）就是这一对。
-    readByteSamples.push(buildByteSample(before, after, universe, candidateRowsDerived));
+    readByteSamples.push(
+      buildByteSample(before, after, universe, candidateRowsDerived, hits.length),
+    );
   }
   // ⚠️ **计数器用完就拆**（把 `db.prepare` 恢复原状 ⇒ 后面那些调用不再被包装）。
   rowCounter.uninstall();
@@ -1359,7 +1393,16 @@ export function measurePerf(
     const scan = collectVectorCandidates(dedupContext, input.embedding);
     writeRowCounter.stop();
     const after = writeRowCounter.snapshot();
-    writeByteSamples.push(buildByteSample(before, after, scan.scanned));
+    // ★★ **写路径的 survivors 数 = Q4「整行读 survivors」的行数差值**（★ T10 · F21）：
+    //   ★ `survivorRow` 这个来源**认领的正是 Q4 读的那些 survivors 整行**
+    //   ⇒ ⇒ 它的行数差值 ≡ 本样本的 survivors 条数
+    //   ⇒ ⇒ 与 `prune` 的 `out.survivors.length` **同源**（Q4 读的就是那些 survivors）
+    //   ⇒ ⇒ **且 `harness.ts` 一个字都不用改**（★ 取数全在已有的快照里）。
+    const survivorRowsBefore = before.bySource.survivorRow?.rows ?? 0;
+    const survivorRowsAfter = after.bySource.survivorRow?.rows ?? 0;
+    writeByteSamples.push(
+      buildByteSample(before, after, scan.scanned, null, survivorRowsAfter - survivorRowsBefore),
+    );
     writeUniverseSamplesB.push(scan.scanned);
     // ⚠️ ★ **写路径的行读读数**（legacy 结论；**只采、不落盘** ⇒ 落盘字段名由架构师裁决）。
     writePathReadSamples.push({
@@ -1548,7 +1591,8 @@ export function measurePerf(
       '但相对每行 3 KB 的读取开销**可忽略（< 1%）** ⇒ **`vectorRouteP99Ms` 的读数不受影响**' +
       '（★ 2026-11-05 ADR §8.11 裁决 ⑤：它已是【参考线】· 不判红绿）；' +
       '⑦ **旧行数判据已降级为并列观测**（`writeSegments.vectorCandidateRows` 仍落盘、仍打印，' +
-      '但**不再进 `failures`** ⇒ 字节口径下它已不是判据；阈值常量一个都没删）。',
+      '但**不再进 `failures`** ⇒ 字节口径下它已不是判据；阈值常量一个都没删）。' +
+      ' ⑧ ★ **`survivorsCount` = 本路径剪枝后的 survivors 条数**（★ **写路径 = Q4「整行读 survivors」的行数** ⇒ ⇒ 与 `prune` 的 `out.survivors.length` 同源）；★ **bench 写路径的 k = `VECTOR_TOPK` = 20** · ★ **生产召回的 k = `VECTOR_TOPK × VECTOR_OVERFETCH_FACTOR` = 60** ⇒ ⇒ ★ **两口径的条数不可比**（★ 读的人不许拿 bench 的 20 去比生产的 60）。',
   );
 
   // ⚠️ ★★ **读路径的字节读数**（**观测值，不判门槛**；口径 §4）。
@@ -1590,7 +1634,8 @@ export function measurePerf(
       '（两个 `push` 在同一个循环体内、无条件、无 `continue` / `break` ⇒ 长度必然相等' +
       '⇒ ⇒ 挂在判红守卫上却**永远打不红**）⇒ ⇒ **已换掉**；' +
       '⚠️ **注意：写路径才是两轮制**（轮 A 计时**不装**计数器 / 轮 B 计量**装**计数器）⇒ ' +
-      '`samplesAligned` 的**两轮对账只在写路径有牙**（读路径的对账量是**上面第 ⑧ 条**）。',
+      '`samplesAligned` 的**两轮对账只在写路径有牙**（读路径的对账量是**上面第 ⑧ 条**）。' +
+      ' ⑨ ★ **`survivorsCount` = 本路径剪枝后的 survivors 条数**（★ **读路径 = `backend.search()` 的返回长度** ⇒ ★ **依据**：`search()` 返回 `hits.slice(0, k)`，而 `prune` 的 `WorstHeap` **容量 = k** ⇒ ⇒ `survivors.length ≤ k` ⇒ ⇒ **`slice(0, k)` 永不截断** ⇒ ⇒ **返回长度 ≡ survivors 条数**）；★ **bench 读路径的 k = `VECTOR_TOPK` = 20** · ★ **生产召回的 k = `VECTOR_TOPK × VECTOR_OVERFETCH_FACTOR` = 60** ⇒ ⇒ ★ **两口径的条数不可比**（★ 读的人不许拿 bench 的 20 去比生产的 60）。',
   );
 
   const writeSegments: WriteSegmentSummary = {
@@ -1689,11 +1734,18 @@ function meanOf(samples: readonly number[]): number {
 }
 
 /**
- * ★ **两次快照相减 ⇒ 一个样本的字节读数**（口径 §4 的逐样本采样）。
+ * ★ **两次快照相减 ⇒ 一个样本的字节读数**（口径 §4 的逐样本采样 · ★ T10：多带一个 `survivorsCount`）。
  *
  * ⚠️ **为什么用「相减」而不是「重置」**：计数器是**累计**的（两次快照相减 = 那段窗口）
  *   ⇒ ⇒ 同一个计数器实例可以罩住**整个采样循环**（逐样本 `start()` / `stop()`）
  *   ⇒ ⇒ **装配一次、窗口逐样本切**（口径 §3.3 第 5 条的「串行安装」纪律）。
+ *
+ * ⚠️ ★★ **`survivorsCount` 必填、且**不带默认值**（★ 这是有意的）：
+ *   ★ 若给它一个缺省值（`0`）⇒ ⇒ 「某个调用点忘了传」就会**静默变成 0**
+ *   ⇒ ⇒ 而「0」在落盘里看起来像一个**合法的读数**（只是小）⇒ ⇒ **测不出来**
+ *   ⇒ ⇒ 所以：两个调用点都**必须显式**说出自己那条路的 survivors 数
+ *   ⇒ ⇒ **漏传 ⇒ 编译期报错**（★ 而不是运行期给出一个假的 0）。
+ *   ⇒ ⇒ 同理 `bucketMemberRowsDerived` 也去掉了默认值（★ 写路径显式传 `null`）。
  *
  * @param before 窗口前的快照
  * @param after 窗口后的快照
@@ -1701,13 +1753,16 @@ function meanOf(samples: readonly number[]): number {
  * @param bucketMemberRowsDerived **读路径专有**：由 `route()` 命中桶推算的成员行数之和
  *   （写路径 = `null`）⇒ ⇒ 与样本里的 `bucketMemberRows`（**计数器实测**）**逐样本配对**
  *   ⇒ ⇒ 读路径的对账量（`readSamplesAlignedOf()`）就是这一对。
+ * @param survivorsCount 本样本的 survivors 条数（★ 写路径 = Q4 的 `survivorRow` 行数差值
+ *   · 读路径 = `backend.search()` 的返回长度）
  * @returns 逐样本的字节读数
  */
 function buildByteSample(
   before: ByteReadSnapshot,
   after: ByteReadSnapshot,
   candidateUniverse: number,
-  bucketMemberRowsDerived: number | null = null,
+  bucketMemberRowsDerived: number | null,
+  survivorsCount: number,
 ): VectorByteSample {
   return {
     memoryRowsRead: after.memoryRowsRead - before.memoryRowsRead,
@@ -1730,6 +1785,7 @@ function buildByteSample(
     unclassifiedSqlKinds: after.unclassifiedSqlKinds,
     legacyCandidateRows: after.candidateRows - before.candidateRows,
     legacyCodeRows: after.codeRows - before.codeRows,
+    survivorsCount,
   };
 }
 
@@ -1911,6 +1967,10 @@ function buildVectorByteReads(
     codeRowsRead: toCountSummary(samples.map((sample) => sample.codeRowsRead)),
     bytesRead: toCountSummary(samples.map((sample) => sample.bytesRead)),
     candidateUniverse: toCountSummary(samples.map((sample) => sample.candidateUniverse)),
+    // ★★ **T10：survivors 条数的分布**（★ 顶层读数 · ★ **写读两路共用这一处汇总**）
+    //   ⇒ ★ **从 `samples` 里汇总、不加参数** ⇒ ⇒ ★ `note` 仍是**第三个参数**
+    //   ⇒ ⇒ ★ `scripts/check-json-note-fidelity.ts` 的**抽取锚点不受影响**（★ 它锚的是第三个参数）。
+    survivorsCount: toCountSummary(samples.map((sample) => sample.survivorsCount)),
     breakdown: {
       codeBytes: toCountSummary(samples.map((sample) => sample.codeBytes)),
       embeddingBytes: toCountSummary(samples.map((sample) => sample.embeddingBytes)),

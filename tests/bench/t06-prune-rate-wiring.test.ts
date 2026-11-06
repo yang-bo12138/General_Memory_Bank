@@ -395,6 +395,11 @@ function makeSample(overrides: Partial<VectorByteSample> = {}): VectorByteSample
     unclassifiedSqlKinds: [],
     legacyCandidateRows: 0,
     legacyCodeRows: 0,
+    // ★★ **T10 连带**：`VectorByteSample` 新增了必填字段 `survivorsCount`
+    //   ⇒ ⇒ **这个合成夹具必须补上**（★ 否则 typecheck 报「缺少属性 survivorsCount」）。
+    //   ⚠️ **它不参与本文件的任何断言**（★ 本文件只验「剪枝率接线读的是哪一列」）
+    //   ⇒ ⇒ ⇒ 默认 0 是**无害的**（★ 真值由 bench 侧的 `measurePerf()` 采样给出）。
+    survivorsCount: 0,
     ...overrides,
   };
 }

@@ -1474,12 +1474,26 @@ describe('T06 · E：口径断言与落盘结构', () => {
           'codeRowsRead',
           'bytesRead',
           'candidateUniverse',
+          // ⚠️ ★★★ **T10 · C8：`survivorsCount` 必须主动写进这条断言**
+          //   ★ `expect.arrayContaining` **不是精确匹配** ⇒ ⇒ 新字段「悄悄消失」也不会被发现
+          //   ⇒ ⇒ **不加 ⇒ 这条断言悄悄变弱**（★ F23 的纪律）。
+          //   ★ 而且它**必须叫 `survivorsCount`**（**不是** `survivorRow` —— 那是
+          //   `bench/lib/byteSources.ts` 里「整行读」的**来源名** ⇒ 同名会与既有口径撞车）。
+          'survivorsCount',
           'breakdown',
           'note',
         ]),
       );
       // ⚠️ ★ **形态 = `CountSummary` 分布**（不是标量 ⇒ 判据取 `max` 有值可取）。
-      for (const key of ['memoryRowsRead', 'codeRowsRead', 'bytesRead', 'candidateUniverse']) {
+      for (const key of [
+        'memoryRowsRead',
+        'codeRowsRead',
+        'bytesRead',
+        'candidateUniverse',
+        // ★★ **`survivorsCount` 也必须是 `CountSummary`**（★ 与既有四读数**同形** ⇒ C2）。
+        //   ⇒ 抓住的变异：把它落成一个裸数字（`number`）⇒ ⇒ 键数变成 1 ⇒ **本断言变红**。
+        'survivorsCount',
+      ]) {
         const summary = block[key as 'bytesRead'];
         expect(Object.keys(summary).sort()).toEqual(
           ['count', 'max', 'mean', 'min', 'p50', 'p99'].sort(),
@@ -1516,6 +1530,62 @@ describe('T06 · E：口径断言与落盘结构', () => {
     //   ★ 这个夹具走生产写路径 ⇒ 码宽 = `int8` ⇒ 且**不是混档**。
     expect(result.codeWidth).toBe('int8');
     expect(result.codeWidthMixed).toBe(false);
+    db.db.close();
+  });
+
+  /**
+   * ★★★ **T10 · `survivorsCount` 的独立断言**（★ 每条都钉住一个「会变红的变异」）。
+   *
+   * ⚠️ ★★ **本文件上面的落盘结构断言只钉「键存在 + 形态是 `CountSummary`」**
+   *   ⇒ ⇒ **它抓不住「值被填错」**（★ 填成 0 / 填成 `candidateUniverse` 都还是合法形状）
+   *   ⇒ ⇒ ⇒ **必须有这一条**（★ 数值与口径的守卫）。
+   *
+   * ★ **变异 → 会被哪条抓住**：
+   * | 变异 | 被哪条抓住 |
+   * |---|---|
+   * | `survivorsCount` 被填成 **0**（或 `undefined`） | ① 「两路都非空」 |
+   * | 被填成 **`candidateUniverse`**（口径串了） | ② 「上界 = k」 |
+   * | **字段名**写成 `survivorRow` | 上面的落盘结构断言（`arrayContaining` 里写死了 `'survivorsCount'`） |
+   * | **类型**不是 `CountSummary`（落成裸数字） | 上面的落盘结构断言（6 键形态） |
+   * | **note** 里没写 k 口径 | ③ 「note 必须写清 k 口径」 |
+   */
+  it('★ T10 · `survivorsCount`：两路都非空 · ≤ k（★ 可证上界）· note 必须写清 k 口径', () => {
+    const { dbPath, db } = buildSmokeBench(newWorkDir());
+    const options = { ...DEFAULT_CORPUS_OPTIONS, size: SMOKE_SIZE };
+    const store = new MemoryStore({ dbPath });
+    const result = measurePerf(db.db, store, options, 5, 5);
+
+    const write = result.writeSegments.vectorByteReads.survivorsCount;
+    const read = result.vectorRouteByteReads.survivorsCount;
+
+    // ── ① 两路都非空（C3）⇒ 抓住「被填成 0 / undefined」──
+    expect(write.count).toBeGreaterThan(0);
+    expect(read.count).toBeGreaterThan(0);
+    expect(write.max).toBeGreaterThan(0);
+    expect(read.max).toBeGreaterThan(0);
+    // ⚠️ ★ **负控**：这两个数**不是**候选宇宙（★ 否则「口径串了」也会看起来合理）
+    //   ⇒ ⇒ 候选宇宙是**大头**（≥ 几十），而 survivors ≤ k = 20 ⇒ ⇒ 两者**不可能相等**。
+    expect(write.max).toBeLessThan(result.writeSegments.vectorByteReads.candidateUniverse.max);
+
+    // ── ② 上界 = k = `VECTOR_TOPK` = 20（★ 可证 ⇒ 口径串了必然越界）──
+    //   ★ **依据**：`prune` 的 `WorstHeap` **容量 = k**（`src/vector/prune.ts`）
+    //   ⇒ ⇒ `survivors.length ≤ k` ⇒ ⇒ 这是**可证**的上界（★ 不是经验值）。
+    expect(write.max).toBeLessThanOrEqual(DEFAULT_PARAMS.VECTOR_TOPK);
+    expect(read.max).toBeLessThanOrEqual(DEFAULT_PARAMS.VECTOR_TOPK);
+
+    // ── ③ note 必须写清 k 口径（C6）⇒ 抓住「note 里没写 k 口径」──
+    //   ⚠️ ★ **必须钉【带限定词的完整短语】**：★ 裸的「20」会被别处命中 ⇒ 恒绿。
+    const writeNote = result.writeSegments.vectorByteReads.note;
+    const readNote = result.vectorRouteByteReads.note;
+    expect(writeNote).toContain('bench 写路径的 k = `VECTOR_TOPK` = 20');
+    expect(readNote).toContain('bench 读路径的 k = `VECTOR_TOPK` = 20');
+    for (const note of [writeNote, readNote]) {
+      // ★ 生产召回的 k = 60 ⇒ ⇒ 两口径**不可比** ⇒ ⇒ 缺了就说明 note 没写口径。
+      expect(note).toContain('VECTOR_TOPK × VECTOR_OVERFETCH_FACTOR` = 60');
+      expect(note).toContain('两口径的条数不可比');
+      // ★ **字段自身也要在 note 里被解释**（★ 读的人不该靠猜）。
+      expect(note).toContain('`survivorsCount` = 本路径剪枝后的 survivors 条数');
+    }
     db.db.close();
   });
 

@@ -229,6 +229,7 @@
 |------|------|---------|
 | `agreement-10000.json` | 吻合率（1 万条） | `pnpm exec tsx bench/agreement.ts --scale=10000 --queries=200 --allow-small-scale` |
 | `perf-10000.json` | 三条 P99（1 万条） | `pnpm exec tsx bench/perf.ts --scale=10000 --queries=200 --writes=200 --allow-small-scale` |
+| `perf-2000.json` | ★ **T10 · 「读路径 survivors 落盘字段」的凭据**（★ 两路都落 `survivorsCount` · ★ `note` 已含 k 口径：bench 的 20 与生产召回的 60 **不可比**）⇒ ★ **小规模档** ⇒ ⇒ **H2′ 越线是【正常的】**（★ 字节 ÷ 库规模 ⇒ 分母太小 ⇒ **不是回归**） | `pnpm exec tsx bench/perf.ts --scale=2000 --queries=200 --writes=200 --allow-small-scale=true --reuse=true --db=.tmp/bench/perf-2000.db --out=docs/baseline/perf-2000.json` |
 | `baseline-flat-10000.json` | 前置测量：flat 路线的向量路占比（1 万条） | `pnpm exec tsx bench/baseline-flat.ts --scale=10000 --queries=200 --allow-small-scale` |
 | `agreement-1000000.json` | ⚠️ **未落盘**（**原因**：flat 参照的**固有算力成本** —— 百万级 flat = 一次 100 万行 × 768 维全表精确点积 ≈ **77 亿次乘加** ⇒ 单核 ~4 小时/次 ⇒ 10 条查询 ≈ **40 小时** ⇒ **不是「本机跑不动」**，是**参照口径的算力量级** ⇒ 要拿到只能改参照口径） | `pnpm exec tsx bench/agreement.ts --scale=1000000 --queries=10 --reuse=true --db=.tmp/bench/shared-1000000.db` |
 | `perf-1000000.json` | 三条 P99 ＋ **候选读取行数**（**100 万条 · 冷盘档**）⇒ ⚠️ **上一轮（热盘档）的完整原文逐字段保留在同一文件的 `_priorWarmRun` 里**（⇒ **一条信息都没有被删掉**）⇒ ⚠️ 该文件里这两行当时写作「H1 / H2」，**归口后该量名 R6** | `pnpm exec tsx bench/perf.ts --scale=1000000 --queries=1000 --writes=500 --reuse=true --db=.tmp/bench/million-perf-h1.db` |
