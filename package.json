@@ -38,6 +38,7 @@
     "check:json-note": "tsx scripts/check-json-note-fidelity.ts",
     "check:benchmark-numbers": "tsx scripts/check-benchmark-numbers.ts",
     "check:wording-drift": "tsx scripts/check-wording-drift.ts",
+    "check:t11-int4-row": "tsx scripts/check-t11-int4-row.ts",
     "check:gate-entry": "tsx scripts/check-gate-entry.ts",
     "check:backlog-ledger": "tsx scripts/check-backlog-ledger.ts",
     "audit:tier-qualifiers": "tsx scripts/audit-tier-qualifiers.ts",
