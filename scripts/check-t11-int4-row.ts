@@ -57,6 +57,19 @@
  *   ★★ 另修 **`cellCount`**（★ R02）：★ 旧实现把**空单元格**也滤掉 ⇒ ⇒ 表少一列也能过
  *      ⇒ 现在按「掐掉首尾 `|` ⇒ 中间按 `|` 切」数 ⇒ ★ **空单元格也算一格**。
  *
+ * ★★★ **v8 的断言（★ doc ↔ 凭据的机器链接） ★★★**：
+ *   ⑬-F ★ **候选宇宙 min/max 与字节侧 C / N_now 必须与凭据 JSON 逐位一致**
+ *      · ★ 起因（★ 主理人独立读凭据时发现）：★ ⑥ 条写「读路径候选宇宙 min **30**」，
+ *        而凭据 `vectorRouteByteReads.candidateUniverse.min` = **29** ⇒ ⇒ 一处一位数字的错误。
+ *      · ⇒ ⇒ v8 **不硬编码**这些数 ⇒ ⇒ **直接从凭据推导** ⇒ ⇒ 凭据一变、文档不同步 ⇒ ⇒ 立刻判红。
+ *      · ★ 涉及：⑥ 条的「读路径 / 写路径 候选宇宙 min / max」+ 字节侧段落的「C / N_now」。
+ *
+ * ★★★ **v9 的断言（★ QA 第 6 轮复核报出的剩余盲区） ★★★**：
+ *   ⑬-G ★ **表二【二值行】的字节侧数值必须带数值在位**：`1,158 行` `21.9069%`
+ *      · ★ 起因：★ v7 只钉了表二【int4 行】的 662 行 / 12.5236% ⇒ ⇒ 二值行仍是裸奔的。
+ *   ⑬-H ★ **表二 int4 行必须标明「1M 档」口径**（★ 12.5236% 是按 C = 5,286 行算的
+ *      ⇒ ⇒ 不标档位就会被人拿去判 2000 行档 ⇒ ⇒ ★ 12.5236% 与 16.0000% / 37.5000% 差 3 倍）。
+ *
  * ★ **链外还是链内**：★ **链外**（★ 不进 `verify` · ★ 纪律 5：门禁链 18 段本批不加段）
  *   ⇒ ⇒ `pnpm run check:t11-int4-row` 可独立运行。
  */
@@ -618,9 +631,80 @@ for (const mark of ['投之前', '影子阈值', '规模已被证伪', '落盘�
       }
     }
   }
-}
+  /* ── ⑬-G / ⑬-H 表二【二值行】的数值在位 + int4 行的档位标注（★ v9）──
+   * ★ 起因（★ QA 第 6 轮复核）：★ v7 只钉了表二【int4 行】的 662 行 / 12.5236%
+   *   ⇒ ⇒ **二值行的 1,158 行 / 21.9069% 仍是裸奔的** ⇒ ⇒ 改数不会红。
+   * ★⇒⇒ v9：★ 二值行的两个数必须带数值在位；★ 且 int4 行必须标明「1M 档」口径
+   *   （★ 12.5236% 是按 C = 5,286 行算的 ⇒ ⇒ 不标档位 ⇒ ⇒ 会被拿去判 2000 行档
+   *   ⇒ ⇒ 而 2000 档自身的上限是 16.0000% / 37.5000% ⇒ ⇒ ★ 差 3 倍）。
+   */
+  const t2RowBinary = t2Header >= 0 ? (rows[t2Header + 3] ?? '') : '';
+  for (const value of ['**1,158 行**', '**21.9069%**']) {
+    if (!t2RowBinary.includes(value)) {
+      issues.push(
+        `表二的二值行里找不到「${value}」（★ ★ 字节侧临界值必须带数值在位：★ 1,158 行 = 1M 档口径 C = 5,286 行算出的进精排上限 · 21.9069% = 同口径的剪枝率上限）`,
+      );
+    }
+  }
+  if (!table2Int4.includes('1M 档')) {
+    issues.push(
+      '表二的 int4 行里找不到「1M 档」的档位标注（★ ★ 662 行 / 12.5236% 是【1M 档】口径（C = 5,286 行）⇒ ⇒ 不标档位 ⇒ ⇒ 会被拿去判 2000 行档 ⇒ ⇒ 而 2000 档自身上限是 16.0000% / 37.5000% ⇒ ⇒ ★ 差 3 倍）',
+    );
+  }
 
-/* ══ ⑨ v3 · 旧表述必须已消失 ══ */
+  /* ── ⑬-F ★★ 候选宇宙的 min/max 必须与【凭据 JSON】逐位一致（★ v8）★★
+   * ★ 起因（★ 主理人独立读凭据时发现）：★ ⑥ 条写「读路径候选宇宙 min **30**」，
+   *   而凭据 `vectorRouteByteReads.candidateUniverse.min` = **29** ⇒ ⇒ 一处一位数字的错误。
+   * ★⇒⇒ v8 不再硬编码这些数 ⇒ ⇒ **直接从凭据推导** ⇒ ⇒ 文档与凭据形成机器链接：
+   *   ★ 凭据一变、文档不同步 ⇒ ⇒ 守卫立刻判红（★ 这才是「同一批数不许各说各话」的机器落点）。
+   */
+  const ev = JSON.parse(readFileSync(EVIDENCE_INT4, 'utf8')) as {
+    vectorRouteByteReads?: {
+      candidateUniverse?: { min?: number; max?: number };
+      memoryRowsRead?: { max?: number };
+    };
+    writeSegments?: {
+      vectorByteReads?: {
+        candidateUniverse?: { min?: number; max?: number };
+        memoryRowsRead?: { max?: number };
+      };
+    };
+  };
+  const readCU = ev.vectorRouteByteReads?.candidateUniverse;
+  const writeCU = ev.writeSegments?.vectorByteReads?.candidateUniverse;
+  const readRows = ev.vectorRouteByteReads?.memoryRowsRead?.max;
+  const writeRows = ev.writeSegments?.vectorByteReads?.memoryRowsRead?.max;
+  if (!readCU || !writeCU || readRows === undefined || writeRows === undefined) {
+    issues.push(
+      `凭据 ${EVIDENCE_INT4} 里读不到 candidateUniverse / memoryRowsRead ⇒ 无法核验「候选宇宙」与文档是否一致`,
+    );
+  } else {
+    /** ★ ⑥ 条（口径 A 段落）必须与凭据逐位一致。 */
+    for (const [label, cu] of [
+      ['读路径', readCU],
+      ['写路径', writeCU],
+    ] as const) {
+      const text = `候选宇宙 min **${cu.min}** / max **${cu.max}**`;
+      if (clause6 !== '' && !clause6.includes(text)) {
+        issues.push(
+          `⑥ 条里的「${label}」候选宇宙与凭据不一致（★ 期望「${text}」· ★ 凭据 ${EVIDENCE_INT4} 的 candidateUniverse = min ${cu.min} / max ${cu.max}）`,
+        );
+      }
+    }
+    /** ★ 字节侧段落的 C 与 N_now 必须与凭据逐位一致（★ 同一公式、同两个口径）。 */
+    for (const [label, c, n] of [
+      ['写路径', writeCU.max, writeRows],
+      ['读路径', readCU.max, readRows],
+    ] as const) {
+      const text = `C = \`candidateUniverse.max\` = **${c}** · N_now = \`memoryRowsRead.max\` = **${n}**`;
+      if (byteSide2000 !== '' && !byteSide2000.includes(text)) {
+        issues.push(
+          `「2000 行档自己的字节侧上限」段落里的「${label}」C / N_now 与凭据不一致（★ 期望「${text}」· ★ 凭据 candidateUniverse.max = ${c} · memoryRowsRead.max = ${n}）`,
+        );
+      }
+    }
+  }
+}
 for (const stale of STALE_PHRASES) {
   if (r3Line.includes(stale)) {
     issues.push(`R3 行里还留着旧表述「${stale}」（★ 已被本轮实测推翻 ⇒ ⇒ 必须已订正）`);
@@ -722,5 +806,11 @@ if (issues.length > 0) {
   );
   process.stdout.write(
     '✓ T11 守卫：表一/表二恰好 5 条逻辑行 + 字节侧数值在位 + ⑥ 条自命中/余量/零漏检 + 口径 A 与混档占比按段落在位（★ v7 · ★ QA 盲区）\n',
+  );
+  process.stdout.write(
+    '✓ T11 守卫：候选宇宙 min/max 与字节侧 C / N_now 均【从凭据 JSON 推导并逐位核对】（★ v8 · ★ doc ↔ 凭据的机器链接）\n',
+  );
+  process.stdout.write(
+    '✓ T11 守卫：表二二值行的 1,158 行 / 21.9069% 在位 + int4 行带「1M 档」档位标注（★ v9 · ★ QA 第 6 轮报出的剩余盲区）\n',
   );
 }
