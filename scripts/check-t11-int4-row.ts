@@ -1,5 +1,5 @@
 /**
- * ★ T11 守卫 · v6 · ★★★ 【表格结构盲区】+【1M 档证伪规模】+【按逻辑行定位】的机器守护 ★★★
+ * ★ T11 守卫 · v7 · ★★★ 【表格结构盲区】+【1M 档证伪规模】+【按逻辑行定位】+【QA 盲区】的机器守护 ★★★
  *
  * ★★★ **v3 的起因（★ QA 独立回归实测出的真盲区 · ★ 我独立复现确认）** ★★★：
  *   · QA 实测：我在表二的**中间**插了一段非表格行（★ 段落被放在 `| **int4** |` 行之后、
@@ -44,6 +44,18 @@
  *      · ⇒ ⇒ v6 改成：**⑥ 条（实测结论）** 与 **⑤ 条（规格区）** 各自必须自带自己的登记：
  *        · ⑥ 条 ⇒ `2,176` `5,286` `0/100` `21/100` `91/100` `3.7037%` `5.0000%` `17.9487%` `66.6667%` `影子阈值`
  *        · ⑤ 条 ⇒ `投之前` `影子阈值` `规模已被证伪` `落盘口径` `无分辨力`
+ *
+ * ★★★ **v7 的断言（★ QA 独立回归指出的盲区 · ★ 主理人实现） ★★★**：
+ *   ⑬-A ★ **表一 / 表二 必须恰好 5 条逻辑行**（★ 表头 + 分隔行 + 3 行数据；★ 第 6 条必须不是表格行）
+ *      · 起因：★ v1~v6 只校验「表内每行单元格数 == 表头列数」⇒ ⇒ **表少一行也照样过**
+ *   ⑬-B ★ **字节侧临界值必须带数值在位**：表二 int4 行 ⇒ `**662 行**` `**12.5236%**`
+ *      · 「2000 行档自己的字节侧上限」段落 ⇒ `允许进精排 8 行` `剪枝率上限 16.0000%`
+ *        `允许进精排 30 行` `剪枝率上限 37.5000%`
+ *   ⑬-C ★ **⑥ 条必须自带** `182`（自命中行数）`18.68×` `18.07×` `负余量（漏检风险）= 0`
+ *   ⑬-D ★ **口径 A 的标记与数字必须在 ⑥ 条里**（★ 收窄 v1~v6 的「整行范围」查法）
+ *   ⑬-E ★ **混档四档占比必须在「混档落差」段落里**（★ 同上）
+ *   ★★ 另修 **`cellCount`**（★ R02）：★ 旧实现把**空单元格**也滤掉 ⇒ ⇒ 表少一列也能过
+ *      ⇒ 现在按「掐掉首尾 `|` ⇒ 中间按 `|` 切」数 ⇒ ★ **空单元格也算一格**。
  *
  * ★ **链外还是链内**：★ **链外**（★ 不进 `verify` · ★ 纪律 5：门禁链 18 段本批不加段）
  *   ⇒ ⇒ `pnpm run check:t11-int4-row` 可独立运行。
@@ -310,13 +322,13 @@ function isSeparatorRow(text: string): boolean {
   return /^\|[\s:-]*\|[\s|:-]*$/.test(text.trim());
 }
 
-/** ★ 一行的单元格数（★ 掐掉首尾空项后按 `|` 切）。 */
+/** ★ 一行的单元格数（★ v7 修：★ 旧实现把**空单元格**也滤掉了 ⇒ ⇒ 表少一列也能过）。
+ *  ★ 现在按「掐掉首尾的 `|`（外层）⇒ 中间按 `|` 切」数 ⇒ ★ **空单元格也要算一格**。 */
 function cellCount(text: string): number {
-  return text
-    .trim()
-    .split('|')
-    .map((cell) => cell.trim())
-    .filter((cell) => cell !== '').length;
+  const t = text.trim();
+  const inner = t.startsWith('|') ? t.slice(1) : t;
+  const body = inner.endsWith('|') ? inner.slice(0, -1) : inner;
+  return body.split('|').length;
 }
 
 {
@@ -476,6 +488,138 @@ for (const mark of ['投之前', '影子阈值', '规模已被证伪', '落盘�
   }
 }
 
+/* ══ ⑬ v7 · QA 独立回归指出的盲区（★ 逐条补 · ★ 主理人实现） ══ */
+{
+  const rows = r3Logical;
+
+  /* ── ⑬-A 表一 / 表二 必须【恰好】5 条逻辑行（★ QA 的 R03/R04）────────────────
+   * ★ 起因：★ v1~v6 只校验「表内每行单元格数 == 表头列数」⇒ ⇒ **表少一行也照样过**
+   *   ⇒ ⇒ 少掉「二值」行或「PQ」行时守卫不会红。
+   * ★⇒⇒ v7 断言：**表头 + 分隔行 + 3 行数据 = 5 条**，且第 6 条**必须不是**表格行
+   *   （★ 否则说明表格被续写了 ⇒ 多了行 ⇒ 也要判红）。
+   */
+  const TABLE_SHAPES: { header: string; rows: string[]; label: string }[] = [
+    {
+      header: '| 码宽 |',
+      label: '表一',
+      rows: ['| **int8** |', '| **int4** |', '二值（1 bit/维）'],
+    },
+    {
+      header: '| 候选档 |',
+      label: '表二',
+      rows: ['| **int4** |', '二值（1 bit/维）', 'PQ（子空间×码本）'],
+    },
+  ];
+  for (const shape of TABLE_SHAPES) {
+    const h = rows.findIndex((p) => p.trim().startsWith(shape.header));
+    if (h < 0) {
+      issues.push(`R3 行里找不到${shape.label}的表头（★ 以「${shape.header}」开头）`);
+      continue;
+    }
+    for (let offset = 0; offset < shape.rows.length; offset += 1) {
+      const cell = rows[h + 2 + offset] ?? '';
+      if (!cell.trim().startsWith('|')) {
+        issues.push(
+          `${shape.label} 的第 ${offset + 3} 行（数据行）不是表格行（★ 期望含「${shape.rows[offset]}」）\n  实际: ${cell.trim().slice(0, 100)}`,
+        );
+      } else if (!cell.includes(shape.rows[offset] as string)) {
+        issues.push(
+          `${shape.label} 的第 ${offset + 3} 行内容不符（★ 期望含「${shape.rows[offset]}」）\n  实际: ${cell.trim().slice(0, 100)}`,
+        );
+      }
+    }
+    // ★ 恰好 5 条 ⇒ 第 6 条必须不是表格行
+    const sixth = rows[h + 5] ?? '';
+    if (sixth.trim().startsWith('|')) {
+      issues.push(
+        `${shape.label} 的逻辑行数 **不是 5**（★ 期望 = 表头 + 分隔行 + 3 行数据；★ 第 6 条仍是表格行 ⇒ 多了一行）\n  多出来的那行: ${sixth.trim().slice(0, 100)}`,
+      );
+    }
+    // ★ 分隔行必须在表头正下方
+    if (!isSeparatorRow(rows[h + 1] ?? '')) {
+      issues.push(`${shape.label} 的表头正下方不是分隔行（★ 表格结构坏了）`);
+    }
+  }
+
+  /* ── ⑬-B 字节侧临界值必须【带数值】在位（★ QA 的 R12~R16）────────────────
+   * ★ 起因：★ v1~v6 只查标记名（★ 「12.5236%」在整行里出现过就算过）
+   *   ⇒ ⇒ **把表二 int4 行的数值换成别的数，守卫不会红**。
+   * ★⇒⇒ v7 断言：★ 表二 int4 行必须自带「**662 行**」与「**12.5236%**」
+   *   ★ 且「2000 行档自己的字节侧上限」段落必须自带 8 行 / 16.0000% / 30 行 / 37.5000%。
+   */
+  const t2Header = rows.findIndex((p) => p.trim().startsWith('| 候选档 |'));
+  const table2Int4 = t2Header >= 0 ? (rows[t2Header + 2] ?? '') : '';
+  for (const value of ['**662 行**', '**12.5236%**']) {
+    if (!table2Int4.includes(value)) {
+      issues.push(
+        `表二的 int4 行里找不到「${value}」（★ ★ 字节侧临界值必须带数值在位：★ 662 行 = 1M 档口径 C = 5,286 行算出的进精排上限 · 12.5236% = 同口径的剪枝率上限）`,
+      );
+    }
+  }
+  const byteSide2000 =
+    rows.find((p) => p.trim().startsWith('★ ★ **2000 行档自己的字节侧上限')) ?? '';
+  if (byteSide2000 === '') {
+    issues.push(
+      'R3 行里找不到「2000 行档自己的字节侧上限」段落（★ ★ 该段落是 2000 档自身上限的唯一登记处 ⇒ ★ 删掉它 = 静默丢失一条已实测的判据）',
+    );
+  } else {
+    for (const value of [
+      '允许进精排 8 行',
+      '剪枝率上限 16.0000%',
+      '允许进精排 30 行',
+      '剪枝率上限 37.5000%',
+    ]) {
+      if (!byteSide2000.includes(value)) {
+        issues.push(
+          `「2000 行档自己的字节侧上限」段落里找不到「${value}」（★ ★ 写路径 C = 50 ⇒ 8 行 / 16.0000% · 读路径 C = 80 ⇒ 30 行 / 37.5000%）`,
+        );
+      }
+    }
+  }
+
+  /* ── ⑬-C ⑥ 条必须自带「自命中行数 / 上界余量倍数 / 零漏检」（★ QA 的 R18/R21/R22）──
+   * ★ 起因：★ v1~v6 没有对这些数做在位断言 ⇒ ⇒ 改了它们守卫不会红。
+   */
+  for (const [value, why] of [
+    ['182', '★ 真值余弦 > 0.99 的【自命中行】数'],
+    ['18.68×', '★ 上界余量 = int8 的倍数（max）'],
+    ['18.07×', '★ 上界余量 = int8 的倍数（均）'],
+    ['负余量（漏检风险）= 0', '★ int4 接线零漏检的实测结论'],
+  ] as const) {
+    if (clause6 !== '' && !clause6.includes(value)) {
+      issues.push(`⑥ 条里找不到「${value}」（★ ★ ${why}）`);
+    }
+  }
+
+  /* ── ⑬-D 口径 A 的【数字】必须在 ⑥ 条里在位（★ QA 的 R23）────────────────
+   * ★ 起因：★ v1~v6 只在【整行】范围查口径 A 的标记 ⇒ ⇒ 把整段换成别的口径也可能过。
+   * ★⇒⇒ v7 把口径 A 的断言**收窄到 ⑥ 条**（★ 口径 A 是 ⑥ 条内部的一个子块）。
+   */
+  for (const value of CALIBER_A_EVIDENCE) {
+    if (clause6 !== '' && !clause6.includes(value)) {
+      issues.push(
+        `⑥ 条里找不到口径 A 的证据「${value}」（★ ★ 口径 A = 落盘口径（★ 本轮凭据的数据源）⇒ ★ 它的标记与数字必须在【实测结论】这一条里）`,
+      );
+    }
+  }
+
+  /* ── ⑬-E 混档段落的【四档占比】必须在该段落里在位（★ QA 的 R24）────────────
+   * ★ 起因：★ v1~v6 只在【整行】范围查四个占比 ⇒ ⇒ 把混档段落整块替换掉也可能过。
+   */
+  const mixedSection = rows.find((p) => p.includes(MIXED_SECTION_MARK)) ?? '';
+  if (mixedSection === '') {
+    issues.push(`R3 行里找不到「${MIXED_SECTION_MARK}」段落（★ ★ 该段落是混档落差的唯一登记处）`);
+  } else {
+    for (const value of MIXED_RATIOS) {
+      if (!mixedSection.includes(value)) {
+        issues.push(
+          `「${MIXED_SECTION_MARK}」段落里找不到占比 ${value}（★ ★ 期望四档：37.19%（落盘写路径）/ 18.56%（去重）/ 8.79%（落盘读路径）/ 9.38%（benchQ×写探针 · 非落盘口径））`,
+        );
+      }
+    }
+  }
+}
+
 /* ══ ⑨ v3 · 旧表述必须已消失 ══ */
 for (const stale of STALE_PHRASES) {
   if (r3Line.includes(stale)) {
@@ -575,5 +719,8 @@ if (issues.length > 0) {
   );
   process.stdout.write(
     '✓ T11 守卫：⑥ 条 / ⑤ 条各自自带自己的登记（★ v6 · ★ 修「整行至少出现一次」的弱断言）\n',
+  );
+  process.stdout.write(
+    '✓ T11 守卫：表一/表二恰好 5 条逻辑行 + 字节侧数值在位 + ⑥ 条自命中/余量/零漏检 + 口径 A 与混档占比按段落在位（★ v7 · ★ QA 盲区）\n',
   );
 }
