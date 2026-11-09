@@ -1,0 +1,40 @@
+
+==================== .tmp/bench/t07-warm.json ====================
+【规模自证】corpusSize=1000000  trainedCells=9966  trainedMembers=1000000
+【档位声明】pageCacheState={"state":"warm","source":"cli:--cache-state","declared":true,"note":"⚠ **由跑的人声明**（不是仪器测量值 —— Windows 没有公开 API 能报「这个库有多少在页缓存里」）⇒ 本档的毫秒数**只能与同档比较**。⚠️ **判档的可复算旁证（不是仪器）**：**先测一下顺序读吞吐**（同一块盘、同一个文件、固定偏移读一段固定大小，报 MB/s）⇒ 与 `storageMedia` 里那块盘的**名义顺序读带宽**对比：**明显低于名义值 ⇒ 随机读要落盘 ⇒ 偏冷**；**接近或高于名义值 ⇒ 页缓存命中率高 ⇒ 偏热**。⚠️ **本字段仍是「声明」不是「测量」**（Windows 没有公开 API 能报「这个库有多少在页缓存里」）⇒ 判档必须连这条旁证一起看；⚠️ **换机器请用自己的盘速重算这个对照**（本段**刻意不写具体盘速**：写死一个数，换一块盘就变成假话）。"}
+【存储介质】storageMedia={"mediaClass":"HDD","source":"powershell:Get-PhysicalDisk","detected":true,"detail":"HDD | SATA | ST1000DM010-2EP102"}
+【failures】
+   ✗ recall P99 1150.002ms > 200ms（样本 200、预热 20）
+   ✗ 写入 P99 1800.454ms > 5ms（样本 200、预热 20）
+   ✗ 向量路 P99 4540.643ms > 20ms（样本 200、预热 20）
+   ✗ 向量路占总耗时 90.16% > 20%
+──── 写路径（H1′ / H2′ / PRUNE_RATE 的判据量）────
+  ★ bytesRead.max          = 4065792 B      [门槛 ≤ 6,144,000 B]  count=200 min=16128 mean=1623229.4 p50=1549824 p99=3998976 max=4065792
+  ★ candidateUniverse.max   = 5286 行   [破点参考 7,838 / 7,960]  count=200 min=21 mean=2109.2 p50=2018 p99=5207 max=5286
+  ★ codeRowsRead.max        = 5286 行   count=200 min=21 mean=2109.2 p50=2018 p99=5207 max=5286
+  ★ memoryRowsRead.max      = 2 行   count=200 min=0 mean=1.1 p50=2 p99=2 max=2
+  ★ pruneRate.max           = 3.70%   [门槛 ≤ 15%]  count=200 min=0 mean=0.0 p50=0.0002738975623116954 p99=0.0125 max=0.037037037037037035
+  ★ embeddingCalls.max      = 1   count=200 min=0 mean=0.5 p50=1 p99=1 max=1
+  ★ embeddingExactRows.max  = 1   count=200 min=0 mean=0.5 p50=1 p99=1 max=1
+  ★ embeddingRowsRead.max   = 2   count=200 min=0 mean=1.1 p50=2 p99=2 max=2
+  ★ bucketMemberRows.max    = 5286   count=200 min=21 mean=2109.2 p50=2018 p99=5207 max=5286
+  ★ narrowRowsRead.max      = 0   count=200 min=0 mean=0.0 p50=0 p99=0 max=0
+  ★ codeBytes.max           = 4059648   count=200 min=16128 mean=1619881.0 p50=1549824 p99=3998976 max=4059648
+  ★ embeddingBytes.max      = 6144   count=200 min=0 mean=3348.5 p50=6144 p99=6144 max=6144
+  ★ contentBytes.max        = 165   count=200 min=0 mean=88.7 p50=161 p99=165 max=165
+  ★ unclassifiedRows        = 0   [必须 0]
+  ★ badCodeRows             = 0   [必须 0]
+  ★ unclassifiedSqlKinds    = []
+  ★ samplesAligned（写路径）  = true   [必须 true]
+  ★ 旧行数（观测值）vectorCandidateRows.max = 5286 行
+──── 判据计算（用落盘值自己算一遍）────
+  H1′ bytesRead.max              = 4065792 B  vs 门槛 6,144,000 B  ⇒ 绿（余量 33.8%）
+  H2′ bytesRead.max ÷ (corpus×3072) = 0.1323%  vs 门槛 0.2%  ⇒ 绿
+  PRUNE_RATE pruneRate.max        = 3.70%  vs 门槛 15%  ⇒ 绿
+  恒等式 bytesRead = codeBytes + embeddingBytes（max）: 4065792 vs 4059648+6144 = 4065792
+──── 读路径（观测值 · 不判门槛）────
+  bytesRead.max = 7233792   candidateUniverse.max = 9251   samplesAligned = true
+  unclassifiedRows = 0   badCodeRows = 0
+──── 毫秒参考线（介质相关 · 不作判据）────
+  recallP99Ms=1150.002  writeP99Ms=1800.454  vectorRouteP99Ms=4540.643  vectorRouteShare=90.16%
+  candidateReadRows(R6 观测) = count=200 min=42 mean=42.5 p50=42 p99=57 max=85   hitFineBuckets = count=200 min=50 mean=50.0 p50=50 p99=50 max=50

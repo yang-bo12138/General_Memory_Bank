@@ -37,6 +37,7 @@
       "node_modules/**",
       "dist/**",
       "coverage/**",
+      "docs/evidence/t07-local-artifacts/**",
       "tests/golden/__captured__/**",
       ".tmp/**",
       "docs/baseline/**"

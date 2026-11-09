@@ -1,0 +1,1050 @@
+diff --git a/bench/perf.ts b/bench/perf.ts
+index 1421711..c18fe4d 100644
+--- a/bench/perf.ts
++++ b/bench/perf.ts
+@@ -142,6 +142,7 @@ import { embedText } from './embedder.js';
+ import { prepareBench } from './lib/db.js';
+ import {
+   BENCH_NOW,
++  type ByteReadSnapshot,
+   type PageCacheStateInfo,
+   type StorageMediaInfo,
+   benchWorkDir,
+@@ -198,8 +199,47 @@ export const THRESHOLDS = {
+    *   不是一个量在召回侧、一个量在写入侧。
+    */
+   candidateReadRowsRatioMax: 0.002,
++  /**
++   * ★★ **H1′（字节 · 唯一判据 · T06）**：**写入去重路径**的单次**向量载荷字节**上限（字节）。
++   *
++   * ⚠️ ★★★ **为什么是「字节」而不是「行」**（口径 §5 / ADR §8.5 理由 2）：
++   *   「行」是**实现相关**的单位（768 B 的 int8 码 vs 96 B 的码 vs 打包块 ⇒ 行数含义完全不同）
++   *   ⇒ ⇒ **换存储形态就等于换了一把尺** ⇒ ⇒ 字节口径**与码宽 / 存储形态无关** ⇒ 换实现不换尺。
++   * ⚠️ **6,144,000 B = 2,000 行 × 3,072 B** ⇒ **与旧 H1 的 2,000 行同源**（同一笔、同一探针 8/20）
++   *   ⇒ ⇒ **H1′ 与 H1 可比**（不是另立一个数）。
++   * ⚠️ **判定只取 `bytesRead.max`**（「单次」⇒ 每一次都要满足 ⇒ 最严口径）。
++   */
++  bytesReadMax: 6_144_000,
++  /**
++   * ★ **H2′（与 H1′ 同义的规模无关写法）**：
++   * **写入去重路径**的向量载荷字节 ÷（库规模 × 3,072 B）的上限（比例）。
++   *
++   * ⚠️ 1M ⇒ ≤ 6,144,000 B；10M ⇒ ≤ 61,440,000 B ⇒ **与库规模解耦**。
++   * ⚠️ **主语与 H1′ 完全相同**（同一个量、同一批样本、同一个探针）⇒ 两者必然同时红 / 同时绿。
++   */
++  bytesReadRatioMax: 0.002,
++  /**
++   * ★ **剪枝率（出关条件①）**：`embeddingCalls ÷ candidateUniverse` 的上限（比例）。
++   *
++   * ⚠️ ★★★ **分子必须是「`get()` 调用次数」**（口径 §1.7 / §2 断言 1c-bench）：
++   *   门槛是「≤ 15%」⇒ **分子偏小 = 更容易过 = 偏松 = 假绿**
++   *   ⇒ 最坏情形：命中桶内全是软删成员 ⇒ 「返回行数」= 0 ⇒ **剪枝率 0% ⇒ 假绿**
++   *   ⇒ ⇒ 必须数**调用次数**（返回 `undefined` 也计）⇒ 它**定义上** == `prune` 的 `exactReads`
++   *   ⇒ ⇒ 等价性由 `tests/unit/prune.test.ts` 的断言 1c 钉住（**零 `src/**` 改动**）。
++   */
++  pruneRateMax: 0.15,
+ } as const;
+ 
++/**
++ * ★ **一条向量行的字节数**（768 个 float32 = 3,072 B）。
++ *
++ * ⚠️ **为什么跟着参数走**（不写死 3,072）：`EMBED_DIM` 是**参数**
++ *   ⇒ 维度一改 ⇒ 向量字节就改 ⇒ ⇒ 写死 3,072 会在改维度后**悄悄算错**。
++ * ⚠️ **它只用于「规模无关写法」的分母**（H2′：`bytesRead ÷ (库规模 × 本值)`）
++ *   ⇒ ⇒ 与旧 H2 的分母（库规模）**同形** ⇒ ⇒ **可与旧 H2 逐位对照**。
++ */
++const BYTES_PER_VECTOR_ROW = DEFAULT_PARAMS.EMBED_DIM * 4;
++
+ /** 预热轮次（**不计入统计**）。 */
+ export const WARMUP_ROUNDS = 20;
+ 
+@@ -261,6 +301,144 @@ export interface CandidateReadRowsBasis {
+   readonly bucketMemberRowsRead: CountSummary | null;
+ }
+ 
++/**
++ * ★★ **T06 · 一次采样的字节读数**（**逐样本**；落盘时压成分布）。
++ *
++ * ⚠️ ★ **为什么是「逐样本」而不是「全程一个总数」**：
++ *   判据取 `max`（「单次写入」⇒ 每一次都要满足）⇒ ⇒ 必须**逐样本**采 ⇒ ⇒ 才能压出分布。
++ */
++export interface VectorByteSample {
++  /** 物化的 `memories` 行数（窄读 + 向量）。 */
++  readonly memoryRowsRead: number;
++  /** 物化的 `vector_codes` 行数（Q2）。 */
++  readonly codeRowsRead: number;
++  /** **向量载荷字节**（`codeBytes + embeddingBytes`，零容差恒等式）。 */
++  readonly bytesRead: number;
++  /** 命中桶内的候选总数（写路径 = `scan.scanned`；读路径 = `COUNT(DISTINCT memory_id)`）。 */
++  readonly candidateUniverse: number;
++  /** 码字节之和（Σ `row.code.byteLength`）。 */
++  readonly codeBytes: number;
++  /** 向量字节之和（Σ `row.embedding.byteLength`）。 */
++  readonly embeddingBytes: number;
++  /** 正文字节（Q4 的 `content` + `content_tokens` 的 UTF-8 实测；**不在** `bytesRead` 里）。 */
++  readonly contentBytes: number;
++  /** **物化出 `embedding` 的行数**（字节账的分子；**含** Q4 的整行读）。 */
++  readonly embeddingRowsRead: number;
++  /** ★ **`scoreOf` 的 `get()` 返回了行的次数**（= `embeddingCalls` 减去白调用）。 */
++  readonly embeddingExactRows: number;
++  /** ★ **`scoreOf` 的 `get()` 调用次数**（**无条件**计数 ⇒ **剪枝率分子** ≡ `exactReads`）。 */
++  readonly embeddingCalls: number;
++  /** Q3 窄读行数（**0 字节**）。 */
++  readonly narrowRowsRead: number;
++  /** Q1 成员行数（**0 字节**进判据）。 */
++  readonly bucketMemberRows: number;
++  /**
++   * ★ **由 `route()` 命中桶推算出来的成员行数之和**（**读路径专有**；写路径 = `null`）。
++   *
++   * ⚠️ ★★ **它是「读路径对账」的另一半**（口径裁决落地 #1）：
++   *   · `bucketMemberRows` = **计数器实测**的成员行数（`search()` 真正扫的桶）；
++   *   · `bucketMemberRowsDerived` = **`route()` 命中的桶**各自 `countBucketMembers()` 之和
++   *     （**在计时窗口之外**算 ⇒ 不污染字节读数）。
++   *   ⇒ ⇒ **两者逐样本相等** ⇒ ⇒ 证明「`search()` 看到的桶」与「`route()` 看到的桶」
++   *     **是同一批** ⇒ ⇒ 落盘的 `candidateUniverse`（由 `route()` 的 `fineIds` 算）
++   *     **对得上**实测的字节账。
++   *   ⇒ ⇒ 不等 ⇒ **`search()` 与 `route()` 看到的不是同一批桶** ⇒ ⇒ 落盘的
++   *     `candidateUniverse` 对不上 ⇒ ⇒ **不可判定 ⇒ 判红**。
++   *
++   * ⚠️ ★ **不许拿 `candidateUniverse` 当比较对象**：它是 `COUNT(DISTINCT memory_id)`
++   *   ⇒ 一个记忆落在多个命中桶时它**小于**成员行总数 ⇒ ⇒ 1M 规模下**不成立**。
++   */
++  readonly bucketMemberRowsDerived: number | null;
++  /** 码长 ≠ 768 的行数（**健康库恒 0** ⇒ 非 0 ⇒ 前提违例 ⇒ 判红）。 */
++  readonly badCodeRows: number;
++  /** **命中零来源**（未登记形状）的行数（**必须 0**）。 */
++  readonly unclassifiedRows: number;
++  /** 未登记语句的指纹集合（**打印 + 落盘**）。 */
++  readonly unclassifiedSqlKinds: readonly string[];
++  /** legacy 计数器的候选行数（**交叉校验 1b** 用；与 `memoryRowsRead` 在写路径相等）。 */
++  readonly legacyCandidateRows: number;
++  /** legacy 计数器的码行数（**交叉校验 1b** 用）。 */
++  readonly legacyCodeRows: number;
++}
++
++/**
++ * ★★ **T06 · 字节读数的 breakdown**（口径 §4 的 `breakdown`）。
++ *
++ * ⚠️ ★ **每一项都必须是 `CountSummary` 分布**（口径 §4：判据取 `max` 有值可取、
++ *   且与既有 `vectorCandidateRows` 同形 ⇒ 「换口径不用重跑百万级」）。
++ *
++ * ⚠️ ★ **共 13 项**（口径 §4 的表里列了 12 项 ⇒ ⇒ **本轮多落了一项 `embeddingExactRows`**
++ *   ⇒ ⇒ 口径若要写死清单 ⇒ **请把 `embeddingExactRows` 补进去**）。
++ */
++export interface VectorByteReadsBreakdown {
++  /** 码字节之和（**进** `bytesRead`）。 */
++  readonly codeBytes: CountSummary;
++  /** 向量字节之和（**进** `bytesRead`）。 */
++  readonly embeddingBytes: CountSummary;
++  /** ★ **正文字节**（Q4 的 `content` + `content_tokens`）⇒ **不在** `bytesRead` 里 ⇒ 让「下界差多少」可见。 */
++  readonly contentBytes: CountSummary;
++  /** 物化出 `embedding` 的行数（字节账的分子）。 */
++  readonly embeddingRowsRead: CountSummary;
++  /** ★ **`scoreOf` 返回了行的次数**（= `embeddingCalls` 减去「白调用」）。 */
++  readonly embeddingExactRows: CountSummary;
++  /** ★ **`get()` 调用次数**（**剪枝率分子**；定义上 == `prune` 的 `exactReads`）。 */
++  readonly embeddingCalls: CountSummary;
++  /** Q3 窄读行数（**0 字节**）。 */
++  readonly narrowRowsRead: CountSummary;
++  /** Q1 成员行数（**0 字节**进判据）。 */
++  readonly bucketMemberRows: CountSummary;
++  /** 坏码行数（**健康库恒 0**；非 0 ⇒ 白读 ⇒ 前提违例 ⇒ 判红）。 */
++  readonly badCodeRows: number;
++  /** **命中零来源**的行数（**必须 0**；> 0 ⇒ 口径不完整 ⇒ 判红）。 */
++  readonly unclassifiedRows: number;
++  /** 未登记语句的指纹集合（**打印 + 落盘**）。 */
++  readonly unclassifiedSqlKinds: string[];
++  /** 剪枝率的分布（每样本 `embeddingCalls ÷ candidateUniverse`；判定取 `max`）。 */
++  readonly pruneRate: CountSummary;
++  /**
++   * ★ **样本对齐**（断言 1d）。
++   *
++   * ⚠️ **写路径 = 两轮对齐**（轮 A 计时 / 轮 B 计量 ⇒ `candidateUniverse` 逐样本相等）
++   *   ⇒ ⇒ **它有牙**：计量若扰动了扫描 ⇒ 两个候选宇宙不等 ⇒ 红。
++   * ⚠️ ★★ **读路径 = 实测桶成员行 === 推算桶成员行**（口径裁决落地 #1）：
++   *   · **实测** = 计数器认领的「成员来源」行数（`search()` 真正扫的桶）；
++   *   · **推算** = `route()` 命中的桶各自 `countBucketMembers()` 之和；
++   *   ⇒ ⇒ **逐样本相等** ⇒ ⇒ 「`search()` 看到的桶」与「`route()` 看到的桶」是同一批
++   *     ⇒ ⇒ 落盘的 `candidateUniverse` 对得上实测字节账 ⇒ ⇒ **可判定**；
++   *   ⇒ ⇒ **不等 ⇒ 不可判定 ⇒ 判红**。
++   *
++   * ⚠️ ★★★ **为什么不能是「字节样本数 == 计时样本数」**（**那条是恒真的**）：
++   *   两个 `push` 在**同一个循环体内、无条件、无 `continue` / `break`** ⇒ 长度必然相等
++   *   ⇒ ⇒ 那条比较**永远为 true** ⇒ ⇒ 它挂在判红守卫上却**永远打不红** ⇒ ⇒ **说谎**。
++   *   ⇒ ⇒ 换成上面那个**真的会因为「两处看到的桶不是同一批」而变红**的量。
++   */
++  readonly samplesAligned: boolean;
++}
++
++/**
++ * ★★ **T06 · 向量字节读数**（**四读数 + breakdown + note**；口径 §4）。
++ *
++ * ⚠️ ★ **四个读数用 ADR §8.5 的原名**（`memoryRowsRead` / `codeRowsRead` /
++ *   `bytesRead` / `candidateUniverse`）⇒ **不另立名字** ⇒ 读旧 JSON 的人对得上账。
++ */
++export interface VectorByteReads {
++  /** 物化的 `memories` 行数（窄读 + 向量）＝ ADR §8.5 的「原口径」。 */
++  readonly memoryRowsRead: CountSummary;
++  /** 物化的 `vector_codes` 行数（Q2 返回行数）。 */
++  readonly codeRowsRead: CountSummary;
++  /** ★ **向量载荷字节**（**唯一判据量**；H1′ / H2′ 都看它）。 */
++  readonly bytesRead: CountSummary;
++  /** 命中桶内的候选总数。 */
++  readonly candidateUniverse: CountSummary;
++  /** 来源分解（**13 项**）。 */
++  readonly breakdown: VectorByteReadsBreakdown;
++  /** 口径说明（**必须落盘** ⇒ 读的人不会把它误读成「一次真实写入的总字节」）。 */
++  readonly note: string;
++}
++
++/**
++ * ★ **写入路径的分段摘要**（旧键一个都没动；新增 `vectorByteReads`）。
++ */
+ /**
+  * ★ **写入路径的分段计时**（2026-11-02 架构师裁决）。
+  *
+@@ -293,6 +471,18 @@ export interface WriteSegmentSummary {
+    *   **不含**「扫描 + 逐条算 cos + 排序」的其余成本 ⇒ 那些在 `vectorCandidateScan`（耗时）里。
+    */
+   readonly vectorCandidateRows: CountSummary;
++  /**
++   * ★★ **T06 · 字节读数（★ H1′ / H2′ 的【唯一】判据量）**。
++   *
++   * ⚠️ ★★★ **口径**：本块 = **bench 的「写入扫描独立实测段」**
++   *   （`collectVectorCandidates()` 那一笔 ⇒ 与旧 H1 的 `vectorCandidateRows`
++   *   **同一笔**：同探针 8/20、同库、同被考核方）⇒ ⇒ **H1′ 与 H1 可比**。
++   * ⚠️ ⚠️ **它【不是】`store.write()` 内部那一笔** —— 生产写入内部自己就会走向量候选扫描
++   *   （`src/store/write.ts:671` → `collectDedupCandidates()` → `collectVectorCandidates()`）
++   *   ⇒ 那一笔**不单独落盘**（已被 `writeTotal` 的计时覆盖）⇒ ⇒ **两笔都在，只有一笔是判据量**
++   *   ⇒ ⇒ 详见 `vectorByteReads.note`。
++   */
++  readonly vectorByteReads: VectorByteReads;
+   /** 写入总耗时（**实测**；就是 P99 用的那批样本）。 */
+   readonly writeTotal: LatencyDistribution;
+   /** 其余段（FTS5 + 索引维护 + 合并判定 + 事件写入）的**均值** —— **推导值**（毫秒）。 */
+@@ -453,6 +643,17 @@ export interface PerfResult {
+    * ⚠️ **`null` ⇒ 候选行数为 0**（分桶尚未训练 ⇒ 向量路整体缺席）⇒ 不是「成本为 0」。
+    */
+   readonly perRowReadCostUs: number | null;
++  /**
++   * ★★ **T06 · 召回路径的字节读数**（**观测值，不判门槛**）。
++   *
++   * ⚠️ ★ **为什么放顶层而不塞进 `recallVectorPath`**（口径 §4）：
++   *   `recallVectorPath` 是「new-path 档**整条召回**的 old vs new 时序对比」
++   *   ⇒ **字节数不参与那个对比** ⇒ 塞进去会 mislead
++   *   ⇒ ⇒ 而字节读数的采样窗口**正是** `candidateReadRows` 那个（`backend.search()`，探针 20/50）
++   *   ⇒ ⇒ **与同组读数放一起**才不拆散。
++   * ⚠️ **它不判红绿**（与 R6 同组：观测值）⇒ 判据只在 `writeSegments.vectorByteReads`。
++   */
++  readonly vectorRouteByteReads: VectorByteReads;
+   /** ★ **写入路径的分段计时**（见 `WriteSegmentSummary` 的口径说明）。 */
+   readonly writeSegments: WriteSegmentSummary;
+   /** recall 的耗时分布 —— ★ **old-path 档**（不传 `queryEmbedding`）；new-path 见 `recallVectorPath.latency`。 */
+@@ -564,10 +765,13 @@ export const GATE_REGROUPING: GateRegrouping = {
+   decidedAt: '2026-11-03',
+   decision: 'D10（H1 归口拆分）',
+   source: 'docs/design/DESIGN-v2-errata.md §11.8 勘误 ⑫ / docs/design/DECISIONS.md 的 D10',
+-  h1h2Quantity: 'writeSegments.vectorCandidateRows（判定取 max）',
++  h1h2Quantity:
++    'writeSegments.vectorCandidateRows（★ **已降级为并列观测**）⇒ ★ **现行判据量 = ' +
++    'writeSegments.vectorByteReads.bytesRead（★ H1′ · 判定取 max）**',
+   h1h2Subject:
+     '写入去重路径（探针 ROUTER_NPROBE_WRITE_COARSE=8 / ROUTER_NPROBE_WRITE_FINE=20）；' +
+-    '门槛 ≤ 2000 行 / ≤ 0.2% 与判定方式（取 max）一个都没改',
++    '⚠️ **旧行数门槛 ≤ 2000 行 / ≤ 0.2% 与判定方式（取 max）一个都没删**（仍在本文件里），' +
++    '但 ★ **字节口径下它们已不是判据**（H1′ = ≤ 6,144,000 B / ≤ 0.2%）',
+   r6Quantity:
+     'candidateReadRows（召回路径 · 探针 ROUTER_NPROBE_COARSE=20 / ROUTER_NPROBE_FINE=50）',
+   r6Status: '观测值：本轮不设门槛、不判红绿',
+@@ -584,7 +788,10 @@ export const GATE_REGROUPING: GateRegrouping = {
+     '④ ⚠️ **两组量的探针配置不同**（8/20 vs 20/50）⇒ **不可混读、不可比大小**' +
+     '（「2.76 倍」与「6.39 倍」是**两个不同的量各自有数**，不是一个数在改善）；' +
+     '⑤ ⚠️ **归口 ≠ 达标**：H1 在 1M 实测里是 5,521 行 = 门槛的 **2.76 倍 ⇒ 仍红**' +
+-    '⇒ 这次改的是**主语**，不是门槛。',
++    '⇒ 这次改的是**主语**，不是门槛；' +
++    '⑥ ⚠️ ★★ **T06（2026-11-05）追加**：**旧行数判据已降级为并列观测**（仍落盘、仍打印，' +
++    '但**不再进 `failures`**）⇒ ★ **唯一判据 = `writeSegments.vectorByteReads.bytesRead`**（H1′，' +
++    '≤ 6,144,000 B）⇒ 阈值常量 `candidateReadRowsMax` / `candidateReadRowsRatioMax` **一个都没删**。',
+ };
+ 
+ /**
+@@ -668,6 +875,42 @@ export function probeVectorPathOfRecall(
+   return { ran, candidates, mode, note };
+ }
+ 
++/**
++ * ★ **写路径一次扫描的行读读数**（T06 第一段的观测产物；**计量轮**那一笔）。
++ *
++ * ⚠️ ★ **为什么是「行数」而不是「字节数」**：
++ *   「**字节怎么算**」由架构师裁决（`bytesRead` 的口径 · 每类行的字节系数 · 落盘字段名）
++ *   ⇒ ⇒ **本段只负责「把每一类读了多少行」采到**（口径 = 生产 SQL **实际物化**的行数）
++ *   ⇒ ⇒ **不许在这里乘任何字节系数**（那会变成第二套字节口径 ⇒ 两套账必然漂移）。
++ *
++ * ⚠️ **这几个数对应写路径（两段式）的四段读**：
++ *   · `candidateUniverse` = **候选宇宙**（`scan.scanned` = 命中桶的成员数；**不是**读出来的行数）
++ *     —— ⚠️ 它与 `writeSegments.vectorCandidateRows` 是**同一个量**（架构师 §10.1 的「有意的冗余」）；
++ *   · `bucketMemberRows` = **Q1**（`vector_cell_members`）；
++ *   · `codeRows` = **Q2**（`vector_codes` 的 int8 码池）；
++ *   · `candidateRows` = **`memories` 侧的行读**（`scoreOf` 的逐条读 + Q4 survivors 整行读）
++ *     —— ⚠️ **写路径里它恰好等于架构师口径的 `memoryRowsRead`**（写路径不发 Q3 窄读）。
++ */
++export interface WritePathReadSample {
++  /** 候选宇宙（`scan.scanned` = 命中桶的**成员数**；⚠️ **不是**读出来的行数）。 */
++  readonly candidateUniverse: number;
++  /** **Q1**：桶成员行（`vector_cell_members`）。 */
++  readonly bucketMemberRows: number;
++  /** **Q2**：码行（`vector_codes` 的 int8 码池）。 */
++  readonly codeRows: number;
++  /**
++   * **`memories` 侧的行读**（`scoreOf` 的逐条读 + Q4 survivors 整行读）。
++   *
++   * ⚠️ ★ **已知缺口（留给 T06 第二段）**：**Q3 的窄列读也会被算在这里**
++   *   （`readGateColumns()` 的 `SELECT id, last_access, pin_factor FROM memories …`
++   *   ⇒ 含 `FROM memories` ⇒ 被认成候选行）
++   *   ⇒ ⇒ **本数目前是「Q3 + Q4 + `scoreOf`」的合计**，**不是**纯 Q4
++   *   ⇒ ⇒ 架构师裁决「按 SQL 分别累计字节」（`byteSources.ts` 的第二结论）之后，这一项必须拆开。
++   *   ⚠️ **写路径当前不发 Q3**（窄列 gate 只在读路径用）⇒ ⇒ **在写路径上本数 == `memoryRowsRead`**。
++   */
++  readonly candidateRows: number;
++}
++
+ /**
+  * ★ **`measurePerf` 的测量选项**（**仅测试用的注入点**）。
+  */
+@@ -684,6 +927,20 @@ export interface PerfMeasurementOptions {
+    * ⚠️ **生产路径不传这个选项** ⇒ **零影响**（默认值 `false` ⇒ 计数照常）。
+    */
+   readonly disableRowReadCounter?: boolean;
++  /**
++   * ★ **仅测试用**：**写路径计数窗口**的观测钩子（`measurePerf()` 跑完写路径扫描后回调一次，
++   * 参数 = 每一次写路径扫描各读到多少行）。
++   *
++   * ⚠️ ★ **为什么需要它**（T06 第一段）：
++   *   「**计数器窗口覆盖写入路径**」这件事**在返回值里看不见**（本段**不落盘**——
++   *   落盘字段的名字与层级由架构师裁决 ⇒ **不许在这一段抢先定**）
++   *   ⇒ ⇒ 没有钩子的话，这条改动**无法被测试证伪**（窗口开不开、罩没罩住，都没人能问）
++   *   ⇒ ⇒ **钩子是本段唯一的可观测出口**（**它只送样本，不改任何判定**）。
++   *
++   * ⚠️ **它不参与任何红/绿判定**（⇒ 与 `disableRowReadCounter` 一样是**注入点**，
++   *   **不是**生产路径的开关 ⇒ 生产路径不传 ⇒ 零影响）。
++   */
++  readonly onWritePathReads?: (samples: readonly WritePathReadSample[]) => void;
+ }
+ 
+ /**
+@@ -740,6 +997,13 @@ export function measurePerf(
+   //   写入探针 8/20 ⇒ 与门槛 2,000 的出处**同源**（§4.9 步骤 3a2）。
+   const writeVectorScanSamples: number[] = [];
+   const writeVectorScanRowSamples: number[] = [];
++  // ⚠️ ★★ **T06 · 写路径两轮制的候选宇宙样本**（轮 A 计时 / 轮 B 计量）
++  //   ⇒ ⇒ **逐样本相等** = `samplesAligned`（口径 §2 断言 1d ⇒ 它证明「计量没有扰动扫描」）。
++  //   ⚠️ **读路径【没有】这两个数组** ⇒ 因为读路径是**单轮**（字节与毫秒同源 ⇒ 天然绑定）。
++  const writeUniverseSamples: number[] = [];
++  const writeUniverseSamplesB: number[] = [];
++  // ⚠️ ★★ **T06 · 读路径的字节样本**（**单轮**：与计时窗口**同一个**执行 ⇒ 天然绑定）。
++  const readByteSamples: VectorByteSample[] = [];
+ 
+   // ⚠️ ★★★ **行读计数器**（H1 的「实测口径」的取数装置 —— **bench 侧只读观测，不改 `src/**`**）。
+   //   ⇒ 它统计**生产 SQL 实际物化**了多少候选行 ⇒ ⇒ **对任何实现都成立**
+@@ -868,6 +1132,30 @@ export function measurePerf(
+   //   ③ **推算**（只作对照）：命中细桶的成员数之和
+   //      （= 「桶内全量精确点积」要读的行数；桶内**不设 LIMIT**，§4.15.3）
+   //      ⇒ ⚠️ **它模型化了实现** ⇒ 阶段 4 引入桶内 LIMIT 后**它不会跟着降** ⇒ **不判任何门槛**。
++  // ── ⚠️ ★★★ **读路径 = 单轮（HEAD 逐字同形 · 口径同源）** ──
++  //   ⚠️ **为什么读路径【不】分两轮**（与写路径相反！裁决第 1 号）：
++  //   · **HEAD 的读路径本来就是「装计数器 + 计数 + 计时」**（已复核 `git show HEAD:bench/perf.ts`）：
++  //       const start = process.hrtime.bigint();
++  //       const fineIds = backend.route(...);
++  //       const before = rowCounter.snapshot();
++  //       rowCounter.start();          ← ★ 计数器【在计数】
++  //       backend.search(query.embedding, DEFAULT_PARAMS.VECTOR_TOPK);
++  //       const end = process.hrtime.bigint();   ← 计时在 search 之后
++  //       rowCounter.stop();
++  //       const after = rowCounter.snapshot();
++  //     ⇒ ⇒ **历史基线的 `vectorRouteP99Ms` 本来就含计数器的逐行开销**
++  //     ⇒ ⇒ **把它拆成两轮（轮 A = 装着但不计数）= 改了口径（方向是变快）**
++  //     ⇒ ⇒ **与历史基线不再逐位可比** ⇒ ⇒ **读路径必须回到单轮**。
++  //   · **口径 §3.3 第 3 条**也是这么说的：「召回窗口（`rowCounter`）本轮【完全不动】
++  //     ⇒ `vectorRouteP99Ms` 的口径没变」⇒ ⇒ 口径要的是「**不动**」，不是「拆开」。
++  //   · **字节读数就在这个窗口里取** ⇒ ⇒ **字节与毫秒来自同一次执行 ⇒ 天然绑定**
++  //     ⇒ ⇒ 读路径**不需要**「两轮对齐」（断言 1d 是**写路径**两轮的对账凭据）
++  //     ⇒ ⇒ **但读路径仍需要一个对账量**（口径裁决落地 #1）：
++  //     「**实测桶成员行**」必须等于「**推算桶成员行**」
++  //     ⇒ ⇒ 否则 `search()` 与 `route()` 看到的不是同一批桶
++  //     ⇒ ⇒ 落盘的 `candidateUniverse` 对不上 ⇒ ⇒ **不可判定 ⇒ 判红**。
++  //   · **读路径的字节只观测、不判门槛**（口径 §4：顶层 `vectorRouteByteReads` 是观测量；
++  //     **判据量是写路径的 `writeSegments.vectorByteReads`**）⇒ ⇒ 付不起「执行次数翻倍」的代价。
+   for (const query of queries) {
+     const start = process.hrtime.bigint();
+     const fineIds = backend.route(
+@@ -879,8 +1167,7 @@ export function measurePerf(
+     const before = rowCounter.snapshot();
+     rowCounter.start();
+     backend.search(query.embedding, DEFAULT_PARAMS.VECTOR_TOPK);
+-    // ⚠️ **计时在 `search()` 之后立刻取**（⇒ 计数器自己的开销不落在被测区间里
+-    //   ⇒ 与历史基线的毫秒数**可比**）。
++    // ⚠️ **计时在 `search()` 之后立刻取**（⇒ 与历史基线的取时位置**逐字同形**）。
+     const end = process.hrtime.bigint();
+     rowCounter.stop();
+     const after = rowCounter.snapshot();
+@@ -895,6 +1182,14 @@ export function measurePerf(
+     }
+     candidateRowDerivedSamples.push(candidateRowsDerived);
+     hitBucketSamples.push(fineIds.length);
++    // ⚠️ ★ **候选宇宙（读路径口径）**：`COUNT(DISTINCT memory_id)`
++    //   ⇒ **在计时窗口之外**执行（聚合查询本就不计行；口径 §1.7）。
++    const universe = countDistinctMembers(db, fineIds);
++    // ⚠️ ★ **字节读数取自【同一个窗口】**（字节与毫秒同源 ⇒ 天然绑定）。
++    // ⚠️ ★★ **第四个参数 = 「由 `route()` 命中桶推算的成员行数之和」**
++    //   ⇒ ⇒ 它与样本里的 `bucketMemberRows`（**计数器实测**）**逐样本配对**
++    //   ⇒ ⇒ 读路径的对账量（口径裁决落地 #1）就是这一对。
++    readByteSamples.push(buildByteSample(before, after, universe, candidateRowsDerived));
+   }
+   // ⚠️ **计数器用完就拆**（把 `db.prepare` 恢复原状 ⇒ 后面那些调用不再被包装）。
+   rowCounter.uninstall();
+@@ -940,16 +1235,86 @@ export function measurePerf(
+       nprobeCoarse: DEFAULT_PARAMS.ROUTER_NPROBE_COARSE,
+     },
+   };
++
++  // ⚠️ ★★★ **T06 · 两轮制（轮 A 计时 / 轮 B 计量 · 同一份输入）** ──
++  //
++  // ⚠️ ★★ **为什么必须两轮**（口径 §3.3 第 3 条的硬证据 · 已复核 `git show HEAD:bench/perf.ts`）：
++  //   HEAD 的写路径扫描段是「`start` → `collectVectorCandidates` → `end`」
++  //   ⇒ **那段计时窗口里【没有计数器】**
++  //   ⇒ ⇒ 历史基线的 `writeSegments.vectorCandidateScan` 是**「无计数器的干净测量」**
++  //   ⇒ ⇒ **单轮（把计数器塞进被测区间）= 改口径 = 与基线不再逐位可比 = 要重采百万级基线**
++  //   ⇒ ⇒ **两轮 = 逐字复现旧取时位置 ⇒ 基线不用重采**。
++  //   ⇒ ⇒ **这不是「怕代理开销」的口味问题，是「基线要不要重采」的成本问题。**
++  //
++  // ⚠️ ★★★ **为什么必须独立装一个计数器**（这是「窗口该开多大」的关键）：
++  //   · 召回那个计数器在上面就拆了 ⇒ **它的窗口 = 召回窗口** ⇒ 写路径的读数**采不到**；
++  //   · 但 **不能**把它的 `uninstall()` 往后挪 ⇒ 因为它与写路径之间还夹着
++  //     **生产的写入循环**（`store.write()` × `writeCount`）—— 那段区间里跑的是**生产的写路径**
++  //     ⇒ **生产写入内部自己就会走向量候选扫描**（`src/store/write.ts:671` → `findMergeCandidate`
++  //     → `collectDedupCandidates()` → `collectVectorCandidates()`）
++  //     ⇒ ① 那些读数会被算进「写路径窗口」⇒ **判据量被污染**；
++  //       ② 代理的开销会落进 `store.write()` 的计时里 ⇒ **写入 P99（硬门槛 ≤ 5ms）被污染**；
++  //   ⇒ ⇒ **独立装一个计数器、只罩住写路径的计量轮** ⇒ 两个窗口**互不重叠、互不污染**，
++  //     且**生产写入循环的计时完全不受影响**（代理根本不在那个区间里）。
++  //   ⇒ ★ **架构师 §3.3 第 5 条 / 施工规格 T06-2 验收标准 1**（口径一致）。
++  //
++  // ⚠️ ★ **口径**：这个窗口量的是**写路径去重扫描那一段**（`collectVectorCandidates()`）
++  //   —— 与旧 H1 的判据量（`writeSegments.vectorCandidateRows`）**同一个探针、同一个库、
++  //   同一个被考核方**（§4.9 步骤 3a2）⇒ ⇒ **字节账与行数账必然对得上**。
++  //
++  // ⚠️ ★★ **两轮必须用同一份输入**（同一个 `content`、同一个 `embedding`）
++  //   ⇒ ⇒ **先把输入算好**（向量化在计时之外，与写入那一次同一口径）
++  //   ⇒ ⇒ 两轮跑的是**同一条生产扫描** ⇒ ⇒ `samplesAligned` 有牙（断言 1d）。
++  const writeScanInputs: Array<{ content: string; embedding: Float32Array }> = [];
+   for (let index = 0; index < writeCount; index += 1) {
+     const content = `写入压测第${index}条、独立的正文${index}、不与语料重复`;
+     // ⚠️ **与写入那一次用同一个向量**（生产的归一化口径：`normalizeNumbers`）。
+-    const embedding = normalizeNumbers(Array.from(embedText(content)));
++    //   ⚠️ **向量化在计时之外**（向量化不是库的开销 ⇒ 不该计入库的 P99 ⇒ 与召回侧同一纪律）。
++    writeScanInputs.push({
++      content,
++      embedding: normalizeNumbers(Array.from(embedText(content))),
++    });
++  }
++
++  // ── 轮 A（计时轮 · **不装任何计数器** ⇒ 逐字复现 HEAD 的取时位置）──
++  for (const input of writeScanInputs) {
+     const start = process.hrtime.bigint();
+-    const scan = collectVectorCandidates(dedupContext, embedding);
++    const scan = collectVectorCandidates(dedupContext, input.embedding);
+     const end = process.hrtime.bigint();
+     writeVectorScanSamples.push(Number(end - start) / 1_000_000);
++    // ⚠️ ★ **旧行数观测量取自轮 A**（与计时同源 ⇒ 两者可以互相解读）。
+     writeVectorScanRowSamples.push(scan.scanned);
++    writeUniverseSamples.push(scan.scanned);
++  }
++
++  // ── 轮 B（计量轮 · **装计数器** ⇒ 字节 / 行读 / 剪枝率的判据量全部取自这一轮）──
++  const writeRowCounter = installRowReadCounter(db, {
++    forceDisabled: measurementOptions.disableRowReadCounter === true,
++  });
++  const writePathReadSamples: WritePathReadSample[] = [];
++  const writeByteSamples: VectorByteSample[] = [];
++  for (const input of writeScanInputs) {
++    // ⚠️ ★ **计数窗口只包住 `collectVectorCandidates()`**（与召回窗口同一形状）：
++    //   快照在窗口**外**取 ⇒ 计数器自身的快照开销不落在被测区间里。
++    const before = writeRowCounter.snapshot();
++    writeRowCounter.start();
++    const scan = collectVectorCandidates(dedupContext, input.embedding);
++    writeRowCounter.stop();
++    const after = writeRowCounter.snapshot();
++    writeByteSamples.push(buildByteSample(before, after, scan.scanned));
++    writeUniverseSamplesB.push(scan.scanned);
++    // ⚠️ ★ **写路径的行读读数**（legacy 结论；**只采、不落盘** ⇒ 落盘字段名由架构师裁决）。
++    writePathReadSamples.push({
++      candidateUniverse: scan.scanned,
++      bucketMemberRows: after.bucketMemberRows - before.bucketMemberRows,
++      codeRows: after.codeRows - before.codeRows,
++      candidateRows: after.candidateRows - before.candidateRows,
++    });
+   }
++  // ⚠️ **计数器用完就拆**（把 `db.prepare` 恢复原状 ⇒ 后面那些调用不再被包装）。
++  writeRowCounter.uninstall();
++  // ⚠️ ★ **观测钩子**（**仅测试用** ⇒ 生产路径不传 ⇒ 零影响）。
++  measurementOptions.onWritePathReads?.(writePathReadSamples);
+ 
+   const recallMean = meanOf(recallSamples);
+   const vectorMean = meanOf(vectorRouteSamples);
+@@ -1036,9 +1401,111 @@ export function measurePerf(
+   const vectorCandidateScan = toDistribution(writeVectorScanSamples);
+   const vectorScanMean = vectorCandidateScan.meanMs;
+   const otherMeanMs = writeTotal.meanMs - vectorScanMean;
++
++  // ⚠️ ★★ **两轮对齐**（口径 §2 断言 1d）：轮 A（计时）与轮 B（计量）的候选宇宙逐样本相等。
++  //   ⚠️ ★ **这是【写路径】的对账凭据**（读路径是**单轮** ⇒ 字节与毫秒同源 ⇒ 天然绑定
++  //   ⇒ ⇒ 读路径不需要「两轮对齐」这个量）。
++  const writeSamplesAligned = samplesAlignedOf(writeUniverseSamples, writeUniverseSamplesB);
++  // ⚠️ ★★★ **读路径的对账凭据（口径裁决落地 #1 · 换掉了那条【恒真】的比较）**：
++  //   **实测桶成员行**（计数器：`search()` 真正扫的桶）**逐样本等于**
++  //   **推算桶成员行**（`route()` 命中的桶各自 `countBucketMembers()` 之和）。
++  //
++  // ⚠️ ★ **为什么不能是「字节样本数 == 计时样本数」**：
++  //   两个 `push` 在**同一个循环体内、无条件、无 `continue` / `break`** ⇒ 长度必然相等
++  //   ⇒ ⇒ 那条比较**恒为 true** ⇒ ⇒ 它挂在判红守卫上却**永远打不红** ⇒ ⇒ **说谎**。
++  //
++  // ⚠️ ★ **为什么这个量有牙**（口径裁决落地 #1 的原文理由）：
++  //   ① 读路径落盘的 `candidateUniverse` 来自 `countDistinctMembers(db, route() 的 fineIds)`
++  //      （**在计时窗口之外**算），而字节来自 **`search()` 实际扫的桶**
++  //      ⇒ 若 `search()` 内部路由与外层 `route()` 不一致 ⇒ 落盘的 `candidateUniverse`
++  //      **对应的是另一批桶** ⇒ ⇒ **读数不可对账** ⇒ ⇒ 必须判红；
++  //   ② 两个量**同形可比**：都是「命中桶的成员行总数」
++  //      （`readMemberIds()` 逐桶全量读、无 LIMIT；`membersOf()` = `countBucketMembers()`
++  //      是桶计数的**唯一口径**）；
++  //   ③ ⚠️ **不许用 `bucketMemberRows === candidateUniverse`** —— 后者是
++  //      `COUNT(DISTINCT memory_id)` ⇒ 当一个记忆落在多个命中桶时它**小于**成员行总数
++  //      ⇒ ⇒ 1M 规模下**不成立**。
++  const readSamplesAligned = readSamplesAlignedOf(
++    readByteSamples.map((sample) => sample.bucketMemberRows),
++    readByteSamples.map((sample) => sample.bucketMemberRowsDerived),
++  );
++
++  // ⚠️ ★★ **写路径的字节读数**（★ H1′ / H2′ 的**唯一**判据量）。
++  const writeVectorByteReads = buildVectorByteReads(
++    writeByteSamples,
++    writeSamplesAligned,
++    '① ★ **口径**：`bytesRead` = **向量载荷字节**（码 BLOB + embedding BLOB 的**实测** `byteLength` 之和；' +
++      '**恒等式** `bytesRead = codeBytes + embeddingBytes`，零容差）；' +
++      '**不含**正文 / 标量 / 成员标识 / SQLite 行头与页开销 ' +
++      '⇒ ⇒ **是真实搬运量的【下界】⇒ 判据偏严、不会假绿**（口径 §1.3 裁决 A）；' +
++      '② ⚠️ ★ **ADR §8.6 那个 4.44 MB 也是【下界】**（它是按「码 768 B/行 + 精确分 3 KB/行」估的）' +
++      '⇒ ⇒ **实测大于它是预期、不是回归**（口径更严）；' +
++      '⚠️ ★ **具体差在哪**：**写路径 survivors 的 `embedding` 被读【两次】** —— ' +
++      '**`scoreOf` 逐条一次** + **Q4 整行批量再一次** ⇒ ⇒ **§8.6 那张表漏了 Q4 那一笔**；' +
++      '③ ⚠️ ★ **H1′ 判的是哪一笔**：本块 = **bench 的「写入扫描独立实测段」** ' +
++      '（`collectVectorCandidates()` 那一笔 ⇒ 同探针 8/20、同库、同被考核方 ⇒ **与旧 H1 的 ' +
++      '`vectorCandidateRows` 同一笔 ⇒ H1′ 与 H1 可比**）；' +
++      '⚠️ **它【不是】`store.write()` 内部那一笔** —— 生产写入内部自己就会走向量候选扫描 ' +
++      '（`src/store/write.ts:671` → `collectDedupCandidates()` → `collectVectorCandidates()`）' +
++      '⇒ 那一笔**不单独落盘**（已被 `writeTotal` 的计时覆盖）⇒ **两笔都在，只有一笔是判据量**；' +
++      '⇒ 且独立实测段跑在写入循环**之后**（库里已多了 N 条 ⇒ 候选面更大）⇒ **略偏悲观 ⇒ H1′ 偏严**；' +
++      '⚠️ **真实写入的「总读取字节」远不止这些**（文本路 FTS / 合并判定 / 桶归属）⇒ **那些字节一次都没被观测** ' +
++      '⇒ ⇒ **H1′ 不是「一次真实写入的总字节预算」**（它只是**向量载荷**这一项）；' +
++      '④ ⚠️ ★ **剪枝率分子的等价性前提**：分子 = `embeddingCalls` = bench 侧数出来的 ' +
++      '**`get()` 调用次数**（**无条件**计数 ⇒ 返回 `undefined` 也计）' +
++      '⇒ ⇒ 它**定义上** == `prune` 的 `exactReads`（`src/vector/prune.ts:289-290` 一一对应）' +
++      '⇒ ⇒ 等价性由 `tests/unit/prune.test.ts` 的断言 1c 钉住（**零 `src/**` 改动**）；' +
++      '⚠️ **该等价性只在两段式分支（`prune = true`）成立**（`prune = false` 的对照分支不调 `scoreOf`）；' +
++      '⚠️ ★ **方向纪律**：门槛是「≤」⇒ **分子偏小 = 偏松 = 假绿** ⇒ **绝不许用「返回行数」当分子**；' +
++      '⑤ ⚠️ ★ **计时口径**：**写路径 = 两轮制**（轮 A 计时**不装**计数器 / 轮 B 计量**装**计数器，' +
++      '**同一份输入**）⇒ ⇒ **`vectorCandidateScan` 的毫秒数与历史基线逐位可比**（口径同源）' +
++      '⇒ ⇒ `samplesAligned` 证明「计量没有扰动扫描」；' +
++      '⚠️ ★ **读路径 = 单轮**（计数器**装着且在计数** + 计时 ⇒ **与 HEAD 逐字同形**）' +
++      '⇒ ⇒ **字节读数与毫秒数来自【同一个计时窗口】**；' +
++      '⑥ ⚠️ ★ **读路径的字节累加与行读计数同处一个计时窗口** ⇒ 逐行字节计算的微小开销落在 ' +
++      '`vectorRouteP99Ms` 里 ⇒ 与历史基线是**同量级而非逐位**；' +
++      '但相对每行 3 KB 的读取开销**可忽略（< 1%）** ⇒ **判门槛的 `vectorRouteP99Ms` 不受影响**；' +
++      '⑦ **旧行数判据已降级为并列观测**（`writeSegments.vectorCandidateRows` 仍落盘、仍打印，' +
++      '但**不再进 `failures`** ⇒ 字节口径下它已不是判据；阈值常量一个都没删）。',
++  );
++
++  // ⚠️ ★★ **读路径的字节读数**（**观测值，不判门槛**；口径 §4）。
++  const vectorRouteByteReads = buildVectorByteReads(
++    readByteSamples,
++    readSamplesAligned,
++    '① ★ **口径**：`bytesRead` = **向量载荷字节**（码 BLOB + embedding BLOB 的**实测** `byteLength` 之和；' +
++      '**恒等式** `bytesRead = codeBytes + embeddingBytes`，零容差）；' +
++      '**不含**正文 / 标量 / 成员标识 / SQLite 行头与页开销 ' +
++      '⇒ ⇒ **是真实搬运量的【下界】⇒ 判据偏严、不会假绿**（口径 §1.3 裁决 A）；' +
++      '② ⚠️ ★ **ADR §8.6 那个 4.44 MB 也是【下界】** ⇒ ⇒ **实测大于它是预期、不是回归**（口径更严）；' +
++      '③ ★ **读路径**：无 Q4（survivors 的 `embedding` 只读一次）⇒ 字节构成 = 码字节 + `scoreOf` 的向量字节；' +
++      '④ **候选宇宙** = `COUNT(DISTINCT memory_id)`（**在计时窗口之外**执行）；' +
++      '⚠️ ★ **等价前提**：bench 的 `backend` 是**新建实例** ⇒ `overlay` 空；' +
++      '`backend.search(q, k)` **不带 filter** ⇒ 无 `excludeIds`、无时间窗 ⇒ **Q3 不发** ' +
++      '⇒ ⇒ 该值 **== `memberIds.size`**（逐位）⇒ **前提一破即不等**（口径 §1.7 / §13 第 3 条）；' +
++      '⑤ ⚠️ **读路径【不判门槛】**（与 R6 同组：观测值）⇒ 判据只在 `writeSegments.vectorByteReads`；' +
++      '⑥ ⚠️ ★ **剪枝率的分子（`embeddingCalls`）只在【两段式分支】与 `prune` 的 `exactReads` 定义性相等**；' +
++      '⚠️ ★ **方向纪律**：**绝不许用「返回行数」当分子**（偏小 = 偏松 = 假绿）；' +
++      '⑦ ★ **计时口径**：**读路径 = 单轮**（计数器**装着且在计数** + 计时 ⇒ **与 HEAD 逐字同形**）' +
++      '⇒ ⇒ **字节读数与毫秒数来自【同一个计时窗口】** ⇒ **字节与毫秒天然同源**；' +
++      '⚠️ ★ **因此**：`vectorRouteP99Ms` 与历史基线是**同量级而非逐位**（逐行字节计算的微小开销落在窗口里）' +
++      '⇒ 但相对每行 3 KB 的读取开销**可忽略（< 1%）** ⇒ **判门槛的 `vectorRouteP99Ms` 不受影响**；' +
++      '⑧ ★★ **读路径的对账量（口径裁决落地 #1）**：`samplesAligned` = ' +
++      '**实测桶成员行**（计数器认领的「成员来源」行数 = `search()` 真正扫的桶）' +
++      '**逐样本等于** **推算桶成员行**（`route()` 命中的桶各自 `countBucketMembers()` 之和）' +
++      '⇒ ⇒ 不等 ⇒ `search()` 看到的桶与 `route()` 看到的不是同一批' +
++      '⇒ ⇒ 落盘的 `candidateUniverse` 对不上 ⇒ ⇒ **不可判定 ⇒ 判红**；' +
++      '⚠️ ★ **读路径原先那条「字节样本数 == 计时样本数」是【恒真的】**' +
++      '（两个 `push` 在同一个循环体内、无条件、无 `continue` / `break` ⇒ 长度必然相等' +
++      '⇒ ⇒ 挂在判红守卫上却**永远打不红**）⇒ ⇒ **已换掉**；' +
++      '⚠️ **注意：写路径才是两轮制**（轮 A 计时**不装**计数器 / 轮 B 计量**装**计数器）⇒ ' +
++      '`samplesAligned` 的**两轮对账只在写路径有牙**（读路径的对账量是**上面第 ⑧ 条**）。',
++  );
++
+   const writeSegments: WriteSegmentSummary = {
+     vectorCandidateScan,
+     vectorCandidateRows: toCountSummary(writeVectorScanRowSamples),
++    vectorByteReads: writeVectorByteReads,
+     writeTotal,
+     otherMeanMs,
+     otherMeanShare: writeTotal.meanMs === 0 ? 0 : otherMeanMs / writeTotal.meanMs,
+@@ -1046,6 +1513,9 @@ export function measurePerf(
+       '① vectorCandidateScan = **独立实测段**（单独调用生产的那条向量候选扫描路径 ' +
+       '`collectVectorCandidates()` ⇒ 内部就是 `src/vector/ivf.ts` 的 `scanBucketCandidates()`；' +
+       '**不是**从写入总耗时里切出来的 ⇒ 与写入那一次**不是同一次调用**）；' +
++      '⚠️ ★ **T06 起这一段改成【两轮制】**（轮 A 计时**不装**计数器 / 轮 B 计量**装**计数器，' +
++      '**同一份输入**）⇒ ⇒ **计时窗口 100% 干净 ⇒ 与历史基线逐位可比**（口径同源）' +
++      '⇒ ⇒ 另加 `samplesAligned` 证明「计量没有扰动扫描」；' +
+       '② otherMeanMs / otherMeanShare = **推导值段**（写入总耗时均值 − 向量扫描段均值）' +
+       '⇒ 其余段 = 「FTS5 + 索引维护 + 合并判定 + 事件写入」；' +
+       '③ ⚠️⚠️ **「① + ② ≠ 写入总耗时」**（**读这两个数时必须知道**）：' +
+@@ -1054,7 +1524,10 @@ export function measurePerf(
+       '⇒ ⇒ **① 与 ② 相加没有「等于写入总耗时」的含义** ⇒ **只能当归因的量级参考**，' +
+       '**不是精确拆分** ⇒ 若要精确拆分，必须在 `src/store/write.ts` 里加一个只读观测点；' +
+       '⚠️ 另：otherMeanMs **可能为负** ⇒ 说明「独立实测的扫描段」比「整次写入」还贵 ' +
+-      '（页缓存状态不同）⇒ 同样不可当精确拆分。',
++      '（页缓存状态不同）⇒ 同样不可当精确拆分；' +
++      '④ ⚠️ ★★ **`vectorCandidateRows`（旧行数判据量）已降级为【并列观测】**（字节口径下它已不是判据）' +
++      '⇒ **仍落盘、仍打印，但不再进 `failures`**（阈值常量 `candidateReadRowsMax` / ' +
++      '`candidateReadRowsRatioMax` **一个都没删**）⇒ ★ **H1′ 的唯一判据量 = `vectorByteReads.bytesRead`**。',
+   };
+ 
+   return {
+@@ -1074,6 +1547,8 @@ export function measurePerf(
+     candidateReadRowsBasis,
+     hitFineBuckets,
+     perRowReadCostUs,
++    // ⚠️ ★★ **T06 · 召回路径的字节读数**（观测值，不判门槛；口径 §4）。
++    vectorRouteByteReads,
+     writeSegments,
+     recallLatency: toDistribution(recallSamples),
+     writeLatency: writeTotal,
+@@ -1118,6 +1593,194 @@ function meanOf(samples: readonly number[]): number {
+   return samples.reduce((total, value) => total + value, 0) / samples.length;
+ }
+ 
++/**
++ * ★ **两次快照相减 ⇒ 一个样本的字节读数**（口径 §4 的逐样本采样）。
++ *
++ * ⚠️ **为什么用「相减」而不是「重置」**：计数器是**累计**的（两次快照相减 = 那段窗口）
++ *   ⇒ ⇒ 同一个计数器实例可以罩住**整个采样循环**（逐样本 `start()` / `stop()`）
++ *   ⇒ ⇒ **装配一次、窗口逐样本切**（口径 §3.3 第 5 条的「串行安装」纪律）。
++ *
++ * @param before 窗口前的快照
++ * @param after 窗口后的快照
++ * @param candidateUniverse 候选宇宙（写路径 = `scan.scanned`；读路径 = `COUNT(DISTINCT …)`）
++ * @param bucketMemberRowsDerived **读路径专有**：由 `route()` 命中桶推算的成员行数之和
++ *   （写路径 = `null`）⇒ ⇒ 与样本里的 `bucketMemberRows`（**计数器实测**）**逐样本配对**
++ *   ⇒ ⇒ 读路径的对账量（`readSamplesAlignedOf()`）就是这一对。
++ * @returns 逐样本的字节读数
++ */
++function buildByteSample(
++  before: ByteReadSnapshot,
++  after: ByteReadSnapshot,
++  candidateUniverse: number,
++  bucketMemberRowsDerived: number | null = null,
++): VectorByteSample {
++  return {
++    memoryRowsRead: after.memoryRowsRead - before.memoryRowsRead,
++    codeRowsRead: after.codeRowsRead - before.codeRowsRead,
++    bytesRead: after.bytesRead - before.bytesRead,
++    candidateUniverse,
++    codeBytes: after.codeBytes - before.codeBytes,
++    embeddingBytes: after.embeddingBytes - before.embeddingBytes,
++    contentBytes: after.contentBytes - before.contentBytes,
++    embeddingRowsRead: after.embeddingRowsRead - before.embeddingRowsRead,
++    embeddingExactRows: after.embeddingExactRows - before.embeddingExactRows,
++    embeddingCalls: after.embeddingCalls - before.embeddingCalls,
++    narrowRowsRead: after.narrowRowsRead - before.narrowRowsRead,
++    bucketMemberRows: after.bucketMemberRowsRead - before.bucketMemberRowsRead,
++    bucketMemberRowsDerived,
++    badCodeRows: after.badCodeRows - before.badCodeRows,
++    unclassifiedRows: after.unclassifiedRows - before.unclassifiedRows,
++    // ⚠️ 指纹集合是**累计**的（快照里是「至今见过的全部」）⇒ 逐样本带全量 ⇒
++    //   落盘时取**并集**（⇒ 少一次集合运算，也保证「打印 + 落盘」看到的是全集）。
++    unclassifiedSqlKinds: after.unclassifiedSqlKinds,
++    legacyCandidateRows: after.candidateRows - before.candidateRows,
++    legacyCodeRows: after.codeRows - before.codeRows,
++  };
++}
++
++/**
++ * ★ **读路径的候选宇宙**（口径 §1.7：`COUNT(DISTINCT memory_id)`）。
++ *
++ * ⚠️ ★ **在计时窗口之外执行**（⇒ 聚合查询本就不计行 ⇒ 不污染读数）。
++ * ⚠️ ★ **等价前提**（口径 §1.7 / §13 第 3 条）：bench 的 `backend` 是**新建实例**
++ *   ⇒ `overlay` 空；`backend.search(q, k)` **不带 filter** ⇒ 无 `excludeIds`、无时间窗
++ *   ⇒ Q3 不发 ⇒ 该值 **== `memberIds.size`**（逐位）⇒ **前提一破即不等**（⇒ 写进 note）。
++ *
++ * @param db 库句柄
++ * @param fineIds 命中的细桶 id
++ * @returns 候选宇宙（命中桶内的成员去重数）
++ */
++function countDistinctMembers(db: Database.Database, fineIds: readonly string[]): number {
++  if (fineIds.length === 0) {
++    return 0;
++  }
++  const placeholders = fineIds.map(() => '?').join(', ');
++  const row = db
++    .prepare(
++      'SELECT COUNT(DISTINCT memory_id) AS n FROM vector_cell_members ' +
++        `WHERE fine_id IN (${placeholders})`,
++    )
++    .get(...fineIds) as { n: number };
++  return row.n;
++}
++
++/**
++ * ★ **两轮样本是否对齐**（口径 §2 断言 1d）。
++ *
++ * ⚠️ **逐样本比较**（不是比总数）⇒ ⇒ 「两轮看到的是同一批数据」这件事才被证明。
++ *
++ * @param roundA 轮 A（计时）的候选宇宙
++ * @param roundB 轮 B（计量）的候选宇宙
++ * @returns 逐样本相等吗
++ */
++function samplesAlignedOf(roundA: readonly number[], roundB: readonly number[]): boolean {
++  if (roundA.length !== roundB.length) {
++    return false;
++  }
++  return roundA.every((value, index) => value === roundB[index]);
++}
++
++/**
++ * ★★ **读路径的样本是否对齐**（口径裁决落地 #1 · 读路径的**真正有牙**的对账量）。
++ *
++ * ⚠️ ★★ **为什么单独一个函数（而不是内联在 `measurePerf()` 里）**：
++ *   本仓库的纪律是「**先想变异，再写断言**」⇒ ⇒ 这条量**必须能被单独喂数据**
++ *   ⇒ ⇒ 门禁里有一条**负控**（喂两个**不相等**的数组 ⇒ 必须返回 `false`）
++ *   ⇒ ⇒ **证明它不是恒绿守卫**（这正是断言 5「两头锁死」的纪律）。
++ *
++ * ⚠️ ★★★ **这个量为什么有牙**（裁决落地 #1 的原文理由）：
++ *   ① 读路径落盘的 `candidateUniverse` 来自 `countDistinctMembers(db, route() 的 fineIds)`
++ *      （**在计时窗口之外**算），而字节来自 **`search()` 实际扫的桶**
++ *      ⇒ 若 `search()` 内部路由与外层 `route()` 不一致 ⇒ 落盘的 `candidateUniverse`
++ *      **对应的是另一批桶** ⇒ ⇒ **读数不可对账** ⇒ ⇒ 必须判红；
++ *   ② 两个量**同形可比**：都是「命中桶的成员行总数」
++ *      （`readMemberIds()` 逐桶全量读、无 LIMIT；`membersOf()` = `countBucketMembers()`
++ *      是桶计数的**唯一口径**）；
++ *   ③ ⚠️ **不许用 `bucketMemberRows === candidateUniverse`** —— 后者是
++ *      `COUNT(DISTINCT memory_id)` ⇒ 当一个记忆落在多个命中桶时它**小于**成员行总数
++ *      ⇒ ⇒ 1M 规模下**不成立**。
++ *
++ * ⚠️ ★ **为什么 `derived` 允许 `null`**：写路径没有「推算桶成员行」这个量
++ *   （写路径的对账量是**两轮 `candidateUniverse`**，见 `samplesAlignedOf()`）
++ *   ⇒ ⇒ 读路径专用 ⇒ ⇒ 但**函数本身是纯函数** ⇒ ⇒ 门禁能单独喂数据（含 `null`）。
++ *   ⚠️ ★ **`null` 一律判 false**（**方向纪律**：对不上 ⇒ 不可判定 ⇒ 判红 ⇒ 宁可误红不可假绿）。
++ *
++ * @param measured 实测的桶成员行数（逐样本）
++ * @param derived 推算的桶成员行数（逐样本；`null` = 没算 ⇒ 不可判定）
++ * @returns 逐样本相等吗
++ */
++export function readSamplesAlignedOf(
++  measured: readonly number[],
++  derived: readonly (number | null)[],
++): boolean {
++  if (measured.length !== derived.length) {
++    return false;
++  }
++  return measured.every((value, index) => {
++    const other = derived[index];
++    if (other === null || other === undefined) {
++      return false;
++    }
++    return value === other;
++  });
++}
++
++/**
++ * ★ **把逐样本的字节读数压成落盘结构**（口径 §4）。
++ *
++ * ⚠️ **四个读数 + breakdown 全部是 `CountSummary` 分布** ⇒ 判据取 `max`。
++ *
++ * @param samples 逐样本读数
++ * @param samplesAligned 样本是否对齐（**写路径** = 两轮 `candidateUniverse` 逐样本相等；
++ *   **读路径** = 单轮 ⇒ 对账量 = **逐样本「实测桶成员行 === route 侧推算桶成员行」**
++ *   （`readSamplesAlignedOf()`）⇒ **不是**「字节样本数 == 计时样本数」（**那条恒真**））
++ * @param note 口径说明（**必须落盘**）
++ * @returns 落盘结构
++ */
++function buildVectorByteReads(
++  samples: readonly VectorByteSample[],
++  samplesAligned: boolean,
++  note: string,
++): VectorByteReads {
++  const unclassifiedKinds = new Set<string>();
++  let unclassifiedRows = 0;
++  let badCodeRows = 0;
++  for (const sample of samples) {
++    unclassifiedRows += sample.unclassifiedRows;
++    badCodeRows += sample.badCodeRows;
++    for (const kind of sample.unclassifiedSqlKinds) {
++      unclassifiedKinds.add(kind);
++    }
++  }
++  return {
++    memoryRowsRead: toCountSummary(samples.map((sample) => sample.memoryRowsRead)),
++    codeRowsRead: toCountSummary(samples.map((sample) => sample.codeRowsRead)),
++    bytesRead: toCountSummary(samples.map((sample) => sample.bytesRead)),
++    candidateUniverse: toCountSummary(samples.map((sample) => sample.candidateUniverse)),
++    breakdown: {
++      codeBytes: toCountSummary(samples.map((sample) => sample.codeBytes)),
++      embeddingBytes: toCountSummary(samples.map((sample) => sample.embeddingBytes)),
++      contentBytes: toCountSummary(samples.map((sample) => sample.contentBytes)),
++      embeddingRowsRead: toCountSummary(samples.map((sample) => sample.embeddingRowsRead)),
++      embeddingExactRows: toCountSummary(samples.map((sample) => sample.embeddingExactRows)),
++      embeddingCalls: toCountSummary(samples.map((sample) => sample.embeddingCalls)),
++      narrowRowsRead: toCountSummary(samples.map((sample) => sample.narrowRowsRead)),
++      bucketMemberRows: toCountSummary(samples.map((sample) => sample.bucketMemberRows)),
++      badCodeRows,
++      unclassifiedRows,
++      unclassifiedSqlKinds: [...unclassifiedKinds].sort(),
++      // ⚠️ ★ **剪枝率 = `embeddingCalls ÷ candidateUniverse`**（分子 = **调用次数** ⇒ 偏大 = 更严）。
++      pruneRate: toCountSummary(
++        samples.map((sample) =>
++          sample.candidateUniverse > 0 ? sample.embeddingCalls / sample.candidateUniverse : 0,
++        ),
++      ),
++      samplesAligned,
++    },
++    note,
++  };
++}
++
+ /**
+  * 性能门槛的**断言**（**逐条写死** ⇒ 可被变异打红）。
+  *
+@@ -1156,54 +1819,112 @@ export function checkPerf(result: PerfResult): string[] {
+     );
+   }
+ 
+-  // ⚠️ ★★★ **H1（硬门槛 · 归 P2 · 2026-11-02 重新定档 · 2026-11-03 归口）** ───
+-  //   **写入去重路径的单次候选读取行数 ≤ 2,000 行** ⇒ **纯计数 ⇒ 与介质无关**。
+-  // ⚠️ ★★★ **改前 / 改后（这就是本次归口的全部内容）**：
+-  //   · **改前**：`result.candidateReadRows.max`（**召回探针 20/50**）去撞**写入侧**的 2,000
+-  //     ⇒ 一个召回侧的量冒充「写入路径超了 6.39 倍」；
+-  //   · **改后**：`result.writeSegments.vectorCandidateRows.max`（**写入探针 8/20**）
+-  //     ⇒ 与门槛 2,000 的出处（§4.9 步骤 3a2）**同源** ⇒ **同一个库、同一个量、同一个被考核方**。
+-  // ⚠️ **判定口径 = 样本的 `max`**（「**单次**」⇒ 每一次都要满足 ⇒ 最严口径）
+-  //   ⇒ 而 `mean` / `p50` / `p99` 一并落盘 ⇒ **换口径不用重跑百万级**。
+-  // ⚠️ **为什么这里不再有「实测 / 推算」二选一**：写入路径的判据量是
+-  //   `scanBucketCandidates()` 返回的 `scanned`（= 那条生产 SQL 返回了几行）
+-  //   ⇒ **它就是行数本身** ⇒ 没有第二条取数路径 ⇒ 也就不存在「口径被悄悄换掉」的兜底分支。
+-  const h1Rows = result.writeSegments.vectorCandidateRows;
+-  const h1BasisNote =
+-    '口径：实测（写入去重路径的生产 SQL 实际返回的行数）；' +
+-    '判据量 = writeSegments.vectorCandidateRows（写入探针 8/20，与门槛 2,000 的出处同源）';
+-  if (h1Rows.count === 0) {
++  // ⚠️ ★★★ **H1′（字节 · 唯一判据 · T06 · 口径 §5）** ───
++  //   **写入去重路径的单次向量载荷字节 ≤ 6,144,000 B**（= 2,000 行 × 3,072 B）
++  //   ⇒ ⇒ **判定只取 `bytesRead.max`**（「单次」⇒ 每一次都要满足 ⇒ 最严口径）。
++  //
++  // ⚠️ ★★★ **旧 H1（行）/ H2（行）已【降级为并列观测】**（口径 §5）：
++  //   · 「行」是**实现相关**的单位（768 B 的码 vs 96 B 的码 vs 打包块 ⇒ 行数含义完全不同）
++  //     ⇒ ⇒ 换存储形态 = 换了一把尺 ⇒ 违反 ADR §8.5 理由 2；
++  //   · C′ 的 `scanned` = **候选宇宙**（≈ 5,521 行）**必然 > 2,000**
++  //     ⇒ ⇒ 留着当判据 ⇒ **本档永远红、无法交付** ⇒ 降级是**必需**，不是偏好；
++  //   · ⇒ ⇒ **常量 `candidateReadRowsMax` / `candidateReadRowsRatioMax` 一个都不许删**
++  //     （删常量 = 制造「同一个门槛两个名字」的镜像问题）⇒ ⇒ 它们仍在 `THRESHOLDS` 里。
++  const byteReads = result.writeSegments.vectorByteReads;
++  const bytesRead = byteReads.bytesRead;
++  const byteBasisNote =
++    '口径：实测（写入去重路径的生产 SQL 实际物化的向量载荷字节 = 实测 byteLength 之和）；' +
++    '判据量 = writeSegments.vectorByteReads.bytesRead（写入探针 8/20，与旧 H1 的 2,000 行同源）';
++  if (bytesRead.count === 0) {
+     failures.push(
+-      `写入去重路径（探针 8/20）候选读取行数（H1）的样本数为 0 ⇒ H1 是真空通过（必须有样本；${h1BasisNote}）`,
++      '写入去重路径（探针 8/20）向量载荷字节（H1′）的样本数为 0 ⇒ H1′ 是真空通过' +
++        `（必须有样本；${byteBasisNote}）`,
+     );
+-  } else if (h1Rows.max > THRESHOLDS.candidateReadRowsMax) {
++  } else if (bytesRead.max === 0) {
+     failures.push(
+-      `写入去重路径（探针 8/20）候选读取行数（H1）${h1Rows.max} 行 > ` +
+-        `${THRESHOLDS.candidateReadRowsMax} 行` +
+-        `（判定取 max；均值 ${h1Rows.mean.toFixed(1)} 行、` +
+-        `p99 ${h1Rows.p99} 行、样本 ${h1Rows.count}；${h1BasisNote}）`,
++      '写入去重路径（探针 8/20）向量载荷字节（H1′）恒为 0 ⇒ 向量路在写入路径整路缺席 ' +
++        `⇒ H1′ 是真空通过（不是「0 字节 ⇒ 达标」；${byteBasisNote}）`,
+     );
+-  } else if (h1Rows.max === 0) {
+-    // ⚠️ **恒为 0 也是真空通过**（不是「0 行 ⇒ 达标」）：写入路径的候选恒为 0
+-    //   ⇒ 只可能是「分桶未训练 / 向量路在写入路径整路缺席」⇒ 那说明**这一轮没测到这个量**。
++  } else if (bytesRead.max > THRESHOLDS.bytesReadMax) {
+     failures.push(
+-      '写入去重路径（探针 8/20）候选读取行数（H1）恒为 0 ⇒ 向量路在写入路径整路缺席 ' +
+-        `⇒ H1 是真空通过（不是「0 行 ⇒ 达标」；${h1BasisNote}）`,
++      `写入去重路径（探针 8/20）向量载荷字节（H1′）${bytesRead.max} B > ${THRESHOLDS.bytesReadMax} B` +
++        `（判定取 max；均值 ${bytesRead.mean.toFixed(1)} B、p99 ${bytesRead.p99} B、样本 ${bytesRead.count}；${byteBasisNote}）`,
+     );
+   }
+ 
+-  // ⚠️ ★ **H2（与 H1 同义的规模无关写法）**：**写入去重路径**的候选读取行数 ÷ 库规模 ≤ 0.2%
+-  //   ⇒ 1M ⇒ ≤ 2,000 行；10M ⇒ ≤ 20,000 行。
+-  // ⚠️ **主语与 H1 完全相同**（同一个量、同一批样本、同一个探针配置）⇒ 两者必须同时红/同时绿。
+-  const candidateRatio = result.corpusSize > 0 ? h1Rows.max / result.corpusSize : 0;
+-  if (h1Rows.count > 0 && candidateRatio > THRESHOLDS.candidateReadRowsRatioMax) {
++  // ⚠️ ★ **H2′（与 H1′ 同义的规模无关写法）**：
++  //   **写入去重路径**的向量载荷字节 ÷（库规模 × 3,072 B）≤ 0.2%
++  //   ⇒ 1M ⇒ ≤ 6,144,000 B；10M ⇒ ≤ 61,440,000 B。
++  // ⚠️ **主语与 H1′ 完全相同**（同一个量、同一批样本、同一个探针）⇒ 两者必然同时红 / 同时绿。
++  const byteRatio =
++    result.corpusSize > 0 ? bytesRead.max / (result.corpusSize * BYTES_PER_VECTOR_ROW) : 0;
++  if (bytesRead.count > 0 && byteRatio > THRESHOLDS.bytesReadRatioMax) {
+     failures.push(
+-      `写入去重路径（探针 8/20）候选读取行数 ÷ 库规模（H2）${(candidateRatio * 100).toFixed(4)}% > ` +
+-        `${(THRESHOLDS.candidateReadRowsRatioMax * 100).toFixed(1)}%` +
+-        `（${h1Rows.max} 行 / 库规模 ${result.corpusSize}；判据量 = writeSegments.vectorCandidateRows）`,
++      '写入去重路径（探针 8/20）向量载荷字节 ÷（库规模 × 3,072 B）（H2′）' +
++        `${(byteRatio * 100).toFixed(4)}% > ${(THRESHOLDS.bytesReadRatioMax * 100).toFixed(1)}%` +
++        `（${bytesRead.max} B /（库规模 ${result.corpusSize} × ${BYTES_PER_VECTOR_ROW} B）；` +
++        '判据量 = writeSegments.vectorByteReads.bytesRead）',
+     );
+   }
+ 
++  // ⚠️ ★ **剪枝率（出关条件① · 标签 `（PRUNE_RATE）`）**：
++  //   `embeddingCalls ÷ candidateUniverse` ≤ 15%
++  // ⚠️ ★★★ **分子必须是「调用次数」**（口径 §1.7 的方向纪律）：
++  //   门槛是「≤」⇒ **分子偏小 = 更容易过 = 偏松 = 假绿**
++  //   ⇒ 最坏情形：命中桶内全是软删成员 ⇒ 「返回行数」= 0 ⇒ 剪枝率 0% ⇒ **假绿**
++  //   ⇒ ⇒ 分子 = `embeddingCalls`（`get()` 调用次数，**无条件**计数）⇒ 它定义上 == `exactReads`。
++  const pruneRate = byteReads.breakdown.pruneRate;
++  if (pruneRate.count > 0 && pruneRate.max > THRESHOLDS.pruneRateMax) {
++    failures.push(
++      `写入去重路径（探针 8/20）剪枝率（PRUNE_RATE）${(pruneRate.max * 100).toFixed(2)}% > ` +
++        `${(THRESHOLDS.pruneRateMax * 100).toFixed(0)}%` +
++        '（分子 = embeddingCalls（get() 调用次数 ≡ prune 的 exactReads）；' +
++        '分母 = candidateUniverse；判定取 max）',
++    );
++  }
++
++  // ⚠️ ★★★ **三条同级的「不可判定」守卫（全部判红 · 口径 §5 末条）** ───
++  //   ① `unclassifiedRows > 0` ⇒ **口径不完整**（有语句没认领 ⇒ 字节账偏小 ⇒ 假绿）；
++  //   ② `badCodeRows > 0` ⇒ **前提违例**（坏码行 = 白读）；
++  //   ③ `samplesAligned === false` ⇒ **样本不可对账**。
++  //   ⚠️ ★ **写路径与读路径的 `samplesAligned` 含义不同**（⇒ 文案也必须分开写）：
++  //   · **写路径 = 两轮**（轮 A 计时 / 轮 B 计量）⇒ 逐样本 `candidateUniverse` 必须相等；
++  //   · **读路径 = 实测桶成员行 vs 推算桶成员行**（口径裁决落地 #1）
++  //     ⇒ ⇒ 「`search()` 看到的桶」必须与「`route()` 看到的桶」是同一批
++  //     ⇒ ⇒ 否则落盘的 `candidateUniverse` 对不上 ⇒ ⇒ **不可判定**。
++  for (const [label, reads, alignmentText] of [
++    [
++      '写入去重路径（探针 8/20）',
++      byteReads,
++      '两轮样本（轮 A 计时 / 轮 B 计量）的 candidateUniverse **逐样本不相等**' +
++        '⇒ 两轮看到的不是同一批数据 ⇒ 读数不可对账 ⇒ 不可判定',
++    ],
++    [
++      '召回路径（探针 20/50）',
++      result.vectorRouteByteReads,
++      '**实测桶成员行 ≠ 推算桶成员行**' +
++        '⇒ `search()` 看到的桶与 `route()` 看到的不是同一批' +
++        '⇒ 落盘的 `candidateUniverse` 对不上 ⇒ 不可判定',
++    ],
++  ] as const) {
++    if (reads.breakdown.unclassifiedRows > 0) {
++      failures.push(
++        `${label}有 ${reads.breakdown.unclassifiedRows} 行**命中零来源**（未登记的语句形状）` +
++          '⇒ 口径不完整 ⇒ 不可判定（指纹：' +
++          `${reads.breakdown.unclassifiedSqlKinds.join(' | ') || '（空）'}）`,
++      );
++    }
++    if (reads.breakdown.badCodeRows > 0) {
++      failures.push(
++        `${label}有 ${reads.breakdown.badCodeRows} 行**坏码行**（码长 ≠ 768）` +
++          '⇒ 读了、搬了字节，却被 fail-open 丢弃 ⇒ **白读** ⇒ 前提违例 ⇒ 不可判定',
++      );
++    }
++    if (!reads.breakdown.samplesAligned) {
++      failures.push(`${label}${alignmentText}`);
++    }
++  }
++
+   // ⚠️ **样本数必须够**：样本为 0 ⇒ P99 是 `0` ⇒ 门槛「通过」是**真空通过**
+   //   ⇒ 必须显式报出来。
+   if (result.recallSamples === 0 || result.writeSamples === 0 || result.vectorRouteSamples === 0) {
+@@ -1236,7 +1957,8 @@ export function formatRecallVecRowsObservation(result: PerfResult): string {
+     rows.max > gate
+       ? `⚠ 它仍然红：${rows.max} 行 = ${gate} 行的 ${multiple.toFixed(2)} 倍 ` +
+         '—— 但这个倍数**没有变小**，只是这条量**不再冒充「写入路径」**' +
+-        '（门槛 2,000 归的是写入去重路径 ⇒ H1/H2）' +
++        '（**历史行数口径** 2,000 行归的是写入去重路径 ⇒ 旧的 H1/H2；' +
++        '⚠️ **字节口径下它已不是判据** ⇒ H1′ 判的是 `writeSegments.vectorByteReads.bytesRead`）' +
+         ' ⇒ ⇒ **不是「达标」，也不是「不再是问题」**'
+       : `⚠ 低于 ${gate} 行只说明「这一轮读数不大」，` +
+         '**不构成任何门槛结论**（它没有门槛可判 ⇒ 既不算红也不算绿）';
+@@ -1299,6 +2021,12 @@ function main(): void {
+   const failures = checkPerf(result);
+   // ★ **H1/H2 的判据量**（2026-11-03 归口：**写入去重路径**；不是 `candidateReadRows`）。
+   const h1Rows = result.writeSegments.vectorCandidateRows;
++  // ⚠️ ★★ **T06 · H1′ 的判据量**（字节口径）+ 三个并列读数 + 剪枝率（打印用）。
++  const h1Bytes = result.writeSegments.vectorByteReads.bytesRead;
++  const h1MemoryRows = result.writeSegments.vectorByteReads.memoryRowsRead;
++  const h1CodeRows = result.writeSegments.vectorByteReads.codeRowsRead;
++  const h1Universe = result.writeSegments.vectorByteReads.candidateUniverse;
++  const h1PruneRate = result.writeSegments.vectorByteReads.breakdown.pruneRate.max;
+   // ★ **R6 的观测行**（**不判红绿** ⇒ 单独算一次 ⇒ 控制台与「未达标清单」用**同一段文字**）。
+   const r6Observation = formatRecallVecRowsObservation(result);
+   // ⚠️ ★ **存储介质类别**（判据的介质解耦落点）—— 探测失败 ⇒ `'unknown'`（**不抛错**）。
+@@ -1335,8 +2063,11 @@ function main(): void {
+     // ⚠️ ★★★ **R6 的口径声明**（★ 实测还是推算 ⇒ **读 JSON 的人不许误读**）。
+     candidateReadRowsBasis: result.candidateReadRowsBasis,
+     hitFineBuckets: result.hitFineBuckets,
+-    // ⚠️ ★ **每行读成本（µs/行）—— 推导值，不是直接测量值**。
++    // ⚠️ ★★ **每行读成本（µs/行）—— 推导值，不是直接测量值**。
+     perRowReadCostUs: result.perRowReadCostUs,
++    // ⚠️ ★★ **T06 · 召回路径的字节读数**（**新键**；观测值、不判门槛 ⇒ 与同组的
++    //   `candidateReadRows` / `hitFineBuckets` 放一起 ⇒ 不拆散）。
++    vectorRouteByteReads: result.vectorRouteByteReads,
+     // ⚠️ ★★★ **写入路径的分段计时**（见 `writeSegments.note` 的口径说明）
+     //   ⇒ ⇒ **其中 `vectorCandidateRows` 就是 H1/H2 的判据量**（写入探针 8/20）。
+     writeSegments: result.writeSegments,
+@@ -1366,14 +2097,26 @@ function main(): void {
+       `  向量扫描本身 P99 = ${result.vectorRouteP99Ms.toFixed(3)}ms（门槛 ${THRESHOLDS.vectorRouteP99Ms}ms，样本 ${result.vectorRouteSamples}）` +
+       '（⚠️ **直接调 backend.route()+search()** ⇒ 不是召回读数，见 vectorScanNote）\n' +
+       `  向量路占总耗时 = ${(result.vectorRouteShare * 100).toFixed(2)}%（门槛 ≤ ${(THRESHOLDS.vectorRouteShare * 100).toFixed(0)}%）\n` +
+-      `  ★ H1 候选读取行数（**写入去重路径** · 探针 8/20）= ${h1Rows.max} 行` +
+-      `（判定取 max；均值 ${h1Rows.mean.toFixed(1)} 行，` +
+-      `门槛 ≤ ${THRESHOLDS.candidateReadRowsMax} 行，样本 ${h1Rows.count}）\n` +
+-      '    ★ H1 口径 = **实测（写入去重路径的生产 SQL 实际返回的行数）**' +
+-      '（判据量 = writeSegments.vectorCandidateRows；1M 实测 5,521 行 = 门槛的 2.76 倍 ⇒ 仍红）\n' +
+-      '  ★ H2 候选行数 ÷ 库规模（**写入去重路径** · 探针 8/20）= ' +
++      `  ★★ H1′ 向量载荷字节（**写入去重路径** · 探针 8/20）= ${h1Bytes.max} B` +
++      `（判定取 max；均值 ${h1Bytes.mean.toFixed(1)} B、p99 ${h1Bytes.p99} B，` +
++      `门槛 ≤ ${THRESHOLDS.bytesReadMax} B，样本 ${h1Bytes.count}）\n` +
++      '    ★ H1′ 口径 = **实测（生产 SQL 实际物化的向量载荷字节 = 实测 byteLength 之和）**' +
++      '（**不含正文 / 标量 / 页开销 ⇒ 是真实搬运量的下界 ⇒ 判据偏严**；' +
++      '判据量 = writeSegments.vectorByteReads.bytesRead）\n' +
++      '  ★★ H2′ 向量载荷字节 ÷（库规模 × 3,072 B）（**写入去重路径** · 探针 8/20）= ' +
++      `${(result.corpusSize > 0 ? (h1Bytes.max / (result.corpusSize * 3_072)) * 100 : 0).toFixed(4)}%` +
++      `（门槛 ≤ ${(THRESHOLDS.bytesReadRatioMax * 100).toFixed(1)}%）\n` +
++      '  ★★ 剪枝率（PRUNE_RATE · 分子 = embeddingCalls = get() 调用次数）= ' +
++      `${(h1PruneRate * 100).toFixed(2)}%（门槛 ≤ ${(THRESHOLDS.pruneRateMax * 100).toFixed(0)}%）\n` +
++      `  ★ 记忆行读数 memoryRowsRead = ${h1MemoryRows.max} 行` +
++      `（均值 ${h1MemoryRows.mean.toFixed(1)}；码行 codeRowsRead = ${h1CodeRows.max} 行；` +
++      `候选宇宙 candidateUniverse = ${h1Universe.max}）\n` +
++      `  ★ 旧行数（**观测值** = ${h1Rows.max} 行，写入去重路径 · 探针 8/20）` +
++      `（均值 ${h1Rows.mean.toFixed(1)} 行；⚠️ **字节口径下它已不是判据**；` +
++      `历史行数口径 ≤ ${THRESHOLDS.candidateReadRowsMax} 行，样本 ${h1Rows.count}）\n` +
++      '  ★ 旧行数 ÷ 库规模（**观测值**）= ' +
+       `${(result.corpusSize > 0 ? (h1Rows.max / result.corpusSize) * 100 : 0).toFixed(4)}%` +
+-      `（门槛 ≤ ${(THRESHOLDS.candidateReadRowsRatioMax * 100).toFixed(1)}%）\n` +
++      `（历史行数口径 ≤ ${(THRESHOLDS.candidateReadRowsRatioMax * 100).toFixed(1)}%）\n` +
+       `  ★ ${r6Observation}\n` +
+       '    ★ R6 口径 = ' +
+       `**${result.candidateReadRowsBasis.mode === 'measured' ? '实测（召回路径的生产 SQL 实际物化的候选行数）' : '⚠ 推算（模型化了「桶内不设 LIMIT」）'}**` +

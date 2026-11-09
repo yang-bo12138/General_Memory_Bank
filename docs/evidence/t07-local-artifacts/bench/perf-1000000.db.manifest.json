@@ -1,0 +1,20 @@
+{
+  "manifestVersion": 2,
+  "corpusSize": 1000000,
+  "seed": 20260101,
+  "rows": 1000000,
+  "vectorRows": 1000000,
+  "fineCells": 9966,
+  "members": 1000000,
+  "loadMs": 12980354.3636,
+  "trainMs": 10036582.148,
+  "trainReadAndKmeansMs": null,
+  "trainMigrateMs": null,
+  "peakRss": {
+    "kernelPeakBytes": 10397401088,
+    "sampledPeakBytes": 10397331456,
+    "sampleCount": 161760,
+    "workerActive": true
+  },
+  "rssBeforeTrainBytes": 282824704
+}

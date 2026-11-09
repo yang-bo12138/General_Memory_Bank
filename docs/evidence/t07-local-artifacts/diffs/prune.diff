@@ -1,0 +1,157 @@
+diff --git a/tests/unit/prune.test.ts b/tests/unit/prune.test.ts
+index a008459..d8898a7 100644
+--- a/tests/unit/prune.test.ts
++++ b/tests/unit/prune.test.ts
+@@ -153,6 +153,152 @@ describe('T04 · 剪枝原语（pruneTopK）', () => {
+     });
+   });
+ 
++  /**
++   * ★★★ **断言 1c（口径 §2）：`exactReads` === `scoreOf` 的【调用次数】**。
++   *
++   * ⚠️ ★ **为什么这条必须存在**（它守的是「bench 侧剪枝率分子的可信性」）：
++   *   bench 侧的剪枝率分子 = `embeddingCalls` = **`scoreOf` 的 `get()` 调用次数**
++   *   （**无条件**计数 ⇒ 返回 `undefined` 也计）
++   *   ⇒ ⇒ 而口径要它与 `prune` 的 `exactReads` **定义性相等**
++   *   ⇒ ⇒ **这条断言就是那两个数的「换算说明书」**：哪天 `prune.ts` 改了 `exactReads`
++   *   的计数口径（比如改成「只数返回了行的」），这条会红 ⇒ ⇒ **bench 的剪枝率不会被悄悄放宽**。
++   *
++   * ⚠️ ★ **为什么必须是「调用次数」而不是「返回行数」**（方向纪律）：
++   *   门槛是「≤」⇒ **分子偏小 = 更容易过 = 偏松 = 假绿**
++   *   ⇒ ⇒ 最坏情形：命中桶内全是软删成员 ⇒ 「返回行数」= 0 ⇒ 剪枝率 0% ⇒ **假绿**。
++   *
++   * ⚠️ ★ **等价性只在【两段式分支（`prune = true`）成立】**：
++   *   `prune = false` 的对照分支（`src/vector/ivf.ts:748`）**根本不调 `scoreOf`**
++   *   ⇒ ⇒ 那条路上「`exactReads` == 调用次数」是**恒真**（两边都是 0）⇒ 没意义。
++   *   ⇒ ⇒ **本条的夹具必须走两段式**（`pruneTopK()` 本身就是两段式的那一段
++   *   ⇒ ⇒ 夹具必须**真的调 `scoreOf`** ⇒ 若一条都没调 ⇒ 断言恒绿 ⇒ 必须排除）。
++   */
++  describe('★ 断言 1c：`exactReads` === `scoreOf` 的【调用次数】（bench 侧剪枝率分子的依据）', () => {
++    it('★ 早停发生 ⇒ `exactReads` 严格等于 `scoreOf` 的调用次数（**不是**返回行数）', () => {
++      // ⚠️ **夹具必须让早停真的发生**（否则 `exactReads` = 全部候选数 ⇒
++      //   「调用次数 == exactReads」会**恰好**也成立 ⇒ 这条断言就变成恒绿 ⇒ 没牙）。
++      //   ⇒ 造 40 条「上界宽、精确分低」的行 + 5 条「上界窄」的行
++      //   ⇒ ⇒ `k = 3` ⇒ 读到第 3 条时堆满 ⇒ 第 4 条起上界 < 第 3 名 ⇒ **早停**。
++      const entries: PruneEntry[] = [];
++      for (let index = 0; index < 40; index += 1) {
++        entries.push({
++          kind: 'coded',
++          id: `w-${String(index).padStart(3, '0')}`,
++          code: Int8Array.from([1, 0, 0, 0]),
++          scale: 0.5,
++          eps: 0.4,
++        });
++      }
++      for (let index = 0; index < 5; index += 1) {
++        entries.push({
++          kind: 'coded',
++          id: `n-${String(index).padStart(3, '0')}`,
++          code: Int8Array.from([1, 0, 0, 0]),
++          scale: 0.1,
++          eps: 0,
++        });
++      }
++      // ⚠️ ★ **计数包装**：数 `scoreOf` 的**调用次数**（**无条件**计数 ⇒ 返回 `null` 也计）。
++      let calls = 0;
++      const scores = new Map<string, number>();
++      for (const entry of entries) {
++        if (entry.kind === 'coded') {
++          scores.set(entry.id, exactOf(entry));
++        }
++      }
++      const countingScoreOf = (id: string): number | null => {
++        calls += 1;
++        return scores.get(id) ?? null;
++      };
++      const out = pruneTopK(entries, { query, k: 3, scoreOf: countingScoreOf });
++      // ⚠️ **前提**：早停真的发生了（`exactReads` 明显小于候选总数）⇒ 否则这条断言没牙。
++      expect(out.exactReads).toBeLessThan(entries.length);
++      expect(out.exactReads).toBeGreaterThan(0);
++      // ⚠️ ★★ **核心断言（口径 §2 断言 1c）**：`exactReads` **逐位等于**调用次数。
++      expect(out.exactReads).toBe(calls);
++      // ⚠️ ★ **反向**：调用次数**不等于**「返回了行的次数」⇒ 说明这两条路**真的分得开**
++      //   ⇒ ⇒ 若哪天有人把 bench 的分子改成「返回行数」⇒ bench 的断言 1c-bench 会红。
++      const returnedRows = out.survivors.length;
++      expect(calls).toBeGreaterThan(returnedRows);
++    });
++
++    it('★ `scoreOf` 返回 `null` 的行**也算一次调用**（⇒ 分子偏大 = 更严，不是偏松）', () => {
++      const entries: PruneEntry[] = [exactEntry('a', 1), exactEntry('b', 0.9), exactEntry('c', 0)];
++      let calls = 0;
++      const out = pruneTopK(entries, {
++        query,
++        k: 2,
++        scoreOf: (id) => {
++          calls += 1;
++          // ⚠️ **`b` 永远返回 `null`**（模拟「不在候选宇宙里」）⇒ 它**消耗了一次调用**。
++          return id === 'b' ? null : exactOf(entries.find((e) => e.id === id) as CodedEntry);
++        },
++      });
++      // ⚠️ ★ **核心断言**：返回 `null` 的那次**照样计入** `exactReads`
++      //   ⇒ ⇒ `exactReads` == 调用次数（**不是**「返回行数」= 2）。
++      expect(out.exactReads).toBe(3);
++      expect(calls).toBe(3);
++      expect(out.exactReads).toBe(calls);
++      // ⚠️ ★ **方向纪律的证据**：`exactReads`（3）> 返回行数（2）
++      //   ⇒ ⇒ 若 bench 的剪枝率分子取「返回行数」⇒ 分子偏小 ⇒ **偏松 = 假绿**
++      //   ⇒ ⇒ 这条差值就是「为什么必须用调用次数」的量化证据。
++      expect(out.exactReads).toBeGreaterThan(out.survivors.length);
++    });
++
++    it('★ 无预算（读路径口径）与写路径预算**两个配置的 `exactReads` 都等于各自的调用次数', () => {
++      const entries: PruneEntry[] = [];
++      for (let index = 0; index < 99; index += 1) {
++        entries.push({
++          kind: 'coded',
++          id: `h-${String(index).padStart(3, '0')}`,
++          code: Int8Array.from([1, 0, 0, 0]),
++          scale: 0.5,
++          eps: 0.4,
++        });
++      }
++      for (let index = 0; index < 100; index += 1) {
++        entries.push({
++          kind: 'coded',
++          id: `l-${String(index).padStart(3, '0')}`,
++          code: Int8Array.from([1, 0, 0, 0]),
++          scale: 0.1,
++          eps: 0,
++        });
++      }
++      const scores = new Map<string, number>();
++      for (const entry of entries) {
++        if (entry.kind === 'coded') {
++          scores.set(entry.id, exactOf(entry));
++        }
++      }
++      // ① 无预算（读路径口径）：早停在 99 处停住。
++      let unbudgetedCalls = 0;
++      const unbudgeted = pruneTopK(entries, {
++        query,
++        k: 5,
++        scoreOf: (id) => {
++          unbudgetedCalls += 1;
++          return scores.get(id) ?? null;
++        },
++      });
++      expect(unbudgeted.exactReads).toBe(99);
++      expect(unbudgeted.exactReads).toBe(unbudgetedCalls);
++      // ② 写路径预算（64）：预算用尽 ⇒ 撤回剪枝 ⇒ 扫完（199 条）。
++      let budgetedCalls = 0;
++      const budgeted = pruneTopK(entries, {
++        query,
++        k: 5,
++        exactRescoreBudget: WRITE_EXACT_RESCORE_BUDGET,
++        scoreOf: (id) => {
++          budgetedCalls += 1;
++          return scores.get(id) ?? null;
++        },
++      });
++      expect(budgeted.exactReads).toBe(entries.length);
++      expect(budgeted.exactReads).toBe(budgetedCalls);
++    });
++  });
++
+   describe('★ 早停：严格小于（`<`，不是 `≤`）', () => {
+     it('「同分且 id 更小」的行**必须**进 survivors（用 `≤` 会把它漏掉）', () => {
+       // 五条**同分**（都是 1.0），id 逆序给出 ⇒ 队列按 upper 降序、同 upper 按 id 升序

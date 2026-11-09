@@ -1,0 +1,14 @@
+P99 测量：语料 1000000 条 / 查询 200 条 / 写入 200 条 / 库 D:\WorkBuddyData\2026-11-02-08-56-53\gmb\.tmp\bench/perf-1000000.db
+D:\WorkBuddyData\2026-11-02-08-56-53\gmb\bench\lib\db.ts:304
+      throw new Error(
+            ^
+
+Error: bench：要求复用已准备好的库（--reuse=true），但**复用不了**：D:\WorkBuddyData\2026-11-02-08-56-53\gmb\.tmp\bench/perf-1000000.db（清单缺失 / 规模或种子对不上 ⇒ 见 D:\WorkBuddyData\2026-11-02-08-56-53\gmb\.tmp\bench/perf-1000000.db.manifest.json）。⇒ **不会**自动删库重灌（那是 3~5 小时的活）。⇒ 若确实要重灌 ⇒ 显式加 --force-rebuild=true；⇒ 若只是清单丢了 ⇒ 把那份清单找回来（复用期间不要删它）。
+    at prepareBench (D:\WorkBuddyData\2026-11-02-08-56-53\gmb\bench\lib\db.ts:304:13)
+    at main (D:\WorkBuddyData\2026-11-02-08-56-53\gmb\bench\perf.ts:2104:20)
+    at <anonymous> (D:\WorkBuddyData\2026-11-02-08-56-53\gmb\bench\perf.ts:2262:3)
+    at ModuleJob.run (node:internal/modules/esm/module_job:343:25)
+    at async onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:665:26)
+    at async asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:117:5)
+
+Node.js v22.22.2

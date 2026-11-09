@@ -1,0 +1,343 @@
+diff --git a/tests/bench/h1-measurement.test.ts b/tests/bench/h1-measurement.test.ts
+index 85e1395..e629bda 100644
+--- a/tests/bench/h1-measurement.test.ts
++++ b/tests/bench/h1-measurement.test.ts
+@@ -197,35 +197,38 @@ describe('R6（召回路径）口径加固 · 实测读行数（不再模型化
+     expect(Object.keys(THRESHOLDS)).toContain('candidateReadRowsRatioMax');
+   });
+ 
+-  it('★ H2 违规行**必须写明主语是「写入去重路径」**（小规模下 H2 必然红 ⇒ 这条总能被验到）', () => {
++  it('★ H2′ 违规行**必须写明主语是「写入去重路径」**（小规模下 H2′ 必然红 ⇒ 这条总能被验到）', () => {
+     const { dbPath, db } = buildSmokeBench(newWorkDir());
+     const options = { ...DEFAULT_CORPUS_OPTIONS, size: SMOKE_SIZE };
+     const store = new MemoryStore({ dbPath });
+     const result = measurePerf(db.db, store, options, 5, 5);
+     const failures = checkPerf(result);
+-    // ⚠️ **为什么这里断言非空**：H2 是**规模无关写法**（≤ 0.2%）⇒
+-    //   1,500 条的小库上「候选行数 ÷ 库规模」必然远超 0.2% ⇒ **H2 本轮一定红**
+-    //   ⇒ ⇒ 于是「H2 的文案对不对」这件事**每一轮都能被验到**（不是碰运气）。
+-    const h2Failures = failures.filter((failure) => failure.includes('（H2）'));
++    // ⚠️ **为什么这里断言非空**：H2′ 是**规模无关写法**（≤ 0.2%）⇒
++    //   1,500 条的小库上「向量载荷字节 ÷（库规模 × 3,072 B）」必然远超 0.2% ⇒ **H2′ 本轮一定红**
++    //   ⇒ ⇒ 于是「H2′ 的文案对不对」这件事**每一轮都能被验到**（不是碰运气）。
++    // ⚠️ ★ **标签是 `（H2′）`**（T06 起字节口径）⇒ **旧标签 `（H2）` 一个都不许再出现在清单里**
++    //   （断言 5 会独立守这一条）。
++    const h2Failures = failures.filter((failure) => failure.includes('（H2′）'));
+     expect(h2Failures.length).toBeGreaterThan(0);
+     for (const failure of h2Failures) {
+       expect(failure).toContain('写入去重路径');
+       expect(failure).toContain('写入');
+       // ⚠️ 判据量的**字段路径**必须点名（⇒ 读的人不用回头翻文档）。
+-      expect(failure).toContain('writeSegments.vectorCandidateRows');
++      expect(failure).toContain('writeSegments.vectorByteReads.bytesRead');
+     }
+     db.db.close();
+   });
+ 
+-  it('★ H1 判红时违规清单里**带上口径与探针配置**（不许让人误以为它判的是召回路径）', () => {
++  it('★ H1′ 判红时违规清单里**带上口径与探针配置**（不许让人误以为它判的是召回路径）', () => {
+     const { dbPath, db } = buildSmokeBench(newWorkDir());
+     const options = { ...DEFAULT_CORPUS_OPTIONS, size: SMOKE_SIZE };
+     const store = new MemoryStore({ dbPath });
+     const result = measurePerf(db.db, store, options, 5, 5);
+     const failures = checkPerf(result);
+-    const h1Failures = failures.filter((failure) => failure.includes('（H1）'));
+-    // ⚠️ **小规模下 H1 不一定超门槛** ⇒ 两种情况都要说得清：
+-    //   超了 ⇒ 清单里必须带口径 + 主语 + 探针；没超 ⇒ 清单里不许出现 H1 判红。
++    // ⚠️ ★ **标签是 `（H1′）`**（字节口径）⇒ 旧的 `（H1）` 已经**不是**判据了。
++    const h1Failures = failures.filter((failure) => failure.includes('（H1′）'));
++    // ⚠️ **小规模下 H1′ 不一定超门槛** ⇒ 两种情况都要说得清：
++    //   超了 ⇒ 清单里必须带口径 + 主语 + 探针；没超 ⇒ 清单里不许出现 H1′ 判红。
+     for (const failure of h1Failures) {
+       expect(failure).toContain('口径');
+       expect(failure).toContain('写入去重路径');
+@@ -367,7 +370,7 @@ function insertSoftDeletedMembers(db: Database.Database): number {
+ }
+ 
+ describe('★ 两条「有牙」的守卫（防「口径被悄悄换掉」）', () => {
+-  it('★ 守卫一：计数器失效 ⇒ R6 兜底把 `mode` 标成 `derived`，而 **H1 的判据量照旧**', () => {
++  it('★ 守卫一：计数器失效 ⇒ R6 兜底把 `mode` 标成 `derived`，而**行数判据量照旧**', () => {
+     const { dbPath, db } = buildSmokeBench(newWorkDir());
+     const options = { ...DEFAULT_CORPUS_OPTIONS, size: SMOKE_SIZE };
+     const store = new MemoryStore({ dbPath });
+@@ -381,18 +384,21 @@ describe('★ 两条「有牙」的守卫（防「口径被悄悄换掉」）',
+     expect(result.candidateReadRows.max).toBe(result.candidateReadRowsBasis.derivedCrossCheck?.max);
+     // ⚠️ ★★ **2026-11-03 归口后的新断言（比原来更强，不是迁就）**：
+     //   原断言是「H1 违规行里必须出现『推算』」—— 那是**旧口径**（H1 用滚动计数器取数）的产物。
+-    //   归口后 H1 的取数是 `writeSegments.vectorCandidateRows`（**不经过这个计数器**）
+-    //   ⇒ ⇒ 正确的新断言是：**计数器被打残，H1 的判据量也必须完全不受影响**
+-    //   ⇒ ⇒ 若哪天有人把 H1 又改回读 `candidateReadRows`，这条会红（R6 那一侧被清成推算值/0）。
++    //   归口后行数判据量的取数是 `writeSegments.vectorCandidateRows`（**不经过这个计数器**）
++    //   ⇒ ⇒ 正确的新断言是：**计数器被打残，行数判据量也必须完全不受影响**
++    //   ⇒ ⇒ 若哪天有人把行数判据又改回读 `candidateReadRows`，这条会红（R6 那一侧被清成推算值/0）。
+     expect(result.writeSegments.vectorCandidateRows.count).toBe(5);
+     expect(result.writeSegments.vectorCandidateRows.max).toBeGreaterThan(0);
+-    // ⚠️ ★ **违规清单里不许出现「推算」**（H1 的口径是实测 ⇒ 提「推算」会把两个量混起来）。
++    // ⚠️ ★★★ **T06 的字节判据（H1′）**：计数器被打残 ⇒ **字节账恒为 0**
++    //   ⇒ ⇒ **H1′ 必须判红（真空通过）**（这是**正确**的行为：判据量被打残 ⇒ 不许静默通过）
++    //   ⇒ ⇒ ⚠️ **与行数判据相反**（行数判据量来自生产返回值 ⇒ 不受计数器影响）⇒ 这是两条不同的账。
++    expect(result.writeSegments.vectorByteReads.bytesRead.max).toBe(0);
+     const failures = checkPerf(result);
+-    const h1Failure = failures.find((failure) => failure.includes('（H1）'));
+-    if (h1Failure !== undefined) {
+-      expect(h1Failure).toContain('实测');
+-      expect(h1Failure).not.toContain('推算');
+-    }
++    const h1PrimeFailure = failures.find((failure) => failure.includes('（H1′）'));
++    expect(h1PrimeFailure).toBeDefined();
++    expect(h1PrimeFailure).toContain('真空通过');
++    // ⚠️ ★ **旧标签 `（H1）` 不许再出现**（否则断言 5 的「过滤串失效」就要判红了）。
++    expect(failures.some((failure) => failure.includes('（H1）'))).toBe(false);
+     db.db.close();
+   });
+ 
+@@ -441,83 +447,94 @@ describe('★ 两条「有牙」的守卫（防「口径被悄悄换掉」）',
+  *   （`checkPerf()` 是纯函数 ⇒ 伪造完全合法，不改任何生产行为）。
+  */
+ describe('★ 门槛归口（D10）：H1/H2 判写入去重路径，召回同名量降为 R6 观测值', () => {
+-  /** 伪造用的离谱值（**故意取得与任何真实读数都不撞** ⇒ 出现在文案里就是「判定真的读了它」）。 */
+-  const FORGED_WRITE_ROWS = 987_654;
+-  const FORGED_RECALL_ROWS = 123_456;
++  /** ★ **伪造的写入侧字节数**（T06 起 H1′/H2′ 的判据量；**故意取得与任何真实读数都不撞**）。 */
++  const FORGED_WRITE_BYTES = 987_654_321;
++  /** ★ **伪造的召回侧字节数**（**与写入侧的刻意不同** ⇒ 才分得清判定读了谁）。 */
++  const FORGED_RECALL_BYTES = 123_456_789;
+ 
+-  it('★ H1/H2 的判据量 = `writeSegments.vectorCandidateRows.max`（不是 `candidateReadRows.max`）', () => {
++  it('★ H1′/H2′ 的判据量 = `writeSegments.vectorByteReads.bytesRead.max`（不是召回侧的字节）', () => {
+     const { dbPath, db } = buildSmokeBench(newWorkDir());
+     const options = { ...DEFAULT_CORPUS_OPTIONS, size: SMOKE_SIZE };
+     const store = new MemoryStore({ dbPath });
+     const base = measurePerf(db.db, store, options, 5, 5);
+-    // ⚠️ **前提**：写入路径与召回路径是两个**真的不同**的数（探针 8/20 vs 20/50）
++    // ⚠️ **前提**：字节账必须是**真的有样本**（否则下面全是「真空通过」分支 ⇒ 测不到判据量）。
++    expect(base.writeSegments.vectorByteReads.bytesRead.count).toBeGreaterThan(0);
++    expect(base.writeSegments.vectorByteReads.bytesRead.max).toBeGreaterThan(0);
++    expect(base.vectorRouteByteReads.bytesRead.count).toBeGreaterThan(0);
++    expect(base.vectorRouteByteReads.bytesRead.max).toBeGreaterThan(0);
++    // ⚠️ **前提**：写入侧与召回侧的字节读数**真的不同**（探针 8/20 vs 20/50）
+     //   ⇒ ⇒ 若两者恰好相等，下面的断言就无法分辨「读了哪一个」⇒ 没有牙。
+-    expect(base.writeSegments.vectorCandidateRows.max).toBeGreaterThan(0);
+-    expect(base.candidateReadRows.max).toBeGreaterThan(0);
+-    expect(base.writeSegments.vectorCandidateRows.max).not.toBe(base.candidateReadRows.max);
++    expect(base.writeSegments.vectorByteReads.bytesRead.max).not.toBe(
++      base.vectorRouteByteReads.bytesRead.max,
++    );
+ 
+-    // ① **把写入路径那个数推过门槛** ⇒ H1/H2 必须红，且文案里出现的是**这个**数。
++    // ① **把写入路径那个字节数推过门槛** ⇒ H1′/H2′ 必须红，且文案里出现的是**这个**数。
+     const forcedWrite: PerfResult = {
+       ...base,
+       writeSegments: {
+         ...base.writeSegments,
+-        vectorCandidateRows: {
+-          ...base.writeSegments.vectorCandidateRows,
+-          max: FORGED_WRITE_ROWS,
++        vectorByteReads: {
++          ...base.writeSegments.vectorByteReads,
++          bytesRead: { ...base.writeSegments.vectorByteReads.bytesRead, max: FORGED_WRITE_BYTES },
+         },
+       },
+     };
+     const writeFailures = checkPerf(forcedWrite);
+-    const h1 = writeFailures.filter((failure) => failure.includes('（H1）'));
+-    const h2 = writeFailures.filter((failure) => failure.includes('（H2）'));
++    const h1 = writeFailures.filter((failure) => failure.includes('（H1′）'));
++    const h2 = writeFailures.filter((failure) => failure.includes('（H2′）'));
+     expect(h1).toHaveLength(1);
+     expect(h2).toHaveLength(1);
+-    expect(h1[0]).toContain(String(FORGED_WRITE_ROWS));
++    expect(h1[0]).toContain(String(FORGED_WRITE_BYTES));
+     expect(h1[0]).toContain('写入去重路径');
+-    expect(h2[0]).toContain(String(FORGED_WRITE_ROWS));
+-    // ⚠️ ★ **反向**：H1/H2 的文案里**不许出现召回路径那个数**（⇒ 判定没读它）。
+-    //   ⚠️ **必须带上单位「 行」再比**：T04 之后 `candidateReadRows.max` 可能小到 20，
+-    //   而 H1 文案里**必然**有「（探针 8/20）」——裸数字比对会被这个子串撞上 ⇒ 假红。
+-    //   （这不是理论风险：T05 落地当天就是这么红的一次。）
+-    const recallRowsText = `${String(base.candidateReadRows.max)} 行`;
+-    expect(h1[0]).not.toContain(recallRowsText);
+-    expect(h2[0]).not.toContain(recallRowsText);
+-
+-    // ② **把召回路径那个数推到 12,782 那种量级** ⇒ **H1/H2 的结论一个字都不许变**
+-    //   ⇒ ⇒ 这条专打「H1 又改回读 `candidateReadRows`」那个变异。
+-    //   ⚠️ **为什么用「与 base 逐条相同」而不是「断言 H1/H2 为空」**：
+-    //     H2 是**规模无关写法**（≤ 0.2%）⇒ 1,500 条的小库上它**必然红**（与 R6 无关）
+-    //     ⇒ 断言「为空」会把「H2 本来该红」误判成失败 ⇒ ⇒ 正确的问法是**「判定对这个字段免疫」**。
++    expect(h2[0]).toContain(String(FORGED_WRITE_BYTES));
++    // ⚠️ ★ **判据量的字段路径必须点名**（⇒ 读的人不用回头翻文档）。
++    expect(h1[0]).toContain('writeSegments.vectorByteReads.bytesRead');
++    // ⚠️ ★ **反向**：H1′/H2′ 的文案里**不许出现召回路径那个字节数**（⇒ 判定没读它）。
++    expect(h1[0]).not.toContain(String(FORGED_RECALL_BYTES));
++    expect(h2[0]).not.toContain(String(FORGED_RECALL_BYTES));
++
++    // ② **把召回路径的字节数推到离谱量级** ⇒ **H1′/H2′ 的结论一个字都不许变**
++    //   ⇒ ⇒ 这条专打「H1′ 又改回读 `vectorRouteByteReads`」那个变异。
++    //   ⚠️ **为什么用「与 base 逐条相同」而不是「断言为空」**：
++    //     H2′ 是**规模无关写法**（≤ 0.2%）⇒ 1,500 条的小库上它**必然红**（与召回侧无关）
++    //     ⇒ 断言「为空」会把「H2′ 本来该红」误判成失败 ⇒ ⇒ 正确的问法是**「判定对这个字段免疫」**。
+     const h1h2Of = (failures: readonly string[]): string[] =>
+-      failures.filter((failure) => failure.includes('（H1）') || failure.includes('（H2）'));
++      failures.filter((failure) => failure.includes('（H1′）') || failure.includes('（H2′）'));
+     const baseH1H2 = h1h2Of(checkPerf(base));
+     const forcedRecall: PerfResult = {
+       ...base,
+-      candidateReadRows: { ...base.candidateReadRows, max: FORGED_RECALL_ROWS },
++      vectorRouteByteReads: {
++        ...base.vectorRouteByteReads,
++        bytesRead: { ...base.vectorRouteByteReads.bytesRead, max: FORGED_RECALL_BYTES },
++      },
+     };
+     const recallFailures = checkPerf(forcedRecall);
+     expect(h1h2Of(recallFailures)).toEqual(baseH1H2);
+-    expect(recallFailures.some((failure) => failure.includes(String(FORGED_RECALL_ROWS)))).toBe(
++    expect(recallFailures.some((failure) => failure.includes(String(FORGED_RECALL_BYTES)))).toBe(
+       false,
+     );
+     db.db.close();
+   });
+ 
+-  it('★ 写入路径的样本数为 0 ⇒ H1 是**真空通过**（必须判出来，不许静默通过）', () => {
++  it('★ 写入路径的字节样本数为 0 ⇒ H1′ 是**真空通过**（必须判出来，不许静默通过）', () => {
+     const { dbPath, db } = buildSmokeBench(newWorkDir());
+     const options = { ...DEFAULT_CORPUS_OPTIONS, size: SMOKE_SIZE };
+     const store = new MemoryStore({ dbPath });
+     const base = measurePerf(db.db, store, options, 5, 5);
+-    // ⚠️ **0 个样本** ⇒ 判据无从谈起 ⇒ 必须红（不是「0 行 ⇒ 达标」）。
++    const emptySummary = { count: 0, min: 0, mean: 0, p50: 0, p99: 0, max: 0 };
++    // ⚠️ **0 个样本** ⇒ 判据无从谈起 ⇒ 必须红（不是「0 字节 ⇒ 达标」）。
+     const empty: PerfResult = {
+       ...base,
+       writeSegments: {
+         ...base.writeSegments,
+-        vectorCandidateRows: { count: 0, min: 0, mean: 0, p50: 0, p99: 0, max: 0 },
++        vectorByteReads: {
++          ...base.writeSegments.vectorByteReads,
++          bytesRead: { ...base.writeSegments.vectorByteReads.bytesRead, ...emptySummary },
++        },
+       },
+     };
+     const failures = checkPerf(empty);
+-    const h1 = failures.filter((failure) => failure.includes('（H1）'));
++    const h1 = failures.filter((failure) => failure.includes('（H1′）'));
+     expect(h1).toHaveLength(1);
+     expect(h1[0]).toContain('真空通过');
+     // ⚠️ **恒为 0 但有样本** ⇒ 同样是真空通过（向量路在写入路径整路缺席）。
+@@ -525,16 +542,103 @@ describe('★ 门槛归口（D10）：H1/H2 判写入去重路径，召回同名
+       ...base,
+       writeSegments: {
+         ...base.writeSegments,
+-        vectorCandidateRows: { count: 5, min: 0, mean: 0, p50: 0, p99: 0, max: 0 },
++        vectorByteReads: {
++          ...base.writeSegments.vectorByteReads,
++          bytesRead: {
++            ...base.writeSegments.vectorByteReads.bytesRead,
++            count: 5,
++            min: 0,
++            mean: 0,
++            p50: 0,
++            p99: 0,
++            max: 0,
++          },
++        },
+       },
+     };
+     const zeroFailures = checkPerf(allZero);
+-    const zeroH1 = zeroFailures.filter((failure) => failure.includes('（H1）'));
++    const zeroH1 = zeroFailures.filter((failure) => failure.includes('（H1′）'));
+     expect(zeroH1).toHaveLength(1);
+     expect(zeroH1[0]).toContain('向量路在写入路径整路缺席');
+     db.db.close();
+   });
+ 
++  /**
++   * ★★★ **断言 5（过滤串失效守卫 · 两头锁死）**。
++   *
++   * ⚠️ ★ **为什么这条必须存在**（口径 §5 末条 + 施工规格 T06-4 验收标准 6）：
++   *   H1/H2 改成 H1′/H2′ 之后，**旧的过滤串 `（H1）` / `（H2）` 一个都匹配不上任何违规行**
++   *   ⇒ ⇒ 那些「靠过滤串找到违规行」的断言**全部变成恒绿 = 没牙**
++   *   ⇒ ⇒ **必须有一条断言专门守「过滤串没有失效」**。
++   *
++   * ⚠️ ★ **两头锁死**（缺一头就等于没守）：
++   *   ① **旧标签行**（`（H1）` / `（H2）`）⇒ 断言它**不**被新过滤串命中
++   *     （⇒ 改名这件事**真的生效了**；否则新旧串会互相命中 ⇒ 改名是假的）；
++   *   ② **新标签行**（`（H1′）` / `（H2′）`）⇒ 断言它**确实**被新过滤串命中
++   *     （⇒ 新过滤串**不是恒空的**；否则「旧串不匹配」可能只是因为「新串也匹配不上」）。
++   *
++   * ⚠️ ★ **为什么用「伪造的 `bytesRead.max`」**（而不是造真数据）：
++   *   `checkPerf()` 是**纯函数** ⇒ 伪造输入完全合法、不改任何生产行为；
++   *   而这条要验的是**判定逻辑**，不是性能 ⇒ 伪造是最小、最快、最精准的手段。
++   */
++  it('★ 断言 5：旧过滤串 `（H1）`/`（H2）` 失效 **且** 新过滤串 `（H1′）`/`（H2′）` 有效（两头锁死）', () => {
++    const { dbPath, db } = buildSmokeBench(newWorkDir());
++    const options = { ...DEFAULT_CORPUS_OPTIONS, size: SMOKE_SIZE };
++    const store = new MemoryStore({ dbPath });
++    const base = measurePerf(db.db, store, options, 5, 5);
++
++    // ⚠️ ★ **造一条真的违规行**（伪造写入侧字节 ⇒ H1′/H2′ 必红）⇒ 拿它当「新标签行」的样本。
++    const forced: PerfResult = {
++      ...base,
++      writeSegments: {
++        ...base.writeSegments,
++        vectorByteReads: {
++          ...base.writeSegments.vectorByteReads,
++          bytesRead: { ...base.writeSegments.vectorByteReads.bytesRead, max: FORGED_WRITE_BYTES },
++        },
++      },
++    };
++    const forcedFailures = checkPerf(forced);
++    const newTagFailures = forcedFailures.filter(
++      (failure) => failure.includes('（H1′）') || failure.includes('（H2′）'),
++    );
++    // ⚠️ **前提**：新标签的违规行必须**确实存在**（否则下面两条都是空断言 ⇒ 没牙）。
++    expect(newTagFailures.length).toBeGreaterThan(0);
++
++    // ── ② **新标签行**：确实进 `failures` **且** 确实被新过滤串命中 ──
++    expect(forcedFailures.filter((failure) => failure.includes('（H1′）'))).toHaveLength(1);
++    expect(forcedFailures.filter((failure) => failure.includes('（H2′）'))).toHaveLength(1);
++    // ⚠️ ★ **反向也要锁**：新标签**不许**被旧过滤串命中（⇒ 两套标签真的分开了）。
++    expect(newTagFailures.some((failure) => failure.includes('（H1）'))).toBe(false);
++    expect(newTagFailures.some((failure) => failure.includes('（H2）'))).toBe(false);
++
++    // ── ① **旧标签行**：把它塞进一份「违规行清单」⇒ 断言它**不**进新过滤串 ──
++    //   ⚠️ **怎么造一条「带旧标签的违规行」**：`checkPerf()` 自己产不出旧标签了
++    //   （这正是要守的事实）⇒ ⇒ 用**把真违规行的标签换回旧标签**来合成一条
++    //   ⇒ ⇒ 若新过滤串是「宽松匹配」（例如用 `includes('H1')` 而不是 `includes('（H1′）')`）
++    //   ⇒ ⇒ 这条合成行**会**被命中 ⇒ ⇒ **这条断言会红** ⇒ ⇒ 过滤串失效有牙。
++    const syntheticOldTagLines = newTagFailures.map((failure) =>
++      failure.replace('（H1′）', '（H1）').replace('（H2′）', '（H2）'),
++    );
++    expect(syntheticOldTagLines).toHaveLength(newTagFailures.length);
++    for (const line of syntheticOldTagLines) {
++      // ⚠️ ★ **旧标签行必须被新过滤串漏掉**（⇒ 改名真的生效了）。
++      expect(line.includes('（H1′）')).toBe(false);
++      expect(line.includes('（H2′）')).toBe(false);
++      // ⚠️ ★ **而旧过滤串自己认它**（⇒ 这条合成行确实是「带旧标签的违规行」⇒ 前提成立）。
++      expect(line.includes('（H1）') || line.includes('（H2）')).toBe(true);
++    }
++    // ⚠️ ★★ **最硬的一条**：**真实的 `failures` 里一个旧标签都不许有**
++    //   ⇒ ⇒ 旧过滤串在真实清单上**匹配不上任何违规行** ⇒ ⇒ **过滤串失效守卫成立**。
++    expect(forcedFailures.some((failure) => failure.includes('（H1）'))).toBe(false);
++    expect(forcedFailures.some((failure) => failure.includes('（H2）'))).toBe(false);
++    // ⚠️ ★ **基线那一轮也一样**（⇒ 不是「伪造才有的现象」）。
++    const baseFailures = checkPerf(base);
++    expect(baseFailures.some((failure) => failure.includes('（H1）'))).toBe(false);
++    expect(baseFailures.some((failure) => failure.includes('（H2）'))).toBe(false);
++    db.db.close();
++  });
++
+   it('★ R6 的观测行：写明「不设门槛」＋「仍然红」＋探针 20/50（**不许**说成达标）', () => {
+     // ⚠️ **用真实读数那条分支**（max > 门槛）⇒ 文案里必须同时出现三件事：
+     //   ①「观测值，不设门槛、不判红绿」；② 与门槛的**倍数关系**；③「不是达标」。
+@@ -578,7 +682,11 @@ describe('★ 门槛归口（D10）：H1/H2 判写入去重路径，召回同名
+     expect(GATE_REGROUPING.decidedAt).toBe('2026-11-03');
+     expect(GATE_REGROUPING.decision).toContain('D10');
+     // ① **H1/H2 判据量必须点名那个字段路径**（机器可核 ⇒ 读 JSON 的脚本能对着它走）。
+-    expect(GATE_REGROUPING.h1h2Quantity).toContain('writeSegments.vectorCandidateRows');
++    //   ⚠️ ★ **T06 起判据量 = `writeSegments.vectorByteReads.bytesRead`**（字节口径）
++    //   ⇒ ⇒ 旧的 `writeSegments.vectorCandidateRows` 已**降级为并列观测**（不再进 `failures`）。
++    expect(GATE_REGROUPING.h1h2Quantity).toContain('writeSegments.vectorByteReads.bytesRead');
++    expect(GATE_REGROUPING.h1h2Quantity).toContain('vectorCandidateRows');
++    expect(GATE_REGROUPING.h1h2Quantity).toContain('降级');
+     expect(GATE_REGROUPING.h1h2Subject).toContain('写入去重路径');
+     // ② **R6 必须点名另一个字段**，且**明确是观测值**。
+     expect(GATE_REGROUPING.r6Quantity).toContain('candidateReadRows');
