@@ -1,6 +1,6 @@
 #!/usr/bin/env tsx
 /**
- * 跨节锚定检查 —— DESIGN-v2.md §14.3.1 末的「机器可检」清单（5 行 × 3 列）。
+ * 跨节锚定检查 —— DESIGN-v2.md §14.3.1 末的「机器可检」清单（6 行 × 3 列）。
  *
  * > 「对每一条『在 §A 声明的规则』，全文搜索它的**动作关键词**，
  * > 断言每个『该规则管辖的代码路径』都在动作关键词的**同一代码块内**出现该动作。」
@@ -85,6 +85,11 @@ export const EXPECTED_ANCHOR_ROWS: readonly string[][] = [
     '切分触发量',
     '原始分量占比 / `maxRawComponentRatio`',
     '§4.12.4 ③ / §6 / §3 `cluster_snapshot_meta` / §7.2 面板 7',
+  ],
+  [
+    '错误码收口',
+    '`SQLITE_CONSTRAINT_FOREIGNKEY` / `SQLITE_CONSTRAINT_UNIQUE` / `SQLITE_BUSY` / 归一化收口',
+    '§11.2 归一化收口 / §4.5 步骤 4 / §4.9 步骤 2',
   ],
 ];
 
@@ -217,6 +222,7 @@ export const EXPECTED_ANCHOR_PATH_COUNTS: readonly (readonly [string, number])[]
   ['reinforce 边界', 6],
   ['向量路缺席', 7],
   ['切分触发量', 4],
+  ['错误码收口', 3],
 ];
 
 /**
@@ -378,6 +384,14 @@ export const ANCHOR_PATH_BINDINGS: readonly AnchorRuleBinding[] = [
         kind: 'pending',
         pendingReason: '§7.2 面板 7（簇快照面板）属阶段 4 的实现范围',
       },
+    ],
+  },
+  {
+    rule: '错误码收口',
+    paths: [
+      { label: '§11.2 归一化收口', kind: 'doc', heading: '### 11.2 错误类型体系' },
+      { label: '§4.5 步骤 4', kind: 'doc', heading: '### 4.5 边权重衰减与强化' },
+      { label: '§4.9 步骤 2', kind: 'doc', heading: '### 4.9 写入去重与合并' },
     ],
   },
 ];
@@ -635,12 +649,67 @@ export function compareAnchorRows(rows: string[][]): AnchorDiff[] {
   return diffs;
 }
 
+/**
+ * ★ **HTML 实体残留检查**（★ 2026-11-07 轮 A 新增）。
+ *
+ * ★ **为什么要有这条**：★ HTML 实体（`&#xNNNN;`）**渲染无差异** ⇒ 看渲染稿发现不了
+ *   ⇒ 但它会**破坏内容锚点匹配**（★ 本仓的锚点/守卫大量用中文正文当锚点）
+ *   ⇒ ⇒ 实测已发生：★ §14.3.1 的 **C29 契约正文**里夹着两个实体（`&#x5206;` `&#x96C6;`）
+ *   ⇒ ⇒ 任何以「分母必须是 flat 的候选全集」为锚点的检索**命中 0 次**。
+ *
+ * ★ **为什么判据是「计数 = 0」而不是「不超过 N」**：★ 实体**没有合法用途**
+ *   （设计稿正文全是纯文本）⇒ ⇒ 基线就是 0 ⇒ ⇒ 上限也是 0
+ *   ⇒ ⇒ **不设余量**（★ 与 `check:wording-drift` 的「基线 + 余量」范式不同 —— 那条判的是
+ *   「自然增长的旧措辞引用」，本条判的是「**根本不该出现**的残留」⇒ 余量会变成后门）。
+ *
+ * ★ **判据覆盖哪几种形态**（★ 这一条必须写死，否则「漏报」会被误当成「通过」）：
+ *   ✅ **十六进制数值引用** `&#xNNNN;`（★ `x` 大小写都算 —— HTML5 允许 `&#X...;`）
+ *   ✅ **十进制数值引用** `&#NNNN;`（★ 与十六进制**同样**渲染成那个汉字）
+ *   ❌ **命名实体** `&amp;` / `&nbsp;` 等 ⇒ **有意不覆盖**（★ 理由见下）
+ *
+ *   ⚠️ **为什么十进制必须一起覆盖**：★ HTML 规范里 `&#20915;` 与 `&#x5206;`
+ *   **是同一个字符的两种写法** ⇒ ⇒ 渲染成同一个「分」⇒ ⇒ **同样破坏内容锚点匹配**
+ *   ⇒ ⇒ 只认十六进制 ⇒ ⇒ 等于「留了半个后门」⇒ ⇒ 而**判据是「计数 = 0」**
+ *   ⇒ ⇒ 后门 = 判据失效（★ 换一种工具导出就会重新出现）。
+ *
+ *   ⚠️ **为什么命名实体有意不覆盖**：★ 命名实体是**具名的有限集合**
+ *   （HTML5 共两千余个）⇒ ⇒ 要覆盖就得**写死一份清单**（⇒ 清单本身会漂）
+ *   ⇒ ⇒ 而本仓的实体事故**全部来自数值引用**（★ 同步/导出工具的产物）
+ *   ⇒ ⇒ 故只锁「数值引用」这一类 ⇒ ⇒ **这条是有意的边界，不是遗漏**
+ *   ⇒ ⇒ 若将来出现命名实体事故 ⇒ ⇒ 改判据（★ 连带补清单）而不是加正则。
+ *
+ * @param markdown 设计稿全文
+ * @returns 每处残留的位置与实体内容（★ 空数组 = 通过）
+ */
+export function findHtmlEntityResidue(
+  markdown: string,
+): { line: number; entity: string; context: string }[] {
+  const lines = markdown.split(/\r?\n/);
+  const found: { line: number; entity: string; context: string }[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? '';
+    // ⚠️ **两种数值引用都要认**（★ 十六进制 + 十进制）——★ 见上面的判据说明。
+    const matches = line.match(/&#[xX][0-9A-Fa-f]+;|&#[0-9]+;/g);
+    if (matches === null) {
+      continue;
+    }
+    for (const entity of matches) {
+      found.push({
+        line: index + 1,
+        entity,
+        context: line.slice(0, 160),
+      });
+    }
+  }
+  return found;
+}
+
 /** 主流程。 */
 function main(): void {
   const markdown = readDesignDoc();
   const rows = findAnchorTable(markdown);
 
-  process.stdout.write('跨节锚定检查（5 行 × 3 列）\n');
+  process.stdout.write('跨节锚定检查（6 行 × 3 列）\n');
 
   if (rows === undefined) {
     process.stderr.write(
@@ -660,7 +729,7 @@ function main(): void {
     return;
   }
 
-  process.stdout.write('\n✓ 跨节锚定清单：5 行 × 3 列，且与写死的期望一致\n');
+  process.stdout.write('\n✓ 跨节锚定清单：6 行 × 3 列，且与写死的期望一致\n');
 
   // ── 动作关键词是否落在管辖路径上（P2-T04）──
   const repoRoot = resolve(fileURLToPath(new URL('..', import.meta.url)));
@@ -712,6 +781,23 @@ function main(): void {
   }
 
   process.stdout.write(`\n✓ §8.4 硬规则条数：${hardRuleCount} 条（与写死的期望一致）\n`);
+
+  // ── HTML 实体残留（★ 2026-11-07 轮 A 新增 · ★ 判据 = 计数为 0）──
+  const residue = findHtmlEntityResidue(markdown);
+  if (residue.length > 0) {
+    process.stderr.write(`\n✗ 设计稿里残留 ${residue.length} 处 HTML 实体（★ 期望 0 处）：\n`);
+    for (const item of residue) {
+      process.stderr.write(`    L${item.line}：${item.entity}\n`);
+    }
+    process.stderr.write(
+      '  ⇒ HTML 实体渲染无差异 ⇒ 看渲染稿发现不了\n' +
+        '  ⇒ 但它会**破坏内容锚点匹配**（本仓的守卫大量用中文正文当锚点）\n' +
+        '  ⇒ 请还原成汉字（★ 只动实体本身、不动周边文字）\n',
+    );
+    process.exitCode = 1;
+    return;
+  }
+  process.stdout.write('\n✓ 设计稿无 HTML 实体残留（计数 = 0）\n');
 }
 
 const invokedDirectly =
