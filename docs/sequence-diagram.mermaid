@@ -1,0 +1,44 @@
+%% T06 字节计量 · 写路径计量轮时序（C′ 档 · ADR §8.5 的 H1′ 判据）
+%%
+%% ⚠️ ★★ **本文件是【抽取副本】，不是权威版** ⇒ 权威版 = ② `docs/design/perf-c2-t06-byte-metering-spec.md` 的「## 12. 类图与时序图」节内（architect 独家维护）
+%% ⇒ ⇒ 若两者不一致 ⇒ **一律以 ② §12 为准**（本文件不得被当作口径来源引用）
+%% ⇒ ⇒ **不要在本文件里改内容** ⇒ 要改改 ② §12 ⇒ 然后重新抽取（否则副本会漂移）
+%% 抽取自：② `docs/design/perf-c2-t06-byte-metering-spec.md` 的「## 12. 类图与时序图」节内
+%%        第 2 个 ```mermaid 围栏块（时序图）
+%% 抽取时刻：2026-11-04 21:59
+sequenceDiagram
+    %% ⚠️ ★★ **本图只画【写路径 · 计量轮（轮 B）】** —— **写路径是两轮制**（轮 A 计时**不装**计数器 /
+    %% 轮 B 计量**装**计数器 · 同一份输入）⇒ ⇒ **【两轮制只限写路径】· 读路径本轮单轮**
+    %% （计数器装着且在计数 · 与 HEAD 逐字同形）⇒ ⇒ 图上**看不到**轮 A、也**看不到**读路径。
+    autonumber
+    participant P as bench/perf.ts<br/>（写入扫描计量轮 · ⚠️ 只画轮 B）
+    participant C as bench/lib/harness.ts<br/>RowReadCounter
+    participant S as bench/lib/byteSources.ts
+    participant D as 生产 SQL<br/>（src/vector/ivf.ts）
+    participant V as scanBucketCandidates()
+
+    P->>C: installRowReadCounter(db)（第二个实例）
+    P->>C: start()
+    P->>V: collectVectorCandidates(ctx, embedding)
+    V->>D: Q1 SELECT fine_id, memory_id FROM vector_cell_members
+    D-->>C: rows[]
+    C->>S: resolveShape(sql) ⇒ Q1（成员来源）
+    C->>C: bucketMemberRows += rows.length（0 字节）
+    V->>D: Q2 SELECT vc.code, vc.scale, vc.eps FROM vector_codes
+    D-->>C: rows[]
+    S-->>C: Q2（码来源）
+    C->>C: codeRows += n；codeBytes += Σ byteLength(code)（当场累加）
+    V->>D: scoreOf SELECT embedding FROM memories WHERE id = ?
+    D-->>C: row | undefined（软删行 ⇒ undefined ⇒ 未物化 ⇒ 0 字节）
+    C->>C: embeddingCalls += 1（无条件）；embeddingBytes += byteLength
+    V->>D: Q4 SELECT … FROM memories m WHERE m.id IN (...)
+    D-->>C: rows[]
+    S-->>C: Q4（向量来源）
+    C->>C: embeddingRows += n；embeddingBytes += Σ byteLength；contentBytes += Σ utf8
+    V-->>P: BucketCandidateScan{scanned, uncoded, exactReads}
+    P->>C: stop()
+    P->>C: snapshot()
+    C-->>P: ByteReadSnapshot
+    P->>P: bytesRead = codeBytes + embeddingBytes（零容差恒等式）
+    P->>P: 剪枝率 = embeddingCalls ÷ candidateUniverse（分子 == prune 的 exactReads）
+    P->>C: uninstall()

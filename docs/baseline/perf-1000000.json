@@ -61,7 +61,7 @@
   },
   "candidateReadRowsBasis": {
     "mode": "derived",
-    "note": "⚠️ **本组 `candidateReadRows` 是「推算口径」采的**（2026-11-01 的两轮 bench 还没有行读计数器）⇒ **判据量 = 命中细桶的成员数之和**⇒ ⚠️ **它模型化了「桶内不设 LIMIT」这个实现** ⇒ **严格说属推导层**⇒ ⇒ **但「红 / 绿」的结论不变**（小规模已逐条核对：**实测 ≡ 推算** ⇒ 见 `tests/bench/h1-measurement.test.ts`）⇒ ⇒ **「实测口径」（`mode = 'measured'`）的百万级值需要重跑一次才能拿到** ⇒ 已登记为待办。",
+    "note": "⚠️ **本组 `candidateReadRows` 是「推算口径」采的**（2026-11-01 的两轮 bench 还没有行读计数器）⇒ **判据量 = 命中细桶的成员数之和**⇒ ⚠️ **它模型化了「桶内不设 LIMIT」这个实现** ⇒ **严格说属推导层**⇒ ⇒ **但「红 / 绿」的结论不变**（小规模已逐条核对：**实测 ≡ 推算** ⇒ 见 `tests/bench/h1-measurement.test.ts`）⇒ ⇒ **「实测口径」（`mode = 'measured'`）的百万级值需要重跑一次才能拿到** ⇒ ✅ **2026-11-04 已兑现**：见同目录 `perf-1000000-vector-wired-nvme.json` 的 `candidateReadRowsBasis.mode = 'measured'`，七个数值与本文件逐位一致（结论不变：H1 仍 2.76 倍 / R6 读数仍 6.39 倍）。",
     "derivedCrossCheck": {
       "count": 1000,
       "min": 57,
@@ -456,7 +456,7 @@
     },
     "candidateReadRowsBasis": {
       "mode": "derived",
-      "note": "⚠️ **本组 `candidateReadRows` 是「推算口径」采的**（2026-11-01 的两轮 bench 还没有行读计数器）⇒ **判据量 = 命中细桶的成员数之和**⇒ ⚠️ **它模型化了「桶内不设 LIMIT」这个实现** ⇒ **严格说属推导层**⇒ ⇒ **但「红 / 绿」的结论不变**（小规模已逐条核对：**实测 ≡ 推算** ⇒ 见 `tests/bench/h1-measurement.test.ts`）⇒ ⇒ **「实测口径」（`mode = 'measured'`）的百万级值需要重跑一次才能拿到** ⇒ 已登记为待办。",
+      "note": "⚠️ **本组 `candidateReadRows` 是「推算口径」采的**（2026-11-01 的两轮 bench 还没有行读计数器）⇒ **判据量 = 命中细桶的成员数之和**⇒ ⚠️ **它模型化了「桶内不设 LIMIT」这个实现** ⇒ **严格说属推导层**⇒ ⇒ **但「红 / 绿」的结论不变**（小规模已逐条核对：**实测 ≡ 推算** ⇒ 见 `tests/bench/h1-measurement.test.ts`）⇒ ⇒ **「实测口径」（`mode = 'measured'`）的百万级值需要重跑一次才能拿到** ⇒ ✅ **2026-11-04 已兑现**：见同目录 `perf-1000000-vector-wired-nvme.json` 的 `candidateReadRowsBasis.mode = 'measured'`，七个数值与本文件逐位一致（结论不变：H1 仍 2.76 倍 / R6 读数仍 6.39 倍）。",
       "derivedCrossCheck": {
         "count": 1000,
         "min": 57,

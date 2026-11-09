@@ -8,7 +8,7 @@
 
 | 命令                                   | 是什么                                              | 是不是门禁 |
 | -------------------------------------- | --------------------------------------------------- | ---------- |
-| **`pnpm run verify`**                  | **门禁本体**：14 条子命令串成一条链                 | ✅ 是       |
+| **`pnpm run verify`**                  | **门禁本体**：18 条子命令串成一条链                 | ✅ 是       |
 | `pnpm run ci`                          | **别名**，内容恰好等于 `pnpm run verify`            | ✅ 是       |
 | `pnpm ci` / `npm ci`（**不带 `run`**） | **包管理器的内建命令**（clean install）             | ❌ **不是** |
 
@@ -20,7 +20,7 @@
 > ⇒ **规范入口是 `pnpm run verify`**（`verify` 不是任何包管理器的内建命令名 ⇒ 不会被遮蔽）。
 > ⇒ 这条纪律由 `scripts/check-gate-entry.ts` **机器可检**（见下表第 6 行）：
 > 它断言 `scripts.ci` 的内容**恰好**是 `pnpm run verify`，
-> 且 `scripts.verify` 串起的 14 条子命令**逐名**齐全、每一段都写成 `pnpm run <名>`。
+> 且 `scripts.verify` 串起的 18 条子命令**逐名**齐全、每一段都写成 `pnpm run <名>`。
 > 有人把 `ci` 改回一串别的命令、或从 `verify` 上摘掉某条门禁 ⇒ 门禁当场失败。
 
 ## 门禁脚本
@@ -40,13 +40,43 @@
 它是 `check-contract-ids.ts` 的一部分（被内联调用），也可单独跑
 （`pnpm exec tsx scripts/check-gate-entry.ts`）。
 
-全部串在 **`pnpm run verify`** 里（typecheck → lint → test → 8 个契约门禁 → 3 条文档审计），
+全部串在 **`pnpm run verify`** 里（typecheck → lint → test → 9 个契约门禁 → 3 条文档审计 → 2 条 T07 守卫），
 任一失败 ⇒ 退出码非 0。`pnpm run ci` 是它的别名。
 
 > ⚠️ GitHub Actions 的工作流在 `.github/workflows/ci.yml`：
 > 它跑的是 **`pnpm run verify`**（**不是** `pnpm ci`）。
 
-## 文档审计（**2026-11-02 起 = 门禁的第 12~14 段**）
+## ⚠️ 链外守卫（★ **不在 `verify` 链里** · 2026-11-05 起 · T07）
+
+> ★ 这些**不在**上面的 `verify` 链里（★ 链外入口）⇒ ⇒ ⇒ **跑 `pnpm run verify` 【不会】跑它们**
+> ⇒ ⇒ ⇒ ⇒ **凡结论依赖它们的 ⇒ ⇒ 必须手动跑**（★ 或把「跑过它」的留痕写进结论里）。
+>
+> ★ ★ **2026-11-05 更新（T07 阶段 3 / 阶段 4）**：★ 下面表里的 **7 条已有 4 条接进 `verify` 链**
+> （★ `check:benchmark-numbers`（第 12 段）· `check:mermaid-copies`（第 16 段）· `check:json-note`（第 17 段）
+> · `check:wording-drift`（第 18 段）⇒ ⇒ **门禁 14 → 18 段**）⇒ ⇒ ★ **仍在链外的只剩 3 条**
+> ⇒ ⇒ ★ **每行都标了它当前在链上还是链外 + 理由**（★ 逐条有理由 ⇒ **不是「不重要」，是「时机未到」**）。
+
+| 脚本 | 链外入口 | 守什么 | 方向 |
+|---|---|---|---|
+| `scripts/check-json-note-fidelity.ts` | `pnpm run check:json-note` | ★ 文档里的 `note` ↔ `bench/perf.ts` **真正落盘**的那串 **逐字节相等**（★ 判据 = 逐字节 · **不是**归一化）★ **2026-11-05 阶段 4 起【已接进 `verify` 链 · 第 17 段】** ⇒ ⇒ 它守的「改落盘 note 必须同批改逐字副本」这条纪律**不再纯靠人记**（★ 零本地 import ⇒ 完全独立 ⇒ ⇒ CI 安全）| 正向（必须逐字相同）|
+| `scripts/check-benchmark-numbers.ts` | `pnpm run check:benchmark-numbers` | ★ 同一批数在多个载体里**逐位相等** + ★ 出关条件**状态**两侧一致 + ★ 规范**措辞**在断言形态 ★ **2026-11-05 阶段 3 起【已接进 `verify` 链 · 第 12 段】**| 正向（必须说同一句话）|
+| `scripts/check-wording-drift.ts` | `pnpm run check:wording-drift` | ★ 旧措辞「只读…2 行」**不许以断言形态出现**（★ 全仓负向扫描）★ **2026-11-05 阶段 4 起【已接进 `verify` 链 · 第 18 段】** ⇒ ⇒ ★ **进链的理由已被实测推翻并订正**：★ 原判据「豁免数随文档增长 ⇒ 余量 2 不够」是**错的** ⇒ ⇒ ★ **豁免只在【引用旧措辞】时才产生** ⇒ ⇒ 实测「新增不含旧措辞的内容 ⇒ 豁免仍 6 处」⇒ ⇒ ⇒ ★ ⇒ **余量已提到 4（上限 8 → 10）**| 负向（禁止说错话）|
+| `scripts/check-mermaid-copies.ts` | `pnpm run check:mermaid-copies` | ★ 两份 mermaid 抽取副本 ↔ 权威版**逐字相等**（锚点定位）+ ★ **静态结构体检**（首行 / 末行 / 嵌套围栏 / `%%` 形态 ⇒ ★ 仓库**原本没有任何 mermaid 校验** ⇒ 它是唯一防线）★ **2026-11-05 阶段 3 起【已接进 `verify` 链 · 第 16 段】**| 正向（副本必须逐字一致）|
+| `scripts/check-credential-hygiene.ts` | `pnpm exec tsx scripts/check-credential-hygiene.ts` | ★ 文档/注释里引用的**机器凭据路径**是否真实存在 + 是否在版本控制内（★ 三档：A 悬空 / B 存在但不在版本控制内 / C 完好）★ **仍链外**：★ 误报面高（330 条凭据 / 4 条豁免规则 / 边界密）| 正向（必须指得到）|
+| `scripts/check-line-endings.ts` | `pnpm exec tsx scripts/check-line-endings.ts` | ★ 工作树里**物理含 CRLF** 的 tracked 文件（★ **按字节扫**，★ **不用 `git diff` / `git status`** —— ★ 那两个在 `text=auto` 仓库里对行尾差异**不可靠**：diff 被归一化吞掉、status 只看 stat）★ **仍链外**：★ **语义与 CI 相反**（它防 Windows 开发机 ⇒ CI 是 ubuntu ⇒ 恒绿 ⇒ 进链 = 零收益 + 一个恒绿段）| 正向（必须全是 LF）|
+| `scripts/check-backlog-ledger.ts` | `pnpm exec tsx scripts/check-backlog-ledger.ts` | ★ `docs/handover/T07-ordered-backlog.md` 里**待办条目 ↔ 实现存在性**的对账（★ ① 登记完整性：每条待办必须登记实现路径**或**显式声明「本条无实现路径」② 登记真实性：登记的路径**必须真实存在** ⇒ ⇒ **专治「只记得改代码、不记得改索引」那种单向漂移**）★ **仍链外**：★ 读 backlog ⇒ **台账改版就误报**| 正向（登记必须指得到）|
+
+★ **依赖方向（★ 2026-11-05 实测订正 · 原表述说过头了）**：★ `check-benchmark-numbers.ts` **import** `check-wording-drift.ts` 的判定入口
+⇒ ⇒ ⇒ **「判定只有一份」** ⇒ ⇒ ⇒ ★ **但这是【单向】依赖**（★ `check-wording-drift.ts` 与 `check-json-note-fidelity.ts` **零本地 import** ⇒ ⇒ **完全独立**）
+⇒ ⇒ ⇒ ★ **⇒ 改 `check-wording-drift.ts` 会波及 `check-benchmark-numbers.ts`；★ 改 `check-json-note-fidelity.ts` 不会波及任何守卫**
+⇒ ⇒ ⇒ ★ **改这三个文件前先互发预告**（★ 见下面检查单第 ④ 条）⇒ ⇒ ⇒ ★ **后面三个是独立脚本**（★ 不 import 上面任何一个 ⇒ ⇒ **改它们不会波及对方**）。
+
+★ 每个都自带 `--self-test`（★ 正控 + 反向对照 + 负控 + 根因断言）⇒ ⇒ ⇒
+⇒ ⇒ ★ **断言项数看 `--self-test` 的实跑输出**（★ **数字是会过期的快照** ⇒ ⇒ 别把条数写进会漂的散文里）。
+
+---
+
+## 文档审计（**2026-11-02 起 = 门禁的第 13~15 段** · ★ 2026-11-05 起第 12 段是 `check:benchmark-numbers`）
 
 > ★ **这三条已经不是「可复跑但不算数」的旁路脚本了**：它们在 `pnpm run verify` 的链上，
 > 红了就**阻断合并**。它们判的不是代码，而是**文档里的数字有没有被写成会误导人的样子**
@@ -101,7 +131,7 @@ node --import tsx scripts/audit-tier-qualifiers.ts path/to/README.md
 | 条 | 内容 | 现状 |
 | --- | --- | --- |
 | ① | 导出纯函数、CLI 只是薄壳 | ✅ `auditTierQualifiers` / `renderAudit` · `auditTwoLayers` / `renderAudit` · `runNegativeControls` / `renderNegativeControlReport` |
-| ② | 串进 `package.json` 的 `verify` 链 | ✅ 第 12~14 段（`audit:tier-qualifiers` / `audit:two-layer` / `audit:negative-control`）⇒ ★ `EXPECTED_GATE_COMMANDS` 同步 11 → **14**（C31：分母写死） |
+| ② | 串进 `package.json` 的 `verify` 链 | ✅ 第 13~15 段（`audit:tier-qualifiers` / `audit:two-layer` / `audit:negative-control`）⇒ ★ `EXPECTED_GATE_COMMANDS` 同步 11 → **14**（C31：分母写死）⇒ ⇒ ★ **2026-11-05 T07 阶段 3 再同步 14 → 16**（★ 加了 `check:benchmark-numbers`（第 12 段）+ `check:mermaid-copies`（第 16 段）⇒ ⇒ ★ **审计三条顺移成 13~15**） |
 | ③ | `tests/contracts/` 里**含反例**的单测 | ✅ 三个文件：`tier-qualifier-audit.test.ts` · `two-layer-audit.test.ts` · `audit-negative-control.test.ts` |
 | ④ | 在本 README 登记 | ✅ 上面那张门禁表 |
 
@@ -124,15 +154,29 @@ node --import tsx scripts/audit-tier-qualifiers.ts path/to/README.md
 | `scripts/backup.ts` | `VACUUM INTO` 备份 + `integrity_check` + **登记尺寸与 sha256** + 按份数轮转 | 定期；★ **硬删之前必须先跑一次**（`coacts.coact_count` 不可重建） |
 | `scripts/restore-checklist.md` | 恢复 runbook（三条硬规则 / 六步恢复 / 四项自检 / 最短排障路径） | 出事时 |
 | `bench/regression/weights.ts` | 打分权重的**排序回归**（只比 id 序列，不比分数） | 改 `recall` 打分链路前后 |
+| `scripts/report-codewidth-table.ts` | ★ **出关条件② 的证据产出器**：「码宽 ↔ ε ↔ 剪枝率 ↔ 延迟」四列表（★ ε 从采集库的 `vector_codes.eps` 统计 ⇒ **零采集成本**；★ 剪枝率与延迟从 `docs/evidence/t07-warm.json` 读）⇒ ⇒ 另给**字节侧临界值**（★ 换成更窄的码后，**进精排行数**涨到多少就不再划算 ⇒ ★ 替代「拍脑袋」） | ★ **要那 5.5 GB 采集库**（`.tmp/bench/perf-1000000.db`）⇒ ⇒ **选码宽前 / 加一个候选码宽档之后** |
+| `scripts/diagnose-disk-health.cmd` | ★ **D: 盘只读体检的启动器**（★ **双击即可** · ★ 用 `%~dp0` 解析自身目录 ⇒ ★ **从任何目录跑都行** ⇒ ★ 参数原样透传）⇒ ⇒ 真正的逻辑在 `scripts/diagnose-disk-health.ps1` | ★ **怀疑 D: 有坏块时** |
+| `scripts/diagnose-disk-health.ps1` | ★ **D: 盘只读体检**（★ **Windows / PowerShell** · ★ 需管理员 ⇒ ★ 脚本会**自提权**）：★ 物理盘健康 + SMART 计数 + 原始 SMART 字节 + `chkdsk /scan` + 卷映射与空间 + **按 runbook 判读表算出的结论** ⇒ ⇒ 结果落成 `docs/evidence/disk-health.json`（★ 正式凭据 · **无 BOM 的 UTF-8**）+ 同名 `.txt`（★ 人读副本）⇒ ★ **绝不执行修复参数 `/f`、绝不删任何东西** | ★ **怀疑 D: 有坏块时**（★ 对应 `docs/handover/T07-cold-tier-and-disk-health-runbook.md`）|
 
 ```bash
 pnpm exec tsx scripts/backup.ts --db data/ocean.db --out-dir backup
 pnpm exec tsx bench/regression/weights.ts            # 比对；不一致 ⇒ exit 1
 pnpm exec tsx bench/regression/weights.ts --capture  # 重新采集 golden
+pnpm exec tsx scripts/report-codewidth-table.ts       # 四列表（人读）
+pnpm exec tsx scripts/report-codewidth-table.ts --json        # 四列表（机器读）
+pnpm exec tsx scripts/report-codewidth-table.ts --self-test   # 只跑自测
+# ★ D: 盘只读体检（★ 需管理员 ⇒ ★ 会自动弹 UAC 自提权；★ 全程只读）
+# ★ ★ 首选：双击 scripts\diagnose-disk-health.cmd（★ 它用 %~dp0 解析自身目录 ⇒ 从任何目录跑都行）
+scripts\diagnose-disk-health.cmd
+scripts\diagnose-disk-health.cmd -SkipChkdsk        # 跳过全卷扫描（快）
+# ★ 或直接跑 .ps1（★ 路径必须是【绝对路径】或【仓库根目录下的相对路径】）
+powershell -ExecutionPolicy Bypass -File "E:\WorkBuddyData\2026-11-02-08-56-53\gmb\scripts\diagnose-disk-health.ps1"
 ```
 
 ⚠️ **它们刻意不进 `verify`**：备份要真实库文件、回归要跑十几秒建库 ⇒
 放进每次门禁只会让「本地全绿」变慢，而**不会**多拦下什么（与三条文档审计不同，那三条是纯文本判定）。
+★ **`report-codewidth-table` 还有一条更硬的理由**：★ 它要**本机那 5.5 GB 采集库** ⇒ ⇒ **CI 上没有那个库**
+⇒ ⇒ 进链 = **CI 恒红** ⇒ ⇒ **零收益 + 一段永远红的门禁** ⇒ ⇒ **它只能链外手动跑**。
 
 ## C25~C37 对照表
 
@@ -250,6 +294,25 @@ pnpm exec tsx bench/regression/weights.ts --capture  # 重新采集 golden
 ⚠️ **若发现某条 stash 的内容已被某个 commit 完全覆盖**（`git diff stash@{0} HEAD -- <file>` 为空），
 它已**冗余**，且留着**有害**（将来有人 `git stash pop` 会把一份已提交的改动贴回去 ⇒ 制造冲突）⇒ **可以 drop**；
 但 drop 前**必须**确认它里面**没有别人的未落地内容**。
+
+### ④ 改【三个共享守卫】之前 —— 先互发预告（★ 路径 + 预计时长）
+
+★ `scripts/check-benchmark-numbers.ts` · `scripts/check-wording-drift.ts` · `scripts/check-json-note-fidelity.ts`
+⇒ ⇒ ⇒ ⚠️ ★ **2026-11-05 订正：这三个【不是「互为依赖」】** ⇒ ⇒ ⇒ **实测的依赖图**：
+★ `check-benchmark-numbers.ts` **import** `check-wording-drift.ts` 的判定入口（★ **单向**）
+⇒ ⇒ ⇒ ★ 而 **`check-json-note-fidelity.ts` 零本地 import ⇒ 【完全独立】**
+⇒ ⇒ ⇒ ★ **⇒ 真实的波及面是：「改 `wording-drift` 会波及 `benchmark-numbers`；★ 改 `json-note` 不波及任何守卫」**
+⇒ ⇒ ⇒ ★ **⇒ 本条的纪律仍成立（★ 三个都是共享资产 ⇒ 都值得先打招呼）**，★ **但「改任一个都波及另外两个」是说过头了** ⇒ ⇒ ★ **⇒ 别因为「怕波及」而不敢单独改 `json-note`**。
+
+⇒ ⇒ **动手前先给对方（ teammate / 主理人）发一条**：「我要动 `<路径>` · 预计 `<时长>` · 改的是 `<哪一段>`」。
+
+⇒ ⇒ ⇒ ★ **这条不是为了礼节**（★ 本轮真出过两次）：
+　① 两个人同时改 `check-wording-drift.ts` ⇒ ⇒ ⇒ **一个人的在途改动被另一个人的 `git add -A` 一起卷走**
+　　⇒ ⇒ ⇒ ⇒ 提交信息里的**数字当场对不上**（★ 实测：写「11 项」而实际是 13 项）；
+　② 撞名覆盖：★ 按规格表新建文件时**没先核目标原文在不在** ⇒ ⇒ ⇒ **覆盖掉了一份已验收的文件**。
+
+⇒ ⇒ ⇒ ★ 碰巧撞上了 ⇒ ⇒ **先核对方的目标文件原文在不在**（★ 防 ②）⇒ ⇒
+⇒ ⇒ ⇒ **也不要 `git add -A`**（★ 防 ① ⇒ ⇒ ⇒ 参见上面第 ① 条：只 `git add` 自己的那几个路径）。
 
 ### 附：门禁偶发「红」时的判定
 

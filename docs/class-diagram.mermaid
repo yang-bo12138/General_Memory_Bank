@@ -1,0 +1,83 @@
+%% T06 字节计量装置 · 类图（C′ 档 · ADR §8.5 的 H1′ 判据）
+%%
+%% ⚠️ ★★ **本文件是【抽取副本】，不是权威版** ⇒ 权威版 = ② `docs/design/perf-c2-t06-byte-metering-spec.md` 的「## 12. 类图与时序图」节内（architect 独家维护）
+%% ⇒ ⇒ 若两者不一致 ⇒ **一律以 ② §12 为准**（本文件不得被当作口径来源引用）
+%% ⇒ ⇒ **不要在本文件里改内容** ⇒ 要改改 ② §12 ⇒ 然后重新抽取（否则副本会漂移）
+%% 抽取自：② `docs/design/perf-c2-t06-byte-metering-spec.md` 的「## 12. 类图与时序图」节内
+%%        第 1 个 ```mermaid 围栏块（类图）
+%% 抽取时刻：2026-11-04 21:59
+classDiagram
+    class ByteSources {
+        +normalizeSql(sql) string
+        +parseSelectList(sql) SelectItem[]
+        +shapeKeyOf(sql) ShapeKey | null
+        +resolveShape(sql) ShapeEntry | null
+        +bytesOfRow(row, shape, expectedCodeBytes) RowBytes
+    }
+    class ShapeEntry {
+        +id string
+        +sources string[]
+        +payloadCols string[]
+        +nonVectorCols string[]
+    }
+    class RowReadCounter {
+        +start() void
+        +stop() void
+        +snapshot() ByteReadSnapshot
+        +uninstall() void
+    }
+    class ByteReadSnapshot {
+        +candidateRows number
+        +bucketMemberRows number
+        +codeRows number
+        +bySource Record~string, ByteSource~
+        +unclassifiedRows number
+        +unclassifiedSqlKinds string[]
+    }
+    class ByteSource {
+        +kind string
+        +rows number
+        +bytes number
+        +calls number
+    }
+    class WriteSegmentSummary {
+        +vectorCandidateScan LatencyDistribution
+        +vectorCandidateRows CountSummary
+        +vectorByteReads VectorByteReads
+        +writeTotal LatencyDistribution
+    }
+    class VectorByteReads {
+        +bytesRead CountSummary
+        +memoryRowsRead CountSummary
+        +codeRowsRead CountSummary
+        +candidateUniverse CountSummary
+        +breakdown ByteBreakdown
+        +note string
+    }
+    class PerfResult {
+        +writeSegments WriteSegmentSummary
+        +vectorRouteByteReads VectorByteReads
+        +candidateReadRows CountSummary
+    }
+    class IvfVectorBackend {
+        +scanBucketCandidates(db, model, q, nc, nf, opts) BucketCandidateScan
+    }
+    class BucketCandidateScan {
+        +scanned number
+        +uncoded number
+        +exactReads number
+    }
+    class CollectVectorCandidates {
+        +exactReads number
+        +uncoded number
+    }
+
+    RowReadCounter --> ByteSources : 委托形状认领
+    ByteSources ..> ShapeEntry : 产出
+    RowReadCounter ..> ByteReadSnapshot : 产出
+    ByteReadSnapshot --> ByteSource : 含
+    PerfResult --> WriteSegmentSummary : 含
+    WriteSegmentSummary --> VectorByteReads : 含
+    IvfVectorBackend ..> BucketCandidateScan : 产出
+    BucketCandidateScan ..> VectorByteReads : candidateUniverse == scanned
+    BucketCandidateScan ..> CollectVectorCandidates : 透传 exactReads/uncoded

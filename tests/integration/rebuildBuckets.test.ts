@@ -529,3 +529,80 @@ describe('P2-T05 · rebuildVectorBuckets（重训、崩溃恢复、旧代桶清�
     expect(observedCounts.every((count) => count === 1)).toBe(true);
   });
 });
+
+/**
+ * ★ **性能轮（2026-11-02）· 缺陷① 的回归**：`BucketRebuildOptions` 现在有 `maxIterations`，
+ * 且**真的会到达训练层**。
+ *
+ * ⚠️ **为什么判据不是「结果不同」**：这份夹具在 1 轮就收敛 ⇒ `maxIterations: 1` 与 25
+ *   产出的中心**逐位相同**（实测），拿「结果不同」当判据会写成一条恒绿断言。
+ * ⇒ 判据改用 **`sphericalKmeans` 对非法值的守卫**：传 0 时那条错误只有**值真的传下去了**
+ *   才会抛 ⇒ 它是一条与数据无关的透传证据。
+ */
+describe('性能轮 · `maxIterations` 透传（缺陷①）', () => {
+  it('非法值（0）⇒ 抛 k-means 的守卫错误 ⇒ 值确实到了训练层', () => {
+    const db = createTestDb();
+    try {
+      insertMemories(
+        db,
+        Array.from({ length: 12 }, (_, index) => pseudoUnitVector(index + 1)),
+      );
+      expect(() =>
+        rebuildBuckets(db, (body) => runWriteTransaction(db, body), {
+          coarseCenters: FIRST_COARSE,
+          fineCenters: FIRST_FINE,
+          nprobeCoarse: NPROBE,
+          now: T0,
+          maxIterations: 0,
+        }),
+      ).toThrowError(/maxIterations 必须是 ≥ 1 的整数/);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('★ 负控：**不传** `maxIterations` 时不该抛（默认 25 合法）', () => {
+    // 与上一条成对：否则「抛错」可能只是这条路径本来就抛。
+    const db = createTestDb();
+    try {
+      insertMemories(
+        db,
+        Array.from({ length: 12 }, (_, index) => pseudoUnitVector(index + 1)),
+      );
+      expect(() =>
+        rebuildBuckets(db, (body) => runWriteTransaction(db, body), {
+          coarseCenters: FIRST_COARSE,
+          fineCenters: FIRST_FINE,
+          nprobeCoarse: NPROBE,
+          now: T0,
+        }),
+      ).not.toThrow();
+    } finally {
+      db.close();
+    }
+  });
+
+  it('合法值（1）⇒ 跑通，且归属仍然完整（降迭代不破坏一致性）', () => {
+    const db = createTestDb();
+    try {
+      const ids = insertMemories(
+        db,
+        Array.from({ length: 20 }, (_, index) => pseudoUnitVector(index + 1)),
+      );
+      const result = rebuildBuckets(db, (body) => runWriteTransaction(db, body), {
+        coarseCenters: FIRST_COARSE,
+        fineCenters: FIRST_FINE,
+        nprobeCoarse: NPROBE,
+        now: T0,
+        maxIterations: 1,
+      });
+      expect(result.members).toBe(ids.length);
+      expect(result.unassigned).toBe(0);
+      // ⚠️ 判据复用生产函数（不自己数表）：归属必须「每条活记忆恰好一个桶」。
+      //   ⚠️ `isBucketMembershipConsistent` 收的是 **diff 对象**（不是 db）⇒ 必须先 diff。
+      expect(isBucketMembershipConsistent(diffBucketMembership(db))).toBe(true);
+    } finally {
+      db.close();
+    }
+  });
+});

@@ -20,7 +20,7 @@ import type Database from 'better-sqlite3';
 import { archiveSpanMs } from '../core/decay.js';
 import { MemoryError } from '../core/errors.js';
 import { DEFAULT_PARAMS } from '../core/params.js';
-import { EXPECTED_V2_TABLE_COUNT, V2_NEW_TABLES } from '../core/schema.js';
+import { EXPECTED_V2_TABLE_COUNT, V2_NEW_TABLES, VECTOR_CODES_SQL } from '../core/schema.js';
 import { SCHEMA_VERSION } from '../core/version.js';
 import { EventWriter } from '../store/events.js';
 import { type Logger, MemoryLogger } from '../util/log.js';
@@ -255,12 +255,47 @@ export function migrateV1ToV2(db: Database.Database, options: MigrateOptions = {
  *
  * @throws {MemoryError} code = `INVALID_INPUT`（版本不认识 / 半成品库）
  */
+/**
+ * ★ **增量表的幂等创建** —— `vector_codes`（2026-11-04 · ADR-PERF-01 §8 · C′ 档）。
+ *
+ * ⚠️ **为什么需要这个函数**（而不是只把 DDL 写进建库脚本）：
+ *   `ensureSchema()` 在 `user_version === 2` 时**早退**（只校验九张指纹表，不重跑建库脚本）
+ *   ⇒ 建库脚本里那行 `CREATE TABLE IF NOT EXISTS vector_codes` **对存量库永远不执行**
+ *   ⇒ 存量库只会在下一次「**可写打开**」时由本函数补建一次（空表，零数据变更）。
+ *
+ * ⚠️ **为什么只读实例不调它**：`ensureSchemaForMode()` 对 `readonly: true` 走的是
+ *   「只校验版本 + 九张表」那条路，**根本不进 `ensureSchema()`**
+ *   （只读句柄执行 DDL 必然 `SQLITE_READONLY`，而裸码不许抛给调用方）
+ *   ⇒ ⇒ **只读侧必须容忍「这张表不存在」**（读取路径的设计已如此：无码行走精确兜底）。
+ *
+ * ⚠️ **幂等**：表已存在 ⇒ `IF NOT EXISTS` 是空操作 ⇒ 每次可写打开的代价是一次 schema 查找（微秒级）。
+ *
+ * @param db 库句柄（**必须是可写连接**）
+ */
+export function ensureVectorCodesTable(db: Database.Database): void {
+  db.exec(VECTOR_CODES_SQL);
+}
+
+/**
+ * 按 `user_version` 决定「建库 / 迁移 / 只校验」，并在**可写**路径上补齐增量表。
+ *
+ * ⚠️ 三个分支**都**会调 `ensureVectorCodesTable()`：
+ *   · `== 0`（新建库）⇒ 建库脚本里已经有了，这里只是**同一个入口**再兜一次（幂等）；
+ *   · `== 1`（v1 迁移）⇒ 迁移脚本里也有，同样兜一次；
+ *   · `== 2`（存量库）⇒ **唯一真正需要它的分支**（建库脚本不会重跑）。
+ *   ⇒ 统一在**返回前**调一次，比在三处各写一遍更难漏。
+ *
+ * @param db 库句柄
+ * @param options 迁移选项
+ * @returns 迁移结果
+ */
 export function ensureSchema(db: Database.Database, options: MigrateOptions = {}): MigrateResult {
   const version = readUserVersion(db);
 
   if (version === SCHEMA_VERSION) {
     // 阶段 B 校验：版本号对了，还要确认九张新表齐全
     assertV2TablesComplete(db);
+    ensureVectorCodesTable(db);
     return { version, created: false, migrated: false, backfilled: 0 };
   }
 
@@ -277,11 +312,14 @@ export function ensureSchema(db: Database.Database, options: MigrateOptions = {}
       });
     }
     assertV2TablesComplete(db);
+    ensureVectorCodesTable(db);
     return { version: after, created: true, migrated: false, backfilled: 0 };
   }
 
   if (version === 1) {
-    return migrateV1ToV2(db, options);
+    const result = migrateV1ToV2(db, options);
+    ensureVectorCodesTable(db);
+    return result;
   }
 
   throw MemoryError.invalidInput(`不认识的 schema 版本：${version}`, {

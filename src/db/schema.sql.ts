@@ -357,6 +357,37 @@ CREATE UNIQUE INDEX idx_vcm_memory_unique ON vector_cell_members(memory_id);
                                                    --   ⇒ 这个唯一索引让它**写不进去**（而不是静默重复）。
 
 -- ═══════════════════════════════════════════════════════════════════════════
+-- ★ 码表（2026-11-04 · ADR-PERF-01 §8 · C′ 档「可证上界剪枝」的第一级）
+-- ═══════════════════════════════════════════════════════════════════════════
+-- ⚠️ **本表不属于 v2 的「九张指纹表」**（\`src/core/schema.ts\` 的 \`V2_NEW_TABLES\`）：
+--   指纹表用来判「这个库是不是 v2」⇒ 把本表塞进去，**所有既有 v2 库都会被判成半成品**
+--   （\`assertV2TablesComplete()\` 当场抛错，而它们的数据其实完好）
+--   ⇒ ⇒ 本表是**增量表**：由 \`ensureSchema()\` 里的 \`ensureVectorCodesTable()\` 幂等创建
+--      （老库下一次「可写打开」时自动多出这张空表；只读实例不建、也不需要它存在）。
+--
+-- ⚠️ **它是「第二份真值」吗？不是**：
+--   \`memories.embedding\` 仍是**唯一的向量真相**；本表只是**同一向量的有损码 + 它的误差上界**。
+--   ⇒ 码可以随时从 \`memories.embedding\` 重算（\`scripts/backfill-codes.ts\`）⇒ 删表不丢任何信息。
+--   ⇒ **禁止**为了让本表「成为唯一真相」而删掉 \`memories.embedding\`（那是不可逆点，见 ADR §8.4）。
+--
+-- ⚠️ **为什么 \`WITHOUT ROWID\`**：主键就是 \`(fine_id, memory_id)\` ⇒ 行按 \`fine_id\` **物理聚簇**
+--   ⇒ 「读一个桶」变成**连续几页顺序读**（这本就是 L3 想要的；两段式顺带把它拿到手）。
+--
+-- ⚠️ **为什么要有 \`idx_vcode_memory_unique\`**：\`assignBucket()\` 换桶时按 \`memory_id\` 删旧行
+--   ⇒ 没有这个索引，那条 DELETE 是**全表扫描**（1M 行 × 784B ≈ 784MB）⇒ 与 \`idx_vcm_memory_unique\`
+--   同理；它同时是「一条记忆只挂一个桶」的**第二道防线**（第一道在 \`vector_cell_members\`）。
+CREATE TABLE IF NOT EXISTS vector_codes (
+  fine_id   TEXT NOT NULL REFERENCES vector_fine_cells(fine_id) ON DELETE CASCADE,
+  memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+  code      BLOB NOT NULL,                         -- 768 个 int8（小端有符号）；长度必须 == EMBED_DIM
+  scale     REAL NOT NULL,                         -- x̂ = scale × code；per-vector 单一标量 = max|x| / 127
+  eps       REAL NOT NULL,                         -- ★ 编码时**实算**的 ‖x − x̂‖₂（不是估算上界）
+                                                   --   ⇒ \`q·x ≤ q·x̂ + eps\` 的**唯一依据**（ADR §8.3）
+  PRIMARY KEY (fine_id, memory_id)
+) WITHOUT ROWID;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vcode_memory_unique ON vector_codes(memory_id);
+
+-- ═══════════════════════════════════════════════════════════════════════════
 -- 归档缓存（§9.4）：把「何时归档」从**每次查询实时算**改成**一次算好、按索引取**
 -- ═══════════════════════════════════════════════════════════════════════════
 -- ★ 只装 \`deleted = 0\` 的行 ⇒ countArchived() 是纯索引扫描，不需要 JOIN memories。
@@ -507,6 +538,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_vcm_memory_unique ON vector_cell_members(m
                                                    -- ★ 唯一索引**同时**服务 \`memory_id = ?\` 的查找
                                                    --   ⇒ 不需要再单独建一个非唯一索引（省一个索引的写放大）。
                                                    --   ★ **一条记忆只属一个细桶**的最终防线。
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- ★ 码表（2026-11-04 · C′ 档的两段式第一级）—— 与建库脚本**逐字同形**
+-- ⚠️ 本表**不属于**「九张指纹表」；这里建它只是让「v1 → v2 的库」与「新建库」形状一致。
+-- ⚠️ 建出来是**空表** ⇒ 对既有行为零影响（读取路径遇到无码行走精确兜底）。
+-- ═══════════════════════════════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS vector_codes (
+  fine_id   TEXT NOT NULL REFERENCES vector_fine_cells(fine_id) ON DELETE CASCADE,
+  memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+  code      BLOB NOT NULL,                         -- 768 个 int8（小端有符号）；长度必须 == EMBED_DIM
+  scale     REAL NOT NULL,                         -- x̂ = scale × code；per-vector 单一标量 = max|x| / 127
+  eps       REAL NOT NULL,                         -- ★ 编码时**实算**的 ‖x − x̂‖₂（不是估算上界）
+  PRIMARY KEY (fine_id, memory_id)
+) WITHOUT ROWID;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vcode_memory_unique ON vector_codes(memory_id);
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- 归档缓存（§9.4）：把「何时归档」从**每次查询实时算**改成**一次算好、按索引取**

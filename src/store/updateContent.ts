@@ -23,6 +23,42 @@
  *
  * ⚠️ **幂等返回时不校验也不更新 embedding**：正文没变 ⇒ 向量就不需要变
  *   ⇒ 此时覆盖向量等于让调用方误以为「传了向量就等于改了正文」。
+ *
+ * ★★ **改向量 ⇒ 必须让该行的码行失效**（C′ 档 T04 收尾）：
+ *   两段式剪枝（`src/vector/prune.ts`）的**全部正确性**建立在
+ *   「码行是按 `memories.embedding` 的**当前值**编的」上（`eps` 是**这一条向量**的误差）。
+ *   而本函数会把向量**就地换成另一个值**（`旧值 → 新值`）⇒ 码、`fine_id`、`eps`
+ *   全都还是**旧向量**的 ⇒ `upper = q·x̂ + eps` **不再是上界**。
+ *
+ *   两种命运（**只有第二种是事故**）：
+ *   · 新向量落到**别的细桶** ⇒ 码行的 `fine_id` 是旧的 ⇒ `readCodes(fine_id IN …)` 取不到它
+ *     ⇒ 该行变成「无码」⇒ 精确兜底 ⇒ **安全**（且 A6 的 `fineIdDrift` 会红，可观测）；
+ *   · ★ 新向量落到**同一个细桶** ⇒ 码行仍被取到、`fine_id` 也对得上
+ *     ⇒ `upper` 不再是上界 ⇒ **静默漏召回**，而 A6 与 `codesMissing` **都查不出来**
+ *     （前者只看归属对不对得上，后者只数「没有码」的行）。
+ *     细桶数只有 4~9966 量级 ⇒ 「改完还在同一个桶」是**常见**结果，不是边角。
+ *
+ *   ⇒ **T05 起的处置：重编码，且只有一份实现**。
+ *     本函数**只调** `assignBucket()`（有向量）/ `unassignBucket()`（置 NULL）——
+ *     这两个函数现在会在**同一个事务**里把码行也换掉（`src/vector/bucketAssign.ts`
+ *     的 `writeCodeRow()` / `clearCodeRows()`）。
+ *     ⇒ 「码怎么维持」只有**一份**实现，且它在**唯一收敛点**上（6 处生产调用点全走它：
+ *       `write.ts:775/:930`、`merge.ts:343/:345`、本文件、`rebuild.ts:228/:245`、`reconcile.ts:251/:255`）。
+ *
+ *   ⚠️ **为什么不在本文件里编码/删码**：码表属于向量层，**表名只在向量层出现**
+ *     （§4.6 步骤 2c；`tests/contracts/table-name-boundary.test.ts` 静态守着）。
+ *     本文件只决定「**什么时候**要维护」，不管「**怎么**维护」。
+ *
+ *   ⚠️ **T04 收尾时的临时方案（先删码让码过期）已撤销**：
+ *     那时 `assignBucket()` 还不碰码，删码只能把「静默漏召回」降级成「多读 3KB」——
+ *     **安全但不是最优**（该行要等下一次 `pnpm codes:backfill` 才重新用上剪枝）。
+ *     T05 之后没有必要再留这个中间态。
+ *
+ *   ⚠️ **必须与 `assignBucket` 在同一个事务里**（`runWriteTransaction`）：
+ *     事务外做 ⇒ 崩在中间时「向量已换、码还是旧的」⇒ 正是上面那种**静默漏召回**的形状。
+ *
+ *   ⚠️ **`vector === null` 的分支**：`unassignBucket()` 现在**同一事务里也删码行**
+ *     （码与成员「同生同死」）⇒ 不会再有 T04 收尾时那种「孤儿码行」。
  */
 
 import { createHash } from 'node:crypto';
@@ -76,6 +112,15 @@ const UPDATE_CONTENT_SQL = `UPDATE memories
        content_hash = @hash,
        embedding = @embedding
  WHERE id = @id`;
+
+// ★ **码行/桶归属的维护调用点在本文件末尾**（步骤 4 续），实现不在本文件：
+//   调 `assignBucket()` / `unassignBucket()`（`src/vector/bucketAssign.ts`，**唯一收敛点**）。
+//   ⚠️ 本文件**不写码表的 SQL、也不出现码表名**（§4.6 步骤 2c：表名只在向量层）——
+//     这里只决定「**什么时候**要维护」（向量真的换了、且新向量已落库），
+//     「**怎么**维护」归向量层（`tests/contracts/table-name-boundary.test.ts` 静态守着）。
+//   ⚠️ 必须与那一次调用同一个事务：`assignBucket()` / `unassignBucket()` 自己会断言
+//     「在事务里」，事务外调会**抛错**而不是静默漏写。
+//   ⚠️ 刻意**不导出**任何东西：「什么时候维护」不该成为调用方可选的第二个开关。
 
 function assertWritable(store: UpdateContentStore): void {
   if (store.events.readonly) {
@@ -175,10 +220,18 @@ export function updateContent(
       embedding: vector === null ? null : vectorToBlob(vector),
     });
 
-    // ── 步骤 4 续：桶归属同步（§9.3.2 ④：改 embedding 必须同事务改归属）──
+    // ── 步骤 4 续：桶归属 + 码行同步（§9.3.2 ④：改 embedding 必须同事务改归属/码）──
+    // ⚠️ ★ **T05 起这里只调一个函数**：`assignBucket()` 现在**自己会把码行一起重编码**
+    //   （`src/vector/bucketAssign.ts` 的 `writeCodeRow()`）。
+    //   ⇒ 本文件既不需要删码、也不需要（更不该）自己编码：
+    //     「码怎么维持」只有一份实现在向量层，这里只决定**什么时候**要它。
+    //   ⇒ 这也把 T04 收尾时那个临时方案（先 `clearCodeRow` 再 `assignBucket`）收敛掉了：
+    //     那时 `assignBucket` 不碰码 ⇒ 只能删掉让码过期；**过期是安全的（走精确兜底）但不是最优**。
     if (vector === null) {
+      // 没有向量 ⇒ 退桶；`unassignBucket()` 同一事务里也会删掉码行（码与成员同生同死）。
       unassignBucket(store.buckets, id);
     } else {
+      // 有向量 ⇒ 落新归属，并按**这个新向量**重编码（桶可能没变，码必须换）。
       assignBucket(store.buckets, id, vector);
     }
 

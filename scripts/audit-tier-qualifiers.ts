@@ -172,8 +172,15 @@ export const TIER_SPECIFIC_CLASSES: readonly TierSpecificClass[] = [
  * **跨档一致的数**（不许被写成「只在这一档成立」）。
  *
  * ⚠️ 只作**提示**：文档里**允许**出现「这组数采自哪一次」的出处陈述。
+ *
+ * ⚠️ ★ **2026-11-05（T06 · 字节口径）：新增 `6,144,000`** ——
+ *   那是 **H1′ 的字节门槛**（= 2,000 行 × 3,072 B）⇒ 它**与介质 / 档位无关**
+ *   ⇒ 与旧的 `12,782` / `1.2782%` / `12.782`（R6 召回路径旧行数读数）**同属「跨档一致的数」**
+ *   ⇒ ⇒ **必须一起进射程** ⇒ 否则「新判据量在档位语境里丢掉档位标注」这件事**审计看不见**
+ *   （= 判据换代的**审计盲区**）。
+ *   ⚠️ **不许加 `0.2%`**（它太泛 ⇒ 会大量误报）⇒ **H2′ 的门槛用 `6,144,000` 间接覆盖**。
  */
-export const CROSS_TIER_PATTERN = /12,782|1\.2782%|12\.782/g;
+export const CROSS_TIER_PATTERN = /12,782|1\.2782%|12\.782|6,144,000/g;
 
 /** 出处陈述的标志词 ⇒ 出现它们 ⇒ 那句里的档位词是在说「出处」而非「适用范围」。 */
 const PROVENANCE_MARKERS: readonly string[] = [
@@ -350,7 +357,7 @@ export function auditTierQualifiers(lines: readonly string[]): AuditResult {
     if (CROSS_TIER_PATTERN.test(line) && hasTier(line) && !hasProvenance(line)) {
       advisories.push({
         line: index + 1,
-        className: '行数类判据（H1/H2）出现在带档位词的句子里',
+        className: '跨档判据量（旧行数读数 / 新字节门槛 6,144,000）出现在带档位词的句子里',
         text: line.trim().slice(0, 150),
       });
     }

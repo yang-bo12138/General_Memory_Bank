@@ -10,6 +10,11 @@
  *     **全库写 `vector_cell_members` 的地方只有这里**
  *     （由 `tests/unit/bucketAssign.test.ts` 的静态扫描断言守着
  *     ⇒ T04 的 lint 规则照这条形状落地即可，不用返工）。
+ *   ★ **T05**：本模块同时是**码表**的唯一写入点 ——
+ *     `writeCodeRow()`（按**本次**向量重编码，与成员行同事务）/
+ *     `clearCodeRows()`（删码，用于「没向量」与「未训练」两个分支）。
+ *     ⇒ **码与成员同生同死**：漏写一次就是「上界不再是上界」，而那种漏召只有逐位比对抓得到。
+ *     `src/store/**` 里**一处都不出现码表名**（`tests/contracts/table-name-boundary.test.ts` 守着）。
  *
  * ⚠️ ★ **换桶必须「先 DELETE 旧归属行、再 INSERT 新行」**（§4.15.5）：
  *   `INSERT OR REPLACE` 只按 `(fine_id, memory_id)` 复合主键覆盖
@@ -55,6 +60,7 @@ import { DEFAULT_PARAMS } from '../core/params.js';
 import type { IvfCentroidModel } from './centroids.js';
 import { assertValidEmbedding } from './dot.js';
 import { assignFineBucket } from './ivf.js';
+import { codeToBlob, encodeVector } from './quantize.js';
 
 /**
  * 桶归属写入所需的**上下文**（事务由调用方开）。
@@ -100,13 +106,57 @@ export interface BucketAssignmentResult {
 }
 
 /**
+ * **写一条码行**（码表的唯一写入点，T05）—— 先删旧行、再插新行，与成员行**同构**。
+ *
+ * ⚠️ **为什么必须先删再插，而不是 `INSERT OR REPLACE`**：码表主键是 `(fine_id, memory_id)`
+ *   ⇒ 换桶时新旧 `fine_id` 不同 ⇒ REPLACE 不会覆盖旧行（它只按**主键**判冲突）。
+ *   `idx_vcode_memory_unique` 会把它挡成 `UNIQUE constraint failed`（响亮），
+ *   但仍不是「先删再插」那种**任何时刻都不违反唯一性**的形状。
+ *
+ * ⚠️ **为什么是「重编码」而不是「只改 `fine_id`」**：`updateContent()` 会**就地**换向量
+ *   而桶可能不变 ⇒ 只搬 `fine_id` 会留下「描述旧向量」的码 ⇒ `upper` 不再是上界 ⇒
+ *   **静默漏召回**（A6 查不出：两边的 `fine_id` 一致）。重编码的代价是 768 次乘加 + 784B 写，
+ *   换掉的是「一个只有逐位比对才抓得到的漏召」。
+ *
+ * ⚠️ 本函数**只写码表**，不写桶表（桶表的唯一写入点是 `assignBucket` / `unassignBucket`）。
+ *
+ * @param db 库句柄（**必须在写事务内**，由调用方保证）
+ * @param memoryId 记忆 id
+ * @param fineId 细桶 id（与刚写入的成员行一致）
+ * @param vector 本次的向量（**已 L2 归一化**，已由调用方校验）
+ */
+function writeCodeRow(
+  db: Database.Database,
+  memoryId: string,
+  fineId: string,
+  vector: Float32Array,
+): void {
+  const { code, scale, eps } = encodeVector(vector);
+  db.prepare('DELETE FROM vector_codes WHERE memory_id = ?').run(memoryId);
+  db.prepare(
+    'INSERT INTO vector_codes (fine_id, memory_id, code, scale, eps) VALUES (?, ?, ?, ?, ?)',
+  ).run(fineId, memoryId, codeToBlob(code), scale, eps);
+}
+
+/**
+ * 删掉一条记忆的码行（幂等：删 0 行合法）。
+ *
+ * @param db 库句柄（**必须在写事务内**）
+ * @param memoryId 记忆 id
+ */
+function clearCodeRows(db: Database.Database, memoryId: string): void {
+  db.prepare('DELETE FROM vector_codes WHERE memory_id = ?').run(memoryId);
+}
+
+/**
  * 把一条记忆归入**最近的细桶** —— 桶归属的**唯一写入点**（§9.3.0）。
  *
- * ⚠️ **内部固定四步，顺序不可换**（§9.3.0 的原文形状）：
+ * ⚠️ **内部固定五步，顺序不可换**（§9.3.0 的原文形状 + T05 的码行维护）：
  *   ① 算最近细桶（复用 `assignFineBucket`）；
  *   ② **DELETE 旧归属**（换桶不残留的唯一保障，§4.15.5）；
  *   ③ INSERT 新归属；
- *   ④ 桶计数（**现算** ⇒ ①②③ 天然正确，不需要「−1/+1」这种手工记账）。
+ *   ④ ★ **DELETE 旧码行 + INSERT 新码行**（按**本次**向量重编码，见 `writeCodeRow()`）；
+ *   ⑤ 桶计数（**现算** ⇒ ①②③ 天然正确，不需要「−1/+1」这种手工记账）。
  *
  * ⚠️ **「先 DELETE 再 INSERT」不能换成 `INSERT OR REPLACE`**（§4.15.5）：
  *   复合主键是 `(fine_id, memory_id)` ⇒ 换桶时旧行的 `fine_id` 不同 ⇒ 不会被覆盖
@@ -159,6 +209,14 @@ export function assignBucket(
     // ⚠️ **分桶尚未训练 ⇒ 没有可归属的桶**（§4.15.3：「模型为空 ⇒ 向量路整体缺席」）。
     //   这里**不写**归属，也**不抛错**；但也**不是静默**——
     //   返回值把「没入桶」显式交出去（`assigned: false`）。
+    //
+    // ⚠️ ★ **但码行必须删掉**（T05 · fail-open）：码的主键里有 `fine_id`，
+    //   没有桶就没法描述「这一行的码属于哪个桶」；而留着**旧 `fine_id`** 的码行
+    //   ⇒ 与新向量对不上（`upper` 不再是上界）而桶归属又没更新
+    //   ⇒ 下一轮读取会按过期上界剪枝 ⇒ **静默漏召回**，且 A6 的 `fine_id` 漂移**看不出来**
+    //   （两边的 `fine_id` 都是旧的、彼此一致）。
+    //   ⇒ 删掉 ⇒ 该行变成「无码」⇒ 走精确兜底 ⇒ **只慢不错**。
+    clearCodeRows(db, memoryId);
     return { fineId: null, assigned: false, previousFineId, changed: false };
   }
 
@@ -171,6 +229,10 @@ export function assignBucket(
       fineId,
       memoryId,
     );
+    // ★ **码与成员同生同死**（T05）：同一个事务里把码行也换成「按**本次**向量算出的码」。
+    //   ⚠️ 必须是**重编码**而不是「只改 `fine_id`」：`updateContent()` 会就地换向量，
+    //      而桶可能不变 ⇒ 只改 `fine_id` 会留下「描述旧向量」的码 ⇒ 上界失效 ⇒ 静默漏召回。
+    writeCodeRow(db, memoryId, fineId, vector);
   } catch (error) {
     // ⚠️ **裸的 SQLite 错误码绝不能抛给调用方**（§11.2）：
     //   外键违规（记忆不存在）⇒ `NOT_FOUND`；唯一性冲突 ⇒ `CONFLICT`。
@@ -214,6 +276,9 @@ export function unassignBucket(context: BucketAssignContext, memoryId: string): 
   assertMemoryId(memoryId);
   try {
     db.prepare('DELETE FROM vector_cell_members WHERE memory_id = ?').run(memoryId);
+    // ★ **码与成员同生同死**（T05）：向量没了 ⇒ 码也没有意义（主键里还带 `fine_id`）。
+    //   留着它 = 一条「有码、无归属」的行 ⇒ `lonelyCodes + 1`（A6 会红）+ 它永远不属于任何桶。
+    clearCodeRows(db, memoryId);
   } catch (error) {
     throw translateSqliteError(error, { path: db.name });
   }

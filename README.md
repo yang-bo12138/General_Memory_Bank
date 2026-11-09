@@ -11,7 +11,7 @@
 
 ```bash
 pnpm install     # 装依赖
-pnpm run verify  # 门禁：类型检查 → 代码风格 → 单元测试 → 8 条契约脚本 → 3 条文档审计（共 14 段）
+pnpm run verify  # 门禁：类型检查 → 代码风格 → 单元测试 → 9 条契约脚本 → 3 条文档审计 → 4 条链外转正守卫（共 18 段）
 pnpm build       # 构建产物（tsup：CJS + ESM + d.ts）
 ```
 
@@ -22,8 +22,23 @@ pnpm build       # 构建产物（tsup：CJS + ESM + d.ts）
 > 公开面 **23 个方法**（§3.1 的归位表：阶段 1~5 全挂上）。
 > 另外交付两个**不在发布产物里**的可执行形态：Electron 只读观察器（`viewer/`，七个面板）与
 > MCP Server（`mcp/`，10 个工具）—— 它们的依赖全是 `devDependencies`，`dist/` 仍只有 `index.*`。
-> ⚠️ **两条性能硬门槛仍红**（H1 = 12,782 行，是门槛的 6.39 倍）⇒ 归「**向量路接线前必须还**」，
-> 与阶段 5 的范围无关。
+> ★ **矢量路已接进 `recall()`**（2026-11-03 · PR #6）：`fromVector` / `cos` / `vectorPart` / `vectorUsed`
+> 第一次可以非零 ⇒ 阶段 2 的 §4.6 步骤 2c 欠账已清偿。
+> ⚠️ **但性能读数仍然红 —— 而且是两个读数、两个主语**（2026-11-03 归口，数值与判定方式未改）：
+> ⚠️ ★ **2026-11-05（T06 · 字节口径）：判据已从「行」改为「字节」** —— **唯一判据 = H1′ = `bytesRead.max ≤ 6,144,000 B`**
+>   （= 2,000 行 × 3,072 B · **判定取 `max`** · **只计向量载荷** ⇒ 是真实搬运量的**下界** ⇒ 判据偏严、不会假绿）⇒ **实测值待 T07 冷 / 热两档重采回填**；
+>   下面的 **H1 / H2（行）保留为历史 / 已降级为并列观测**（**不是「已废」** —— 旧基线就是按行判的；常量 `candidateReadRowsMax` / `candidateReadRowsRatioMax` 保留不删）
+>   ⇒ 口径唯一权威 = `docs/design/perf-c2-t06-byte-metering.md`。
+> · **H1′（字节 · 唯一判据）= 写入去重路径**：`bytesRead.max` 门槛 **≤ 6,144,000 B**（实测值待 T07 回填）；
+> · **H1 / H2（旧行数口径 · 已降级为并列观测）= 写入去重路径**：观测值 max **5,521 行** = 旧门槛 ≤2,000 的 **2.76 倍**（**不再判红绿**）；
+> · **R6（`RECALL_VEC_ROWS`）= 召回路径的观测值**：max **12,782 行** ⇒ 相对旧行数门槛 2,000 是 **6.39 倍**，
+>   **仍然红，但本轮不设门槛、不判红绿**（它不再冒充「写入路径超了 6.39 倍」）。
+> ⇒ ⚠️ **接线不会让任何一条转绿**，只会让它们第一次测到真东西；⚠️ **6.39 倍没有变小，它换了主语**
+> （2.76 与 6.39 是**两个量各自有数**，不是一个数在改善）。
+> ⚠️ **为什么不给 R6 立刻定一个数**：行数→毫秒随介质差 15~26 倍、而「降探针」同时是召回损失的唯一来源
+> ⇒ 先测真数、再测质量损失、最后定档（正文见 `docs/design/DESIGN-v2-errata.md` §11.8）。
+> ⇒ 当前未还的全部清单（性能 / 功能 / 既有缺陷 / 覆盖空洞 / 环境）见
+> [`docs/progress/vector-round-progress.md`](docs/progress/vector-round-progress.md) §四。
 > ⇒ 逐任务状态、验收证据、**断言判别力审计**、遗留清单与**下一步起点**见
 > [`docs/progress/stage5-progress.md`](docs/progress/stage5-progress.md) §九（阶段 4 / 3 的账分别在
 > [`stage4-progress.md`](docs/progress/stage4-progress.md) / [`stage3-progress.md`](docs/progress/stage3-progress.md)），
@@ -54,6 +69,6 @@ pnpm build       # 构建产物（tsup：CJS + ESM + d.ts）
 >
 > 门禁的形状由 `scripts/check-gate-entry.ts` **机器可检**：
 > `scripts.ci` 必须**恰好**是 `pnpm run verify` 的别名，
-> 且 `scripts.verify` 串起的 14 条子命令逐名齐全、每段都写成 `pnpm run <名>`。
+> 且 `scripts.verify` 串起的 18 条子命令逐名齐全、每段都写成 `pnpm run <名>`。
 >
 > CI 工作流在 `.github/workflows/ci.yml`，跑的是 `pnpm run verify`（**不是** `pnpm ci`）。

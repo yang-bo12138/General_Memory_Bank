@@ -528,12 +528,17 @@ describe('P2-T07 · 写入路径的去重候选收窄（§4.9 步骤 3a2）', ()
       });
       const query = pseudoUnitVector(999_999);
 
+      // ⚠️ ★ **C′ 档 T04**：`scan.rows` 的语义从「候选全集」变成「剪枝后的 survivors」
+      //   ⇒ 本组断言测的是「**候选宇宙** ⊆ flat 的全集」⇒ 显式关掉剪枝（`prune: false`）
+      //     才能拿回「全集」这个语义（那是 A7 的对照路径，行为与 HEAD 逐位相同）。
+      //   ⚠️ 剪枝之后 `rows` 变少是**设计内**的结果（`scanned` 仍然是成员数，见 `BucketCandidateScan`）。
       const scan = scanBucketCandidates(
         fixture.db,
         fixture.model,
         query,
         DEFAULT_PARAMS.ROUTER_NPROBE_WRITE_COARSE,
         DEFAULT_PARAMS.ROUTER_NPROBE_WRITE_FINE,
+        { prune: false },
       );
       const bucketIds = new Set(scan.rows.map((row) => row.id));
       const flatIds = flatCandidateIds(fixture.db);
@@ -560,6 +565,8 @@ describe('P2-T07 · 写入路径的去重候选收窄（§4.9 步骤 3a2）', ()
         query,
         DEFAULT_PARAMS.ROUTER_NPROBE_WRITE_COARSE,
         DEFAULT_PARAMS.ROUTER_NPROBE_WRITE_FINE,
+        // ⚠️ 同上：要的是**候选全集** ⇒ 关掉剪枝（T04）
+        { prune: false },
       );
       const bucketIds = new Set(scan.rows.map((row) => row.id));
 
@@ -598,6 +605,8 @@ describe('P2-T07 · 写入路径的去重候选收窄（§4.9 步骤 3a2）', ()
         query,
         DEFAULT_PARAMS.ROUTER_NPROBE_WRITE_COARSE,
         DEFAULT_PARAMS.ROUTER_NPROBE_WRITE_FINE,
+        // ⚠️ 同上：要的是**候选全集** ⇒ 关掉剪枝（T04）
+        { prune: false },
       );
       const bucketIds = new Set(scan.rows.map((row) => row.id));
 
@@ -696,12 +705,23 @@ describe('P2-T07 · 静态断言：候选收集不做全表扫', () => {
     // ⚠️ **只查代码、不查注释**（注释里会讨论「v1.0 的写法是全表扫」⇒ 会被误伤）
     const code = stripComments(source);
 
+    // ★ **C′ 档 T04**：本文件现在有**一条** `FROM memories`，它是**主键点查**
+    //   （逐条读 survivors 的向量给剪枝原语算精确分，规格 §5.1.10）。
+    //   ⇒ 先把它**正控钉死**（只允许这一条），再从被检文本里剔除 ⇒ 下面两条旧断言
+    //     仍然只对「全表扫的形状」生效（不因为一条点查而放弃守卫）。
+    const POINT_LOOKUP =
+      'SELECT embedding FROM memories WHERE id = ? AND deleted = 0 AND embedding IS NOT NULL';
+    expect(code.split(POINT_LOOKUP).length - 1).toBe(1);
+    const codeWithoutPointLookup = code.split(POINT_LOOKUP).join('SELECT 1');
+
     // 性质：**没有**「直接从 memories 取全部有向量的行」那种 SQL
-    expect(code).not.toMatch(
+    expect(codeWithoutPointLookup).not.toMatch(
       /FROM\s+memories\s+m?\s*WHERE\s+m?\.?deleted\s*=\s*0\s+AND\s+m?\.?embedding\s+IS\s+NOT\s+NULL/i,
     );
     // 性质：**没有**「无 LIMIT 的 memories 全表扫」
-    expect(code).not.toMatch(/SELECT[\s\S]{0,200}FROM\s+memories(?![\s\S]{0,400}JOIN\s+memories)/i);
+    expect(codeWithoutPointLookup).not.toMatch(
+      /SELECT[\s\S]{0,200}FROM\s+memories(?![\s\S]{0,400}JOIN\s+memories)/i,
+    );
   });
 
   it('★ 桶表名**不出现在**存储层（§4.6 步骤 2c：流水线不得直接引用分桶表名）', () => {

@@ -34,11 +34,20 @@ import { Worker } from 'node:worker_threads';
 
 import type Database from 'better-sqlite3';
 
+import { DEFAULT_PARAMS } from '../../src/core/params.js';
 import { openDatabase } from '../../src/db/connection.js';
 import { ensureSchema } from '../../src/db/migrate.js';
 import { runWriteTransaction } from '../../src/store/transaction.js';
 import { vectorToBlob } from '../../src/vector/centroids.js';
+import { codeWidthByteLengths } from '../../src/vector/quantize.js';
 import { rebuildBuckets } from '../../src/vector/rebuild.js';
+import {
+  type ByteSourceKind,
+  type ShapeEntry,
+  bytesOfRow,
+  resolveShape,
+  sqlFingerprint,
+} from './byteSources.js';
 
 // ═══════════════════════════════ 时钟（唯一的计时入口） ═══════════════════════════════
 
@@ -718,19 +727,22 @@ export interface PageCacheStateInfo {
  *   ⇒ ⇒ **本段只是给出「怎么判断自己该声明哪一档」的可复算旁证**
  *   ⇒ ⇒ **不改变「缺省 unknown、不许猜」这条纪律**。
  *
- * ⚠️ ★ **旁证的来源**（工程师-7 在 2026-11-01 23:43 的补测里实测）：
- *   **顺序读吞吐 ≈ 166 MB/s**（≈ **机械盘速度** ⇒ SATA HDD 的量级）
- *   ⇒ ⇒ 页缓存只命中了 **~0.55 GB**（4.23 GiB 的库**装不下**）
- *   ⇒ ⇒ ⇒ **随机读路径基本没命中缓存** ⇒ ⇒ **这就是「冷盘档」的物理含义**。
+ * ⚠️ ★ **本段不写任何具体盘速**（2026-11-04 改）：
+ *   旧版在这里写死「本机 2026-11-01 冷盘档实测 ≈ 166 MB/s（≈ 机械盘速度）」⇒
+ *   **换到 NVMe 档之后，这句话与同一份 JSON 里的 `storageMedia` 直接矛盾**
+ *   （一边写 `SSD | NVMe | WD Blue SN570`，一边写「本机是 SATA HDD」）⇒
+ *   而 `note` 是**落盘、会被后人引用的字段** ⇒ 写死机器相关的数 = 让基线自己说谎。
+ *   ⇒ 现在只给**方法**：拿顺序读吞吐与 `storageMedia` 那块盘的**名义带宽**比。
  *
- * ⚠️ **换机器必须用自己的盘速重算这个对照**（⇒ 本段带机器相关性）。
+ * ⚠️ **换机器必须用自己的盘速重算这个对照** ⇒ 所以对照值只能由读的人现算，不能由代码写死。
  */
 const PAGE_CACHE_STATE_CROSS_CHECK =
-  '⚠️ **判档的可复算旁证（不是仪器）**：**先测一下顺序读吞吐** ⇒ ' +
-  '⚠️ 本机 2026-11-01 冷盘档实测 ≈ **166 MB/s**（≈ 机械盘速度）' +
-  '⇒ 页缓存只命中 **~0.55 GB**（4.23 GiB 的库装不下）⇒ ⇒ **随机读路径基本没命中缓存**' +
-  '⇒ ⇒ **「顺序读吞吐接近本机盘速」⇒ 多半是冷盘档**' +
-  '（⚠️ 本机是 SATA HDD ⇒ **换机器请用自己的盘速重算这个对照**）。';
+  '⚠️ **判档的可复算旁证（不是仪器）**：**先测一下顺序读吞吐**（同一块盘、同一个文件、' +
+  '固定偏移读一段固定大小，报 MB/s）⇒ 与 `storageMedia` 里那块盘的**名义顺序读带宽**对比：' +
+  '**明显低于名义值 ⇒ 随机读要落盘 ⇒ 偏冷**；**接近或高于名义值 ⇒ 页缓存命中率高 ⇒ 偏热**。' +
+  '⚠️ **本字段仍是「声明」不是「测量」**（Windows 没有公开 API 能报「这个库有多少在页缓存里」）' +
+  '⇒ 判档必须连这条旁证一起看；⚠️ **换机器请用自己的盘速重算这个对照**' +
+  '（本段**刻意不写具体盘速**：写死一个数，换一块盘就变成假话）。';
 
 /**
  * 解析 `--cache-state` 参数（**缺省 `unknown`**；**非法值 ⇒ 报错**，不静默钳制）。
@@ -792,20 +804,141 @@ export function parsePageCacheState(raw: string | undefined): PageCacheStateInfo
 // ═══════════════════════════════ 行读计数（H1 的「实测口径」取数装置） ═══════════════════════════════
 
 /**
- * ★ **行读计数器的快照**（**累计值**；两次快照相减 = 那段窗口里读的行数）。
+ * ★ **行读的分类**（**按表名派生** —— 分类器认的是「这条 SQL 读的是哪张表」）。
+ *
+ * ⚠️ **为什么成员名按表名派生**（`bucketMember` / `vectorCode`）：
+ *   分类器的判据是**表名**（`memories` / `vector_cell_members` / `vector_codes`）
+ *   ⇒ ⇒ 成员名也按表名派生 ⇒ **看名字就知道它对应哪张表**（不靠记忆、也不靠顺序）。
+ *
+ * ⚠️ ★ **加新表时必须同批扩展这里**（ADR-PERF-01 §5 的 P5 陷阱）：
+ *   「让新表不计入行读计数器」会被当成达标 ⇒ **H1 会显示行数很少，而物理读一点没少**
+ *   ⇒ ⇒ **加表 = 必须同批扩展本类型与 `classifyReadKind()`**。
  */
-export interface RowReadSnapshot {
+export type ReadKind = 'candidate' | 'bucketMember' | 'vectorCode';
+
+/**
+ * ★ **一个字节来源的累计值**（口径 §12 类图的 `ByteSource`）。
+ *
+ * ⚠️ **为什么每个来源都带 `calls`**（不只是 `rows`）：
+ *   `rows` = **物化出来的行数**；`calls` = **`.get()` 被调用的次数**（**返回 `undefined` 也计**）
+ *   ⇒ ⇒ 两者之差 = **软删 / 无向量 / 已硬删**的行数（**白调用、零字节**）
+ *   ⇒ ⇒ **剪枝率的分子必须用 `calls`**（口径 §1.7 的方向纪律：偏小 = 偏松 = 假绿）。
+ */
+export interface ByteSourceSnapshot {
+  /** 来源种类（`member` / `code` / `narrow` / `exactEmbedding` / `survivorRow`）。 */
+  readonly kind: ByteSourceKind;
+  /** **物化出来的行数**。 */
+  readonly rows: number;
+  /** **载荷字节**（进 `bytesRead`）。 */
+  readonly bytes: number;
+  /** **非向量字节**（进 `contentBytes`；**不在** `bytesRead` 里）。 */
+  readonly contentBytes: number;
+  /** **`.get()` 调用次数**（**无条件**计数 ⇒ 返回 `undefined` 也计）。 */
+  readonly calls: number;
+}
+
+/**
+ * ★ **计数器内部的可变累计状态**（快照的原料）。
+ *
+ * ⚠️ **为什么另立一个可变类型**：对外的 `ByteSourceSnapshot` 是**只读**的
+ *   （读的人不该能改它）⇒ ⇒ 内部用可变的、对外用只读的 ⇒ **一次转换，边界清楚**。
+ */
+interface MutableByteSource {
+  readonly kind: ByteSourceKind;
+  rows: number;
+  bytes: number;
+  contentBytes: number;
+  calls: number;
+}
+
+/**
+ * ★ **行读计数器的快照**（**累计值**；两次快照相减 = 那段窗口里读的行数 / 字节）。
+ *
+ * ⚠️ ★ **名字为什么是 `ByteReadSnapshot`**（架构师 §12 类图钉死的形状）：
+ *   它现在装**行数**与**字节来源分解** ⇒ ⇒ 与其以后再改名（⇒ 又一次「同一个东西两个名字」），
+ *   **现在一次改到位**。
+ *   ⚠️ **这是 TypeScript 类型名，不是落盘 JSON 的键** ⇒ **旧落盘键一个都没动**。
+ *
+ * ⚠️ ★★ **两个结论必须分开读**（口径 §3：「一次归一化、两个结论」）：
+ *   · **legacy 结论**（`candidateRows` / `bucketMemberRows` / `codeRows`）= **逐位复现旧行为**
+ *     ⇒ ⇒ `docs/baseline/*.json` 的 R6 `candidateReadRows` **不断档**；
+ *   · **byte 结论**（`bySource` + 派生字段）= **形状登记制** ⇒ 未登记 ⇒ 命中零来源 ⇒ `unclassified`。
+ */
+export interface ByteReadSnapshot {
   /**
-   * **候选行读数**（`memories` 表**实际物化**的行数）—— **H1 的判据量**。
+   * **候选行读数**（`memories` 表**实际物化**的行数）—— **legacy 结论**。
    *
    * ⚠️ **口径**：与**写入路径**那个「候选 ≤ 2000」（§4.9 步骤 3a2 的扫描量）**同一口径**
    *   （都是「候选行」⇒ **同一个库、同一个量、同一个被考核方**）。
    */
   readonly candidateRows: number;
   /**
-   * **桶成员行读数**（`vector_cell_members` 表**实际物化**的行数）—— **附加信息**，不判 H1。
+   * **桶成员行读数**（`vector_cell_members` 表**实际物化**的行数）—— **legacy 结论**，不判门槛。
    */
   readonly bucketMemberRows: number;
+  /**
+   * ★ **码行读数**（`vector_codes` 表**实际物化**的行数）—— **legacy 结论**。
+   *
+   * ⚠️ ★ **它是「行数」不是「字节数」**：一个码行 = 768 个 int8 + `scale` + `eps`
+   *   ⇒ **一行不等于一字节** ⇒ 字节口径在 `bySource.code.bytes`（**实测 `byteLength`**）。
+   */
+  readonly codeRows: number;
+  /**
+   * ★ **字节来源分解**（形状登记制；**键 = 来源种类**）。
+   *
+   * ⚠️ **断言 2 的依据**：每个登记形状的行数之和 == 对应读数
+   *   （码形状 → `codeRowsRead` / 向量形状 → `embeddingRowsRead` /
+   *   窄读形状 → `narrowRowsRead` / 成员形状 → `bucketMemberRowsRead`）。
+   */
+  readonly bySource: Readonly<Record<string, ByteSourceSnapshot>>;
+  /** ★ **每个登记形状各自物化了几行**（断言 2 的逐形状证据）。 */
+  readonly shapeRows: Readonly<Record<string, number>>;
+  /** ★ **命中零来源**（未登记形状）的行数（**必须为 0**；> 0 ⇒ 口径不完整 ⇒ 判红）。 */
+  readonly unclassifiedRows: number;
+  /** ★ **未登记语句的指纹集合**（**打印 + 落盘** ⇒ 否则只知道「有东西没认领」，不知道「是什么」）。 */
+  readonly unclassifiedSqlKinds: readonly string[];
+  /** ★ **物化的 `memories` 行数**（窄读 + 向量）＝ ADR §8.5 的「原口径」。 */
+  readonly memoryRowsRead: number;
+  /** ★ **物化的 `vector_codes` 行数**（Q2 返回行数）。 */
+  readonly codeRowsRead: number;
+  /** ★ **物化出 `embedding` 的行数**（**字节账的分子**；含 Q4 的整行读）。 */
+  readonly embeddingRowsRead: number;
+  /**
+   * ★ **`scoreOf` 返回了行的次数**（= `embeddingCalls` 减去「白调用」）。
+   *
+   * ⚠️ **为什么单列它**（口径 §2 断言 1c-bench 的可判定形式）：
+   *   `embeddingCalls`（调用次数）与「返回行数」必须**逐条可比**才能证明
+   *   「剪枝率分子用的是调用次数、不是返回行数」⇒ ⇒ 断言 1c-bench 比的是这一对。
+   */
+  readonly embeddingExactRows: number;
+  /** ★ **`scoreOf` 的 `get()` 调用次数**（**无条件**计数 ⇒ **剪枝率分子** ≡ `prune` 的 `exactReads`）。 */
+  readonly embeddingCalls: number;
+  /** ★ **Q3 窄读行数**（**0 字节**）。 */
+  readonly narrowRowsRead: number;
+  /**
+   * ★ **字节侧的桶成员行数**（形状登记制认领「成员来源」的行数之和）。
+   *
+   * ⚠️ **它与 legacy 的 `bucketMemberRows` 是【两个数】**：legacy 只认「纯 `vector_cell_members` 表」
+   *   的语句；字节侧认「认领成员来源的**形状**」（含 `bucketCandidate` 那个 JOIN 形状）
+   *   ⇒ ⇒ 在生产路径上两者相等（Q1 是唯一的成员形状）⇒ **但不要混用**。
+   */
+  readonly bucketMemberRowsRead: number;
+  /** ★ **码字节之和**（Σ `row.code.byteLength`；**实测**，不是「行数 × 768」）。 */
+  readonly codeBytes: number;
+  /** ★ **向量字节之和**（Σ `row.embedding.byteLength`）。 */
+  readonly embeddingBytes: number;
+  /** ★ **非向量字节**（Q4 的 `content` + `content_tokens` 的 UTF-8 实测）。 */
+  readonly contentBytes: number;
+  /** ★ **向量载荷字节**（`codeBytes + embeddingBytes`，**零容差恒等式**）。 */
+  readonly bytesRead: number;
+  /**
+   * ★ **坏码行数**（码长**不属于该维度下任何已知码宽** ⇒ 读了、搬了字节、
+   * 却被 fail-open 丢弃 ⇒ **白读**）。
+   *
+   * ⚠️ ★ **判据是【集合】**（T09 · B1）：int8 = 768 B · int4 = 384 B · 二值 = 96 B
+   *   ⇒ ⇒ **三档都合法** ⇒ ⇒ 只有「不属于任何一档」的才算坏码行。
+   */
+  readonly badCodeRows: number;
 }
 
 /**
@@ -817,7 +950,7 @@ export interface RowReadCounter {
   /** 停止计数（幂等）。 */
   stop(): void;
   /** 取**累计**快照（两次快照相减 = 窗口内读的行数）。 */
-  snapshot(): RowReadSnapshot;
+  snapshot(): ByteReadSnapshot;
   /** 拆掉计数器（把 `db.prepare` 恢复原状）。 */
   uninstall(): void;
 }
@@ -838,6 +971,20 @@ export interface RowReadCounterOptions {
    * ⚠️ **生产路径不传这个选项** ⇒ **零影响**（默认值 `false` ⇒ 计数照常）。
    */
   readonly forceDisabled?: boolean;
+  /**
+   * ★ **期望的码长**（★ **集合**：该维度下**任一已知码宽**的长度）
+   *   —— 用来检出**坏码行**（码长不属于任何已知码宽 ⇒ 读了、搬了字节、
+   *   却被 `readCodes()` fail-open 丢弃 ⇒ **白读** ⇒ 断言 1a 的前提违例）。
+   *
+   * ⚠️ ★ **为什么是【集合】而不是「单一长度」**（T09 · B1）：
+   *   码宽是**数据属性**（由这一行的 blob 长度决定）⇒ int4 = 384 B · 二值 = 96 B
+   *   ⇒ ⇒ **用单一长度会把 int4 / 二值的码行全判成「坏码行」** ⇒ ⇒ **假红**。
+   *
+   * ⚠️ **缺省 = 该维度下所有已知码宽的长度**（★ 来自 `src/vector/quantize.ts` 的
+   *   `codeWidthByteLengths(dim)` ⇒ ★ **与生产侧 `detectCodeWidth()` 同一份口径**
+   *   ⇒ ⇒ **bench 侧不许另写一份长度表**（★ 那会造出两处口径 ⇒ 未来漂移））。
+   */
+  readonly expectedCodeBytes?: readonly number[];
 }
 
 /**
@@ -857,7 +1004,10 @@ export interface RowReadCounterOptions {
  *
  * ⚠️ ★ **为什么按 SQL 分类**（口径必须写死）：
  *   · `memories` ⇒ **候选行**（= H1 的判据量）；
- *   · `vector_cell_members` ⇒ **桶成员行**（路由侧的行读；**附加信息**，不判 H1）。
+ *   · `vector_cell_members` ⇒ **桶成员行**（路由侧的行读；**附加信息**，不判 H1）；
+ *   · `vector_codes` ⇒ **码行**（C′ 档两段式的 **Q2 码池**；**附加信息**，不判 H1）
+ *     ⇒ ⚠️ **T06 第一段新增**：两段式剪枝把「读 3KB/行」换成「读 ~784B/行」
+ *       ⇒ **码行数是 H1′ 字节账的第一项** ⇒ ⇒ **它必须被认领**（不被认领 ⇒ 读数恒 0）。
  *   ⇒ ⇒ ⚠️ **聚合查询不算行读**（`COUNT(*)` 之类 ⇒ 它读的是索引，**不是候选行**）。
  *
  * ⚠️ **纪律**：
@@ -874,12 +1024,24 @@ export function installRowReadCounter(
   db: Database.Database,
   options: RowReadCounterOptions = {},
 ): RowReadCounter {
-  type ReadKind = 'candidate' | 'bucketMember';
-  const counters: Record<ReadKind, number> = { candidate: 0, bucketMember: 0 };
+  const counters: Record<ReadKind, number> = { candidate: 0, bucketMember: 0, vectorCode: 0 };
+  // ⚠️ ★ **字节侧的来源状态**（形状登记制；**当场累加标量 ⇒ O(1) 内存**）。
+  const sources = new Map<ByteSourceKind, MutableByteSource>();
+  // ⚠️ ★ **逐形状的行数**（断言 2 的逐形状证据）。
+  const shapeRows = new Map<string, number>();
+  // ⚠️ ★ **未登记语句的指纹集合**（打印 + 落盘）。
+  const unclassifiedSqlKinds = new Set<string>();
+  let unclassifiedRows = 0;
+  let badCodeRows = 0;
   let counting = false;
   // ⚠️ **「装了但不计数」**（**仅测试用的注入点**）⇒ 实测值恒为 0
   //   ⇒ ⇒ 用来验证「计数器失效 ⇒ 兜底把 `mode` 标成 `derived`」这条纪律。
   const forceDisabled = options.forceDisabled === true;
+  // ⚠️ ★ **期望的码长（★ 集合：该维度下任一已知码宽的长度）** ⇒ 用来检出**坏码行**（白读）。
+  //   ★ 集合的**唯一出处** = `src/vector/quantize.ts` 的 `codeWidthByteLengths(dim)`
+  //   ⇒ ⇒ **与生产侧 `detectCodeWidth()` 同一份口径**（★ bench 侧不许另写一份长度表）。
+  const expectedCodeBytes =
+    options.expectedCodeBytes ?? codeWidthByteLengths(DEFAULT_PARAMS.EMBED_DIM);
 
   const handle = db as unknown as { prepare: (source: string) => unknown };
   // ⚠️ **存「原函数对象」而不是它的 bind 产物** ⇒ `uninstall()` 能**逐位**还原
@@ -890,25 +1052,96 @@ export function installRowReadCounter(
     const statement = originalPrepare.call(db, source);
     const kind = classifyReadKind(source);
     // ⚠️ **不是候选行 / 桶成员行的 SQL ⇒ 原样返回**（不包装 ⇒ 零开销）。
+    //   ⚠️ ★ **聚合查询也走这一条**（`classifyReadKind()` 第一条规则就是聚合 ⇒ 返回 `null`）
+    //   ⇒ ⇒ **聚合命中零来源、但【不计入 `unclassified`】**（与 legacy 侧对称）：
+    //   聚合读的是索引、**不物化行** ⇒ 不进字节账、不进行数账、也不算「口径不完整」。
     if (kind === null) {
       return statement;
     }
-    return wrapStatement(statement, kind);
+    // ⚠️ ★ **字节侧：形状登记制**（未登记 ⇒ 命中零来源 ⇒ `unclassified` ⇒ 判红）。
+    //   ⚠️ **护栏升级为结构性**：Q2 若写成 `JOIN memories` ⇒ 形状键不再匹配 Q2
+    //   ⇒ ⇒ **直接暴露**（而不是「记到 candidate 后被人忽略」）。
+    const shape = resolveShape(source);
+    return wrapStatement(statement, kind, shape, source);
   };
 
-  function wrapStatement(statement: unknown, kind: ReadKind): unknown {
+  /**
+   * ★ **取（并初始化）一个来源的累计状态**。
+   *
+   * @param kind 来源种类
+   * @returns 可累加的状态
+   */
+  function sourceState(kind: ByteSourceKind): MutableByteSource {
+    const existing = sources.get(kind);
+    if (existing !== undefined) {
+      return existing;
+    }
+    const created: MutableByteSource = { kind, rows: 0, bytes: 0, contentBytes: 0, calls: 0 };
+    sources.set(kind, created);
+    return created;
+  }
+
+  /**
+   * ★ **累加一行的字节**（**当场累加标量** ⇒ 绝不缓存行数组 ⇒ O(1) 内存）。
+   *
+   * @param shape 该行所属的形状
+   * @param row 物化出来的一行
+   */
+  function accumulateRow(shape: ShapeEntry, row: unknown): void {
+    const bytes = bytesOfRow(row, shape, expectedCodeBytes);
+    if (bytes.badCode) {
+      // ⚠️ ★ **坏码行 = 白读**（进了结果集 ⇒ 字节已搬 ⇒ 但 `readCodes()` fail-open 丢弃它）
+      //   ⇒ ⇒ 计数（口径 §2 断言 1a 的前提 / §6 修正 7）。
+      badCodeRows += 1;
+    }
+    for (const source of shape.sources) {
+      const state = sourceState(source);
+      // ⚠️ ★ **向量来源只认「真的物化出了 embedding」的行**
+      //   （否则 Q3 的窄读会被算成向量行 ⇒ 字节账虚高 ⇒ 口径 §1.2 的告警）。
+      if ((source === 'exactEmbedding' || source === 'survivorRow') && !bytes.hasEmbedding) {
+        continue;
+      }
+      state.rows += 1;
+      // ⚠️ ★ **载荷字节只记在 `payloadSource` 这一个来源上**
+      //   （`bucketCandidate` 那个 JOIN 形状同时认领「向量 + 成员」⇒ 按 `sources` 逐个累加会**记两遍**）。
+      if (shape.payloadSource === source) {
+        state.bytes += bytes.payloadBytes;
+        state.contentBytes += bytes.contentBytes;
+      }
+    }
+  }
+
+  function wrapStatement(
+    statement: unknown,
+    kind: ReadKind,
+    shape: ShapeEntry | null,
+    source: string,
+  ): unknown {
     const target = statement as {
       all: (...args: unknown[]) => unknown[];
       get: (...args: unknown[]) => unknown;
       iterate: (...args: unknown[]) => IterableIterator<unknown>;
     };
+    // ⚠️ **指纹在包装时算一次**（不是每次执行算 ⇒ 零额外开销）。
+    const fingerprint = sqlFingerprint(source);
     return new Proxy(target, {
       get(inner, property) {
         if (property === 'all') {
           return (...args: unknown[]): unknown[] => {
             const rows = target.all(...args);
             if (counting) {
+              // ⚠️ ★ **legacy 结论：逐位复现旧行为**（物化了几行就计几行）。
               counters[kind] += rows.length;
+              if (shape === null) {
+                // ⚠️ ★ **命中零来源** ⇒ 记进 `unclassified`（判红 ⇒ 「口径不完整」）。
+                unclassifiedRows += rows.length;
+                unclassifiedSqlKinds.add(fingerprint);
+              } else {
+                shapeRows.set(shape.id, (shapeRows.get(shape.id) ?? 0) + rows.length);
+                for (const row of rows) {
+                  accumulateRow(shape, row);
+                }
+              }
             }
             return rows;
           };
@@ -916,8 +1149,28 @@ export function installRowReadCounter(
         if (property === 'get') {
           return (...args: unknown[]): unknown => {
             const row = target.get(...args);
-            if (counting && row !== undefined) {
-              counters[kind] += 1;
+            if (counting) {
+              // ⚠️ ★ **legacy 结论**：只在「真的返回了行」时计（**逐位复现旧行为**）。
+              if (row !== undefined) {
+                counters[kind] += 1;
+              }
+              if (shape === null) {
+                if (row !== undefined) {
+                  unclassifiedRows += 1;
+                  unclassifiedSqlKinds.add(fingerprint);
+                }
+              } else {
+                // ⚠️ ★★★ **调用次数无条件计数**（**返回 `undefined` 也计**）
+                //   ⇒ ⇒ 这是**剪枝率的分子**（口径 §1.7）⇒ ⇒ 它**定义上** == `prune` 的 `exactReads`
+                //   ⇒ ⇒ **不许**改成「只在返回行时计」（那会偏小 = 偏松 = 假绿）。
+                if (shape.callSource !== null) {
+                  sourceState(shape.callSource).calls += 1;
+                }
+                if (row !== undefined) {
+                  shapeRows.set(shape.id, (shapeRows.get(shape.id) ?? 0) + 1);
+                  accumulateRow(shape, row);
+                }
+              }
             }
             return row;
           };
@@ -929,6 +1182,13 @@ export function installRowReadCounter(
               for (const row of iterator) {
                 if (counting) {
                   counters[kind] += 1;
+                  if (shape === null) {
+                    unclassifiedRows += 1;
+                    unclassifiedSqlKinds.add(fingerprint);
+                  } else {
+                    shapeRows.set(shape.id, (shapeRows.get(shape.id) ?? 0) + 1);
+                    accumulateRow(shape, row);
+                  }
                 }
                 yield row;
               }
@@ -952,8 +1212,70 @@ export function installRowReadCounter(
     stop(): void {
       counting = false;
     },
-    snapshot(): RowReadSnapshot {
-      return { candidateRows: counters.candidate, bucketMemberRows: counters.bucketMember };
+    snapshot(): ByteReadSnapshot {
+      const bySource: Record<string, ByteSourceSnapshot> = {};
+      let memoryRowsRead = 0;
+      let codeRowsRead = 0;
+      let embeddingRowsRead = 0;
+      let embeddingExactRows = 0;
+      let embeddingCalls = 0;
+      let narrowRowsRead = 0;
+      let bucketMemberRowsRead = 0;
+      let codeBytes = 0;
+      let embeddingBytes = 0;
+      let contentBytes = 0;
+      for (const [kind, state] of sources) {
+        bySource[kind] = {
+          kind,
+          rows: state.rows,
+          bytes: state.bytes,
+          contentBytes: state.contentBytes,
+          calls: state.calls,
+        };
+        if (kind === 'member') {
+          bucketMemberRowsRead = state.rows;
+        } else if (kind === 'code') {
+          codeRowsRead = state.rows;
+          codeBytes = state.bytes;
+        } else if (kind === 'narrow') {
+          narrowRowsRead = state.rows;
+          // ⚠️ **窄读也是 `memories` 行**（0 字节，但计入行数 ⇒ ADR §8.5 的「原口径」）。
+          memoryRowsRead += state.rows;
+        } else if (kind === 'exactEmbedding') {
+          embeddingExactRows = state.rows;
+          embeddingCalls = state.calls;
+          embeddingRowsRead += state.rows;
+          embeddingBytes += state.bytes;
+          memoryRowsRead += state.rows;
+        } else if (kind === 'survivorRow') {
+          embeddingRowsRead += state.rows;
+          embeddingBytes += state.bytes;
+          memoryRowsRead += state.rows;
+        }
+        contentBytes += state.contentBytes;
+      }
+      return {
+        candidateRows: counters.candidate,
+        bucketMemberRows: counters.bucketMember,
+        codeRows: counters.vectorCode,
+        bySource,
+        shapeRows: Object.fromEntries(shapeRows),
+        unclassifiedRows,
+        unclassifiedSqlKinds: [...unclassifiedSqlKinds].sort(),
+        memoryRowsRead,
+        codeRowsRead,
+        embeddingRowsRead,
+        embeddingExactRows,
+        embeddingCalls,
+        narrowRowsRead,
+        bucketMemberRowsRead,
+        codeBytes,
+        embeddingBytes,
+        contentBytes,
+        // ⚠️ ★ **字节恒等式**（口径 §2 断言 1）：**零容差**、永远成立。
+        bytesRead: codeBytes + embeddingBytes,
+        badCodeRows,
+      };
     },
     uninstall(): void {
       counting = false;
@@ -963,26 +1285,53 @@ export function installRowReadCounter(
 }
 
 /**
- * 把一条 SQL 归到「候选行 / 桶成员行 / 不计」三类。
+ * 把一条 SQL 归到「候选行 / 桶成员行 / 码行 / 不计」四类。
  *
  * ⚠️ **口径**：
  *   · `FROM memories` / `JOIN memories` ⇒ **候选行**（写入路径那条 JOIN 也归这一类
  *     ⇒ 因为它的**结果集**就是候选行）；
  *   · `FROM vector_cell_members` / `JOIN vector_cell_members` ⇒ **桶成员行**；
+ *   · `FROM vector_codes` / `JOIN vector_codes` ⇒ **码行**（C′ 档两段式的 **Q2 码池**）；
  *   · **聚合查询**（`COUNT(` / `SUM(` / `AVG(` …）⇒ **不计**（它读的是索引，不是行）。
+ *
+ * ⚠️ ★★★ **匹配顺序是有意的，不许倒**（T06 第一段 · 规格 §5.1.2 的告警靠它生效）：
+ *   ① **聚合**最先（`COUNT(*)` 那条诊断 SQL 内部还嵌了 `NOT EXISTS (… FROM vector_codes …)`
+ *      ⇒ 若不先判聚合，它会被后面的规则抢走）；
+ *   ② **`memories` 必须排在 `vector_codes` 前面** ——
+ *      · 一条 SQL **碰了 `memories`** ⇒ 它**真的要付 `memories` 的字节**
+ *        ⇒ 归成 `candidate` 才是**如实**的（哪怕它同时还读了码池）；
+ *      · 规格 §5.1.2 的原文告警正是这条顺序的后果：
+ *        「若把 Q2 写成 `JOIN memories`（哪怕只 `SELECT m.deleted`），
+ *          `classifyReadKind()` 会把它认成 `candidate` ⇒ `codeRowsRead` 永远 0、
+ *          `memoryRowsRead` 永远满额 ⇒ **H1′ 的账从根上算错，而报表看起来很正常**」；
+ *      · ⇒ ⇒ **顺序倒过来 ⇒ 那条告警就失效了** ⇒ Q2 写成 JOIN 会被静默吞掉
+ *        ⇒ ⇒ **生产 SQL（`src/vector/ivf.ts` 的 `readCodes()`）必须保持不 JOIN `memories`**。
+ *   ③ `vector_cell_members` 排在 `vector_codes` 前面（架构师 §10.2 的 legacy 判定顺序；
+ *      两者互斥 ⇒ 顺序不影响行为 ⇒ 固定下来只为「读的人不用猜」）。
  *
  * @param sql SQL 文本
  * @returns 分类（`null` ⇒ 不计）
  */
-function classifyReadKind(sql: string): 'candidate' | 'bucketMember' | null {
+export function classifyReadKind(sql: string): ReadKind | null {
   if (/\b(?:COUNT|SUM|AVG|TOTAL)\s*\(/i.test(sql)) {
     return null;
   }
+  // ⚠️ ★ **`memories` 优先**（理由见上面的头注释 §② —— 顺序不许倒）。
   if (/\b(?:FROM|JOIN)\s+memories\b/i.test(sql)) {
     return 'candidate';
   }
   if (/\b(?:FROM|JOIN)\s+vector_cell_members\b/i.test(sql)) {
     return 'bucketMember';
+  }
+  // ⚠️ ★ **码池（Q2）**：`vector_codes` 是 C′ 档两段式的第二级（int8 码）
+  //   ⇒ 它**不碰 `memories`** ⇒ 不会被上面那条抢走 ⇒ 这里认领它。
+  //   ⚠️ **认领它之前它恒为 0** ⇒ 报表上「码行数 = 0」看起来像「码表是空的」，
+  //     实际是「**没人认领这张表**」⇒ ⇒ 这一条是 T06 第一段必须补上的洞。
+  //   ⚠️ **放在 `vector_cell_members` 之后**（架构师 §10.2 的 legacy 判定顺序）：
+  //   两者互斥（没有一条 SQL 同时读这两张表）⇒ 顺序不影响行为 ⇒ 但**固定下来**，
+  //   读的人不用猜、第二段照抄时也不会排成另一个顺序。
+  if (/\b(?:FROM|JOIN)\s+vector_codes\b/i.test(sql)) {
+    return 'vectorCode';
   }
   return null;
 }
@@ -1145,9 +1494,14 @@ function diskInfo(): { totalDiskBytes: number; freeDiskBytes: number } {
 /**
  * 采集机器环境。
  *
+ * @param storageTargetPath 判定**存储介质**用的路径（**传库文件路径**）。
+ *   ⚠️ **不传会退回 `process.cwd()` 所在盘**，而当库放在**另一个盘**上时，那会把介质**标错**：
+ *   例：库在 NVMe `E:`、cwd 在机械盘 `D:` ⇒ 旧实现记成 `HDD`
+ *   ⇒ 而「每行读成本（µs/行）」这条推论**完全依赖这个标签** ⇒ 标签错，读成本就不可解释。
+ *   （2026-11-03 修正：原实现无参，等价于「永远报 cwd 的盘」。）
  * @returns 机器环境快照
  */
-export function machineInfo(): MachineInfo {
+export function machineInfo(storageTargetPath?: string): MachineInfo {
   const cpus = cpus_();
   const totalMemoryBytes = totalmem();
   const freeMemoryBytes = freemem();
@@ -1163,7 +1517,8 @@ export function machineInfo(): MachineInfo {
     totalDiskBytes: disk.totalDiskBytes,
     freeDiskBytes: disk.freeDiskBytes,
     // ⚠️ **介质探测失败不抛错**（`detectStorageMedia` 内部全吞）⇒ 这一行不会让 bench 挂掉。
-    storageMedia: detectStorageMedia(),
+    // ⚠️ **按库文件所在的盘判介质**（不传 ⇒ 退回 cwd 的盘 ⇒ 库放在别的盘时会标错）。
+    storageMedia: detectStorageMedia(storageTargetPath),
   };
 }
 

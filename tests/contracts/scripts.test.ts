@@ -19,6 +19,7 @@ import {
   compareAnchorRows,
   countHardRules,
   findAnchorTable,
+  findHtmlEntityResidue,
   normalizeCell,
 } from '../../scripts/check-anchor.js';
 import {
@@ -250,10 +251,10 @@ describe('P0-T06 · check-payload-keys（§8.4 键集）', () => {
   });
 });
 
-describe('P0-T06 · check-anchor（跨节锚定 5 行 × 3 列）', () => {
-  it('§14.3.1 里的锚定表恰好 5 行', () => {
+describe('P0-T06 · check-anchor（跨节锚定 6 行 × 3 列）', () => {
+  it('§14.3.1 里的锚定表恰好 6 行', () => {
     const rows = findAnchorTable(markdown);
-    expect(rows).toHaveLength(5);
+    expect(rows).toHaveLength(6);
   });
 
   it('逐行逐列与写死的期望一致', () => {
@@ -280,7 +281,7 @@ describe('P0-T06 · check-anchor（跨节锚定 5 行 × 3 列）', () => {
   });
 
   it('★ 反例：少一行 ⇒ 失败', () => {
-    const rows = (findAnchorTable(markdown) ?? []).slice(0, 4);
+    const rows = (findAnchorTable(markdown) ?? []).slice(0, 5);
     const diffs = compareAnchorRows(rows);
     expect(diffs.length).toBeGreaterThan(0);
     expect(diffs[0]?.reason).toContain('行数不一致');
@@ -291,7 +292,53 @@ describe('P0-T06 · check-anchor（跨节锚定 5 行 × 3 列）', () => {
   });
 
   it('写死的期望恰好五行', () => {
-    expect(EXPECTED_ANCHOR_ROWS).toHaveLength(5);
+    expect(EXPECTED_ANCHOR_ROWS).toHaveLength(6);
+  });
+});
+
+describe('轮 A · check-anchor 的 HTML 实体残留判据', () => {
+  it('★ 真实设计稿：残留实体数 = 0', () => {
+    expect(findHtmlEntityResidue(markdown)).toEqual([]);
+  });
+
+  it('★ 反例：一个实体 ⇒ 被抓出来（否则是恒绿守卫）', () => {
+    const found = findHtmlEntityResidue('前面\n### 11.2 错误类型体系 &#x4F46;\n后面');
+    expect(found).toHaveLength(1);
+    expect(found[0]?.entity).toBe('&#x4F46;');
+    expect(found[0]?.line).toBe(2);
+  });
+
+  it('★ 反例：同一行多个实体 ⇒ 逐个报出（不合并）', () => {
+    const found = findHtmlEntityResidue('a &#x4E3A; b &#x7684; c');
+    expect(found).toHaveLength(2);
+    expect(found.map((item) => item.entity)).toEqual(['&#x4E3A;', '&#x7684;']);
+  });
+
+  it('★ 反例：十进制数值引用 &#NNNN; ⇒ 同样被抓（★ 它与十六进制是同一个字符）', () => {
+    const found = findHtmlEntityResidue('前面 &#20915; 后面');
+    expect(found).toHaveLength(1);
+    expect(found[0]?.entity).toBe('&#20915;');
+  });
+
+  it('★ 反例：大写 X 的十六进制 &#XNNNN; ⇒ 同样被抓（★ HTML5 允许）', () => {
+    const found = findHtmlEntityResidue('前面 &#X4F46; 后面');
+    expect(found).toHaveLength(1);
+    expect(found[0]?.entity).toBe('&#X4F46;');
+  });
+
+  it('★ 内容驱动：只换内容 ⇒ 判定必须跟着变（★ 证明不是恒绿守卫）', () => {
+    // ★ 同一个「有实体 / 无实体」的对照 ⇒ 只换内容、判定必须反向
+    expect(findHtmlEntityResidue('分母必须是 flat 的候选全集')).toEqual([]);
+    expect(findHtmlEntityResidue('分&#x5206;母必须是 flat 的候选全&#x96C6;')).toHaveLength(2);
+    // ★ 同一形态、只改一个十六进制位 ⇒ 仍然被抓（★ 证明不是「凑够某个数就过」）
+    const mutated = findHtmlEntityResidue('分&#x5207;母');
+    expect(mutated).toHaveLength(1);
+    expect(mutated[0]?.entity).toBe('&#x5207;');
+  });
+
+  it('★ 判据边界：命名实体 &amp; ⇒ **有意不覆盖**（★ 具名集合要写死清单 ⇒ 边界要写清）', () => {
+    // ⚠️ 这里**只放命名实体**（★ 十进制数值引用已被判据覆盖 ⇒ 上面那条已单独断言）
+    expect(findHtmlEntityResidue('&amp; 与 &lt; 与 &#xZZ;')).toEqual([]);
   });
 });
 
@@ -344,7 +391,7 @@ describe('P2-T04 · check-anchor 的「动作关键词落在管辖路径上」',
       designDoc: markdown,
     });
     expect(diffs).toEqual([]);
-    expect(outcomes.length).toBe(27);
+    expect(outcomes.length).toBe(30);
   });
 
   it('待补的路径**被记进结果**（不许静默跳过），且**不判红**', () => {
@@ -442,7 +489,7 @@ describe('P2-T04 · 关键词与路径标签的口径', () => {
     expect(normalizeAnchorLabel('§3 `cluster_snapshot_meta`')).toBe('§3 cluster_snapshot_meta');
   });
 
-  it('路径标签逐条解析出写死的条数（4 / 6 / 6 / 7 / 4）', () => {
+  it('路径标签逐条解析出写死的条数（4 / 6 / 6 / 7 / 4 / 3）', () => {
     const rows = findAnchorTable(markdown) ?? [];
     const counts = rows.map((row) => parseAnchorPathLabels(row[2] ?? '').length);
     expect(counts).toEqual(EXPECTED_ANCHOR_PATH_COUNTS.map(([, count]) => count));
@@ -458,7 +505,7 @@ describe('P2-T04 · 关键词与路径标签的口径', () => {
   it('★ F5：期望行的第三列项数与写死的分母**互相锁死**（第三处 ⇒ 同改两处会被抓住）', () => {
     // ⚠️ 这里的数字是**独立硬编码**的（不是从 `EXPECTED_ANCHOR_PATH_COUNTS` 推导）
     //   ⇒ 它与 `EXPECTED_ANCHOR_PATH_COUNTS` 构成**互锁**。
-    const expectedCountsFromRows = [4, 6, 6, 7, 4];
+    const expectedCountsFromRows = [4, 6, 6, 7, 4, 3];
     const countsFromConstants = EXPECTED_ANCHOR_PATH_COUNTS.map(([, count]) => count);
     expect(countsFromConstants).toEqual(expectedCountsFromRows);
 
@@ -739,7 +786,7 @@ describe('P0-T07 · 门禁入口的可见性（防「假绿闸门」）', () => 
     expect(pkg.scripts?.verify).toContain('pnpm run typecheck');
   });
 
-  it('`verify` 链恰好串起 14 条门禁（11 条契约 + 3 条文档审计），且每段都写成 `pnpm run <名>`', () => {
+  it('`verify` 链恰好串起 18 条门禁（10 条契约 + 3 条文档审计 + 4 条链外转正守卫），且每段都写成 `pnpm run <名>`', () => {
     const pkg = readPackageJson();
     const { names, malformed } = parseVerifyChain(pkg.scripts?.verify ?? '');
     expect(malformed).toEqual([]);
